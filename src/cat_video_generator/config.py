@@ -36,6 +36,7 @@ _ARK_AGENT_PLAN_BASE_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
 _ARK_STANDARD_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 _ARK_AGENT_PLAN_IMAGE_MODEL = "doubao-seedream-5.0-lite"
 _ARK_AGENT_PLAN_VIDEO_TIERS = {
+    "doubao-seedance-1.5-pro": ("medium", "large", "max"),
     "doubao-seedance-1.5-pro-即将下线": ("medium", "large", "max"),
     "doubao-seedance-2.0-mini": ("large", "max"),
 }

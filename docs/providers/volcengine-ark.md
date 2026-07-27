@@ -21,8 +21,9 @@ Seedance 不作为生图模型，Seedream 不负责异步视频任务。
 Agent Plan 的视频模型按模型单独校验套餐：
 
 - `doubao-seedance-2.0-mini`：Large或Max，作为产品默认值。
-- `doubao-seedance-1.5-pro-即将下线`：Medium、Large或Max，仅在操作者显式选择时
-  允许，不作为失败后的自动降级；控制台已标记该型号即将下线。
+- `doubao-seedance-1.5-pro` 或
+  `doubao-seedance-1.5-pro-即将下线`：Medium、Large或Max，仅在操作者
+  显式选择时允许，不作为失败后的自动降级。
 
 套餐不满足时必须在创建数据库任务和供应商任务前失败。代码不会根据一次
 `UnsupportedModel` 自动猜测或切换模型，避免重复收费和把套餐问题误判为
@@ -105,10 +106,10 @@ Ark 日期版本模型的 A/B。标准模式后续若要更换 Model ID 或 Endp
 - 音频：请求显式设置 `generate_audio=true`，生成环境声、动作音效和可选轻音乐；Prompt 明确禁止对白、旁白和歌词。
 - Seedance 2.0 不配置 `seed`、`frames`、`camera_fixed` 或 `service_tier`。
 
-显式选择 `doubao-seedance-1.5-pro-即将下线` 时沿用相同的异步任务、首帧输入、
-原生音频、下载、QC和幂等边界，但这只用于受控验证或迁移，不改变默认
-2.0-mini 配置。1.5-pro 被供应商返回 `UnsupportedModel` 时同样按权益错误
-终止，不再回退到其他视频模型。
+显式选择上述任一1.5名称时沿用相同的异步任务、首帧输入、原生音频、
+下载、QC和幂等边界，但这只用于受控验证或迁移，不改变默认2.0-mini
+配置。1.5-pro 被供应商返回 `UnsupportedModel` 时同样按权益错误终止，
+不再回退到其他视频模型。
 
 ### 输入模式
 

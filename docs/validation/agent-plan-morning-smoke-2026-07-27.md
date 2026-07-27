@@ -8,8 +8,9 @@
 - 两个 render revision 的 Seedream 首帧均生成成功并通过人工审核。
 - Seedance 2.0-mini、一次被错误截断名称的 Seedance 1.5-pro，以及用户
   确认的完整名称 `doubao-seedance-1.5-pro-即将下线` 均被供应商以
-  `UnsupportedModel` 拒绝；三次调用都没有返回 task ID，也没有进入轮询、
-  下载或视频媒体 QC。
+  `UnsupportedModel` 拒绝；用户随后再次确认
+  `doubao-seedance-1.5-pro` 并重试，结果相同。四次调用都没有返回 task
+  ID，也没有进入轮询、下载或视频媒体 QC。
 - 当前没有 morning MP4；Slot 保持 `failed`，不得直接重复提交。
 
 官方套餐表显示 `doubao-seedance-2.0-mini` 只对 Agent Plan Large/Max
@@ -99,6 +100,25 @@ Medium/Large/Max 开放，而
 完整名称仍被当前 Key 拒绝，因此不能再把失败归因于名称截断。系统按不可
 恢复错误停止，没有执行相同请求的第二次 POST。
 
+## 再次确认1.5短名称后的重试
+
+用户将本地配置再次调整为 `doubao-seedance-1.5-pro` 并明确要求继续。
+程序创建 render revision 4，复用已有批准首帧，没有创建新的
+`keyframe_first` Job。
+
+- SlotRetryEvent：`23cdbb87-c758-4ff0-a251-0a78a2423a5b`。
+- GenerationJob：`e58563f4-682d-4fb7-a8c0-060c9b98ad4b`。
+- render revision：4。
+- 模型：`doubao-seedance-1.5-pro`。
+- 尝试次数：1。
+- 状态：`failed`。
+- 错误码：`UnsupportedModel`。
+- Provider task ID：无。
+- 本地视频：无。
+
+该结果与 revision 2 的同名模型调用一致，说明当前 Key 与 Agent Plan
+端点仍不接受该视频模型。系统没有继续重试。
+
 ## 恢复步骤
 
 1. 在火山方舟控制台确认当前 API Key 所属账号、Agent Plan 套餐档位以及
@@ -112,7 +132,7 @@ Medium/Large/Max 开放，而
 ```powershell
 uv run cvg retry-slot life-2026-07-24-seaside-travel `
   --slot morning `
-  --reason "Provider video entitlement verified after three UnsupportedModel responses"
+  --reason "Provider video entitlement verified after four UnsupportedModel responses"
 ```
 
 4. 检查 Slot 已进入 `planned`、render revision 再增加1，然后显式运行

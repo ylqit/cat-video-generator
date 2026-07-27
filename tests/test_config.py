@@ -178,8 +178,16 @@ def test_agent_plan_runtime_requires_supported_visual_profile(
     }
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        "doubao-seedance-1.5-pro",
+        "doubao-seedance-1.5-pro-即将下线",
+    ],
+)
 @pytest.mark.parametrize("tier", ["medium", "large", "max"])
 def test_agent_plan_accepts_seedance_1_5_for_supported_tiers(
+    model: str,
     tier: str,
 ) -> None:
     configured = RuntimeSettings.from_env(
@@ -189,7 +197,7 @@ def test_agent_plan_accepts_seedance_1_5_for_supported_tiers(
             "ARK_API_KEY": "test-only-key",
             "ARK_BASE_URL": AGENT_PLAN_URL,
             "ARK_IMAGE_MODEL": "doubao-seedream-5.0-lite",
-            "ARK_VIDEO_MODEL": "doubao-seedance-1.5-pro-即将下线",
+            "ARK_VIDEO_MODEL": model,
         }
     )
 
