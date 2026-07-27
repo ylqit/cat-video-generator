@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "templateId": "micro-event-v1",
+  "clipKind": "micro_event",
+  "continuityMode": "shared_context",
+  "requiresDependency": false,
+  "allowedSlots": [
+    "morning",
+    "noon",
+    "evening"
+  ],
+  "beatPattern": [
+    "establish",
+    "discovery",
+    "reaction",
+    "result"
+  ],
+  "cooldownDays": 3,
+  "invariants": [
+    "event-is-complete-inside-one-clip",
+    "both-protagonists-are-readable",
+    "result-does-not-require-another-slot",
+    "location-belongs-to-day-context"
+  ],
+  "forbiddenPatterns": [
+    "harm-as-comedy",
+    "humiliation",
+    "hard-cliffhanger",
+    "identity-change",
+    "copied-external-story-structure"
+  ]
+}

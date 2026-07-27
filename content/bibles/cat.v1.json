@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "characterId": "cat",
+  "subjectVersionId": "cat-v1",
+  "identityReferencePath": "主题示例/猫咪本体.png",
+  "name": null,
+  "storyRole": "equal-protagonist",
+  "traits": [
+    "curious",
+    "quick-to-act",
+    "easily-attracted-by-light-sound-and-motion",
+    "returns-when-partner-needs-help"
+  ],
+  "wants": [
+    "discover-new-paths",
+    "share-discoveries-with-person"
+  ],
+  "growthDirection": "learn-to-complete-shared-goals-instead-of-only-chasing-novelty",
+  "speechRules": [
+    "no-human-language",
+    "communicate-through-action-expression-purr-and-meow"
+  ],
+  "forbiddenChanges": [
+    "gray-marking-layout",
+    "face-structure",
+    "ear-shape",
+    "tail-proportion",
+    "body-proportion",
+    "permanent-accessories",
+    "subject-identity"
+  ]
+}

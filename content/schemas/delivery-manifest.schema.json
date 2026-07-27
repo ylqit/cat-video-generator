@@ -1,0 +1,219 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cat-video-generator.local/schemas/delivery-manifest.schema.json",
+  "title": "DeliveryManifestV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "deliveryId",
+    "lifePackId",
+    "date",
+    "planRevision",
+    "deliveryRevision",
+    "createdAt",
+    "degraded",
+    "videos"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "deliveryId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "lifePackId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "date": {
+      "type": "string",
+      "format": "date"
+    },
+    "planRevision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "deliveryRevision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "degraded": {
+      "type": "boolean"
+    },
+    "videos": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "prefixItems": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/videoItem"
+            },
+            {
+              "properties": {
+                "sortOrder": {
+                  "const": 1
+                },
+                "slot": {
+                  "const": "morning"
+                },
+                "fileName": {
+                  "const": "01-morning.mp4"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/videoItem"
+            },
+            {
+              "properties": {
+                "sortOrder": {
+                  "const": 2
+                },
+                "slot": {
+                  "const": "noon"
+                },
+                "fileName": {
+                  "const": "02-noon.mp4"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/videoItem"
+            },
+            {
+              "properties": {
+                "sortOrder": {
+                  "const": 3
+                },
+                "slot": {
+                  "const": "evening"
+                },
+                "fileName": {
+                  "const": "03-evening.mp4"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "items": false
+    }
+  },
+  "$defs": {
+    "videoItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sortOrder",
+        "slot",
+        "episodeId",
+        "title",
+        "fileName",
+        "relativePath",
+        "sha256",
+        "byteSize",
+        "durationMs",
+        "container",
+        "videoCodec",
+        "audioCodec",
+        "width",
+        "height",
+        "hasAudio",
+        "renderRevision",
+        "selectedVariant",
+        "qcStatus"
+      ],
+      "properties": {
+        "sortOrder": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3
+        },
+        "slot": {
+          "enum": [
+            "morning",
+            "noon",
+            "evening"
+          ]
+        },
+        "episodeId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "fileName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "relativePath": {
+          "type": "string",
+          "pattern": "^\\./[^/\\\\]+\\.mp4$"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "byteSize": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "durationMs": {
+          "type": "integer",
+          "minimum": 8000,
+          "maximum": 15000
+        },
+        "container": {
+          "const": "mp4"
+        },
+        "videoCodec": {
+          "const": "h264"
+        },
+        "audioCodec": {
+          "const": "aac"
+        },
+        "width": {
+          "const": 720
+        },
+        "height": {
+          "const": 1280
+        },
+        "hasAudio": {
+          "const": true
+        },
+        "renderRevision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "selectedVariant": {
+          "enum": [
+            "primary",
+            "content_fallback"
+          ]
+        },
+        "qcStatus": {
+          "const": "passed"
+        }
+      }
+    }
+  }
+}

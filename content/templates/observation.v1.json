@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "templateId": "observation-v1",
+  "clipKind": "observation",
+  "continuityMode": "shared_context",
+  "requiresDependency": false,
+  "allowedSlots": [
+    "morning",
+    "noon",
+    "evening"
+  ],
+  "beatPattern": [
+    "establish",
+    "activity",
+    "interaction",
+    "linger"
+  ],
+  "cooldownDays": 1,
+  "invariants": [
+    "both-protagonists-are-readable",
+    "activity-is-understandable-without-previous-clips",
+    "location-belongs-to-day-context",
+    "no-forced-conflict-or-resolution"
+  ],
+  "forbiddenPatterns": [
+    "hard-cliffhanger",
+    "undelivered-event-reference",
+    "identity-change",
+    "dialogue-dependent-plot"
+  ]
+}

@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cat-video-generator.local/schemas/continuity-event.schema.json",
+  "title": "ContinuityEventV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "eventId",
+    "effectiveEpisodeId",
+    "scope",
+    "entityId",
+    "operation",
+    "path",
+    "value",
+    "status",
+    "reason"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "eventId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "effectiveEpisodeId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scope": {
+      "enum": [
+        "day",
+        "canon"
+      ]
+    },
+    "entityId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "operation": {
+      "enum": [
+        "add",
+        "replace",
+        "retire"
+      ]
+    },
+    "path": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9_.-]+$"
+    },
+    "value": {},
+    "status": {
+      "enum": [
+        "proposed",
+        "approved",
+        "applied",
+        "rejected"
+      ]
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240
+    },
+    "approvedBy": {
+      "type": "string"
+    },
+    "approvedAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "chapterId": "chapter-seaside-week-v1",
+  "title": "海滨城市生活周",
+  "contextType": "travel",
+  "startDate": "2026-07-24",
+  "endDate": "2026-07-30",
+  "theme": "人物和猫咪在同一座海滨城市体验不同地点和日常活动，不设置必须完成的周目标。",
+  "locationClusterIds": [
+    "seaside-city-core",
+    "seaside-city-nature",
+    "seaside-city-neighborhood"
+  ],
+  "wardrobeVersionIds": {
+    "person": "person-classic-v1",
+    "cat": "cat-natural-v1"
+  },
+  "recurringProps": [
+    "travel-backpack",
+    "small-camera"
+  ],
+  "moodRange": [
+    "curious",
+    "relaxed",
+    "playful",
+    "quiet"
+  ],
+  "contentLanes": [
+    "observation",
+    "micro_event",
+    "continuation"
+  ],
+  "dailyContextHints": [
+    {
+      "date": "2026-07-24",
+      "theme": "海边、市集和缆车组成的自由旅行日",
+      "suggestedLocationIds": [
+        "beach-sunrise",
+        "old-town-market",
+        "mountain-cable-car"
+      ],
+      "sharedMood": "curious-and-relaxed"
+    },
+    {
+      "date": "2026-07-25",
+      "theme": "在老街和港口观察当地人的普通生活",
+      "suggestedLocationIds": [
+        "old-town-alley",
+        "small-harbor",
+        "harbor-viewpoint"
+      ],
+      "sharedMood": "slow-and-observant"
+    },
+    {
+      "date": "2026-07-26",
+      "theme": "下雨后留在旅店附近度过安静一天",
+      "suggestedLocationIds": [
+        "guesthouse-window",
+        "neighborhood-cafe",
+        "rainy-arcade"
+      ],
+      "sharedMood": "cozy-and-unhurried"
+    }
+  ]
+}

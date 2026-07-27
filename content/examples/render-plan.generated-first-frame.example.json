@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "renderPlanId": "render-ep-2026-07-25-fishing-evening-r1",
+  "episodeId": "ep-2026-07-25-fishing-evening",
+  "planRevision": 1,
+  "renderRevision": 1,
+  "generationStrategy": "single_pass",
+  "clipCount": 1,
+  "durationMs": 10000,
+  "visualInputMode": "generated_first_frame",
+  "identityReferences": {
+    "personAssetId": "asset-person-v1",
+    "catAssetId": "asset-cat-v1"
+  },
+  "styleReferenceAssetIds": [
+    "asset-style-storybook-pencil-v1"
+  ],
+  "sceneKeyframeAssetIds": [
+    "asset-keyframe-2026-07-25-fishing-evening-first"
+  ],
+  "visualInputReasonCodes": [
+    "exact_opening",
+    "critical_prop_state"
+  ],
+  "timelineCues": [
+    {
+      "beatOrder": 1,
+      "startMs": 0,
+      "endMs": 3000,
+      "promptText": "严格从批准首帧开始，人物提着装有鱼获和清水的鱼桶，猫咪位于人物身侧，人物、猫咪、鱼桶和鱼获状态均不改变。"
+    },
+    {
+      "beatOrder": 2,
+      "startMs": 3000,
+      "endMs": 7000,
+      "promptText": "人物沿鱼塘出口缓慢行走，猫咪自然跟随，镜头轻微侧向移动，鱼桶始终保持直立且不新增物品。"
+    },
+    {
+      "beatOrder": 3,
+      "startMs": 7000,
+      "endMs": 10000,
+      "promptText": "它们在傍晚光线里继续离开鱼塘，画面自然停留，不展示鱼挣扎、受伤、死亡或烹饪。"
+    }
+  ],
+  "videoPrompt": "生成一条连续的10秒竖屏绘本生活视频。只使用已批准合成首帧作为Seedance首帧输入；人物本体、猫咪本体和画风资产仅用于该首帧的来源追踪，不作为reference_image重复提交。保持固定人物、灰白猫、服装、鱼桶、鱼获状态和彩铅蜡笔纸张质感不变。时间段仅表示语义节奏。无对白、无旁白、无歌词、无字幕、无水印、无UI。",
+  "audioPlan": {
+    "mode": "native",
+    "allowDialogue": false,
+    "allowNarration": false,
+    "allowLyrics": false,
+    "audioCues": [
+      {
+        "startMs": 0,
+        "endMs": 10000,
+        "category": "environment",
+        "precision": "suggested",
+        "description": "傍晚鱼塘的微风、远处水声和轻柔脚步声。"
+      }
+    ],
+    "externalAudioAssetIds": []
+  },
+  "finalizationPolicy": "validate_then_passthrough",
+  "deliveryProfile": {
+    "container": "mp4",
+    "videoCodec": "h264",
+    "audioCodec": "aac",
+    "aspectRatio": "9:16",
+    "resolution": "720p"
+  }
+}

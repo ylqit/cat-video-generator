@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "relationshipId": "person-cat-duo",
+  "memberIds": [
+    "person",
+    "cat"
+  ],
+  "relationshipType": "equal-partners",
+  "complementaryPattern": {
+    "person": "notices-meaning-and-finishes",
+    "cat": "notices-paths-and-initiates"
+  },
+  "allowedConflictSources": [
+    "different-pace",
+    "different-attention",
+    "good-intentioned-misunderstanding"
+  ],
+  "forbiddenConflictSources": [
+    "malice",
+    "humiliation",
+    "coercion",
+    "physical-harm",
+    "ownership-punishment"
+  ],
+  "affectionSignals": [
+    "waiting",
+    "sharing",
+    "mirroring",
+    "exchanging-small-items",
+    "moving-side-by-side",
+    "shared-ritual"
+  ]
+}

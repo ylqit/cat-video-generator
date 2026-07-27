@@ -1,0 +1,378 @@
+{
+  "schemaVersion": 1,
+  "lifePackId": "life-2026-07-24-seaside-travel",
+  "date": "2026-07-24",
+  "timezone": "Asia/Shanghai",
+  "dayContext": {
+    "contextType": "travel",
+    "theme": "人物和猫咪在海滨城市自由旅行的一天",
+    "locationCluster": {
+      "id": "seaside-city-core",
+      "label": "海滨城市旅行区域",
+      "allowedLocationIds": [
+        "beach-sunrise",
+        "old-town-market",
+        "mountain-cable-car"
+      ]
+    },
+    "weather": "clear-with-sea-breeze",
+    "wardrobeVersionIds": {
+      "person": "person-classic-v1",
+      "cat": "cat-natural-v1"
+    },
+    "availableProps": [
+      "travel-backpack",
+      "small-camera",
+      "market-paper-bag",
+      "round-yellow-fruit",
+      "cable-car-ticket"
+    ],
+    "sharedMood": "curious-and-relaxed",
+    "chapterId": "chapter-seaside-week-v1"
+  },
+  "planRevision": 1,
+  "status": "approved",
+  "slots": {
+    "morning": {
+      "schemaVersion": 1,
+      "episodeId": "ep-2026-07-24-travel-morning",
+      "lifePackId": "life-2026-07-24-seaside-travel",
+      "slot": "morning",
+      "title": "它们在海边等到第一束光",
+      "logline": "人物和猫咪坐在海边看日出，猫咪试着踩住被风吹动的光斑。",
+      "durationMs": 10000,
+      "clipKind": "observation",
+      "visualControl": {
+        "requiresExactOpening": false,
+        "requiresExactEnding": false,
+        "complexSubjectInteraction": false,
+        "criticalPropState": false
+      },
+      "continuityMode": "shared_context",
+      "dependsOnEpisodeIds": [],
+      "contextReads": {
+        "locationId": "beach-sunrise",
+        "locationClusterId": "seaside-city-core",
+        "weather": "clear-with-sea-breeze",
+        "wardrobeVersionIds": {
+          "person": "person-classic-v1",
+          "cat": "cat-natural-v1"
+        },
+        "propIds": [
+          "travel-backpack",
+          "small-camera"
+        ],
+        "sharedMood": "curious-and-relaxed"
+      },
+      "stateWrites": [
+        {
+          "scope": "day",
+          "operation": "add",
+          "path": "visitedLocations.beachSunrise",
+          "value": true,
+          "approvalStatus": "not_required"
+        }
+      ],
+      "fallbackEpisodeId": null,
+      "beats": [
+        {
+          "order": 1,
+          "startMs": 0,
+          "endMs": 2500,
+          "purpose": "establish",
+          "visualAction": "人物把旅行背包放在沙滩上，灰白猫坐在身旁面向海平线。",
+          "actors": [
+            "person",
+            "cat",
+            "environment"
+          ],
+          "emotion": "安静期待",
+          "sfx": [
+            "海浪",
+            "晨风"
+          ]
+        },
+        {
+          "order": 2,
+          "startMs": 2500,
+          "endMs": 6500,
+          "purpose": "activity",
+          "visualAction": "第一束阳光在湿沙上移动，猫咪伸爪跟着光斑慢慢向前，人物举起小相机。",
+          "actors": [
+            "person",
+            "cat",
+            "environment"
+          ],
+          "emotion": "好奇",
+          "sfx": [
+            "相机轻响",
+            "沙粒摩擦"
+          ]
+        },
+        {
+          "order": 3,
+          "startMs": 6500,
+          "endMs": 10000,
+          "purpose": "linger",
+          "visualAction": "人物放下相机与猫咪并肩坐回沙滩，朝阳把两道影子拉长。",
+          "actors": [
+            "person",
+            "cat",
+            "environment"
+          ],
+          "emotion": "放松",
+          "sfx": [
+            "柔和海浪",
+            "音乐轻起"
+          ]
+        }
+      ],
+      "requiredSubjectVersionIds": [
+        "person-v1",
+        "cat-v1"
+      ],
+      "styleVersionId": "storybook-pencil-v1",
+      "forbiddenContent": [
+        "identity-drift",
+        "dialogue",
+        "forced-conflict",
+        "ui-elements",
+        "realistic-photography"
+      ],
+      "sourceSignalIds": []
+    },
+    "noon": {
+      "schemaVersion": 1,
+      "episodeId": "ep-2026-07-24-travel-noon",
+      "lifePackId": "life-2026-07-24-seaside-travel",
+      "slot": "noon",
+      "title": "市集里的水果自己滚走了",
+      "logline": "在老城市场，一颗圆水果从纸袋滚出，人物和猫咪从两侧轻松接住它。",
+      "durationMs": 10000,
+      "clipKind": "micro_event",
+      "visualControl": {
+        "requiresExactOpening": false,
+        "requiresExactEnding": true,
+        "complexSubjectInteraction": true,
+        "criticalPropState": true
+      },
+      "continuityMode": "shared_context",
+      "dependsOnEpisodeIds": [],
+      "contextReads": {
+        "locationId": "old-town-market",
+        "locationClusterId": "seaside-city-core",
+        "weather": "clear-with-sea-breeze",
+        "wardrobeVersionIds": {
+          "person": "person-classic-v1",
+          "cat": "cat-natural-v1"
+        },
+        "propIds": [
+          "travel-backpack",
+          "market-paper-bag",
+          "round-yellow-fruit"
+        ],
+        "sharedMood": "curious-and-relaxed"
+      },
+      "stateWrites": [
+        {
+          "scope": "day",
+          "operation": "add",
+          "path": "souvenirs.marketFruit",
+          "value": "round-yellow-fruit",
+          "approvalStatus": "not_required"
+        }
+      ],
+      "fallbackEpisodeId": null,
+      "beats": [
+        {
+          "order": 1,
+          "startMs": 0,
+          "endMs": 2000,
+          "purpose": "establish",
+          "visualAction": "人物提着市场纸袋看摊位，猫咪在脚边观察彩色果篮。",
+          "actors": [
+            "person",
+            "cat"
+          ],
+          "emotion": "悠闲",
+          "sfx": [
+            "市集环境声",
+            "纸袋轻响"
+          ]
+        },
+        {
+          "order": 2,
+          "startMs": 2000,
+          "endMs": 5000,
+          "purpose": "discovery",
+          "visualAction": "一颗圆黄色水果从纸袋底部滚出，沿着缓坡穿过两位主角之间。",
+          "actors": [
+            "person",
+            "cat",
+            "environment"
+          ],
+          "emotion": "意外",
+          "sfx": [
+            "水果滚动",
+            "轻快木琴"
+          ]
+        },
+        {
+          "order": 3,
+          "startMs": 5000,
+          "endMs": 8000,
+          "purpose": "reaction",
+          "visualAction": "猫咪从前方用尾巴挡住水果，人物从后方蹲下伸手托住。",
+          "actors": [
+            "person",
+            "cat"
+          ],
+          "emotion": "默契",
+          "sfx": [
+            "短促脚步",
+            "柔软碰撞"
+          ]
+        },
+        {
+          "order": 4,
+          "startMs": 8000,
+          "endMs": 10000,
+          "purpose": "result",
+          "visualAction": "人物把水果放回加固后的纸袋，猫咪得意地翘起尾巴继续逛市场。",
+          "actors": [
+            "person",
+            "cat"
+          ],
+          "emotion": "轻松",
+          "sfx": [
+            "纸袋折叠",
+            "猫咪短叫"
+          ]
+        }
+      ],
+      "requiredSubjectVersionIds": [
+        "person-v1",
+        "cat-v1"
+      ],
+      "styleVersionId": "storybook-pencil-v1",
+      "forbiddenContent": [
+        "identity-drift",
+        "dialogue",
+        "hard-cliffhanger",
+        "ui-elements",
+        "copied-external-story"
+      ],
+      "sourceSignalIds": []
+    },
+    "evening": {
+      "schemaVersion": 1,
+      "episodeId": "ep-2026-07-24-travel-evening",
+      "lifePackId": "life-2026-07-24-seaside-travel",
+      "slot": "evening",
+      "title": "傍晚的缆车像一盏小灯",
+      "logline": "人物和猫咪乘坐缆车经过山坡，在逐渐亮起的城市灯光上方安静看风景。",
+      "durationMs": 10000,
+      "clipKind": "observation",
+      "visualControl": {
+        "requiresExactOpening": false,
+        "requiresExactEnding": false,
+        "complexSubjectInteraction": false,
+        "criticalPropState": false
+      },
+      "continuityMode": "shared_context",
+      "dependsOnEpisodeIds": [],
+      "contextReads": {
+        "locationId": "mountain-cable-car",
+        "locationClusterId": "seaside-city-core",
+        "weather": "clear-with-sea-breeze",
+        "wardrobeVersionIds": {
+          "person": "person-classic-v1",
+          "cat": "cat-natural-v1"
+        },
+        "propIds": [
+          "travel-backpack",
+          "cable-car-ticket"
+        ],
+        "sharedMood": "curious-and-relaxed"
+      },
+      "stateWrites": [
+        {
+          "scope": "day",
+          "operation": "add",
+          "path": "visitedLocations.mountainCableCar",
+          "value": true,
+          "approvalStatus": "not_required"
+        }
+      ],
+      "fallbackEpisodeId": null,
+      "beats": [
+        {
+          "order": 1,
+          "startMs": 0,
+          "endMs": 3000,
+          "purpose": "establish",
+          "visualAction": "红色小缆车离开站台，人物与猫咪坐在窗边，远处能看见海与城市。",
+          "actors": [
+            "person",
+            "cat",
+            "environment"
+          ],
+          "emotion": "新鲜",
+          "sfx": [
+            "缆车滑轮",
+            "傍晚风声"
+          ]
+        },
+        {
+          "order": 2,
+          "startMs": 3000,
+          "endMs": 7000,
+          "purpose": "interaction",
+          "visualAction": "猫咪把前爪贴近玻璃追随下方移动的灯光，人物用手指在旁边慢慢同步。",
+          "actors": [
+            "person",
+            "cat",
+            "environment"
+          ],
+          "emotion": "默契",
+          "sfx": [
+            "玻璃轻触",
+            "远处城市声"
+          ]
+        },
+        {
+          "order": 3,
+          "startMs": 7000,
+          "endMs": 10000,
+          "purpose": "linger",
+          "visualAction": "缆车继续越过山坡，两位主角保持并肩姿势看着逐渐亮起的城市。",
+          "actors": [
+            "person",
+            "cat",
+            "environment"
+          ],
+          "emotion": "安静满足",
+          "sfx": [
+            "柔和音乐",
+            "缆车运行声"
+          ]
+        }
+      ],
+      "requiredSubjectVersionIds": [
+        "person-v1",
+        "cat-v1"
+      ],
+      "styleVersionId": "storybook-pencil-v1",
+      "forbiddenContent": [
+        "identity-drift",
+        "dialogue",
+        "forced-return-home",
+        "forced-resolution",
+        "ui-elements"
+      ],
+      "sourceSignalIds": []
+    }
+  },
+  "fallbackEpisodes": [],
+  "externalSignalIds": []
+}

@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cat-video-generator"
+version = "0.1.0"
+description = "Local three-slot video production and delivery system"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "alembic>=1.14,<2",
+  "httpx>=0.28,<1",
+  "jsonschema>=4.23,<5",
+  "pillow>=11,<13",
+  "psycopg[binary]>=3.2,<4",
+  "pyyaml>=6.0,<7",
+  "sqlalchemy>=2.0.36,<3",
+  "typer>=0.15,<1",
+  "volcengine-python-sdk[ark]>=5.0,<6",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.3,<9",
+  "testcontainers[postgres]>=4.9,<5",
+]
+
+[project.scripts]
+cvg = "cat_video_generator.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cat_video_generator"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+markers = [
+  "postgres: requires a disposable PostgreSQL instance",
+]

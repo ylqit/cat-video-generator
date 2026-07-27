@@ -1,0 +1,22 @@
+# Cat Video Generator
+
+人物与猫咪三时段生活流视频的本地生产与交付系统。
+
+- 运行时只接入真实火山方舟 Ark，不提供 Mock Provider。
+- 低风险内容直接使用批准的人物、猫咪和画风参考；高风险内容按需调用 Seedream 生成首帧或首尾帧。
+- 每个 Episode 由 Seedance 单次生成8～15秒竖屏原生音视频。
+- PostgreSQL 保存计划、任务、审核和交付元数据；图片、视频与交付包保存在本机。
+- 最终输出固定为 `01-morning.mp4`、`02-noon.mp4`、`03-evening.mp4` 和 `manifest.json`。
+- 不包含微信小程序、HTTP API、对象存储、CDN 或定时发布。
+
+完整设计见[文档总览](docs/README.md)，首次真实测试按[真实 Ark 链路运行手册](docs/workflows/ark-real-chain-runbook.md)执行。
+
+基础验证：
+
+```powershell
+uv sync --extra test
+uv run pytest -q
+uv run cvg --help
+```
+
+真实生成必须同时具备安全 PostgreSQL、最新 Alembic revision、ffprobe、批准的 Canon、当前会话中的 `ARK_API_KEY`，并在命令中显式使用 `--allow-paid-generation`。ffmpeg 只在后续条件式媒体修复时需要。

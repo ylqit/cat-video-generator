@@ -1,0 +1,478 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cat-video-generator.local/schemas/render-plan.schema.json",
+  "title": "RenderPlanV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "renderPlanId",
+    "episodeId",
+    "planRevision",
+    "renderRevision",
+    "generationStrategy",
+    "clipCount",
+    "durationMs",
+    "visualInputMode",
+    "identityReferences",
+    "styleReferenceAssetIds",
+    "sceneKeyframeAssetIds",
+    "visualInputReasonCodes",
+    "timelineCues",
+    "videoPrompt",
+    "audioPlan",
+    "finalizationPolicy",
+    "deliveryProfile"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "renderPlanId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "episodeId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "planRevision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "renderRevision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "generationStrategy": {
+      "enum": [
+        "single_pass",
+        "multi_clip"
+      ]
+    },
+    "clipCount": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 3
+    },
+    "durationMs": {
+      "type": "integer",
+      "minimum": 8000,
+      "maximum": 15000,
+      "multipleOf": 1000
+    },
+    "visualInputMode": {
+      "enum": [
+        "direct_references",
+        "generated_first_frame",
+        "generated_first_last_frames"
+      ]
+    },
+    "identityReferences": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "personAssetId",
+        "catAssetId"
+      ],
+      "properties": {
+        "personAssetId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "catAssetId": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "styleReferenceAssetIds": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 7,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "sceneKeyframeAssetIds": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 2,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "visualInputReasonCodes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "enum": [
+          "low_risk_direct",
+          "exact_opening",
+          "exact_ending",
+          "complex_subject_interaction",
+          "critical_prop_state",
+          "identity_drift_retry"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "timelineCues": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 4,
+      "items": {
+        "$ref": "#/$defs/timelineCue"
+      }
+    },
+    "videoPrompt": {
+      "type": "string",
+      "minLength": 1
+    },
+    "audioPlan": {
+      "$ref": "#/$defs/audioPlan"
+    },
+    "finalizationPolicy": {
+      "enum": [
+        "validate_then_passthrough",
+        "always_remux",
+        "replace_audio",
+        "hybrid_mix",
+        "transcode"
+      ]
+    },
+    "deliveryProfile": {
+      "$ref": "#/$defs/deliveryProfile"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "generationStrategy": {
+            "const": "single_pass"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "clipCount": {
+            "const": 1
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "clipCount": {
+            "minimum": 2
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "visualInputMode": {
+            "const": "direct_references"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "sceneKeyframeAssetIds": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "visualInputMode": {
+            "const": "generated_first_frame"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "sceneKeyframeAssetIds": {
+            "minItems": 1,
+            "maxItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "visualInputMode": {
+            "const": "generated_first_last_frames"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "sceneKeyframeAssetIds": {
+            "minItems": 2,
+            "maxItems": 2
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "audioPlan": {
+            "properties": {
+              "mode": {
+                "const": "native"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "finalizationPolicy": {
+            "enum": [
+              "validate_then_passthrough",
+              "always_remux",
+              "replace_audio",
+              "transcode"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "audioPlan": {
+            "properties": {
+              "mode": {
+                "const": "external"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "finalizationPolicy": {
+            "const": "replace_audio"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "audioPlan": {
+            "properties": {
+              "mode": {
+                "const": "hybrid"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "finalizationPolicy": {
+            "const": "hybrid_mix"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "timelineCue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "beatOrder",
+        "startMs",
+        "endMs",
+        "promptText"
+      ],
+      "properties": {
+        "beatOrder": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4
+        },
+        "startMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 14999
+        },
+        "endMs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 15000
+        },
+        "promptText": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 400
+        }
+      }
+    },
+    "audioPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "allowDialogue",
+        "allowNarration",
+        "allowLyrics",
+        "audioCues",
+        "externalAudioAssetIds"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "native",
+            "external",
+            "hybrid"
+          ]
+        },
+        "allowDialogue": {
+          "const": false
+        },
+        "allowNarration": {
+          "const": false
+        },
+        "allowLyrics": {
+          "const": false
+        },
+        "audioCues": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/audioCue"
+          }
+        },
+        "externalAudioAssetIds": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "native"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "externalAudioAssetIds": {
+                "maxItems": 0
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "externalAudioAssetIds": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "audioCue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "startMs",
+        "endMs",
+        "category",
+        "precision",
+        "description"
+      ],
+      "properties": {
+        "startMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 14999
+        },
+        "endMs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 15000
+        },
+        "category": {
+          "enum": [
+            "environment",
+            "action_sfx",
+            "music",
+            "brand_cue"
+          ]
+        },
+        "precision": {
+          "enum": [
+            "suggested",
+            "exact"
+          ]
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        }
+      }
+    },
+    "deliveryProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "container",
+        "videoCodec",
+        "audioCodec",
+        "aspectRatio",
+        "resolution"
+      ],
+      "properties": {
+        "container": {
+          "const": "mp4"
+        },
+        "videoCodec": {
+          "const": "h264"
+        },
+        "audioCodec": {
+          "const": "aac"
+        },
+        "aspectRatio": {
+          "const": "9:16"
+        },
+        "resolution": {
+          "enum": [
+            "720p",
+            "1080p",
+            "4k"
+          ]
+        }
+      }
+    }
+  }
+}
