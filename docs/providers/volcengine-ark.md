@@ -15,11 +15,14 @@ Seedance 不作为生图模型，Seedream 不负责异步视频任务。
 - `ARK_ACCESS_MODE=standard`
 - `ARK_AGENT_PLAN_TIER` 为空。
 - `ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3`
-- Seedream：`doubao-seedream-5.0-lite`
+- Seedream：`doubao-seedream-5-0-lite-260128`
 - Seedance：`doubao-seedance-2-0-mini-260615`
 
 标准模式的 Model ID 必须已在当前账号开通，也可以替换成对应 Endpoint
 ID。当前所有 Episode 默认10秒，仍允许内容显式使用8至15秒。
+`doubao-seedream-5.0-lite` 是 Agent Plan 别名，不能直接用于标准
+`/api/v3`；标准API示例使用日期版本ID
+`doubao-seedream-5-0-lite-260128`。
 标准接口返回 `ModelNotOpen` 时表示当前 Key 所属账号尚未开通该模型；
 该错误不可自动重试，必须先在控制台开通服务。
 
@@ -62,7 +65,7 @@ Key 与 Coding Plan Key 不是可互换配置；Key 类型无法靠静态格式�
 开发基线：
 
 - 图片：2K PNG、关闭供应商水印。
-- 视频：9:16、720p、默认10秒、最长15秒、启用原生音频、关闭供应商水印。
+- 视频：9:16、默认480p、默认10秒、最长15秒、启用原生音频、关闭供应商水印。可通过 `ARK_VIDEO_RESOLUTION` 显式切换720p或1080p。
 - 生成策略：默认 `single_pass`；`multi_clip` 仅作为特殊降级。
 - 视觉输入：使用显式风险规则，低风险默认 `direct_references`，直接参考最多9张图片。
 - 音频策略：默认 `native`，禁止角色对白、旁白和歌词。
@@ -106,7 +109,7 @@ Ark 日期版本模型的 A/B。标准模式后续若要更换 Model ID 或 Endp
 
 - 模型：`doubao-seedance-2.0-mini`。
 - 时长：模型支持4至15秒；本产品只使用8至15秒。
-- 交付：9:16、720p，默认10秒。
+- 交付：9:16、默认480p，默认10秒。媒体QC按配置的短边分辨率与9:16比例检查，不硬编码具体长边像素。
 - 音频：请求显式设置 `generate_audio=true`，生成环境声、动作音效和可选轻音乐；Prompt 明确禁止对白、旁白和歌词。
 - Seedance 2.0 不配置 `seed`、`frames`、`camera_fixed` 或 `service_tier`。
 

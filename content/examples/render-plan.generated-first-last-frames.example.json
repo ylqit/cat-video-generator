@@ -74,6 +74,6 @@
     "videoCodec": "h264",
     "audioCodec": "aac",
     "aspectRatio": "9:16",
-    "resolution": "720p"
+    "resolution": "480p"
   }
 }

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import date
+from pathlib import Path
 
 import typer
 from sqlalchemy import select
@@ -17,9 +19,10 @@ from ..contracts import ContentConflictError, ContentValidationError
 from ..doctor import DatabasePreflightError
 from ..generation import OrchestrationError, PackGenerationService
 from ..generation.jobs import ArkJobExecutor
+from ..generation.media_recheck import recheck_video_asset
 from ..models import DailyLifePack
 from ..repository import claim_next_life_pack
-from ..status_query import query_status
+from ..status_query import PromptQueryError, query_prompts, query_status
 from .common import abort_operation, database_context, echo_json
 
 
@@ -33,6 +36,76 @@ def status(
         ):
             payload = query_status(session, life_pack_id)
     except (ConfigurationError, DatabasePreflightError, SQLAlchemyError) as exc:
+        abort_operation(exc)
+    echo_json(payload)
+
+
+def show_prompt(
+    life_pack_id: str,
+    slot: str = typer.Option(..., "--slot"),
+    plan_revision: int | None = typer.Option(None, "--plan-revision"),
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        help="Also save the secret-free prompt payload as UTF-8 JSON.",
+    ),
+) -> None:
+    try:
+        with (
+            database_context() as context,
+            context.session_factory() as session,
+        ):
+            payload = query_prompts(
+                session,
+                life_pack_id=life_pack_id,
+                slot_name=slot,
+                plan_revision=plan_revision,
+            )
+        if output is not None:
+            destination = output.expanduser().resolve()
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with destination.open(
+                    "x",
+                    encoding="utf-8",
+                    newline="\n",
+                ) as handle:
+                    json.dump(payload, handle, ensure_ascii=False, indent=2)
+                    handle.write("\n")
+            except FileExistsError as exc:
+                raise PromptQueryError(
+                    f"Prompt export already exists: {destination}"
+                ) from exc
+            payload["exportedTo"] = str(destination)
+    except (
+        ConfigurationError,
+        DatabasePreflightError,
+        PromptQueryError,
+        SQLAlchemyError,
+    ) as exc:
+        abort_operation(exc)
+    echo_json(payload)
+
+
+def recheck_media(asset_id: str) -> None:
+    try:
+        parsed_asset_id = uuid.UUID(asset_id)
+    except ValueError as exc:
+        raise typer.BadParameter("asset_id must be a UUID.") from exc
+    runtime_settings = RuntimeSettings.from_env()
+    try:
+        with database_context() as context:
+            payload = recheck_video_asset(
+                context.session_factory,
+                runtime_settings,
+                parsed_asset_id,
+            )
+    except (
+        ConfigurationError,
+        DatabasePreflightError,
+        OrchestrationError,
+        SQLAlchemyError,
+    ) as exc:
         abort_operation(exc)
     echo_json(payload)
 

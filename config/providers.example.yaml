@@ -38,7 +38,7 @@ media:
       videoModel: doubao-seedance-2.0-mini
 
   image:
-    model: doubao-seedream-5.0-lite
+    model: doubao-seedream-5-0-lite-260128
     size: 2K
     responseFormat: url
     outputFormat: png
@@ -48,7 +48,7 @@ media:
   video:
     model: doubao-seedance-2-0-mini-260615
     aspectRatio: "9:16"
-    resolution: 720p
+    resolution: 480p
     defaultGenerationStrategy: single_pass
     defaultDurationSeconds: 10
     maxDurationSeconds: 15

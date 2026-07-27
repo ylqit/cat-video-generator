@@ -35,15 +35,14 @@ _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _ARK_AGENT_PLAN_BASE_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
 _ARK_STANDARD_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 _ARK_AGENT_PLAN_IMAGE_MODEL = "doubao-seedream-5.0-lite"
+_ARK_VIDEO_RESOLUTIONS = ("480p", "720p", "1080p")
 _ARK_AGENT_PLAN_VIDEO_TIERS = {
     "doubao-seedance-1.5-pro": ("medium", "large", "max"),
     "doubao-seedance-1.5-pro-即将下线": ("medium", "large", "max"),
     "doubao-seedance-2.0-mini": ("large", "max"),
 }
 _SCHEMA_NAME_PATTERN = re.compile(r"[a-z_][a-z0-9_]{0,62}")
-_REMOTE_VALIDATION_SCHEMA_PATTERN = re.compile(
-    r"cat_video_validation_[0-9a-f]{12}"
-)
+_REMOTE_VALIDATION_SCHEMA_PATTERN = re.compile(r"cat_video_validation_[0-9a-f]{12}")
 
 
 def _read_bool(value: str | None, *, default: bool = False) -> bool:
@@ -73,6 +72,7 @@ class RuntimeSettings:
     ark_base_url: str
     ark_image_model: str
     ark_video_model: str
+    ark_video_resolution: str
     ark_poll_interval_seconds: float
     ark_task_timeout_seconds: float
     ffmpeg_path: Path | None
@@ -102,9 +102,7 @@ class RuntimeSettings:
         access_mode_value = values.get("ARK_ACCESS_MODE", "").strip().lower()
         try:
             access_mode = (
-                None
-                if not access_mode_value
-                else ArkAccessMode(access_mode_value)
+                None if not access_mode_value else ArkAccessMode(access_mode_value)
             )
         except ValueError as exc:
             raise ConfigurationError(
@@ -115,15 +113,14 @@ class RuntimeSettings:
             ark_api_key=values.get("ARK_API_KEY") or None,
             ark_access_mode=access_mode,
             ark_agent_plan_tier=tier_value or None,
-            ark_base_url=values.get(
-                "ARK_BASE_URL", _ARK_STANDARD_BASE_URL
-            ).rstrip("/"),
+            ark_base_url=values.get("ARK_BASE_URL", _ARK_STANDARD_BASE_URL).rstrip("/"),
             ark_image_model=values.get(
                 "ARK_IMAGE_MODEL", "doubao-seedream-5-0-pro-260628"
             ),
-            ark_video_model=values.get(
-                "ARK_VIDEO_MODEL", "doubao-seedance-2-0-260128"
-            ),
+            ark_video_model=values.get("ARK_VIDEO_MODEL", "doubao-seedance-2-0-260128"),
+            ark_video_resolution=values.get("ARK_VIDEO_RESOLUTION", "480p")
+            .strip()
+            .lower(),
             ark_poll_interval_seconds=poll_interval,
             ark_task_timeout_seconds=task_timeout,
             ffmpeg_path=_resolve_executable(
@@ -143,9 +140,7 @@ class RuntimeSettings:
 
     def validate_for_generation(self, *, allow_paid_generation: bool) -> None:
         if not allow_paid_generation:
-            raise ConfigurationError(
-                "Ark generation requires --allow-paid-generation."
-            )
+            raise ConfigurationError("Ark generation requires --allow-paid-generation.")
         self.validate_for_ark_access()
         if self.ffprobe_path is None:
             raise ConfigurationError(
@@ -163,14 +158,20 @@ class RuntimeSettings:
             raise ConfigurationError("ARK_API_KEY is required for Ark access.")
 
     def ark_configuration_issues(self) -> tuple[str, ...]:
+        issues: list[str] = []
+        if self.ark_video_resolution not in _ARK_VIDEO_RESOLUTIONS:
+            issues.append(
+                "ARK_VIDEO_RESOLUTION must be one of: "
+                + ", ".join(_ARK_VIDEO_RESOLUTIONS)
+                + "."
+            )
         if self.ark_access_mode is None:
-            return ("ARK_ACCESS_MODE must be explicitly configured.",)
+            issues.append("ARK_ACCESS_MODE must be explicitly configured.")
+            return tuple(issues)
         if self.ark_access_mode is ArkAccessMode.AGENT_PLAN:
-            issues: list[str] = []
             if self.ark_base_url != _ARK_AGENT_PLAN_BASE_URL:
                 issues.append(
-                    "Agent Plan requires ARK_BASE_URL="
-                    f"{_ARK_AGENT_PLAN_BASE_URL}."
+                    f"Agent Plan requires ARK_BASE_URL={_ARK_AGENT_PLAN_BASE_URL}."
                 )
             if self.ark_image_model != _ARK_AGENT_PLAN_IMAGE_MODEL:
                 issues.append(
@@ -189,30 +190,20 @@ class RuntimeSettings:
             elif self.ark_agent_plan_tier not in supported_video_tiers:
                 issues.append(
                     f"{self.ark_video_model} on Agent Plan requires "
-                    "ARK_AGENT_PLAN_TIER="
-                    + ", ".join(supported_video_tiers)
-                    + "."
+                    "ARK_AGENT_PLAN_TIER=" + ", ".join(supported_video_tiers) + "."
                 )
             return tuple(issues)
 
-        issues = []
         if self.ark_base_url != _ARK_STANDARD_BASE_URL:
             issues.append(
-                "Standard Ark requires ARK_BASE_URL="
-                f"{_ARK_STANDARD_BASE_URL}."
+                f"Standard Ark requires ARK_BASE_URL={_ARK_STANDARD_BASE_URL}."
             )
         if self.ark_agent_plan_tier is not None:
-            issues.append(
-                "ARK_AGENT_PLAN_TIER must be empty in standard mode."
-            )
+            issues.append("ARK_AGENT_PLAN_TIER must be empty in standard mode.")
         if not self.ark_image_model.strip():
-            issues.append(
-                "ARK_IMAGE_MODEL must be configured in standard mode."
-            )
+            issues.append("ARK_IMAGE_MODEL must be configured in standard mode.")
         if not self.ark_video_model.strip():
-            issues.append(
-                "ARK_VIDEO_MODEL must be configured in standard mode."
-            )
+            issues.append("ARK_VIDEO_MODEL must be configured in standard mode.")
         return tuple(issues)
 
     @property
@@ -233,9 +224,7 @@ class RuntimeSettings:
 
     def request_profile_snapshot(self) -> dict[str, str]:
         if self.ark_access_mode is None:
-            raise ConfigurationError(
-                "ARK_ACCESS_MODE must be explicitly configured."
-            )
+            raise ConfigurationError("ARK_ACCESS_MODE must be explicitly configured.")
         snapshot = {
             "accessMode": self.ark_access_mode.value,
             "providerProfile": self.provider_profile,
@@ -254,9 +243,7 @@ class RuntimeSettings:
             "provider": self.provider_profile,
             "arkApiKeyConfigured": bool(self.ark_api_key),
             "arkAccessMode": (
-                None
-                if self.ark_access_mode is None
-                else self.ark_access_mode.value
+                None if self.ark_access_mode is None else self.ark_access_mode.value
             ),
             "agentPlanTier": self.ark_agent_plan_tier,
             "agentPlanTierVerification": (
@@ -271,6 +258,7 @@ class RuntimeSettings:
             "arkBaseUrl": self.ark_base_url,
             "arkImageModel": self.ark_image_model,
             "arkVideoModel": self.ark_video_model,
+            "arkVideoResolution": self.ark_video_resolution,
             "arkPollIntervalSeconds": self.ark_poll_interval_seconds,
             "arkTaskTimeoutSeconds": self.ark_task_timeout_seconds,
             "ffmpeg": None if self.ffmpeg_path is None else str(self.ffmpeg_path),
@@ -327,7 +315,9 @@ class DatabaseSettings:
             "user": "CAT_VIDEO_DB_USER",
             "password": "CAT_VIDEO_DB_PASSWORD",
         }
-        missing = [env_name for env_name in required.values() if not values.get(env_name)]
+        missing = [
+            env_name for env_name in required.values() if not values.get(env_name)
+        ]
         if missing:
             raise ConfigurationError(
                 "Missing required database environment variables: "

@@ -27,15 +27,14 @@ def compile_render_plan(
     references: VisualReferences,
     scene_keyframe_asset_ids: tuple[str, ...] = (),
     retry_after_identity_or_composition_drift: bool = False,
+    resolution: str = "480p",
 ) -> dict[str, Any]:
     control_value = episode["visualControl"]
     decision = select_visual_input(
         VisualControl(
             requires_exact_opening=control_value["requiresExactOpening"],
             requires_exact_ending=control_value["requiresExactEnding"],
-            complex_subject_interaction=control_value[
-                "complexSubjectInteraction"
-            ],
+            complex_subject_interaction=control_value["complexSubjectInteraction"],
             critical_prop_state=control_value["criticalPropState"],
         ),
         retry_after_identity_or_composition_drift=(
@@ -74,9 +73,7 @@ def compile_render_plan(
     ]
     plan = {
         "schemaVersion": 1,
-        "renderPlanId": (
-            f"render-{episode['episodeId']}-r{render_revision}"
-        ),
+        "renderPlanId": (f"render-{episode['episodeId']}-r{render_revision}"),
         "episodeId": episode["episodeId"],
         "planRevision": plan_revision,
         "renderRevision": render_revision,
@@ -90,9 +87,7 @@ def compile_render_plan(
         },
         "styleReferenceAssetIds": list(references.style_asset_ids),
         "sceneKeyframeAssetIds": list(scene_keyframe_asset_ids),
-        "visualInputReasonCodes": [
-            reason.value for reason in decision.reason_codes
-        ],
+        "visualInputReasonCodes": [reason.value for reason in decision.reason_codes],
         "timelineCues": timeline_cues,
         "videoPrompt": _video_prompt(episode, decision.mode, timeline_cues),
         "audioPlan": {
@@ -109,7 +104,7 @@ def compile_render_plan(
             "videoCodec": "h264",
             "audioCodec": "aac",
             "aspectRatio": "9:16",
-            "resolution": "720p",
+            "resolution": resolution,
         },
     }
     validate_render_plan(plan)
@@ -179,9 +174,7 @@ def _audio_cues(episode: dict[str, Any]) -> list[dict[str, Any]]:
                 "startMs": beat["startMs"],
                 "endMs": beat["endMs"],
                 "category": (
-                    "environment"
-                    if beat["actors"] == ["environment"]
-                    else "action_sfx"
+                    "environment" if beat["actors"] == ["environment"] else "action_sfx"
                 ),
                 "precision": "suggested",
                 "description": "、".join(beat["sfx"]),

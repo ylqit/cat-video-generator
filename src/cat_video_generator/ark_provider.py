@@ -163,7 +163,7 @@ class ArkMediaProvider:
                 return_last_frame=False,
                 generate_audio=True,
                 watermark=False,
-                resolution="720p",
+                resolution=self._settings.ark_video_resolution,
                 ratio="9:16",
                 duration=duration_ms // 1000,
                 timeout=120.0,
@@ -218,13 +218,9 @@ def _map_video_task(task: Any) -> ArkVideoTask:
     return ArkVideoTask(
         task_id=task.id,
         status=task.status,
-        video_url=(
-            None if content is None else getattr(content, "video_url", None)
-        ),
+        video_url=(None if content is None else getattr(content, "video_url", None)),
         error_code=None if error is None else getattr(error, "code", None),
-        error_message=(
-            None if error is None else getattr(error, "message", None)
-        ),
+        error_message=(None if error is None else getattr(error, "message", None)),
         model=getattr(task, "model", None),
         duration_seconds=getattr(task, "duration", None),
         resolution=getattr(task, "resolution", None),
@@ -266,11 +262,7 @@ def _provider_error(exc: ArkAPIError, *, submission: bool) -> ArkProviderError:
         if isinstance(body, dict) and isinstance(body.get("error"), dict)
         else {}
     )
-    code = (
-        getattr(exc, "code", None)
-        or nested_error.get("code")
-        or type(exc).__name__
-    )
+    code = getattr(exc, "code", None) or nested_error.get("code") or type(exc).__name__
     message = (
         nested_error.get("message")
         or getattr(exc, "message", None)

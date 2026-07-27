@@ -43,6 +43,7 @@ def _settings(tmp_path: Path) -> RuntimeSettings:
             "ARK_BASE_URL": "https://ark.cn-beijing.volces.com/api/plan/v3",
             "ARK_IMAGE_MODEL": "doubao-seedream-5.0-lite",
             "ARK_VIDEO_MODEL": "doubao-seedance-2.0-mini",
+            "ARK_VIDEO_RESOLUTION": "480p",
             "MEDIA_WORK_ROOT": str(tmp_path / "work"),
             "MEDIA_ASSET_ROOT": str(tmp_path / "assets"),
             "DELIVERY_OUTPUT_ROOT": str(tmp_path / "output"),
@@ -171,17 +172,10 @@ def test_continuation_waits_for_review_then_uses_ready_or_fallback() -> None:
     episode = pack["slots"]["evening"]
     dependency_id = episode["dependsOnEpisodeIds"][0]
 
+    assert resolve_continuation(episode, {dependency_id: "content_review"}) == "wait"
+    assert resolve_continuation(episode, {dependency_id: "ready"}) == "primary"
     assert (
-        resolve_continuation(episode, {dependency_id: "content_review"})
-        == "wait"
-    )
-    assert (
-        resolve_continuation(episode, {dependency_id: "ready"})
-        == "primary"
-    )
-    assert (
-        resolve_continuation(episode, {dependency_id: "failed"})
-        == "content_fallback"
+        resolve_continuation(episode, {dependency_id: "failed"}) == "content_fallback"
     )
 
 
@@ -202,7 +196,7 @@ class _FakeTasks:
             error=None,
             model="video-model",
             duration=8,
-            resolution="720p",
+            resolution="480p",
             ratio="9:16",
             generate_audio=True,
         )
@@ -218,7 +212,7 @@ class _FakeTasks:
                     error=None,
                     model="video-model",
                     duration=8,
-                    resolution="720p",
+                    resolution="480p",
                     ratio="9:16",
                     generate_audio=True,
                     created_at=1_700_000_000,
@@ -271,20 +265,25 @@ def test_ark_adapter_maps_direct_references_without_unsupported_fields(
     assert kwargs["generate_audio"] is True
     assert kwargs["duration"] == 8
     assert kwargs["ratio"] == "9:16"
-    assert kwargs["resolution"] == "720p"
-    assert [
-        item["role"] for item in kwargs["content"][1:]
-    ] == ["reference_image", "reference_image", "reference_image"]
+    assert kwargs["resolution"] == "480p"
+    assert [item["role"] for item in kwargs["content"][1:]] == [
+        "reference_image",
+        "reference_image",
+        "reference_image",
+    ]
     assert all(
         item["image_url"]["url"].startswith("data:image/png;base64,")
         for item in kwargs["content"][1:]
     )
-    assert not {
-        "seed",
-        "frames",
-        "camera_fixed",
-        "service_tier",
-    } & kwargs.keys()
+    assert (
+        not {
+            "seed",
+            "frames",
+            "camera_fixed",
+            "service_tier",
+        }
+        & kwargs.keys()
+    )
 
 
 def test_ark_adapter_lists_redactable_reconciliation_metadata(
@@ -388,7 +387,7 @@ def test_ffprobe_accepts_valid_vertical_video(tmp_path: Path) -> None:
             "-f",
             "lavfi",
             "-i",
-            "color=c=blue:s=720x1280:d=8",
+            "color=c=blue:s=480x854:d=8",
             "-f",
             "lavfi",
             "-i",
@@ -410,8 +409,49 @@ def test_ffprobe_accepts_valid_vertical_video(tmp_path: Path) -> None:
         path,
         ffprobe_path=Path(ffprobe),
         expected_duration_ms=8000,
+        expected_resolution="480p",
     )
 
-    assert result.qc_status == "passed", json.dumps(
-        result.report, ensure_ascii=False
+    assert result.qc_status == "passed", json.dumps(result.report, ensure_ascii=False)
+
+
+def test_ffprobe_accepts_provider_aligned_480p_width(tmp_path: Path) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if ffmpeg is None or ffprobe is None:
+        pytest.skip("ffmpeg/ffprobe are not on this test process PATH")
+    path = tmp_path / "provider-aligned.mp4"
+    subprocess.run(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=496x864:d=8",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=8",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(path),
+        ],
+        check=True,
+        timeout=120,
     )
+
+    result = probe_video(
+        path,
+        ffprobe_path=Path(ffprobe),
+        expected_duration_ms=8000,
+        expected_resolution="480p",
+    )
+
+    assert result.qc_status == "passed", json.dumps(result.report, ensure_ascii=False)

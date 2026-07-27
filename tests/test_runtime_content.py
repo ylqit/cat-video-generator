@@ -201,3 +201,18 @@ def test_retry_slot_is_explicit_and_non_paid() -> None:
     assert "--slot" in result.stdout
     assert "--reason" in result.stdout
     assert "--allow-paid-generation" not in result.stdout
+
+
+def test_prompt_export_and_media_recheck_are_non_paid_cli_entrypoints() -> None:
+    runner = CliRunner()
+
+    prompt = runner.invoke(app, ["show-prompt", "--help"])
+    recheck = runner.invoke(app, ["recheck-media", "--help"])
+
+    assert prompt.exit_code == 0
+    assert "--slot" in prompt.stdout
+    assert "--plan-revision" in prompt.stdout
+    assert "--output" in prompt.stdout
+    assert "--allow-paid-generation" not in prompt.stdout
+    assert recheck.exit_code == 0
+    assert "--allow-paid-generation" not in recheck.stdout

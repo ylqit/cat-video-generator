@@ -312,6 +312,23 @@ def test_standard_ark_requires_both_model_identifiers() -> None:
         configured.validate_for_ark_access()
 
 
+def test_runtime_rejects_unsupported_video_resolution() -> None:
+    configured = RuntimeSettings.from_env(
+        {
+            "ARK_ACCESS_MODE": "standard",
+            "ARK_API_KEY": "test-only-key",
+            "ARK_BASE_URL": STANDARD_ARK_URL,
+            "ARK_VIDEO_RESOLUTION": "4k",
+        }
+    )
+
+    with pytest.raises(
+        ConfigurationError,
+        match="ARK_VIDEO_RESOLUTION.*480p, 720p, 1080p",
+    ):
+        configured.validate_for_ark_access()
+
+
 def test_runtime_requires_prefixed_credentials_and_explicit_mode() -> None:
     configured = RuntimeSettings.from_env(
         {
@@ -345,6 +362,7 @@ def test_preflight_reports_profile_without_secret_material() -> None:
     assert report["agentPlanTier"] == "large"
     assert report["agentPlanTierVerification"] == "declared_only"
     assert report["endpointProfile"] == "agent_plan"
+    assert report["arkVideoResolution"] == "480p"
     assert report["generationConfigurationValid"] is True
     assert report["generationConfigurationIssues"] == []
     assert report["providerEntitlementVerification"] == "not_performed"

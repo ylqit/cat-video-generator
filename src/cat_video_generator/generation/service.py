@@ -73,11 +73,13 @@ class PackGenerationService:
                     results.append(result)
         with self._session_factory.begin() as session:
             pack = session.get_one(DailyLifePack, pack_id)
-            all_slots = session.execute(
-                select(DailySlot).where(
-                    DailySlot.daily_life_pack_id == pack.id
+            all_slots = (
+                session.execute(
+                    select(DailySlot).where(DailySlot.daily_life_pack_id == pack.id)
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             if (
                 all(slot.status == "ready" for slot in all_slots)
                 and pack.status == "rendering"
@@ -100,29 +102,31 @@ class PackGenerationService:
                 .order_by(DailyLifePack.date, DailyLifePack.created_at)
             )
             if life_pack_id is not None:
-                statement = statement.where(
-                    DailyLifePack.life_pack_id == life_pack_id
-                )
+                statement = statement.where(DailyLifePack.life_pack_id == life_pack_id)
             pack = session.execute(statement.limit(1)).scalar_one_or_none()
             if pack is None:
                 return {"lifePackId": life_pack_id, "resumed": False, "slots": []}
             selected_id = pack.life_pack_id
-            slots = session.execute(
-                select(DailySlot)
-                .where(
-                    DailySlot.daily_life_pack_id == pack.id,
-                    DailySlot.status.in_(
-                        (
-                            "keyframe_generating",
-                            "keyframe_review",
-                            "video_generating",
-                            "media_qc",
-                            "content_review",
-                        )
-                    ),
+            slots = (
+                session.execute(
+                    select(DailySlot)
+                    .where(
+                        DailySlot.daily_life_pack_id == pack.id,
+                        DailySlot.status.in_(
+                            (
+                                "keyframe_generating",
+                                "keyframe_review",
+                                "video_generating",
+                                "media_qc",
+                                "content_review",
+                            )
+                        ),
+                    )
+                    .order_by(DailySlot.sort_order)
                 )
-                .order_by(DailySlot.sort_order)
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             pack_id = pack.id
             slot_ids = [slot.id for slot in slots]
         results: list[dict[str, Any]] = []
@@ -163,9 +167,7 @@ class PackGenerationService:
                 .limit(1)
             ).scalar_one_or_none()
             if pack is None:
-                raise OrchestrationError(
-                    f"LifePack {life_pack_id!r} does not exist."
-                )
+                raise OrchestrationError(f"LifePack {life_pack_id!r} does not exist.")
             if pack.status == "approved":
                 transition_pack(pack, "frozen")
                 pack.frozen_at = datetime.now(UTC)
@@ -208,15 +210,12 @@ class PackGenerationService:
             mode = required_visual_mode(
                 variant.episode_spec_json,
                 retry_after_identity_or_composition_drift=(
-                    variant.last_error
-                    in {"identity_drift", "composition_drift"}
+                    variant.last_error in {"identity_drift", "composition_drift"}
                 ),
             )
             variant_id = variant.id
             episode = variant.episode_spec_json
-            plan_revision = session.get_one(
-                DailyLifePack, pack_id
-            ).plan_revision
+            plan_revision = session.get_one(DailyLifePack, pack_id).plan_revision
             render_revision = variant.active_render_revision
 
         if mode is not VisualInputMode.DIRECT_REFERENCES:
@@ -258,9 +257,9 @@ class PackGenerationService:
                     str(asset.id) for asset in ordered_scene_assets
                 ),
                 retry_after_identity_or_composition_drift=(
-                    variant.last_error
-                    in {"identity_drift", "composition_drift"}
+                    variant.last_error in {"identity_drift", "composition_drift"}
                 ),
+                resolution=self._settings.ark_video_resolution,
             )
             variant.render_plan_json = plan
             if variant.status == "planned":
@@ -270,22 +269,18 @@ class PackGenerationService:
             input_paths = (
                 references.paths
                 if mode is VisualInputMode.DIRECT_REFERENCES
-                else tuple(
-                    Path(asset.storage_path) for asset in ordered_scene_assets
-                )
+                else tuple(Path(asset.storage_path) for asset in ordered_scene_assets)
             )
             request_snapshot = {
                 **self._settings.request_profile_snapshot(),
                 "model": self._settings.ark_video_model,
                 "visualInputMode": plan["visualInputMode"],
                 "durationMs": plan["durationMs"],
-                "resolution": "720p",
+                "resolution": self._settings.ark_video_resolution,
                 "ratio": "9:16",
                 "generateAudio": True,
                 "watermark": False,
-                "inputAssetSha256": [
-                    file_sha256(path) for path in input_paths
-                ],
+                "inputAssetSha256": [file_sha256(path) for path in input_paths],
                 "videoPrompt": plan["videoPrompt"],
             }
 
@@ -320,9 +315,7 @@ def _slot_result(slot: DailySlot, action: str) -> dict[str, Any]:
         "status": slot.status,
         "action": action,
         "selectedVariantId": (
-            None
-            if slot.selected_variant_id is None
-            else str(slot.selected_variant_id)
+            None if slot.selected_variant_id is None else str(slot.selected_variant_id)
         ),
         "lastError": slot.last_error,
     }

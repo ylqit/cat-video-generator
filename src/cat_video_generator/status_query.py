@@ -12,6 +12,92 @@ from .models import (
 )
 
 
+class PromptQueryError(LookupError):
+    """Raised when no unambiguous persisted prompt matches the query."""
+
+
+def query_prompts(
+    session: Session,
+    *,
+    life_pack_id: str,
+    slot_name: str,
+    plan_revision: int | None = None,
+) -> dict[str, object]:
+    pack_statement = (
+        select(DailyLifePack)
+        .where(DailyLifePack.life_pack_id == life_pack_id)
+        .order_by(DailyLifePack.plan_revision.desc())
+    )
+    if plan_revision is not None:
+        pack_statement = pack_statement.where(
+            DailyLifePack.plan_revision == plan_revision
+        )
+    pack = session.execute(pack_statement.limit(1)).scalar_one_or_none()
+    if pack is None:
+        raise PromptQueryError("The requested LifePack revision does not exist.")
+    slot = session.execute(
+        select(DailySlot).where(
+            DailySlot.daily_life_pack_id == pack.id,
+            DailySlot.slot == slot_name,
+        )
+    ).scalar_one_or_none()
+    if slot is None:
+        raise PromptQueryError(
+            f"Slot {slot_name!r} does not exist in the requested LifePack."
+        )
+    variants = session.execute(
+        select(EpisodeVariant)
+        .where(EpisodeVariant.daily_slot_id == slot.id)
+        .order_by(EpisodeVariant.role, EpisodeVariant.created_at)
+    ).scalars().all()
+    if not variants:
+        raise PromptQueryError("The requested Slot has no Episode variant.")
+    variant = next(
+        (
+            item
+            for item in variants
+            if item.id == slot.selected_variant_id
+        ),
+        next(
+            (item for item in variants if item.role == "primary"),
+            variants[0],
+        ),
+    )
+    jobs = session.execute(
+        select(GenerationJob)
+        .where(GenerationJob.episode_variant_id == variant.id)
+        .order_by(GenerationJob.created_at)
+    ).scalars().all()
+    persisted_prompts = []
+    for job in jobs:
+        snapshot = job.request_snapshot_json
+        prompt = snapshot.get("videoPrompt") or snapshot.get("prompt")
+        if not isinstance(prompt, str):
+            continue
+        persisted_prompts.append(
+            {
+                "jobId": str(job.id),
+                "jobType": job.job_type,
+                "renderRevision": job.render_revision,
+                "providerTaskId": job.provider_task_id,
+                "status": job.status,
+                "resolution": snapshot.get("resolution"),
+                "prompt": prompt,
+            }
+        )
+    render_plan = variant.render_plan_json or {}
+    return {
+        "lifePackId": pack.life_pack_id,
+        "planRevision": pack.plan_revision,
+        "slot": slot.slot,
+        "episodeId": variant.episode_id,
+        "activeRenderRevision": variant.active_render_revision,
+        "visualInputMode": render_plan.get("visualInputMode"),
+        "finalVideoPrompt": render_plan.get("videoPrompt"),
+        "persistedGenerationPrompts": persisted_prompts,
+    }
+
+
 def query_status(
     session: Session,
     life_pack_id: str | None = None,

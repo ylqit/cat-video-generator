@@ -120,9 +120,13 @@ def inspect_image(path: Path) -> dict[str, Any]:
             width, height = image.size
             image_format = (image.format or "").lower()
     except (OSError, ValueError) as exc:
-        raise MediaProcessingError(f"Generated keyframe is not a valid image: {exc}") from exc
+        raise MediaProcessingError(
+            f"Generated keyframe is not a valid image: {exc}"
+        ) from exc
     if width < 1 or height < 1 or image_format not in {"png", "jpeg", "webp"}:
-        raise MediaProcessingError("Generated keyframe has unsupported media properties.")
+        raise MediaProcessingError(
+            "Generated keyframe has unsupported media properties."
+        )
     return {
         "format": image_format,
         "width": width,
@@ -136,7 +140,19 @@ def probe_video(
     *,
     ffprobe_path: Path,
     expected_duration_ms: int,
+    expected_resolution: str,
 ) -> VideoProbe:
+    expected_widths = {
+        "480p": 480,
+        "720p": 720,
+        "1080p": 1080,
+    }
+    try:
+        expected_width = expected_widths[expected_resolution]
+    except KeyError as exc:
+        raise MediaProcessingError(
+            f"Unsupported expected video resolution: {expected_resolution!r}"
+        ) from exc
     try:
         completed = subprocess.run(
             [
@@ -162,7 +178,9 @@ def probe_video(
         subprocess.TimeoutExpired,
         json.JSONDecodeError,
     ) as exc:
-        raise MediaProcessingError(f"ffprobe could not inspect generated video: {exc}") from exc
+        raise MediaProcessingError(
+            f"ffprobe could not inspect generated video: {exc}"
+        ) from exc
 
     streams = payload.get("streams", [])
     video_stream = next(
@@ -176,7 +194,9 @@ def probe_video(
     format_value = payload.get("format", {})
     duration_raw = format_value.get("duration")
     try:
-        duration_ms = None if duration_raw is None else round(float(duration_raw) * 1000)
+        duration_ms = (
+            None if duration_raw is None else round(float(duration_raw) * 1000)
+        )
     except (TypeError, ValueError):
         duration_ms = None
     container = format_value.get("format_name")
@@ -195,8 +215,19 @@ def probe_video(
         failures.append("missing_audio_stream")
     elif audio_codec != "aac":
         failures.append("audio_codec_not_aac")
-    if width != 720 or height != 1280:
-        failures.append("resolution_not_720x1280")
+    portrait_nine_sixteen = (
+        isinstance(width, int)
+        and isinstance(height, int)
+        and height > 0
+        and abs((width / height) - (9 / 16)) <= 0.02
+    )
+    codec_alignment_tolerance = 16
+    if (
+        not isinstance(width, int)
+        or abs(width - expected_width) > codec_alignment_tolerance
+        or not portrait_nine_sixteen
+    ):
+        failures.append(f"resolution_not_{expected_resolution}_9x16")
     if duration_ms is None or not 8000 <= duration_ms <= 15000:
         failures.append("duration_outside_product_range")
     elif abs(duration_ms - expected_duration_ms) > 1000:
@@ -210,6 +241,8 @@ def probe_video(
         "height": height,
         "durationMs": duration_ms,
         "expectedDurationMs": expected_duration_ms,
+        "expectedResolution": expected_resolution,
+        "resolutionAlignmentTolerancePx": codec_alignment_tolerance,
         "hasAudio": audio_stream is not None,
     }
     return VideoProbe(

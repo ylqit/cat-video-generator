@@ -145,7 +145,7 @@ PostgreSQL 或本地媒体。
 1. 数据库先写入唯一 `GenerationJob(submitting)`。
 2. Seedream 使用人物、猫咪和画风三张 Canon 生成一张海边合成首帧。
 3. 首帧下载、QC 后进入 `keyframe_review`；未批准前不得创建 Seedance 任务。
-4. 批准首帧并再次运行命令后，Seedance Create 只发送该首帧，使用720p、
+4. 批准首帧并再次运行命令后，Seedance Create 只发送该首帧，使用配置的分辨率（当前默认480p）、
    9:16、10秒、`generate_audio=true`、`watermark=false`。
 5. 请求不发送 `frames`、`camera_fixed`、`service_tier` 或 `seed`。
 6. 获得 task ID 后短事务写入 `queued`，随后轮询 `queued/running/succeeded`。
@@ -224,6 +224,28 @@ uv run cvg reconcile-job <generationJobUuid> `
 `resume` 继续轮询或下载。Seedream 是同步接口，无法通过 Seedance List
 Tasks 对账；其未知提交保持冻结并由人工检查账单后创建新的 render
 revision。
+
+实际提交给供应商的最终Prompt会同时保存在 RenderPlan 和 GenerationJob
+请求快照中。可随时查看或导出，不会再次调用模型：
+
+```powershell
+uv run cvg show-prompt <lifePackId> `
+  --slot noon `
+  --plan-revision 3 `
+  --output var\prompts\<lifePackId>\r3\02-noon.json
+```
+
+导出文件包含关键帧和视频Prompt、renderRevision、任务状态、task ID与请求
+分辨率，不包含API Key、Base64图片或签名URL。目标文件已存在时拒绝覆盖。
+
+若供应商返回的合法编码对齐尺寸被旧QC规则误判，可在修正规则后只复检
+原始本地媒体：
+
+```powershell
+uv run cvg recheck-media <mediaAssetId>
+```
+
+该命令不调用Ark，只允许恢复 `media_qc_failed` 的最终视频。
 
 ## 9. 生成本地交付包
 

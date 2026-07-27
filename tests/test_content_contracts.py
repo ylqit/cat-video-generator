@@ -31,10 +31,7 @@ def load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-SCHEMAS = {
-    path.name: load_json(path)
-    for path in SCHEMA_ROOT.glob("*.json")
-}
+SCHEMAS = {path.name: load_json(path) for path in SCHEMA_ROOT.glob("*.json")}
 SCHEMA_REGISTRY = Registry().with_resources(
     (
         schema["$id"],
@@ -133,15 +130,11 @@ def test_identity_drift_retry_upgrades_mode_without_changing_plan_revision() -> 
         low_risk_control(),
         retry_after_identity_or_composition_drift=True,
     )
-    retry_plan = load_json(
-        EXAMPLE_ROOT / "render-plan.single-pass-audio.example.json"
-    )
+    retry_plan = load_json(EXAMPLE_ROOT / "render-plan.single-pass-audio.example.json")
     retry_plan["renderRevision"] += 1
     original_plan_revision = retry_plan["planRevision"]
     retry_plan["visualInputMode"] = decision.mode.value
-    retry_plan["sceneKeyframeAssetIds"] = [
-        "asset-keyframe-identity-drift-retry-first"
-    ]
+    retry_plan["sceneKeyframeAssetIds"] = ["asset-keyframe-identity-drift-retry-first"]
     retry_plan["visualInputReasonCodes"] = [
         reason.value for reason in decision.reason_codes
     ]
@@ -176,13 +169,8 @@ def test_visual_input_modes_reject_wrong_scene_keyframe_counts(
 
 
 def test_direct_references_allow_at_most_nine_provider_images() -> None:
-    plan = load_json(
-        EXAMPLE_ROOT / "render-plan.single-pass-audio.example.json"
-    )
-    plan["styleReferenceAssetIds"] = [
-        f"asset-style-{index}"
-        for index in range(7)
-    ]
+    plan = load_json(EXAMPLE_ROOT / "render-plan.single-pass-audio.example.json")
+    plan["styleReferenceAssetIds"] = [f"asset-style-{index}" for index in range(7)]
     validator("render-plan.schema.json").validate(plan)
 
     plan["styleReferenceAssetIds"].append("asset-style-8")
@@ -226,11 +214,12 @@ def test_provider_config_uses_on_demand_execution_without_time_gate() -> None:
             "videoModel": "doubao-seedance-2.0-mini",
         },
     }
-    assert config["media"]["image"]["model"] == "doubao-seedream-5.0-lite"
     assert (
-        config["media"]["video"]["model"]
-        == "doubao-seedance-2-0-mini-260615"
+        config["media"]["image"]["model"]
+        == "doubao-seedream-5-0-lite-260128"
     )
+    assert config["media"]["video"]["model"] == "doubao-seedance-2-0-mini-260615"
+    assert config["media"]["video"]["resolution"] == "480p"
 
 
 def test_env_example_defaults_to_secret_free_standard_ark() -> None:
@@ -238,15 +227,13 @@ def test_env_example_defaults_to_secret_free_standard_ark() -> None:
 
     assert values["ARK_ACCESS_MODE"] == "standard"
     assert values["ARK_AGENT_PLAN_TIER"] == ""
+    assert values["ARK_BASE_URL"] == "https://ark.cn-beijing.volces.com/api/v3"
     assert (
-        values["ARK_BASE_URL"]
-        == "https://ark.cn-beijing.volces.com/api/v3"
+        values["ARK_IMAGE_MODEL"]
+        == "doubao-seedream-5-0-lite-260128"
     )
-    assert values["ARK_IMAGE_MODEL"] == "doubao-seedream-5.0-lite"
-    assert (
-        values["ARK_VIDEO_MODEL"]
-        == "doubao-seedance-2-0-mini-260615"
-    )
+    assert values["ARK_VIDEO_MODEL"] == "doubao-seedance-2-0-mini-260615"
+    assert values["ARK_VIDEO_RESOLUTION"] == "480p"
     assert values["ARK_API_KEY"] == ""
     assert "API_KEY" not in values
     assert "BASE_URL" not in values

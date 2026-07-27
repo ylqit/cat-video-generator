@@ -90,7 +90,7 @@ RenderPlan 保存 `visualInputMode`、固定人物和猫咪资产、1至7张画�
 
 渲染层根据 RenderPlan 创建 Seedance 任务：
 
-- 9:16、720p。
+- 9:16、默认480p；历史资产保持其生成时的原分辨率，不重编码覆盖。
 - 默认10秒，允许8至15秒。
 - `generate_audio=true`。
 - 禁止对白、旁白和歌词。

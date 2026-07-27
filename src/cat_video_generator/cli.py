@@ -19,11 +19,13 @@ from .commands.database import (
 from .commands.delivery import deliver
 from .commands.generation import (
     reconcile_job,
+    recheck_media,
     resume,
     retry_slot,
     run_next,
     run_pack,
     status,
+    show_prompt,
 )
 from .config import load_local_env
 
@@ -37,11 +39,13 @@ app.command("import-pack")(import_pack)
 app.command("approve-pack")(approve_pack)
 app.command()(review)
 app.command()(status)
+app.command("show-prompt")(show_prompt)
 app.command("run-next")(run_next)
 app.command("run-pack")(run_pack)
 app.command("retry-slot")(retry_slot)
 app.command()(resume)
 app.command("reconcile-job")(reconcile_job)
+app.command("recheck-media")(recheck_media)
 app.command()(deliver)
 
 db_app.command("upgrade")(db_upgrade)

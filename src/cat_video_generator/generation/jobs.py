@@ -268,9 +268,7 @@ class ArkJobExecutor:
         with self._session_factory() as session:
             job = session.get(GenerationJob, job_id)
             if job is None:
-                raise OrchestrationError(
-                    f"GenerationJob {job_id} does not exist."
-                )
+                raise OrchestrationError(f"GenerationJob {job_id} does not exist.")
             if job.job_type != "video":
                 raise OrchestrationError(
                     "Only asynchronous video jobs can be reconciled from "
@@ -278,8 +276,7 @@ class ArkJobExecutor:
                 )
             if job.status != "submission_unknown":
                 raise OrchestrationError(
-                    "Only submission_unknown jobs require task-list "
-                    "reconciliation."
+                    "Only submission_unknown jobs require task-list reconciliation."
                 )
             if job.provider != self._settings.provider_profile:
                 raise OrchestrationError(
@@ -302,9 +299,7 @@ class ArkJobExecutor:
             key=lambda task: task.created_at or 0,
             reverse=True,
         )
-        candidate_payload = [
-            _reconciliation_candidate(task) for task in candidates
-        ]
+        candidate_payload = [_reconciliation_candidate(task) for task in candidates]
         if provider_task_id is None:
             return {
                 "jobId": str(job_id),
@@ -317,11 +312,7 @@ class ArkJobExecutor:
             }
 
         matched = next(
-            (
-                task
-                for task in candidates
-                if task.task_id == provider_task_id
-            ),
+            (task for task in candidates if task.task_id == provider_task_id),
             None,
         )
         if matched is None:
@@ -413,14 +404,18 @@ class ArkJobExecutor:
         expected_duration_ms: int,
     ) -> MediaAsset:
         with self._session_factory() as session:
-            existing = session.execute(
-                select(MediaAsset)
-                .where(
-                    MediaAsset.generation_job_id == job_id,
-                    MediaAsset.asset_kind == "final_video",
+            existing = (
+                session.execute(
+                    select(MediaAsset)
+                    .where(
+                        MediaAsset.generation_job_id == job_id,
+                        MediaAsset.asset_kind == "final_video",
+                    )
+                    .order_by(MediaAsset.created_at.desc())
                 )
-                .order_by(MediaAsset.created_at.desc())
-            ).scalars().first()
+                .scalars()
+                .first()
+            )
             if existing is not None:
                 return existing
             job = session.get_one(GenerationJob, job_id)
@@ -468,9 +463,7 @@ class ArkJobExecutor:
                 raise OrchestrationError(
                     "Ark video task polling timed out; use cvg resume later."
                 )
-        if task is None or (
-            task.status == "succeeded" and not task.video_url
-        ):
+        if task is None or (task.status == "succeeded" and not task.video_url):
             task = self._gateway.get_video_task(task_id)
         if task.status != "succeeded":
             with self._session_factory.begin() as session:
@@ -503,6 +496,7 @@ class ArkJobExecutor:
             landed.path,
             ffprobe_path=self._settings.ffprobe_path,
             expected_duration_ms=expected_duration_ms,
+            expected_resolution=self._settings.ark_video_resolution,
         )
         with self._session_factory.begin() as session:
             job = session.get_one(GenerationJob, job_id)
@@ -575,11 +569,7 @@ class ArkJobExecutor:
                     input_paths=input_paths,
                 )
             except ArkProviderError as exc:
-                if (
-                    exc.retryable
-                    and not exc.submission_unknown
-                    and attempt_no < 2
-                ):
+                if exc.retryable and not exc.submission_unknown and attempt_no < 2:
                     time.sleep((2 ** (attempt_no - 1)) + random.uniform(0, 0.5))
                     continue
                 self._record_provider_failure(job_id, exc)
@@ -602,11 +592,7 @@ class ArkJobExecutor:
                     reference_paths=reference_paths,
                 )
             except ArkProviderError as exc:
-                if (
-                    exc.retryable
-                    and not exc.submission_unknown
-                    and attempt_no < 2
-                ):
+                if exc.retryable and not exc.submission_unknown and attempt_no < 2:
                     time.sleep((2 ** (attempt_no - 1)) + random.uniform(0, 0.5))
                     continue
                 self._record_provider_failure(job_id, exc)
@@ -619,9 +605,7 @@ def file_sha256(path: Path) -> str:
         with path.open("rb") as stream:
             return hashlib.file_digest(stream, "sha256").hexdigest()
     except OSError as exc:
-        raise OrchestrationError(
-            f"Cannot read visual input asset: {path}"
-        ) from exc
+        raise OrchestrationError(f"Cannot read visual input asset: {path}") from exc
 
 
 def _job_key(
