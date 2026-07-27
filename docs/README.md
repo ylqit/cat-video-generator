@@ -58,6 +58,7 @@ revision 为 `0003_slot_retry_events`，增加了终态任务的显式人工重�
 `CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true`；切换 SSL 后关闭该开关即可，不
 需要搬迁数据。真实生成仍要求 `ARK_API_KEY` 和显式
 `--allow-paid-generation`。Agent Plan 失败历史保持不变；当前标准 Ark
-烟测使用 `doubao-seedance-2-0-mini-260615` 和10秒 Episode；当前账号
-返回 `ModelNotOpen`，必须先在控制台开通模型。详见
+烟测使用 `doubao-seedance-2-0-mini-260615` 和10秒 Episode；模型开通后
+已创建任务，但以 `SetLimitExceeded` 失败，必须先处理账号任务限额或
+配额。详见
 [真实 Ark 链路运行手册](workflows/ark-real-chain-runbook.md)。

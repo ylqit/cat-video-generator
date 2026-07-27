@@ -31,6 +31,7 @@ uv run cvg --help
 `CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true` 时通过明文 PostgreSQL 运行；诊断会持续标记该临时架构债务。真实生成还必须具备最新 Alembic revision、ffprobe、批准的 Canon、`ARK_API_KEY`，并在命令中显式使用 `--allow-paid-generation`。ffmpeg 只在后续条件式媒体修复时需要。
 
 2026-07-27 已切换标准 Ark，并使用新的10秒内容 revision。标准视频请求
-已到达 `doubao-seedance-2-0-mini-260615`，但当前账号返回
-`ModelNotOpen`，尚无 MP4；需先在控制台开通模型。详见
+已到达 `doubao-seedance-2-0-mini-260615`；模型开通后已成功创建任务，
+但任务以 `SetLimitExceeded` 失败，尚无 MP4；需先处理账号任务限额或
+配额。详见
 [标准 Ark morning 真实烟测记录](docs/validation/standard-ark-morning-smoke-2026-07-27.md)。

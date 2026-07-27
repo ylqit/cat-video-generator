@@ -75,5 +75,7 @@ uv run cvg retry-slot life-2026-07-24-seaside-travel `
 标准 Ark。标准图片模型返回 `InvalidEndpointOrModel.NotFound`；系统复用
 语义一致的历史批准首帧后，视频模型
 `doubao-seedance-2-0-mini-260615` 返回 `ModelNotOpen`。当前仍无 MP4，
-下一步是在同一 API Key 账号开通标准视频模型。详见
+模型开通后已成功创建视频 task，但 task 立即以 `SetLimitExceeded`
+终态失败；只读任务列表没有其他 queued/running 任务。当前仍无 MP4，
+下一步是在同一 API Key 账号处理视频任务限额或配额。详见
 [标准 Ark morning 真实烟测记录](../validation/standard-ark-morning-smoke-2026-07-27.md)。
