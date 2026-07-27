@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from PIL import Image
+from volcenginesdkarkruntime import Ark
 
 from cat_video_generator.ark_provider import ArkMediaProvider
 from cat_video_generator.config import RuntimeSettings
@@ -32,7 +33,12 @@ ROOT = Path(__file__).resolve().parents[1]
 def _settings(tmp_path: Path) -> RuntimeSettings:
     return RuntimeSettings.from_env(
         {
+            "ARK_ACCESS_MODE": "agent_plan",
+            "ARK_AGENT_PLAN_TIER": "large",
             "ARK_API_KEY": "test-only-key",
+            "ARK_BASE_URL": "https://ark.cn-beijing.volces.com/api/plan/v3",
+            "ARK_IMAGE_MODEL": "doubao-seedream-5.0-lite",
+            "ARK_VIDEO_MODEL": "doubao-seedance-2.0-mini",
             "MEDIA_WORK_ROOT": str(tmp_path / "work"),
             "MEDIA_ASSET_ROOT": str(tmp_path / "assets"),
             "DELIVERY_OUTPUT_ROOT": str(tmp_path / "output"),
@@ -239,6 +245,48 @@ def test_ark_adapter_lists_redactable_reconciliation_metadata(
         "model": "video-model",
         "timeout": 120.0,
     }
+
+
+def test_agent_plan_base_url_maps_to_official_visual_endpoints() -> None:
+    requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, str(request.url)))
+        if request.url.path.endswith("/images/generations"):
+            return httpx.Response(
+                200,
+                json={
+                    "model": "doubao-seedream-5.0-lite",
+                    "data": [{"url": "https://example.invalid/image.png"}],
+                },
+            )
+        return httpx.Response(200, json={"id": "task-agent-plan-path-test"})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = Ark(
+            api_key="test-only-key",
+            base_url="https://ark.cn-beijing.volces.com/api/plan/v3",
+            http_client=http_client,
+        )
+        client.images.generate(
+            model="doubao-seedream-5.0-lite",
+            prompt="path probe",
+        )
+        client.content_generation.tasks.create(
+            model="doubao-seedance-2.0-mini",
+            content=[{"type": "text", "text": "path probe"}],
+        )
+
+    assert requests == [
+        (
+            "POST",
+            "https://ark.cn-beijing.volces.com/api/plan/v3/images/generations",
+        ),
+        (
+            "POST",
+            "https://ark.cn-beijing.volces.com/api/plan/v3/contents/generations/tasks",
+        ),
+    ]
 
 
 def test_download_is_content_addressed_and_atomic(tmp_path: Path) -> None:

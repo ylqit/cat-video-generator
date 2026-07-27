@@ -89,7 +89,7 @@ class ArkJobExecutor:
                     clip_index=clip_index,
                     normalized_input_hash=normalized_hash,
                     idempotency_key=idempotency_key,
-                    provider="volcengine-ark",
+                    provider=self._settings.provider_profile,
                     request_snapshot_json=request_snapshot,
                 )
             job_id = job.id
@@ -208,7 +208,7 @@ class ArkJobExecutor:
                     clip_index=0,
                     normalized_input_hash=normalized_hash,
                     idempotency_key=idempotency_key,
-                    provider="volcengine-ark",
+                    provider=self._settings.provider_profile,
                     request_snapshot_json=request_snapshot,
                 )
             job_id = job.id
@@ -280,6 +280,11 @@ class ArkJobExecutor:
                 raise OrchestrationError(
                     "Only submission_unknown jobs require task-list "
                     "reconciliation."
+                )
+            if job.provider != self._settings.provider_profile:
+                raise OrchestrationError(
+                    "GenerationJob belongs to a different Ark access mode; "
+                    "reconcile it with the original endpoint profile."
                 )
             variant_id = job.episode_variant_id
             variant = session.get_one(EpisodeVariant, variant_id)

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from dotenv import dotenv_values
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from referencing import Registry, Resource
@@ -23,6 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_ROOT = PROJECT_ROOT / "content" / "schemas"
 EXAMPLE_ROOT = PROJECT_ROOT / "content" / "examples"
 PROVIDER_CONFIG = PROJECT_ROOT / "config" / "providers.example.yaml"
+ENV_EXAMPLE = PROJECT_ROOT / ".env.example"
 
 
 def load_json(path: Path) -> dict:
@@ -209,3 +211,36 @@ def test_provider_config_uses_on_demand_execution_without_time_gate() -> None:
         "scheduler": "external_optional",
         "paidGenerationRequiresCliAcknowledgement": True,
     }
+    assert config["media"]["accessProfile"] == {
+        "mode": "agent_plan",
+        "agentPlanTier": "large",
+        "providerProfile": "volcengine-agent-plan",
+        "baseUrl": "https://ark.cn-beijing.volces.com/api/plan/v3",
+        "apiKeyEnv": "ARK_API_KEY",
+        "standardAlternative": {
+            "mode": "standard",
+            "agentPlanTier": None,
+            "providerProfile": "volcengine-ark-standard",
+            "baseUrl": "https://ark.cn-beijing.volces.com/api/v3",
+            "imageModel": "<standard-image-model-or-endpoint-id>",
+            "videoModel": "<standard-video-model-or-endpoint-id>",
+        },
+    }
+    assert config["media"]["image"]["model"] == "doubao-seedream-5.0-lite"
+    assert config["media"]["video"]["model"] == "doubao-seedance-2.0-mini"
+
+
+def test_env_example_defaults_to_secret_free_agent_plan_large() -> None:
+    values = dotenv_values(ENV_EXAMPLE)
+
+    assert values["ARK_ACCESS_MODE"] == "agent_plan"
+    assert values["ARK_AGENT_PLAN_TIER"] == "large"
+    assert (
+        values["ARK_BASE_URL"]
+        == "https://ark.cn-beijing.volces.com/api/plan/v3"
+    )
+    assert values["ARK_IMAGE_MODEL"] == "doubao-seedream-5.0-lite"
+    assert values["ARK_VIDEO_MODEL"] == "doubao-seedance-2.0-mini"
+    assert values["ARK_API_KEY"] == ""
+    assert "API_KEY" not in values
+    assert "BASE_URL" not in values

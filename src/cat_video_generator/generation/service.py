@@ -35,6 +35,7 @@ class PackGenerationService:
         *,
         gateway: ArkGateway | None = None,
     ) -> None:
+        settings.validate_for_ark_access()
         self._session_factory = session_factory
         self._settings = settings
         ark_gateway = gateway or ArkMediaProvider(settings)
@@ -273,7 +274,7 @@ class PackGenerationService:
                 )
             )
             request_snapshot = {
-                "provider": "volcengine-ark",
+                **self._settings.request_profile_snapshot(),
                 "model": self._settings.ark_video_model,
                 "visualInputMode": plan["visualInputMode"],
                 "durationMs": plan["durationMs"],

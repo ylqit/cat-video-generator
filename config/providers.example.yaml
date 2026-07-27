@@ -23,11 +23,22 @@ execution:
   paidGenerationRequiresCliAcknowledgement: true
 
 media:
-  image:
-    provider: volcengine-ark
-    baseUrl: https://ark.cn-beijing.volces.com/api/v3
+  accessProfile:
+    mode: agent_plan
+    agentPlanTier: large
+    providerProfile: volcengine-agent-plan
+    baseUrl: https://ark.cn-beijing.volces.com/api/plan/v3
     apiKeyEnv: ARK_API_KEY
-    model: doubao-seedream-5-0-pro-260628
+    standardAlternative:
+      mode: standard
+      agentPlanTier: null
+      providerProfile: volcengine-ark-standard
+      baseUrl: https://ark.cn-beijing.volces.com/api/v3
+      imageModel: <standard-image-model-or-endpoint-id>
+      videoModel: <standard-video-model-or-endpoint-id>
+
+  image:
+    model: doubao-seedream-5.0-lite
     size: 2K
     responseFormat: url
     outputFormat: png
@@ -35,10 +46,7 @@ media:
     timeoutMs: 120000
 
   video:
-    provider: volcengine-ark
-    baseUrl: https://ark.cn-beijing.volces.com/api/v3
-    apiKeyEnv: ARK_API_KEY
-    model: doubao-seedance-2-0-260128
+    model: doubao-seedance-2.0-mini
     aspectRatio: "9:16"
     resolution: 720p
     defaultGenerationStrategy: single_pass

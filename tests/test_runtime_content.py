@@ -14,6 +14,7 @@ from cat_video_generator.contracts import (
     canonical_content_hash,
     validate_daily_life_pack,
 )
+from cat_video_generator.generation import PackGenerationService
 from cat_video_generator.state import StateTransitionError, transition_pack
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -40,7 +41,9 @@ def test_runtime_settings_require_ffprobe_key_and_paid_acknowledgement(
     ffprobe.write_bytes(b"exe")
     settings = RuntimeSettings.from_env(
         {
+            "ARK_ACCESS_MODE": "standard",
             "ARK_API_KEY": "secret",
+            "ARK_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
             "FFMPEG_PATH": str(tmp_path / "missing-ffmpeg.exe"),
             "FFPROBE_PATH": str(ffprobe),
         }
@@ -54,6 +57,8 @@ def test_runtime_settings_require_ffprobe_key_and_paid_acknowledgement(
 
     missing_key = RuntimeSettings.from_env(
         {
+            "ARK_ACCESS_MODE": "standard",
+            "ARK_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
             "FFMPEG_PATH": str(ffmpeg),
             "FFPROBE_PATH": str(ffprobe),
         }
@@ -63,13 +68,31 @@ def test_runtime_settings_require_ffprobe_key_and_paid_acknowledgement(
 
     missing_probe = RuntimeSettings.from_env(
         {
+            "ARK_ACCESS_MODE": "standard",
             "ARK_API_KEY": "secret",
+            "ARK_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
             "FFMPEG_PATH": str(ffmpeg),
             "FFPROBE_PATH": str(tmp_path / "missing-ffprobe.exe"),
         }
     )
     with pytest.raises(ConfigurationError, match="ffprobe"):
         missing_probe.validate_for_generation(allow_paid_generation=True)
+
+
+def test_generation_service_rejects_incompatible_agent_plan_before_database() -> None:
+    incompatible = RuntimeSettings.from_env(
+        {
+            "ARK_ACCESS_MODE": "agent_plan",
+            "ARK_AGENT_PLAN_TIER": "medium",
+            "ARK_API_KEY": "test-only-key",
+            "ARK_BASE_URL": "https://ark.cn-beijing.volces.com/api/plan/v3",
+            "ARK_IMAGE_MODEL": "doubao-seedream-5.0-lite",
+            "ARK_VIDEO_MODEL": "doubao-seedance-2.0-mini",
+        }
+    )
+
+    with pytest.raises(ConfigurationError, match="large or max"):
+        PackGenerationService(None, incompatible, gateway=object())  # type: ignore[arg-type]
 
 
 def test_cross_object_validation_rejects_context_drift() -> None:

@@ -15,6 +15,8 @@
 - 画面：全画面彩铅、蜡笔、粉彩儿童绘本，不是真人实拍加2D贴纸。
 - 声音：Seedance 原生环境声、动作音效和可选轻音乐；无对白、旁白和歌词。
 - 生成：低风险内容直接使用已批准人物、猫咪和画风参考；高风险内容由 Seedream 按需生成1至2张场景关键帧，Seedance 默认一次生成8至15秒完整音视频。
+- 接入：默认 Agent Plan Large，也支持显式切换到标准按量 Ark；两种
+  profile 共用生成、恢复、审核和下载链路，但不复用任务幂等记录。
 - 后期：合格原始 MP4 直接保存，FFmpeg 只作条件式修复。
 - 交付：固定输出 `01-morning.mp4`、`02-noon.mp4`、`03-evening.mp4` 和 `manifest.json`。
 
@@ -46,6 +48,6 @@
 
 ## 当前仓库状态
 
-当前仓库已经落地真实 Ark 模块化单体链路：内容与 Canon 导入、审核、视觉风险决策、按需 Seedream、Seedance 异步任务、即时下载、SHA-256 不可变存储、ffprobe QC、人工审核、continuation 等待/fallback、1/2/3 本地交付和恢复接口。LifePack 编排、视觉资产、Ark 任务执行和 CLI 已形成独立职责边界。运行时代码中不存在 Mock Provider 或 Mock 配置；自动测试只在进程内替换 SDK/HTTP 边界，不形成可选择的业务链路。
+当前仓库已经落地真实 Ark 模块化单体链路：内容与 Canon 导入、审核、视觉风险决策、按需 Seedream、Seedance 异步任务、即时下载、SHA-256 不可变存储、ffprobe QC、人工审核、continuation 等待/fallback、1/2/3 本地交付和恢复接口。LifePack 编排、视觉资产、Ark 任务执行和 CLI 已形成独立职责边界。运行时可选 Agent Plan 与标准 Ark 两种真实 API profile，不存在 Mock Provider 或 Mock 配置；自动测试只在进程内替换 SDK/HTTP 边界，不形成可选择的业务链路。
 
 正式 `vedio-appdb.cat_video` 已在用户明确授权下通过明文连接迁移到 `0002_content_and_reviews`，结构、事务、幂等和并发验证均通过。该例外必须同时满足固定数据库、固定 Schema 和 `CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true`；切换 SSL 后关闭该开关即可，不需要搬迁数据。当前尚未执行真实收费生成，仍要求 `ARK_API_KEY` 和显式 `--allow-paid-generation`。详见[真实 Ark 链路运行手册](workflows/ark-real-chain-runbook.md)。

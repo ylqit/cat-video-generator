@@ -64,6 +64,13 @@ CAT_VIDEO_DB_PASSWORD=<password>
 CAT_VIDEO_DB_SSLMODE=disable
 CAT_VIDEO_DB_SCHEMA=cat_video
 CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true
+
+ARK_ACCESS_MODE=agent_plan
+ARK_AGENT_PLAN_TIER=large
+ARK_API_KEY=
+ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/plan/v3
+ARK_IMAGE_MODEL=doubao-seedream-5.0-lite
+ARK_VIDEO_MODEL=doubao-seedance-2.0-mini
 ```
 
 CLI 启动时自动读取当前工作目录的 `.env`，但不会覆盖 PowerShell 已有
@@ -92,6 +99,17 @@ uv run cvg doctor --allow-insecure-readonly-smoke
 当前连接未加密时，报告必须包含 `transport_security=plaintext`、
 `insecure_runtime_authorized=true` 和临时架构债务警告。该命令不创建
 Schema、表或业务记录。
+
+Ark 静态预检同时返回：
+
+- `arkAccessMode=agent_plan`。
+- `agentPlanTier=large` 或 `max`。
+- `endpointProfile=agent_plan`。
+- `generationConfigurationValid=true`。
+
+这些字段只说明 URL、模式、套餐和模型组合自洽，不会调用供应商，也不会
+验证 Key 类型。输出不包含 Key 或完整鉴权信息。无前缀的 `API_KEY` 和
+`BASE_URL` 不会被读取。
 
 ## 5. 正式 Schema 迁移与验证
 
@@ -170,7 +188,10 @@ Start in: D:\soft\code\OpenGit\cat-video-generator
 - 正式 `cat_video` 表保留，验证 UUID 数据不存在。
 - 缺少 `CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true` 时明文迁移和运行仍拒绝。
 - ffprobe 可发现；如准备执行条件式修复，ffmpeg 也可发现。
-- 全仓不存在运行时 Mock Provider、Mock 视频路径或 Provider 模式切换。
+- 全仓不存在运行时 Mock Provider 或 Mock 视频路径；只允许显式的
+  `agent_plan` 与 `standard` Ark 访问模式。
+- Agent Plan Large/Max、Plan URL 和两个固定模型别名通过静态配置检查。
+- Standard 模式使用 `/api/v3`、空套餐字段和自身模型/Endpoint ID。
 - 任何输出和异常都不显示数据库密码。
 
 ## 常见故障
@@ -183,5 +204,8 @@ Start in: D:\soft\code\OpenGit\cat-video-generator
 | `validation schema cleanup failed` | 只检查错误中给出的精确 `cat_video_validation_*` Schema，不使用宽泛删除 |
 | Alembic revision 不匹配 | 执行受控 `cvg db upgrade`；已有未知对象时先人工核对 |
 | 找不到 ffmpeg/ffprobe | 安装工具并重新打开 PowerShell，使新的 `PATH` 生效 |
+| `generationConfigurationValid=false` | 整组检查 `ARK_ACCESS_MODE`、套餐、Base URL 和两个模型；不要混用 Agent Plan 与标准 Ark 配置 |
+| Agent Plan 套餐为 Small/Medium | 升级至 Large/Max；本项目不降级到 Seedance 1.5 |
+| Ark 鉴权失败 | 确认 Key 属于当前访问模式；Agent Plan、标准 Ark 和 Coding Plan Key 不能混用 |
 | 重复收费风险 | 检查 GenerationJob 幂等记录，不能直接重放供应商 POST |
 | 下载中断 | 恢复 `.part`/任务状态，不能把不完整文件当成最终 MP4 |

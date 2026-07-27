@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-仓库已经落地 PostgreSQL 持久化、两版 Alembic 迁移、数据库安全守卫、内容/Canon 导入审核、RenderPlan 编译、真实 Seedream/Seedance SDK 映射、下载与 ffprobe QC、人工审核、恢复、fallback 和三条本地交付。当前未配置 `ARK_API_KEY`，也未执行收费烟测；正式运行仍等待安全 PostgreSQL 和用户注入 Key。
+仓库已经落地 PostgreSQL 持久化、两版 Alembic 迁移、数据库安全守卫、内容/Canon 导入审核、RenderPlan 编译、真实 Seedream/Seedance SDK 映射、下载与 ffprobe QC、人工审核、恢复、fallback 和三条本地交付。当前没有执行收费烟测；文档不记录本机凭据状态。真实生成仍必须通过 Ark profile 静态检查、数据库和 ffprobe 预检，并由操作者显式确认付费。
 
 当前范围：
 
@@ -28,6 +28,8 @@ DailyLifePack
 - SQLAlchemy 2、Alembic 和 `psycopg` 管理远程 PostgreSQL。
 - 所有业务表位于数据库 `vedio-appdb` 的独立 `cat_video` Schema。
 - `volcengine-python-sdk[ark]` 调用 Ark。
+- Ark 接入支持 `agent_plan` 与 `standard` 两个显式 profile；默认 Agent
+  Plan Large，Medium/Small 不进入 Seedance 2.0-mini 生产链路。
 - `httpx` 流式下载媒体。
 - ffprobe 执行每条视频的只读媒体检查。
 - FFmpeg 保留用于后续条件式 remux、转码、音轨替换、混音或 multi_clip；当前 V1 对 QC 不合格媒体直接阻断，不自动改写。

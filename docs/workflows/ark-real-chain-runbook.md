@@ -1,6 +1,9 @@
 # 真实 Ark 链路运行手册
 
-本手册用于在 Windows PowerShell 中完成从 Canon 本体到本地 MP4 交付的真实链路。运行时代码只支持火山方舟 Ark，不提供 Mock Provider。未配置 Key 时可以完成安装、Schema 校验和单元测试，但不会创建任何收费任务。
+本手册用于在 Windows PowerShell 中完成从 Canon 本体到本地 MP4
+交付的真实链路。运行时代码只支持火山方舟 API，不提供 Mock Provider；
+可显式选择 Agent Plan 或标准按量 Ark。没有有效凭据时可以完成安装、
+Schema 校验和单元测试，但不会创建收费任务。
 
 ## 1. 付费烟测前的硬门槛
 
@@ -13,8 +16,10 @@
 3. `cvg db upgrade` 已将正式 `cat_video` Schema 升级到最新 Alembic head。
 4. ffprobe 可以从 `PATH` 或 `FFPROBE_PATH` 找到；只有启用条件式媒体修复时才要求 ffmpeg。
 5. 人物、猫咪和画风 Canon 均已导入并人工批准。
-6. `ARK_API_KEY` 只在当前 PowerShell 会话中注入。
-7. 每次可能创建任务的命令都显式带 `--allow-paid-generation`。
+6. Agent Plan 必须使用 Large 或 Max，URL 和两个模型别名必须与该模式匹配；
+   标准 Ark 必须使用标准 URL、空套餐字段和自身已开通的模型/Endpoint ID。
+7. `ARK_API_KEY` 只保存在被 Git 忽略的 `.env` 或当前 PowerShell 会话。
+8. 每次可能创建任务的命令都显式带 `--allow-paid-generation`。
 
 当前 `vedio-appdb.cat_video` 已按用户明确授权允许保存正式 LifePack、Ark task ID 和视频元数据。该权限只匹配固定数据库与固定 Schema，不会使其他明文数据库自动获得运行权限；诊断始终返回 `transportSecurity=plaintext` 和架构债务警告。
 
@@ -93,17 +98,42 @@ uv run cvg status life-2026-07-24-seaside-travel
 
 `validate-pack` 不连接模型也不写数据库。`approve-pack` 只冻结内容，不产生费用。
 
-## 6. 配置 Ark 并执行第一条真实烟测
+## 6. 配置 Agent Plan 并执行第一条真实烟测
+
+默认配置使用 Agent Plan Large。Windows CLI 直接调用 API，不需要安装
+Ark Helper 或 Agent Plan 图片/视频 Skill：
 
 ```powershell
 $env:ARK_API_KEY = "<your-ark-api-key>"
-$env:ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-$env:ARK_IMAGE_MODEL = "doubao-seedream-5-0-pro-260628"
-$env:ARK_VIDEO_MODEL = "doubao-seedance-2-0-260128"
+$env:ARK_ACCESS_MODE = "agent_plan"
+$env:ARK_AGENT_PLAN_TIER = "large"
+$env:ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
+$env:ARK_IMAGE_MODEL = "doubao-seedream-5.0-lite"
+$env:ARK_VIDEO_MODEL = "doubao-seedance-2.0-mini"
 
 uv run cvg doctor
 uv run cvg run-pack life-2026-07-24-seaside-travel --slot morning --allow-paid-generation
 ```
+
+`doctor` 必须显示 `arkAccessMode=agent_plan`、
+`agentPlanTier=large|max`、`endpointProfile=agent_plan` 和
+`generationConfigurationValid=true`。报告不会显示 Key。
+
+如果以后切换到标准按量 Ark，必须一次替换整组 Mode、Base URL、模型和
+Key；`ARK_AGENT_PLAN_TIER` 必须删除：
+
+```powershell
+$env:ARK_ACCESS_MODE = "standard"
+Remove-Item Env:ARK_AGENT_PLAN_TIER -ErrorAction SilentlyContinue
+$env:ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+$env:ARK_IMAGE_MODEL = "<standard-image-model-or-endpoint-id>"
+$env:ARK_VIDEO_MODEL = "<standard-video-model-or-endpoint-id>"
+$env:ARK_API_KEY = "<your-standard-ark-api-key>"
+```
+
+Agent Plan Key、标准 Ark Key 与 Coding Plan Key 不可混用。配置层无法通过
+Key 字符串判断类型；供应商鉴权失败时终止且不重试。切换模式不会迁移
+PostgreSQL 或本地媒体。
 
 首条8秒 smoke Episode 的四项视觉风险均为 false，所以走 `direct_references`：
 
@@ -150,7 +180,7 @@ uv run cvg status <lifePackId>
 uv run cvg resume <lifePackId> --allow-paid-generation
 ```
 
-`resume` 只处理已经存在的 keyframe/video job、轮询、下载和 QC。它不会为 `planned` Slot 创建新收费任务，也不会重新 POST `submission_unknown`。幂等键由 `episodeId + renderRevision + jobType + clipIndex + normalizedInputHash` 派生；重复执行会恢复已有记录。
+`resume` 只处理已经存在的 keyframe/video job、轮询、下载和 QC。它不会为 `planned` Slot 创建新收费任务，也不会重新 POST `submission_unknown`。幂等键由 `episodeId + renderRevision + jobType + clipIndex + normalizedInputHash` 派生；规范化输入包含访问模式和供应商 profile，因此 Agent Plan 与标准 Ark 不会错误复用任务。
 
 若 Create 请求已经发送但没有拿到 task ID，状态变为 `submission_unknown`。此时必须在 Ark 控制台或任务列表人工对账，不能直接重跑付费 POST。
 
@@ -167,7 +197,12 @@ uv run cvg reconcile-job <generationJobUuid> `
   --provider-task-id <verifiedArkTaskId>
 ```
 
-绑定使用行锁并只允许 `submission_unknown` 视频 Job；重复绑定、非视频任务或候选列表中不存在的 task ID 会被拒绝。绑定成功后运行 `resume` 继续轮询或下载。Seedream 是同步接口，无法通过 Seedance List Tasks 对账；其未知提交保持冻结并由人工检查账单后创建新的 render revision。
+绑定使用行锁并只允许 `submission_unknown` 视频 Job；任务原始
+`generation_jobs.provider` 必须与当前访问模式一致。跨模式绑定、重复绑定、
+非视频任务或候选列表中不存在的 task ID 都会被拒绝。绑定成功后运行
+`resume` 继续轮询或下载。Seedream 是同步接口，无法通过 Seedance List
+Tasks 对账；其未知提交保持冻结并由人工检查账单后创建新的 render
+revision。
 
 ## 9. 生成本地交付包
 

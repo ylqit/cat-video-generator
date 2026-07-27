@@ -1,4 +1,4 @@
-# 火山引擎 Ark 媒体生成接入
+# 火山引擎 Agent Plan 与标准 Ark 媒体生成接入
 
 ## 职责
 
@@ -7,13 +7,42 @@
 
 Seedance 不作为生图模型，Seedream 不负责异步视频任务。
 
-## 默认配置
+## 双访问模式
+
+运行时使用同一个 Ark Python SDK，但必须显式选择一套完整的访问配置。
+当前默认是 Agent Plan Large：
+
+- `ARK_ACCESS_MODE=agent_plan`
+- `ARK_AGENT_PLAN_TIER=large`；也允许 `max`。
+- `ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/plan/v3`
+- Seedream：`doubao-seedream-5.0-lite`
+- Seedance：`doubao-seedance-2.0-mini`
+
+Agent Plan 调用 Seedance 2.0-mini 时不支持 Small 或 Medium。本项目不会为
+Medium 降级到 Seedance 1.5；套餐不满足时必须在创建数据库任务和供应商
+任务前失败。
+
+切换到标准按量 Ark 时必须整组替换：
+
+- `ARK_ACCESS_MODE=standard`
+- `ARK_AGENT_PLAN_TIER` 为空。
+- `ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3`
+- `ARK_IMAGE_MODEL` 和 `ARK_VIDEO_MODEL` 使用标准 Ark 已开通的日期版本
+  Model ID 或 Endpoint ID。
+- `ARK_API_KEY` 使用与标准 Ark 对应的凭据。
+
+两种模式不能混用 URL、模型标识或凭据。Agent Plan 专属 Key、标准 Ark
+Key 与 Coding Plan Key 不是可互换配置；Key 类型无法靠静态格式可靠识别，
+实际请求返回鉴权错误时立即终止且不自动重试。
+
+两个 Base URL 都会先删除末尾 `/`，然后按上述精确值校验。切换访问模式
+不会迁移 PostgreSQL，也不会移动已经下载的本地媒体，但新模式会进入任务
+请求摘要与幂等哈希，不能复用另一模式的任务。
+
+## 通用媒体配置
 
 开发基线：
 
-- Seedream：`doubao-seedream-5-0-pro-260628`
-- Seedance：`doubao-seedance-2-0-260128`
-- API Base URL：`https://ark.cn-beijing.volces.com/api/v3`
 - 图片：2K PNG、关闭供应商水印。
 - 视频：9:16、720p、默认10秒、最长15秒、启用原生音频、关闭供应商水印。
 - 生成策略：默认 `single_pass`；`multi_clip` 仅作为特殊降级。
@@ -21,7 +50,9 @@ Seedance 不作为生图模型，Seedream 不负责异步视频任务。
 - 音频策略：默认 `native`，禁止角色对白、旁白和歌词。
 - 媒体策略：默认 `validate_then_passthrough`，合格原始 MP4 直接落盘保存。
 
-正式生产前必须使用同一人物、猫咪和风格测试集，对 Seedream 5.0 Pro、5.0 Lite 和 4.5 做小规模 A/B。身份一致性优先于风格匹配，成本排在第三。
+Agent Plan 模式只使用套餐公开支持的上述模型别名，不在该模式下进行普通
+Ark 日期版本模型的 A/B。标准模式后续若要更换 Model ID 或 Endpoint ID，
+仍需使用同一人物、猫咪和画风测试集独立验收。身份一致性优先于风格匹配。
 
 ## Seedream
 
@@ -53,11 +84,11 @@ Seedance 不作为生图模型，Seedream 不负责异步视频任务。
 - 删除：`DELETE /contents/generations/tasks/{id}`
 - Python SDK：`client.content_generation.tasks.create/get/list/delete`
 
-当前正式 Seedance 2.0 基线：
+当前 Agent Plan Seedance 2.0-mini 基线：
 
-- 模型：`doubao-seedance-2-0-260128`。
+- 模型：`doubao-seedance-2.0-mini`。
 - 时长：模型支持4至15秒；本产品只使用8至15秒。
-- 交付：9:16、720p、24fps，默认10秒。
+- 交付：9:16、720p，默认10秒。
 - 音频：请求显式设置 `generate_audio=true`，生成环境声、动作音效和可选轻音乐；Prompt 明确禁止对白、旁白和歌词。
 - Seedance 2.0 不配置 `seed`、`frames`、`camera_fixed` 或 `service_tier`。
 
@@ -104,6 +135,11 @@ Seedance 不作为生图模型，Seedream 不负责异步视频任务。
 - 视觉输入模式及决策原因
 - 创建、轮询、完成和下载时间
 - 成本和错误分类
+
+请求摘要额外保存 `accessMode`、`providerProfile`，Agent Plan 还保存
+`agentPlanTier`。`generation_jobs.provider` 分别记录
+`volcengine-agent-plan` 或 `volcengine-ark-standard`。摘要和幂等输入不
+保存 Base URL、API Key、完整 Base64 或签名下载 URL。
 
 创建任务接口没有可依赖的客户端幂等字段。调用前必须先保存本地 `submitting` 记录；取得火山任务 ID 后立即提交数据库。如果 POST 已经发送但响应读取失败且没有 task ID，状态改为 `submission_unknown`，通过任务列表和时间窗口人工对账，不得盲目再次创建，以免重复计费。
 
@@ -172,12 +208,19 @@ ffprobe 是每条视频的只读 QC 工具；FFmpeg 仅是条件式后期工具�
 ## 安全与配置
 
 - API Key 只从 `ARK_API_KEY` 环境变量读取。
+- 不读取无前缀的 `API_KEY` 或 `BASE_URL`。
+- `ARK_ACCESS_MODE`、Base URL、套餐和模型必须通过兼容性检查后才允许创建
+  `GenerationJob`。
+- Windows CLI 直接通过 API 接入，不依赖 Ark Helper 或 Agent Plan Skill。
 - 日志不得打印 Key、完整 Base64 图片或带签名的临时 URL。
 - 模型能力由代码内 registry 定义，配置文件不能伪造 `supportsStream`、参考图上限等能力。
 - 内容 Schema 不包含供应商模型和参数；渲染层负责从 `RenderPlan` 映射到 Ark 请求。
 
 ## 官方资料
 
+- Agent Plan 视觉模型 API 接入：https://www.volcengine.com/docs/82379/2375486?lang=zh
+- Agent Plan 套餐与模型范围：https://www.volcengine.com/docs/82379/2366394?lang=zh
+- Seedance 2.0能力说明：https://www.volcengine.com/activity/seedance2
 - 图片生成 API：https://www.volcengine.com/docs/82379/1541523
 - 模型列表：https://www.volcengine.com/docs/82379/1330310
 - Seedream 指南：https://www.volcengine.com/docs/82379/1829186

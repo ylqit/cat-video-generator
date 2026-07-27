@@ -52,12 +52,12 @@ c19272059a31a5e5d1555abbbff406b7118a02d622b63b38a67e1538e5ad05c4
 - `storybook-pencil-v1`：裁剪后的彩铅绘本画风。
 - `life-2026-07-24-seaside-travel`：三时段旅游 LifePack。
 
-morning Episode 已调整为8秒、`observation`、`direct_references`。当前
+morning Episode 已调整为8秒、`observation`、`direct_references`。验收时
 LifePack 保持 `approved`，三个 Slot 保持 `planned`，数据库中没有
-GenerationJob 或 MediaAsset。缺少 `ARK_API_KEY` 的付费命令已经验证会在
-创建任何任务前失败。
+GenerationJob 或 MediaAsset。凭据状态不在本文档记录；付费命令必须先通过
+当前 Ark 访问 profile、凭据、媒体工具和显式付费开关的完整预检。
 
-补充 Key 后的唯一下一步：
+准备好 Agent Plan Large/Max 的整套配置后，唯一下一步：
 
 ```powershell
 uv run cvg run-pack life-2026-07-24-seaside-travel `

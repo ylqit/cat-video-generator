@@ -13,7 +13,7 @@ from sqlalchemy import URL
 
 
 class ConfigurationError(ValueError):
-    """Raised when database configuration is incomplete or unsafe."""
+    """Raised when runtime configuration is incomplete or unsafe."""
 
 
 class DatabaseOperation(StrEnum):
@@ -24,9 +24,19 @@ class DatabaseOperation(StrEnum):
     REMOTE_VALIDATION = "remote_validation"
 
 
+class ArkAccessMode(StrEnum):
+    AGENT_PLAN = "agent_plan"
+    STANDARD = "standard"
+
+
 _SECURE_SSL_MODES = frozenset({"require", "verify-ca", "verify-full"})
 _SUPPORTED_SSL_MODES = _SECURE_SSL_MODES | {"disable"}
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_ARK_AGENT_PLAN_BASE_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
+_ARK_STANDARD_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+_ARK_AGENT_PLAN_IMAGE_MODEL = "doubao-seedream-5.0-lite"
+_ARK_AGENT_PLAN_VIDEO_MODEL = "doubao-seedance-2.0-mini"
+_ARK_AGENT_PLAN_VIDEO_TIERS = frozenset({"large", "max"})
 _SCHEMA_NAME_PATTERN = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 _REMOTE_VALIDATION_SCHEMA_PATTERN = re.compile(
     r"cat_video_validation_[0-9a-f]{12}"
@@ -55,6 +65,8 @@ def load_local_env(path: Path | None = None) -> bool:
 @dataclass(frozen=True, slots=True)
 class RuntimeSettings:
     ark_api_key: str | None
+    ark_access_mode: ArkAccessMode | None
+    ark_agent_plan_tier: str | None
     ark_base_url: str
     ark_image_model: str
     ark_video_model: str
@@ -84,10 +96,24 @@ class RuntimeSettings:
             raise ConfigurationError(
                 "Ark poll interval and task timeout must be greater than zero."
             )
+        access_mode_value = values.get("ARK_ACCESS_MODE", "").strip().lower()
+        try:
+            access_mode = (
+                None
+                if not access_mode_value
+                else ArkAccessMode(access_mode_value)
+            )
+        except ValueError as exc:
+            raise ConfigurationError(
+                "ARK_ACCESS_MODE must be agent_plan or standard."
+            ) from exc
+        tier_value = values.get("ARK_AGENT_PLAN_TIER", "").strip().lower()
         return cls(
             ark_api_key=values.get("ARK_API_KEY") or None,
+            ark_access_mode=access_mode,
+            ark_agent_plan_tier=tier_value or None,
             ark_base_url=values.get(
-                "ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"
+                "ARK_BASE_URL", _ARK_STANDARD_BASE_URL
             ).rstrip("/"),
             ark_image_model=values.get(
                 "ARK_IMAGE_MODEL", "doubao-seedream-5-0-pro-260628"
@@ -126,14 +152,107 @@ class RuntimeSettings:
             )
 
     def validate_for_ark_access(self) -> None:
-        """Require credentials for non-billable Ark task lookups."""
+        """Require one internally consistent endpoint, model, tier, and key."""
+        issues = self.ark_configuration_issues()
+        if issues:
+            raise ConfigurationError("; ".join(issues))
         if not self.ark_api_key:
             raise ConfigurationError("ARK_API_KEY is required for Ark access.")
 
+    def ark_configuration_issues(self) -> tuple[str, ...]:
+        if self.ark_access_mode is None:
+            return ("ARK_ACCESS_MODE must be explicitly configured.",)
+        if self.ark_access_mode is ArkAccessMode.AGENT_PLAN:
+            issues: list[str] = []
+            if self.ark_base_url != _ARK_AGENT_PLAN_BASE_URL:
+                issues.append(
+                    "Agent Plan requires ARK_BASE_URL="
+                    f"{_ARK_AGENT_PLAN_BASE_URL}."
+                )
+            if self.ark_image_model != _ARK_AGENT_PLAN_IMAGE_MODEL:
+                issues.append(
+                    "Agent Plan requires ARK_IMAGE_MODEL="
+                    f"{_ARK_AGENT_PLAN_IMAGE_MODEL}."
+                )
+            if self.ark_video_model != _ARK_AGENT_PLAN_VIDEO_MODEL:
+                issues.append(
+                    "Agent Plan requires ARK_VIDEO_MODEL="
+                    f"{_ARK_AGENT_PLAN_VIDEO_MODEL}."
+                )
+            if self.ark_agent_plan_tier not in _ARK_AGENT_PLAN_VIDEO_TIERS:
+                issues.append(
+                    "Seedance 2.0-mini on Agent Plan requires "
+                    "ARK_AGENT_PLAN_TIER=large or max."
+                )
+            return tuple(issues)
+
+        issues = []
+        if self.ark_base_url != _ARK_STANDARD_BASE_URL:
+            issues.append(
+                "Standard Ark requires ARK_BASE_URL="
+                f"{_ARK_STANDARD_BASE_URL}."
+            )
+        if self.ark_agent_plan_tier is not None:
+            issues.append(
+                "ARK_AGENT_PLAN_TIER must be empty in standard mode."
+            )
+        if not self.ark_image_model.strip():
+            issues.append(
+                "ARK_IMAGE_MODEL must be configured in standard mode."
+            )
+        if not self.ark_video_model.strip():
+            issues.append(
+                "ARK_VIDEO_MODEL must be configured in standard mode."
+            )
+        return tuple(issues)
+
+    @property
+    def provider_profile(self) -> str:
+        if self.ark_access_mode is ArkAccessMode.AGENT_PLAN:
+            return "volcengine-agent-plan"
+        if self.ark_access_mode is ArkAccessMode.STANDARD:
+            return "volcengine-ark-standard"
+        return "volcengine-ark-unconfigured"
+
+    @property
+    def endpoint_profile(self) -> str:
+        if self.ark_base_url == _ARK_AGENT_PLAN_BASE_URL:
+            return "agent_plan"
+        if self.ark_base_url == _ARK_STANDARD_BASE_URL:
+            return "standard"
+        return "unknown"
+
+    def request_profile_snapshot(self) -> dict[str, str]:
+        if self.ark_access_mode is None:
+            raise ConfigurationError(
+                "ARK_ACCESS_MODE must be explicitly configured."
+            )
+        snapshot = {
+            "accessMode": self.ark_access_mode.value,
+            "providerProfile": self.provider_profile,
+        }
+        if self.ark_access_mode is ArkAccessMode.AGENT_PLAN:
+            if self.ark_agent_plan_tier is None:
+                raise ConfigurationError(
+                    "ARK_AGENT_PLAN_TIER is required in Agent Plan mode."
+                )
+            snapshot["agentPlanTier"] = self.ark_agent_plan_tier
+        return snapshot
+
     def preflight_report(self) -> dict[str, object]:
+        configuration_issues = self.ark_configuration_issues()
         return {
-            "provider": "volcengine-ark",
+            "provider": self.provider_profile,
             "arkApiKeyConfigured": bool(self.ark_api_key),
+            "arkAccessMode": (
+                None
+                if self.ark_access_mode is None
+                else self.ark_access_mode.value
+            ),
+            "agentPlanTier": self.ark_agent_plan_tier,
+            "endpointProfile": self.endpoint_profile,
+            "generationConfigurationValid": not configuration_issues,
+            "generationConfigurationIssues": list(configuration_issues),
             "arkBaseUrl": self.ark_base_url,
             "arkImageModel": self.ark_image_model,
             "arkVideoModel": self.ark_video_model,

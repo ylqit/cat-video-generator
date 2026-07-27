@@ -133,7 +133,7 @@ class VisualAssetService:
 
             prompt = compile_keyframe_prompt(episode, frame_role=frame_role)
             request_snapshot = {
-                "provider": "volcengine-ark",
+                **self._settings.request_profile_snapshot(),
                 "model": self._settings.ark_image_model,
                 "frameRole": frame_role,
                 "size": "2K",
