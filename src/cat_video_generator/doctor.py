@@ -21,6 +21,8 @@ class DatabaseDoctorReport:
     server_version_num: int
     server_version: str
     ssl_in_use: bool
+    transport_security: str
+    insecure_runtime_authorized: bool
     schema_exists: bool
     schema_usage_allowed: bool
     alembic_revision: str | None
@@ -106,7 +108,13 @@ def inspect_database(
             f"{settings.minimum_server_version}."
         )
     if not identity[4]:
-        warnings.append("The current PostgreSQL session is not encrypted.")
+        if settings.insecure_runtime_allowed:
+            warnings.append(
+                "The current PostgreSQL session is plaintext and production "
+                "runtime is explicitly authorized as temporary architecture debt."
+            )
+        else:
+            warnings.append("The current PostgreSQL session is not encrypted.")
     if not schema_exists:
         warnings.append(f"Schema {settings.schema!r} does not exist yet.")
     elif not schema_usage_allowed:
@@ -123,6 +131,7 @@ def inspect_database(
         bool(identity[4])
         or settings.insecure_local_test_allowed
         or settings.insecure_remote_write_test_allowed
+        or settings.insecure_runtime_allowed
     )
     ready_for_migrations = database_matches and version_supported and transport_allowed
     ready_for_runtime = (
@@ -141,6 +150,8 @@ def inspect_database(
         server_version_num=identity[2],
         server_version=identity[3],
         ssl_in_use=bool(identity[4]),
+        transport_security="tls" if identity[4] else "plaintext",
+        insecure_runtime_authorized=settings.insecure_runtime_allowed,
         schema_exists=schema_exists,
         schema_usage_allowed=schema_usage_allowed,
         alembic_revision=alembic_revision,

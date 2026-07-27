@@ -47,6 +47,7 @@ def test_runtime_settings_require_ffprobe_key_and_paid_acknowledgement(
     )
 
     settings.validate_for_generation(allow_paid_generation=True)
+    settings.validate_for_ark_access()
     assert settings.ffmpeg_path is None
     with pytest.raises(ConfigurationError, match="allow-paid-generation"):
         settings.validate_for_generation(allow_paid_generation=False)
@@ -131,3 +132,20 @@ def test_review_cli_requires_exactly_one_decision() -> None:
 
     assert result.exit_code == 2
     assert "exactly one" in result.stderr
+
+
+def test_status_accepts_optional_life_pack_id_argument() -> None:
+    runner = CliRunner()
+    result = runner.invoke(app, ["status", "--help"])
+
+    assert result.exit_code == 0
+    assert "[life_pack_id]" in result.stdout
+
+
+def test_reconcile_job_is_a_non_paid_explicit_cli_entrypoint() -> None:
+    runner = CliRunner()
+    result = runner.invoke(app, ["reconcile-job", "--help"])
+
+    assert result.exit_code == 0
+    assert "--provider-task-id" in result.stdout
+    assert "--allow-paid-generation" not in result.stdout

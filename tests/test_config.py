@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 from typer.testing import CliRunner
 
@@ -8,6 +11,7 @@ from cat_video_generator.config import (
     ConfigurationError,
     DatabaseOperation,
     DatabaseSettings,
+    load_local_env,
 )
 
 
@@ -87,6 +91,55 @@ def test_remote_insecure_write_permission_is_scoped_to_validation_operation() ->
         ).validate_for(DatabaseOperation.REMOTE_VALIDATION)
 
 
+def test_insecure_runtime_requires_exact_database_schema_and_explicit_flag() -> None:
+    configured = settings(
+        sslmode="disable",
+        allow_insecure_runtime=True,
+    )
+
+    configured.validate_for(DatabaseOperation.MIGRATION)
+    configured.validate_for(DatabaseOperation.RUNTIME)
+    with pytest.raises(ConfigurationError):
+        configured.validate_for(DatabaseOperation.TEST)
+
+    for unsafe in (
+        settings(
+            database="another-db",
+            sslmode="disable",
+            allow_insecure_runtime=True,
+        ),
+        settings(
+            schema="another_schema",
+            sslmode="disable",
+            allow_insecure_runtime=True,
+        ),
+        settings(
+            sslmode="disable",
+            allow_insecure_runtime=False,
+        ),
+    ):
+        with pytest.raises(ConfigurationError):
+            unsafe.validate_for(DatabaseOperation.RUNTIME)
+
+
+def test_local_env_does_not_override_powershell_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "CAT_VIDEO_DB_HOST=file-host\n"
+        "CAT_VIDEO_DB_SCHEMA=cat_video\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CAT_VIDEO_DB_HOST", "powershell-host")
+    monkeypatch.delenv("CAT_VIDEO_DB_SCHEMA", raising=False)
+
+    assert load_local_env(env_file) is True
+    assert os.environ["CAT_VIDEO_DB_HOST"] == "powershell-host"
+    assert os.environ["CAT_VIDEO_DB_SCHEMA"] == "cat_video"
+
+
 def test_from_env_rejects_missing_secrets_and_invalid_port() -> None:
     with pytest.raises(ConfigurationError, match="CAT_VIDEO_DB_PASSWORD"):
         DatabaseSettings.from_env(
@@ -96,6 +149,20 @@ def test_from_env_rejects_missing_secrets_and_invalid_port() -> None:
                 "CAT_VIDEO_DB_USER": "postgres",
             }
         )
+
+    configured = DatabaseSettings.from_env(
+        {
+            "CAT_VIDEO_DB_HOST": "db.example.test",
+            "CAT_VIDEO_DB_NAME": "vedio-appdb",
+            "CAT_VIDEO_DB_USER": "postgres",
+            "CAT_VIDEO_DB_PASSWORD": "secret",
+            "CAT_VIDEO_DB_SSLMODE": "disable",
+            "CAT_VIDEO_DB_SCHEMA": "cat_video",
+            "CAT_VIDEO_ALLOW_INSECURE_RUNTIME": "true",
+        }
+    )
+    assert configured.schema == "cat_video"
+    assert configured.allow_insecure_runtime is True
 
     with pytest.raises(ConfigurationError, match="must be an integer"):
         DatabaseSettings.from_env(

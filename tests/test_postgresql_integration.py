@@ -22,7 +22,11 @@ from cat_video_generator.content_service import (
 )
 from cat_video_generator.db import create_database_engine, create_session_factory
 from cat_video_generator.doctor import inspect_database
-from cat_video_generator.migration import alembic_config, expected_alembic_head
+from cat_video_generator.migration import (
+    alembic_config,
+    expected_alembic_head,
+    upgrade_database,
+)
 from cat_video_generator.models import (
     ContinuityEvent,
     DailyLifePack,
@@ -38,6 +42,7 @@ from cat_video_generator.repository import (
     claim_next_life_pack,
     get_or_create_generation_job,
 )
+from cat_video_generator.runtime_validation import validate_runtime_database
 
 pytestmark = pytest.mark.postgres
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -130,6 +135,22 @@ def test_migration_schema_and_doctor(
         "reference_assets",
         "review_decisions",
     }
+
+
+def test_upgrade_is_idempotent_and_runtime_validation_cleans_its_rows(
+    migrated_database: DatabaseSettings,
+) -> None:
+    assert upgrade_database(migrated_database) == expected_alembic_head()
+    engine = create_database_engine(migrated_database, DatabaseOperation.TEST)
+    try:
+        report = validate_runtime_database(engine, migrated_database)
+    finally:
+        engine.dispose()
+
+    assert report.ok is True
+    assert report.alembic_revision == expected_alembic_head()
+    assert report.schema == "cat_video"
+    assert all(report.checks.values())
 
 
 def test_slot_order_and_selected_variant_constraints(

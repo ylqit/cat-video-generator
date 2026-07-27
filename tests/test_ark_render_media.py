@@ -116,6 +116,7 @@ def test_continuation_waits_for_review_then_uses_ready_or_fallback() -> None:
 class _FakeTasks:
     def __init__(self) -> None:
         self.create_kwargs: dict | None = None
+        self.list_kwargs: dict | None = None
 
     def create(self, **kwargs):
         self.create_kwargs = kwargs
@@ -132,6 +133,25 @@ class _FakeTasks:
             resolution="720p",
             ratio="9:16",
             generate_audio=True,
+        )
+
+    def list(self, **kwargs):
+        self.list_kwargs = kwargs
+        return SimpleNamespace(
+            items=[
+                SimpleNamespace(
+                    id="task-reconciliation-candidate",
+                    status="running",
+                    content=None,
+                    error=None,
+                    model="video-model",
+                    duration=8,
+                    resolution="720p",
+                    ratio="9:16",
+                    generate_audio=True,
+                    created_at=1_700_000_000,
+                )
+            ]
         )
 
 
@@ -193,6 +213,32 @@ def test_ark_adapter_maps_direct_references_without_unsupported_fields(
         "camera_fixed",
         "service_tier",
     } & kwargs.keys()
+
+
+def test_ark_adapter_lists_redactable_reconciliation_metadata(
+    tmp_path: Path,
+) -> None:
+    tasks = _FakeTasks()
+    provider = ArkMediaProvider(
+        _settings(tmp_path),
+        client=SimpleNamespace(
+            images=_FakeImages(),
+            content_generation=SimpleNamespace(tasks=tasks),
+        ),
+    )
+
+    result = provider.list_video_tasks(model="video-model")
+
+    assert len(result) == 1
+    assert result[0].task_id == "task-reconciliation-candidate"
+    assert result[0].video_url is None
+    assert result[0].created_at == 1_700_000_000
+    assert tasks.list_kwargs == {
+        "page_num": 1,
+        "page_size": 100,
+        "model": "video-model",
+        "timeout": 120.0,
+    }
 
 
 def test_download_is_content_addressed_and_atomic(tmp_path: Path) -> None:

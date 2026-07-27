@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from dotenv import load_dotenv
 from sqlalchemy import URL
 
 
@@ -41,6 +42,14 @@ def _read_bool(value: str | None, *, default: bool = False) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ConfigurationError(f"Invalid boolean value: {value!r}")
+
+
+def load_local_env(path: Path | None = None) -> bool:
+    """Load the local CLI environment without overriding the caller's session."""
+    env_path = Path.cwd() / ".env" if path is None else path
+    if not env_path.is_file():
+        return False
+    return load_dotenv(dotenv_path=env_path, override=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,14 +117,18 @@ class RuntimeSettings:
             raise ConfigurationError(
                 "Ark generation requires --allow-paid-generation."
             )
-        if not self.ark_api_key:
-            raise ConfigurationError("ARK_API_KEY is required for Ark generation.")
+        self.validate_for_ark_access()
         if self.ffprobe_path is None:
             raise ConfigurationError(
                 "ffprobe is required for media QC. Set FFPROBE_PATH or add "
                 "ffprobe to PATH. ffmpeg is optional until a conditional media "
                 "repair is requested."
             )
+
+    def validate_for_ark_access(self) -> None:
+        """Require credentials for non-billable Ark task lookups."""
+        if not self.ark_api_key:
+            raise ConfigurationError("ARK_API_KEY is required for Ark access.")
 
     def preflight_report(self) -> dict[str, object]:
         return {
@@ -164,6 +177,7 @@ class DatabaseSettings:
     allow_insecure_readonly_smoke: bool = False
     allow_insecure_local_tests: bool = False
     allow_insecure_remote_write_test: bool = False
+    allow_insecure_runtime: bool = False
     schema: str = "cat_video"
     minimum_server_version: int = 140000
 
@@ -207,11 +221,15 @@ class DatabaseSettings:
             user=values[required["user"]],
             password=values[required["password"]],
             sslmode=sslmode,
+            schema=values.get("CAT_VIDEO_DB_SCHEMA", "cat_video").strip(),
             allow_insecure_readonly_smoke=_read_bool(
                 values.get("CAT_VIDEO_ALLOW_INSECURE_READONLY_SMOKE")
             ),
             allow_insecure_local_tests=_read_bool(
                 values.get("CAT_VIDEO_ALLOW_INSECURE_LOCAL_TESTS")
+            ),
+            allow_insecure_runtime=_read_bool(
+                values.get("CAT_VIDEO_ALLOW_INSECURE_RUNTIME")
             ),
         )
 
@@ -251,6 +269,15 @@ class DatabaseSettings:
             and _REMOTE_VALIDATION_SCHEMA_PATTERN.fullmatch(self.schema) is not None
         )
 
+    @property
+    def insecure_runtime_allowed(self) -> bool:
+        return (
+            self.sslmode == "disable"
+            and self.allow_insecure_runtime
+            and self.database == "vedio-appdb"
+            and self.schema == "cat_video"
+        )
+
     def validate_for(self, operation: DatabaseOperation) -> None:
         if _SCHEMA_NAME_PATTERN.fullmatch(self.schema) is None:
             raise ConfigurationError(
@@ -280,8 +307,19 @@ class DatabaseSettings:
             and self.insecure_local_test_allowed
         ):
             return
+        if (
+            operation
+            in {
+                DatabaseOperation.MIGRATION,
+                DatabaseOperation.RUNTIME,
+            }
+            and self.insecure_runtime_allowed
+        ):
+            return
         raise ConfigurationError(
             "Unencrypted PostgreSQL is restricted to an explicitly enabled "
-            "read-only smoke test or isolated remote validation. Enable "
-            "SSL/tunneling before normal migrations or runtime."
+            "read-only smoke test, isolated remote validation, local test, or "
+            "the explicitly authorized vedio-appdb.cat_video runtime. Enable "
+            "SSL/tunneling or set CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true for "
+            "that exact temporary runtime."
         )

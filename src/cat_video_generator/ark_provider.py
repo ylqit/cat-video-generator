@@ -39,6 +39,7 @@ class ArkVideoTask:
     resolution: str | None
     ratio: str | None
     generate_audio: bool | None
+    created_at: int | None = None
 
 
 class ArkProviderError(RuntimeError):
@@ -185,24 +186,52 @@ class ArkMediaProvider:
             )
         except ArkAPIError as exc:
             raise _provider_error(exc, submission=False) from exc
-        content = getattr(task, "content", None)
-        error = getattr(task, "error", None)
-        return ArkVideoTask(
-            task_id=task.id,
-            status=task.status,
-            video_url=(
-                None if content is None else getattr(content, "video_url", None)
-            ),
-            error_code=None if error is None else getattr(error, "code", None),
-            error_message=(
-                None if error is None else getattr(error, "message", None)
-            ),
-            model=getattr(task, "model", None),
-            duration_seconds=getattr(task, "duration", None),
-            resolution=getattr(task, "resolution", None),
-            ratio=getattr(task, "ratio", None),
-            generate_audio=getattr(task, "generate_audio", None),
-        )
+        return _map_video_task(task)
+
+    def list_video_tasks(
+        self,
+        *,
+        model: str,
+        page_size: int = 100,
+    ) -> tuple[ArkVideoTask, ...]:
+        if not 1 <= page_size <= 100:
+            raise ArkProviderError(
+                "Ark task list page_size must be between 1 and 100.",
+                code="invalid_page_size",
+                retryable=False,
+            )
+        try:
+            response = self._client.content_generation.tasks.list(
+                page_num=1,
+                page_size=page_size,
+                model=model,
+                timeout=120.0,
+            )
+        except ArkAPIError as exc:
+            raise _provider_error(exc, submission=False) from exc
+        return tuple(_map_video_task(task) for task in response.items)
+
+
+def _map_video_task(task: Any) -> ArkVideoTask:
+    content = getattr(task, "content", None)
+    error = getattr(task, "error", None)
+    return ArkVideoTask(
+        task_id=task.id,
+        status=task.status,
+        video_url=(
+            None if content is None else getattr(content, "video_url", None)
+        ),
+        error_code=None if error is None else getattr(error, "code", None),
+        error_message=(
+            None if error is None else getattr(error, "message", None)
+        ),
+        model=getattr(task, "model", None),
+        duration_seconds=getattr(task, "duration", None),
+        resolution=getattr(task, "resolution", None),
+        ratio=getattr(task, "ratio", None),
+        generate_audio=getattr(task, "generate_audio", None),
+        created_at=getattr(task, "created_at", None),
+    )
 
 
 def _image_data_url(path: Path) -> str:
