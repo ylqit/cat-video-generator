@@ -24,18 +24,18 @@ execution:
 
 media:
   accessProfile:
-    mode: agent_plan
-    agentPlanTier: large
-    providerProfile: volcengine-agent-plan
-    baseUrl: https://ark.cn-beijing.volces.com/api/plan/v3
+    mode: standard
+    agentPlanTier: null
+    providerProfile: volcengine-ark-standard
+    baseUrl: https://ark.cn-beijing.volces.com/api/v3
     apiKeyEnv: ARK_API_KEY
-    standardAlternative:
-      mode: standard
-      agentPlanTier: null
-      providerProfile: volcengine-ark-standard
-      baseUrl: https://ark.cn-beijing.volces.com/api/v3
-      imageModel: <standard-image-model-or-endpoint-id>
-      videoModel: <standard-video-model-or-endpoint-id>
+    agentPlanAlternative:
+      mode: agent_plan
+      agentPlanTier: large
+      providerProfile: volcengine-agent-plan
+      baseUrl: https://ark.cn-beijing.volces.com/api/plan/v3
+      imageModel: doubao-seedream-5.0-lite
+      videoModel: doubao-seedance-2.0-mini
 
   image:
     model: doubao-seedream-5.0-lite
@@ -46,7 +46,7 @@ media:
     timeoutMs: 120000
 
   video:
-    model: doubao-seedance-2.0-mini
+    model: doubao-seedance-2-0-mini-260615
     aspectRatio: "9:16"
     resolution: 720p
     defaultGenerationStrategy: single_pass

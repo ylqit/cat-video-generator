@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +29,34 @@ from .jobs import ArkJobExecutor, file_sha256
 class PreparedVisualReferences:
     paths: tuple[Path, ...]
     plan: VisualReferences
+
+
+def keyframe_context_fingerprint(
+    episode: dict[str, Any],
+    *,
+    frame_role: str,
+) -> str:
+    if frame_role not in {"first", "last"}:
+        raise OrchestrationError("frame_role must be first or last.")
+    beat = episode["beats"][0] if frame_role == "first" else episode["beats"][-1]
+    context = episode["contextReads"]
+    payload = {
+        "frameRole": frame_role,
+        "locationId": context["locationId"],
+        "weather": context["weather"],
+        "wardrobeVersionIds": context["wardrobeVersionIds"],
+        "propIds": context["propIds"],
+        "visualAction": beat["visualAction"],
+        "requiredSubjectVersionIds": episode["requiredSubjectVersionIds"],
+        "styleVersionId": episode["styleVersionId"],
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class VisualAssetService:
@@ -103,27 +133,16 @@ class VisualAssetService:
         )
         for clip_index, frame_role in enumerate(required_roles):
             with self._session_factory.begin() as session:
-                approved = session.execute(
-                    select(MediaAsset)
-                    .join(
-                        GenerationJob,
-                        MediaAsset.generation_job_id == GenerationJob.id,
-                    )
-                    .where(
-                        MediaAsset.episode_variant_id == variant_id,
-                        MediaAsset.asset_kind
-                        == f"scene_keyframe_{frame_role}",
-                        MediaAsset.qc_status == "passed",
-                        MediaAsset.review_status == "approved",
-                        GenerationJob.render_revision <= render_revision,
-                    )
-                    .order_by(
-                        GenerationJob.render_revision.desc(),
-                        MediaAsset.created_at.desc(),
-                    )
-                    .limit(1)
-                ).scalar_one_or_none()
-                if approved is not None:
+                approved = self.approved_keyframes(
+                    session,
+                    variant_id,
+                    episode,
+                    render_revision,
+                )
+                if any(
+                    asset.asset_kind == f"scene_keyframe_{frame_role}"
+                    for asset in approved
+                ):
                     continue
                 existing = session.execute(
                     select(MediaAsset)
@@ -173,7 +192,10 @@ class VisualAssetService:
 
         with self._session_factory() as session:
             assets = self.approved_keyframes(
-                session, variant_id, render_revision
+                session,
+                variant_id,
+                episode,
+                render_revision,
             )
             return len(self.ordered_keyframes(assets, mode)) == len(
                 required_roles
@@ -183,28 +205,58 @@ class VisualAssetService:
         self,
         session: Session,
         variant_id: uuid.UUID,
+        episode: dict[str, Any],
         render_revision: int,
     ) -> list[MediaAsset]:
-        return session.execute(
-            select(MediaAsset)
+        current_variant = session.get_one(EpisodeVariant, variant_id)
+        rows = session.execute(
+            select(
+                MediaAsset,
+                EpisodeVariant.episode_spec_json,
+                GenerationJob.render_revision,
+            )
             .join(
                 GenerationJob,
                 MediaAsset.generation_job_id == GenerationJob.id,
             )
+            .join(
+                EpisodeVariant,
+                MediaAsset.episode_variant_id == EpisodeVariant.id,
+            )
             .where(
-                MediaAsset.episode_variant_id == variant_id,
+                EpisodeVariant.episode_id == current_variant.episode_id,
                 MediaAsset.asset_kind.in_(
                     ("scene_keyframe_first", "scene_keyframe_last")
                 ),
                 MediaAsset.qc_status == "passed",
                 MediaAsset.review_status == "approved",
-                GenerationJob.render_revision <= render_revision,
             )
             .order_by(
-                GenerationJob.render_revision.desc(),
                 MediaAsset.created_at.desc(),
             )
-        ).scalars().all()
+        ).all()
+        selected: dict[str, MediaAsset] = {}
+        for asset, candidate_episode, candidate_render_revision in rows:
+            frame_role = (
+                "first"
+                if asset.asset_kind == "scene_keyframe_first"
+                else "last"
+            )
+            if (
+                asset.episode_variant_id == variant_id
+                and candidate_render_revision > render_revision
+            ):
+                continue
+            if keyframe_context_fingerprint(
+                candidate_episode,
+                frame_role=frame_role,
+            ) != keyframe_context_fingerprint(
+                episode,
+                frame_role=frame_role,
+            ):
+                continue
+            selected.setdefault(asset.asset_kind, asset)
+        return list(selected.values())
 
     @staticmethod
     def ordered_keyframes(

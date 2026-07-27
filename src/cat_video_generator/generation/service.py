@@ -242,6 +242,7 @@ class PackGenerationService:
             scene_assets = self._visual_assets.approved_keyframes(
                 session,
                 variant_id,
+                episode,
                 render_revision,
             )
             ordered_scene_assets = self._visual_assets.ordered_keyframes(

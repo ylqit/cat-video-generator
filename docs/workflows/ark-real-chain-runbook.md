@@ -16,8 +16,8 @@ Schema 校验和单元测试，但不会创建收费任务。
 3. `cvg db upgrade` 已将正式 `cat_video` Schema 升级到最新 Alembic head。
 4. ffprobe 可以从 `PATH` 或 `FFPROBE_PATH` 找到；只有启用条件式媒体修复时才要求 ffmpeg。
 5. 人物、猫咪和画风 Canon 均已导入并人工批准。
-6. Agent Plan 必须使用 Large 或 Max，URL 和两个模型别名必须与该模式匹配；
-   标准 Ark 必须使用标准 URL、空套餐字段和自身已开通的模型/Endpoint ID。
+6. 默认标准 Ark 必须使用 `/api/v3`、空套餐字段和自身已开通的
+   Model ID/Endpoint ID；切换 Agent Plan 时才使用套餐 URL 与模型别名。
 7. `ARK_API_KEY` 只保存在被 Git 忽略的 `.env` 或当前 PowerShell 会话。
 8. 每次可能创建任务的命令都显式带 `--allow-paid-generation`。
 
@@ -97,63 +97,62 @@ uv run cvg status life-2026-07-24-seaside-travel
 ```
 
 `validate-pack` 不连接模型也不写数据库。`approve-pack` 只冻结内容，不产生费用。
-当前旅游示例是 `planRevision=2`：morning 强制合成首帧、noon 强制首尾帧、
-evening 保留直接主体参考。数据库中的 revision 1 保持不可变；烟测必须使用
+当前旅游示例是 `planRevision=3`：三条均为10秒，morning 强制合成首帧、
+noon 强制首尾帧、evening 保留直接主体参考。数据库中的 revision 1和2
+保持不可变；烟测必须使用
 显式 `run-pack`，不要用 `run-next` 领取旧 revision。
 
-## 6. 配置 Agent Plan 并执行第一条真实烟测
+## 6. 配置标准 Ark 并执行真实烟测
 
-默认配置使用 Agent Plan Large。Windows CLI 直接调用 API，不需要安装
-Ark Helper 或 Agent Plan 图片/视频 Skill：
+默认配置使用标准 Ark API。Windows CLI 直接调用 `/api/v3`：
 
 ```powershell
-$env:ARK_API_KEY = "<your-ark-api-key>"
-$env:ARK_ACCESS_MODE = "agent_plan"
-$env:ARK_AGENT_PLAN_TIER = "large"
-$env:ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
+$env:ARK_API_KEY = "<your-standard-ark-api-key>"
+$env:ARK_ACCESS_MODE = "standard"
+Remove-Item Env:ARK_AGENT_PLAN_TIER -ErrorAction SilentlyContinue
+$env:ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 $env:ARK_IMAGE_MODEL = "doubao-seedream-5.0-lite"
-$env:ARK_VIDEO_MODEL = "doubao-seedance-2.0-mini"
+$env:ARK_VIDEO_MODEL = "doubao-seedance-2-0-mini-260615"
 
 uv run cvg doctor
 uv run cvg run-pack life-2026-07-24-seaside-travel --slot morning --allow-paid-generation
 ```
 
-`doctor` 必须显示 `arkAccessMode=agent_plan`、
-`agentPlanTier=large|max`、`endpointProfile=agent_plan` 和
-`generationConfigurationValid=true`。其中套餐为本地声明，报告同时显示
-`agentPlanTierVerification=declared_only` 和
-`providerEntitlementVerification=not_performed`；报告不会显示 Key，也不
-保证 Key 所属账号已实际开通 Large/Max。
+`doctor` 必须显示 `arkAccessMode=standard`、
+`agentPlanTier=null`、`endpointProfile=standard` 和
+`generationConfigurationValid=true`。报告不会显示 Key；真正请求时若
+模型未开通、Key 类型不匹配或余额不足，系统立即终止且不自动重试。
 
-如果以后切换到标准按量 Ark，必须一次替换整组 Mode、Base URL、模型和
-Key；`ARK_AGENT_PLAN_TIER` 必须删除：
+如果以后切换回 Agent Plan，必须一次替换整组 Mode、Base URL、模型和
+Key：
 
 ```powershell
-$env:ARK_ACCESS_MODE = "standard"
-Remove-Item Env:ARK_AGENT_PLAN_TIER -ErrorAction SilentlyContinue
-$env:ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-$env:ARK_IMAGE_MODEL = "<standard-image-model-or-endpoint-id>"
-$env:ARK_VIDEO_MODEL = "<standard-video-model-or-endpoint-id>"
-$env:ARK_API_KEY = "<your-standard-ark-api-key>"
+$env:ARK_ACCESS_MODE = "agent_plan"
+$env:ARK_AGENT_PLAN_TIER = "large"
+$env:ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
+$env:ARK_IMAGE_MODEL = "doubao-seedream-5.0-lite"
+$env:ARK_VIDEO_MODEL = "doubao-seedance-2.0-mini"
+$env:ARK_API_KEY = "<your-agent-plan-api-key>"
 ```
 
 Agent Plan Key、标准 Ark Key 与 Coding Plan Key 不可混用。配置层无法通过
 Key 字符串判断类型；供应商鉴权失败时终止且不重试。切换模式不会迁移
 PostgreSQL 或本地媒体。
 
-首条8秒 smoke Episode 要求精确开场，所以先走
+当前10秒 smoke Episode 要求精确开场，所以先走
 `generated_first_frame`：
 
 1. 数据库先写入唯一 `GenerationJob(submitting)`。
 2. Seedream 使用人物、猫咪和画风三张 Canon 生成一张海边合成首帧。
 3. 首帧下载、QC 后进入 `keyframe_review`；未批准前不得创建 Seedance 任务。
 4. 批准首帧并再次运行命令后，Seedance Create 只发送该首帧，使用720p、
-   9:16、8秒、`generate_audio=true`、`watermark=false`。
+   9:16、10秒、`generate_audio=true`、`watermark=false`。
 5. 请求不发送 `frames`、`camera_fixed`、`service_tier` 或 `seed`。
 6. 获得 task ID 后短事务写入 `queued`，随后轮询 `queued/running/succeeded`。
 7. 成功 URL 立即流式下载到 `.part`，计算 SHA-256 后原子进入
    `var/assets/generated/sha256/`。
-8. ffprobe 检查 MP4、H.264、AAC、720×1280、8～15秒和音轨；通过后进入
+8. ffprobe 检查 MP4、H.264、AAC、720×1280、目标10秒（允许1秒误差）和
+   音轨；通过后进入
    `content_review`，不会自动交付。
 
 执行后查看待审核资产：

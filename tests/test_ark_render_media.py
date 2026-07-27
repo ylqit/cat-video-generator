@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 import subprocess
@@ -16,6 +17,9 @@ from cat_video_generator.config import RuntimeSettings
 from cat_video_generator.contracts import (
     ContentValidationError,
     load_json_object,
+)
+from cat_video_generator.generation.visual_assets import (
+    keyframe_context_fingerprint,
 )
 from cat_video_generator.media import (
     download_to_content_address,
@@ -56,7 +60,7 @@ def _episode(slot: str) -> dict:
 def test_render_plan_compiles_direct_references() -> None:
     plan = compile_render_plan(
         _episode("evening"),
-        plan_revision=2,
+        plan_revision=3,
         render_revision=1,
         references=VisualReferences(
             person_asset_id="person-v1",
@@ -79,14 +83,14 @@ def test_travel_pack_exercises_all_visual_input_modes() -> None:
     )
     morning = compile_render_plan(
         _episode("morning"),
-        plan_revision=2,
+        plan_revision=3,
         render_revision=1,
         references=references,
         scene_keyframe_asset_ids=("approved-first-frame",),
     )
     noon = compile_render_plan(
         _episode("noon"),
-        plan_revision=2,
+        plan_revision=3,
         render_revision=1,
         references=references,
         scene_keyframe_asset_ids=(
@@ -96,15 +100,41 @@ def test_travel_pack_exercises_all_visual_input_modes() -> None:
     )
     evening = compile_render_plan(
         _episode("evening"),
-        plan_revision=2,
+        plan_revision=3,
         render_revision=1,
         references=references,
     )
 
-    assert morning["durationMs"] == 8000
+    assert morning["durationMs"] == 10000
     assert morning["visualInputMode"] == "generated_first_frame"
     assert noon["visualInputMode"] == "generated_first_last_frames"
     assert evening["visualInputMode"] == "direct_references"
+
+
+def test_keyframe_fingerprint_ignores_timing_but_not_visual_semantics() -> None:
+    original = _episode("morning")
+    retimed = copy.deepcopy(original)
+    retimed["durationMs"] = 12000
+    retimed["beats"][0]["endMs"] = 3000
+    retimed["beats"][1]["startMs"] = 3000
+
+    assert keyframe_context_fingerprint(
+        original,
+        frame_role="first",
+    ) == keyframe_context_fingerprint(
+        retimed,
+        frame_role="first",
+    )
+
+    changed = copy.deepcopy(retimed)
+    changed["beats"][0]["visualAction"] = "人物和猫咪改在车站等待。"
+    assert keyframe_context_fingerprint(
+        original,
+        frame_role="first",
+    ) != keyframe_context_fingerprint(
+        changed,
+        frame_role="first",
+    )
 
 
 def test_exact_ending_requires_two_reviewed_keyframes() -> None:
@@ -118,14 +148,14 @@ def test_exact_ending_requires_two_reviewed_keyframes() -> None:
     with pytest.raises(ContentValidationError, match="exactly 2"):
         compile_render_plan(
             episode,
-            plan_revision=2,
+            plan_revision=3,
             render_revision=1,
             references=references,
         )
 
     plan = compile_render_plan(
         episode,
-        plan_revision=2,
+        plan_revision=3,
         render_revision=1,
         references=references,
         scene_keyframe_asset_ids=("first-frame", "last-frame"),

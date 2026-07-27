@@ -212,35 +212,41 @@ def test_provider_config_uses_on_demand_execution_without_time_gate() -> None:
         "paidGenerationRequiresCliAcknowledgement": True,
     }
     assert config["media"]["accessProfile"] == {
-        "mode": "agent_plan",
-        "agentPlanTier": "large",
-        "providerProfile": "volcengine-agent-plan",
-        "baseUrl": "https://ark.cn-beijing.volces.com/api/plan/v3",
+        "mode": "standard",
+        "agentPlanTier": None,
+        "providerProfile": "volcengine-ark-standard",
+        "baseUrl": "https://ark.cn-beijing.volces.com/api/v3",
         "apiKeyEnv": "ARK_API_KEY",
-        "standardAlternative": {
-            "mode": "standard",
-            "agentPlanTier": None,
-            "providerProfile": "volcengine-ark-standard",
-            "baseUrl": "https://ark.cn-beijing.volces.com/api/v3",
-            "imageModel": "<standard-image-model-or-endpoint-id>",
-            "videoModel": "<standard-video-model-or-endpoint-id>",
+        "agentPlanAlternative": {
+            "mode": "agent_plan",
+            "agentPlanTier": "large",
+            "providerProfile": "volcengine-agent-plan",
+            "baseUrl": "https://ark.cn-beijing.volces.com/api/plan/v3",
+            "imageModel": "doubao-seedream-5.0-lite",
+            "videoModel": "doubao-seedance-2.0-mini",
         },
     }
     assert config["media"]["image"]["model"] == "doubao-seedream-5.0-lite"
-    assert config["media"]["video"]["model"] == "doubao-seedance-2.0-mini"
+    assert (
+        config["media"]["video"]["model"]
+        == "doubao-seedance-2-0-mini-260615"
+    )
 
 
-def test_env_example_defaults_to_secret_free_agent_plan_large() -> None:
+def test_env_example_defaults_to_secret_free_standard_ark() -> None:
     values = dotenv_values(ENV_EXAMPLE)
 
-    assert values["ARK_ACCESS_MODE"] == "agent_plan"
-    assert values["ARK_AGENT_PLAN_TIER"] == "large"
+    assert values["ARK_ACCESS_MODE"] == "standard"
+    assert values["ARK_AGENT_PLAN_TIER"] == ""
     assert (
         values["ARK_BASE_URL"]
-        == "https://ark.cn-beijing.volces.com/api/plan/v3"
+        == "https://ark.cn-beijing.volces.com/api/v3"
     )
     assert values["ARK_IMAGE_MODEL"] == "doubao-seedream-5.0-lite"
-    assert values["ARK_VIDEO_MODEL"] == "doubao-seedance-2.0-mini"
+    assert (
+        values["ARK_VIDEO_MODEL"]
+        == "doubao-seedance-2-0-mini-260615"
+    )
     assert values["ARK_API_KEY"] == ""
     assert "API_KEY" not in values
     assert "BASE_URL" not in values

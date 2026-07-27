@@ -65,12 +65,12 @@ CAT_VIDEO_DB_SSLMODE=disable
 CAT_VIDEO_DB_SCHEMA=cat_video
 CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true
 
-ARK_ACCESS_MODE=agent_plan
-ARK_AGENT_PLAN_TIER=large
+ARK_ACCESS_MODE=standard
+ARK_AGENT_PLAN_TIER=
 ARK_API_KEY=
-ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/plan/v3
+ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
 ARK_IMAGE_MODEL=doubao-seedream-5.0-lite
-ARK_VIDEO_MODEL=doubao-seedance-2.0-mini
+ARK_VIDEO_MODEL=doubao-seedance-2-0-mini-260615
 ```
 
 CLI 启动时自动读取当前工作目录的 `.env`，但不会覆盖 PowerShell 已有
@@ -102,15 +102,14 @@ Schema、表或业务记录。
 
 Ark 静态预检同时返回：
 
-- `arkAccessMode=agent_plan`。
-- `agentPlanTier=large` 或 `max`。
-- `agentPlanTierVerification=declared_only`。
-- `endpointProfile=agent_plan`。
+- `arkAccessMode=standard`。
+- `agentPlanTier=null`。
+- `endpointProfile=standard`。
 - `generationConfigurationValid=true`。
 - `providerEntitlementVerification=not_performed`。
 
-这些字段只说明 URL、模式、套餐和模型组合自洽，不会调用供应商，也不会
-验证 Key 类型、Key 所属账号或真实套餐权益。输出不包含 Key 或完整鉴权
+这些字段只说明 URL、模式和模型组合自洽，不会调用供应商，也不会
+验证 Key 类型、模型开通状态或余额。输出不包含 Key 或完整鉴权
 信息。无前缀的 `API_KEY` 和 `BASE_URL` 不会被读取。
 
 ## 5. 正式 Schema 迁移与验证
@@ -192,8 +191,9 @@ Start in: D:\soft\code\OpenGit\cat-video-generator
 - ffprobe 可发现；如准备执行条件式修复，ffmpeg 也可发现。
 - 全仓不存在运行时 Mock Provider 或 Mock 视频路径；只允许显式的
   `agent_plan` 与 `standard` Ark 访问模式。
-- Agent Plan Large/Max、Plan URL 和两个固定模型别名通过静态配置检查。
-- Standard 模式使用 `/api/v3`、空套餐字段和自身模型/Endpoint ID。
+- 默认 Standard 模式使用 `/api/v3`、空套餐字段和
+  `doubao-seedance-2-0-mini-260615`。
+- 可选 Agent Plan Large/Max、Plan URL 和套餐模型别名仍通过静态配置检查。
 - 任何输出和异常都不显示数据库密码。
 
 ## 常见故障

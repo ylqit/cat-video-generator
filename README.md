@@ -2,8 +2,8 @@
 
 人物与猫咪三时段生活流视频的本地生产与交付系统。
 
-- 运行时只接入真实火山方舟 API，不提供 Mock Provider；支持 Agent Plan
-  与标准按量 Ark 两种显式访问模式，默认 Agent Plan Large。
+- 运行时只接入真实火山方舟 API，不提供 Mock Provider；支持标准按量 Ark
+  与 Agent Plan 两种显式访问模式，当前默认标准 Ark API。
 - 低风险内容直接使用批准的人物、猫咪和画风参考；高风险内容按需调用 Seedream 生成首帧或首尾帧。
 - 每个 Episode 由 Seedance 单次生成8～15秒竖屏原生音视频。
 - PostgreSQL 保存计划、任务、审核和交付元数据；图片、视频与交付包保存在本机。
@@ -20,9 +20,9 @@ uv run pytest -q
 uv run cvg --help
 ```
 
-Agent Plan 默认使用 `/api/plan/v3`、Seedream 5.0 Lite 和 Seedance
-2.0-mini；标准 Ark 使用 `/api/v3` 和自身已开通的 Model ID 或 Endpoint
-ID。两套配置和 Key 不能混用，访问模式会进入任务幂等输入。操作者也可
+标准 Ark 默认使用 `/api/v3`、Seedream 5.0 Lite 和
+`doubao-seedance-2-0-mini-260615`；Agent Plan 使用 `/api/plan/v3`
+及其套餐模型别名。两套配置和 Key 不能混用，访问模式会进入任务幂等输入。操作者也可
 显式使用 `doubao-seedance-1.5-pro` 或
 `doubao-seedance-1.5-pro-即将下线`；程序按配置原样提交，不会自动截断、
 追加后缀或降级模型。
@@ -30,6 +30,7 @@ ID。两套配置和 Key 不能混用，访问模式会进入任务幂等输入�
 当前远程 `vedio-appdb.cat_video` 已允许在显式
 `CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true` 时通过明文 PostgreSQL 运行；诊断会持续标记该临时架构债务。真实生成还必须具备最新 Alembic revision、ffprobe、批准的 Canon、`ARK_API_KEY`，并在命令中显式使用 `--allow-paid-generation`。ffmpeg 只在后续条件式媒体修复时需要。
 
-2026-07-27 的真实烟测已生成并批准首帧，但当前 Agent Plan Key 对三个
-视频模型字符串均返回 `UnsupportedModel`，因此尚无 morning MP4。完整
-记录见[Agent Plan morning 真实烟测记录](docs/validation/agent-plan-morning-smoke-2026-07-27.md)。
+2026-07-27 已切换标准 Ark，并使用新的10秒内容 revision。标准视频请求
+已到达 `doubao-seedance-2-0-mini-260615`，但当前账号返回
+`ModelNotOpen`，尚无 MP4；需先在控制台开通模型。详见
+[标准 Ark morning 真实烟测记录](docs/validation/standard-ark-morning-smoke-2026-07-27.md)。

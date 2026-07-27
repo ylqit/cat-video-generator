@@ -15,7 +15,7 @@
 - 画面：全画面彩铅、蜡笔、粉彩儿童绘本，不是真人实拍加2D贴纸。
 - 声音：Seedance 原生环境声、动作音效和可选轻音乐；无对白、旁白和歌词。
 - 生成：低风险内容直接使用已批准人物、猫咪和画风参考；高风险内容由 Seedream 按需生成1至2张场景关键帧，Seedance 默认一次生成8至15秒完整音视频。
-- 接入：默认 Agent Plan Large，也支持显式切换到标准按量 Ark；两种
+- 接入：默认标准按量 Ark，也支持显式切换到 Agent Plan；两种
   profile 共用生成、恢复、审核和下载链路，但不复用任务幂等记录。
 - 后期：合格原始 MP4 直接保存，FFmpeg 只作条件式修复。
 - 交付：固定输出 `01-morning.mp4`、`02-noon.mp4`、`03-evening.mp4` 和 `manifest.json`。
@@ -29,6 +29,7 @@
 - [Windows 按需执行与验证](workflows/windows-on-demand-validation.md)
 - [正式 PostgreSQL 运行验收记录](workflows/postgresql-runtime-validation.md)
 - [Agent Plan morning 真实烟测记录](validation/agent-plan-morning-smoke-2026-07-27.md)
+- [标准 Ark morning 真实烟测记录](validation/standard-ark-morning-smoke-2026-07-27.md)
 - [本地视频交付包](delivery/local-video-package.md)
 - [三时段生活流](content/tri-slot-life-stream.md)
 - [系列、角色与世界 Bible](content/series-bible.md)
@@ -56,6 +57,7 @@ revision 为 `0003_slot_retry_events`，增加了终态任务的显式人工重�
 该例外必须同时满足固定数据库、固定 Schema 和
 `CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true`；切换 SSL 后关闭该开关即可，不
 需要搬迁数据。真实生成仍要求 `ARK_API_KEY` 和显式
-`--allow-paid-generation`。首帧真实生成已验证；当前 Key 的视频请求被
-供应商以 `UnsupportedModel` 拒绝，尚无 MP4，必须先核实实际视频权益，
-不得直接重复付费提交。详见[真实 Ark 链路运行手册](workflows/ark-real-chain-runbook.md)。
+`--allow-paid-generation`。Agent Plan 失败历史保持不变；当前标准 Ark
+烟测使用 `doubao-seedance-2-0-mini-260615` 和10秒 Episode；当前账号
+返回 `ModelNotOpen`，必须先在控制台开通模型。详见
+[真实 Ark 链路运行手册](workflows/ark-real-chain-runbook.md)。

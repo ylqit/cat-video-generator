@@ -70,3 +70,10 @@ uv run cvg retry-slot life-2026-07-24-seaside-travel `
 
 恢复后才可再次显式执行 `run-pack --allow-paid-generation`。完整烟测明细
 见[Agent Plan morning 真实烟测记录](../validation/agent-plan-morning-smoke-2026-07-27.md)。
+
+随后新增并批准 `planRevision=3`，三条 Episode 均为10秒，访问模式切换为
+标准 Ark。标准图片模型返回 `InvalidEndpointOrModel.NotFound`；系统复用
+语义一致的历史批准首帧后，视频模型
+`doubao-seedance-2-0-mini-260615` 返回 `ModelNotOpen`。当前仍无 MP4，
+下一步是在同一 API Key 账号开通标准视频模型。详见
+[标准 Ark morning 真实烟测记录](../validation/standard-ark-morning-smoke-2026-07-27.md)。

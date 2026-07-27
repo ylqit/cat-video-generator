@@ -10,10 +10,23 @@ Seedance 不作为生图模型，Seedream 不负责异步视频任务。
 ## 双访问模式
 
 运行时使用同一个 Ark Python SDK，但必须显式选择一套完整的访问配置。
-当前默认是 Agent Plan Large：
+当前默认是标准按量 Ark：
+
+- `ARK_ACCESS_MODE=standard`
+- `ARK_AGENT_PLAN_TIER` 为空。
+- `ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3`
+- Seedream：`doubao-seedream-5.0-lite`
+- Seedance：`doubao-seedance-2-0-mini-260615`
+
+标准模式的 Model ID 必须已在当前账号开通，也可以替换成对应 Endpoint
+ID。当前所有 Episode 默认10秒，仍允许内容显式使用8至15秒。
+标准接口返回 `ModelNotOpen` 时表示当前 Key 所属账号尚未开通该模型；
+该错误不可自动重试，必须先在控制台开通服务。
+
+切换到 Agent Plan 时必须整组替换：
 
 - `ARK_ACCESS_MODE=agent_plan`
-- `ARK_AGENT_PLAN_TIER=large`；也允许 `max`。
+- `ARK_AGENT_PLAN_TIER=large` 或 `max`。
 - `ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/plan/v3`
 - Seedream：`doubao-seedream-5.0-lite`
 - Seedance：`doubao-seedance-2.0-mini`
@@ -35,15 +48,6 @@ Agent Plan 的视频模型按模型单独校验套餐：
 `providerEntitlementVerification=not_performed`。首次真实请求返回
 `UnsupportedModel` 时，应核对 Key 所属账号的实际套餐，不得通过修改本地
 声明或猜测其他模型别名绕过。
-
-切换到标准按量 Ark 时必须整组替换：
-
-- `ARK_ACCESS_MODE=standard`
-- `ARK_AGENT_PLAN_TIER` 为空。
-- `ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3`
-- `ARK_IMAGE_MODEL` 和 `ARK_VIDEO_MODEL` 使用标准 Ark 已开通的日期版本
-  Model ID 或 Endpoint ID。
-- `ARK_API_KEY` 使用与标准 Ark 对应的凭据。
 
 两种模式不能混用 URL、模型标识或凭据。Agent Plan 专属 Key、标准 Ark
 Key 与 Coding Plan Key 不是可互换配置；Key 类型无法靠静态格式可靠识别，
