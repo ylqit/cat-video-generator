@@ -6,15 +6,17 @@
 
 同时满足以下条件后才允许运行 `run-pack` 或 `run-next`：
 
-1. 远程 PostgreSQL 已启用 SSL，或本机通过安全隧道连接；`CAT_VIDEO_DB_SSLMODE` 为 `require`、`verify-ca` 或 `verify-full`。
-2. 对话中曾暴露的旧数据库密码已经轮换。
+1. PostgreSQL 使用 TLS/隧道；或当前明确使用
+   `CAT_VIDEO_DB_SSLMODE=disable`、`CAT_VIDEO_DB_SCHEMA=cat_video` 和
+   `CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true` 的临时明文例外。
+2. 数据库密码只保存在被 Git 忽略的 `.env`；已暴露密码建议尽快轮换。
 3. `cvg db upgrade` 已将正式 `cat_video` Schema 升级到最新 Alembic head。
 4. ffprobe 可以从 `PATH` 或 `FFPROBE_PATH` 找到；只有启用条件式媒体修复时才要求 ffmpeg。
 5. 人物、猫咪和画风 Canon 均已导入并人工批准。
 6. `ARK_API_KEY` 只在当前 PowerShell 会话中注入。
 7. 每次可能创建任务的命令都显式带 `--allow-paid-generation`。
 
-现有无 SSL 的公网 PostgreSQL 只允许 `doctor --allow-insecure-readonly-smoke` 和随机临时 Schema 写测，不能保存正式 LifePack、Ark task ID 或视频元数据。
+当前 `vedio-appdb.cat_video` 已按用户明确授权允许保存正式 LifePack、Ark task ID 和视频元数据。该权限只匹配固定数据库与固定 Schema，不会使其他明文数据库自动获得运行权限；诊断始终返回 `transportSecurity=plaintext` 和架构债务警告。
 
 ## 2. Windows 环境准备
 
@@ -32,23 +34,35 @@ uv run cvg --help
 
 本机已验证的媒体基线是 FFmpeg/ffprobe 8.1.2。`pytest` 会用测试专用 SDK 对象和 HTTP transport 检查请求映射、下载和 QC；这些 fake 不会出现在运行时配置，也不能被 CLI 选为供应商。
 
-## 3. 安全数据库配置与迁移
+## 3. 数据库配置与迁移
 
-在当前 PowerShell 会话设置数据库环境变量。密码不要写入仓库、Markdown 或命令历史文件：
+复制 `.env.example` 为被 Git 忽略的 `.env`，写入真实值。PowerShell
+环境变量仍具有更高优先级：
 
-```powershell
-$env:CAT_VIDEO_DB_HOST = "<secure-host-or-tunnel>"
-$env:CAT_VIDEO_DB_PORT = "5432"
-$env:CAT_VIDEO_DB_NAME = "vedio-appdb"
-$env:CAT_VIDEO_DB_USER = "postgres"
-$env:CAT_VIDEO_DB_PASSWORD = "<rotated-password>"
-$env:CAT_VIDEO_DB_SSLMODE = "require"
-
-uv run cvg db upgrade
-uv run cvg doctor
+```dotenv
+CAT_VIDEO_DB_HOST=<database-host>
+CAT_VIDEO_DB_PORT=5432
+CAT_VIDEO_DB_NAME=vedio-appdb
+CAT_VIDEO_DB_USER=postgres
+CAT_VIDEO_DB_PASSWORD=<password>
+CAT_VIDEO_DB_SSLMODE=disable
+CAT_VIDEO_DB_SCHEMA=cat_video
+CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true
 ```
 
-`doctor` 必须报告正确数据库名、PostgreSQL 14+、SSL 已启用、Schema 权限通过和 Alembic revision 匹配。
+```powershell
+uv run cvg db upgrade
+uv run cvg db current
+uv run cvg db validate-runtime
+```
+
+当前实际验收结果为 PostgreSQL 16.13、`sslInUse=false`、
+`0002_content_and_reviews`，表结构、事务回滚、Slot约束、幂等、
+`SKIP LOCKED` 和交付原子性全部通过。`validate-runtime` 只清理自身
+UUID 标记的数据，保留正式表和既有业务记录。
+
+未来启用 SSL 时将 `CAT_VIDEO_DB_SSLMODE` 改为 `require` 或验证模式，
+删除/关闭 `CAT_VIDEO_ALLOW_INSECURE_RUNTIME`；无需迁移 Schema 和数据。
 
 ## 4. 导入并审核固定本体
 
@@ -91,11 +105,11 @@ uv run cvg doctor
 uv run cvg run-pack life-2026-07-24-seaside-travel --slot morning --allow-paid-generation
 ```
 
-旅游 morning 的四项视觉风险均为 false，所以第一条烟测走 `direct_references`：
+首条8秒 smoke Episode 的四项视觉风险均为 false，所以走 `direct_references`：
 
 1. 数据库先写入唯一 `GenerationJob(submitting)`。
 2. 本地三张 Canon 图片转为内存中的 Base64 data URL；完整 Base64 不写日志或数据库。
-3. Seedance Create 使用 `reference_image`、720p、9:16、10秒、`generate_audio=true`、`watermark=false`。
+3. Seedance Create 使用 `reference_image`、720p、9:16、8秒、`generate_audio=true`、`watermark=false`。
 4. 请求不发送 `frames`、`camera_fixed`、`service_tier` 或 `seed`。
 5. 获得 task ID 后短事务写入 `queued`，随后轮询 `queued/running/succeeded`。
 6. 成功 URL 立即流式下载到 `.part`，计算 SHA-256 后原子进入 `var/assets/generated/sha256/`。
@@ -139,6 +153,21 @@ uv run cvg resume <lifePackId> --allow-paid-generation
 `resume` 只处理已经存在的 keyframe/video job、轮询、下载和 QC。它不会为 `planned` Slot 创建新收费任务，也不会重新 POST `submission_unknown`。幂等键由 `episodeId + renderRevision + jobType + clipIndex + normalizedInputHash` 派生；重复执行会恢复已有记录。
 
 若 Create 请求已经发送但没有拿到 task ID，状态变为 `submission_unknown`。此时必须在 Ark 控制台或任务列表人工对账，不能直接重跑付费 POST。
+
+先列出当前模型最近100个任务的安全候选元数据；该操作不产生新的付费任务，也不会把临时下载 URL 写入终端或数据库：
+
+```powershell
+uv run cvg reconcile-job <generationJobUuid>
+```
+
+人工同时核对 Ark 控制台中的创建时间、模型、时长、分辨率、比例和音频选项。只有确认唯一匹配后才显式绑定：
+
+```powershell
+uv run cvg reconcile-job <generationJobUuid> `
+  --provider-task-id <verifiedArkTaskId>
+```
+
+绑定使用行锁并只允许 `submission_unknown` 视频 Job；重复绑定、非视频任务或候选列表中不存在的 task ID 会被拒绝。绑定成功后运行 `resume` 继续轮询或下载。Seedream 是同步接口，无法通过 Seedance List Tasks 对账；其未知提交保持冻结并由人工检查账单后创建新的 render revision。
 
 ## 9. 生成本地交付包
 

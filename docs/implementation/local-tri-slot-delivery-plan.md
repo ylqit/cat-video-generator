@@ -47,16 +47,16 @@ DailyLifePack
 
 ## PostgreSQL 安全边界
 
-- 环境变量使用 `CAT_VIDEO_DB_HOST/PORT/NAME/USER/PASSWORD/SSLMODE`，代码通过 `SQLAlchemy.URL.create()` 构建连接。
+- 环境变量使用 `CAT_VIDEO_DB_HOST/PORT/NAME/USER/PASSWORD/SSLMODE/SCHEMA`，代码通过 `SQLAlchemy.URL.create()` 构建连接。
 - 密码不得出现在配置示例、日志、异常文本或交付 manifest。
-- 正式迁移和运行要求 `sslmode=require|verify-ca|verify-full`。
-- 无 TLS 时只允许显式执行 `cvg doctor --allow-insecure-readonly-smoke`，不能建表、迁移或运行任务。
-- 一次性 `cvg db validate-remote --allow-insecure-write-test` 是唯一的远程明文写入例外。它每次创建随机 `cat_video_validation_<runId>` Schema，执行迁移和数据库行为检查后立即删除；不会接触正式 `cat_video` Schema，也不会开放普通运行命令。
+- 默认正式迁移和运行要求 `sslmode=require|verify-ca|verify-full`。
+- 当前用户明确授权的例外只匹配 `vedio-appdb.cat_video`、`sslmode=disable` 和 `CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true`；其他明文数据库仍被拒绝。
+- `cvg db validate-remote --allow-insecure-write-test` 保留为其他服务器的随机临时 Schema 隔离诊断，不是当前正式 Schema 的主要验证入口。
 - 本地 Testcontainers 仅在 loopback、`test*` 数据库和显式测试开关同时满足时允许无 SSL。
 - 连接池固定为3，最大溢出2，启用 pre-ping 和900秒 recycle。
 - PostgreSQL 最低版本14，集成测试使用 PostgreSQL 16。
-- 当前正式账号按已确定方案继续使用 `postgres`，但密码只从运行环境注入。临时验证结束后仍必须轮换已经暴露的旧密码。
-- 当前服务器不支持 PostgreSQL SSL，因此正式 Schema 迁移和业务任务保持禁止；临时写测只用于隔离技术验收。
+- 当前正式账号按已确定方案继续使用 `postgres`，密码只保存在被 Git 忽略的 `.env` 或 PowerShell 环境；已经暴露的旧密码仍建议轮换。
+- 当前服务器不支持 PostgreSQL SSL，正式 Schema 和业务任务暂时通过显式明文许可运行；诊断必须持续显示该架构债务。
 
 ### 连接、超时与失败语义
 
@@ -71,45 +71,51 @@ DailyLifePack
 
 ### 迁移与远程验收顺序
 
-1. 在 Windows PowerShell 运行只读诊断，确认 PostgreSQL 版本、当前数据库、当前用户和 `pg_stat_ssl`。
-2. 如需验证现有明文连接，显式运行一次 `cvg db validate-remote --allow-insecure-write-test`；确认随机验证 Schema 的迁移、事务回滚、排序约束、幂等键和 `SKIP LOCKED` 全部通过并完成清理。
-3. 轮换已暴露密码，并在服务端启用 SSL，或建立能够提供等价传输保护的安全隧道。
-4. 运行 `cvg db upgrade`，创建正式 `cat_video` Schema 和 `cat_video.alembic_version`。
-5. 按外键依赖顺序创建八张业务表，再添加 Slot/Variant 组合外键、CHECK、唯一约束和索引。
-6. 运行 `cvg doctor`，确认数据库名、版本、SSL、Schema 权限和 Alembic head 全部匹配。
-7. 在空测试库执行一次 `alembic downgrade base`；出现正式业务数据后，不再用降级命令删除业务表或 Schema。
-8. 导入一个测试 LifePack，验证双 Worker 领取和生成任务幂等。
-9. 最后执行一次 morning/noon/evening 完整交付。
+1. CLI 从被忽略的 `.env` 读取连接，PowerShell 环境变量具有更高优先级。
+2. 运行只读 doctor，确认 PostgreSQL版本、数据库、用户、`pg_stat_ssl` 和明文授权状态。
+3. `cvg db upgrade` 在空 Schema 上创建正式 `cat_video`；已有未知对象且无 Alembic 版本表时拒绝接管。
+4. 迁移到 `0002_content_and_reviews`，保留十张业务表和版本表。
+5. `cvg db current` 确认 Schema 权限和 Alembic head。
+6. `cvg db validate-runtime` 对比字段、类型、约束和索引，并执行事务、幂等、`SKIP LOCKED` 和交付原子性检查。
+7. 验证记录只按本次 UUID 清理，不删除 Schema 或既有业务数据。
+8. 在 Testcontainers 空库保留 upgrade/downgrade 和破坏性回归；正式 Schema 不执行 downgrade。
+9. 配置 Ark Key 后执行一条8秒 morning smoke，再扩展三时段交付。
 
-当前没有旧状态库运行数据，不进行数据搬迁。正式 `cat_video` Schema 上禁止破坏性测试；远程明文验证只操作本次命令创建的随机验证 Schema。常规升级、降级、约束和并发回归测试仍优先在 Testcontainers PostgreSQL 16 中执行。
+当前正式 `cat_video` 已在 PostgreSQL 16.13 上迁移并通过运行验证。正式 Schema 禁止清空、降级和宽泛删除；运行验证只清理自身 UUID 数据。常规破坏性迁移回归仍优先在 Testcontainers PostgreSQL 16 中执行。
 
 ## 代码边界
 
-建议目录：
+当前目录：
 
 ```text
 src/cat_video_generator/
   cli.py
-  config.py
-  domain/
-  persistence/
-  providers/ark.py
-  media/
-  orchestration/
-  delivery/
+  commands/
+  generation/
+    service.py
+    visual_assets.py
+    jobs.py
+    continuity.py
+  contracts.py / state.py / visual_policy.py / render_plan.py
+  models.py / db.py / repository.py
+  ark_provider.py
+  media.py
+  delivery.py
 tests/
 alembic/
 ```
 
 职责：
 
-- `domain`：DailyLifePack、EpisodeSpec、RenderPlan、DeliveryManifest 和跨对象业务校验。
-- `persistence`：SQLAlchemy 模型、事务、锁和恢复查询。
-- `providers/ark.py`：Create/Get、请求映射、供应商状态和错误分类。
+- `contracts/state/visual_policy/render_plan`：内容契约和纯领域规则。
+- `models/db/repository`：SQLAlchemy模型、连接、锁和幂等查询。
+- `ark_provider.py`：Create/Get、请求映射、供应商状态和错误分类。
 - `media`：下载、哈希、原子写入、ffprobe 和条件式 FFmpeg。
-- `orchestration`：状态机、幂等、依赖、fallback、尝试上限。
+- `generation/service`：LifePack/Slot状态机、依赖和 fallback。
+- `generation/visual_assets`：Canon、直接参考和按需关键帧。
+- `generation/jobs`：收费任务幂等、重试、轮询、下载和 QC。
 - `delivery`：三条资产选择、目录构建、manifest 和连续状态提交。
-- `cli.py`：操作入口，不承载业务规则。
+- `commands`：CLI参数与输出；根 `cli.py` 只组合命令。
 
 不得创建只改名、格式化路径或转发参数的薄 Manager/Service。存储边界只有在真正拥有原子写入、哈希、冲突策略和恢复语义时才单独抽象。
 
@@ -245,6 +251,7 @@ cvg doctor [--allow-insecure-readonly-smoke]
 cvg db upgrade
 cvg db current
 cvg db validate-remote --allow-insecure-write-test
+cvg db validate-runtime
 cvg canon import --role <person|cat|style> --asset-id <id> --file <path>
 cvg validate-pack <file>
 cvg import-pack <file>
@@ -258,7 +265,7 @@ cvg deliver <lifePackId>
 ```
 
 - `doctor`：检查数据库、迁移、Ark Key 是否配置以及 FFmpeg/ffprobe 发现状态，不产生收费请求。
-- `db upgrade/current/validate-remote`：分别负责正式安全迁移、状态检查和隔离明文技术验证。
+- `db upgrade/current/validate-runtime`：分别负责正式受控迁移、状态检查和保留 Schema 的运行验证；`validate-remote` 只用于随机隔离技术诊断。
 - `validate-pack`：只运行 Schema 和连续性校验。
 - `import-pack`：创建 LifePack、Slot 和 Variant 记录。
 - `approve-pack`：批准内容但不产生收费任务。
@@ -329,6 +336,7 @@ cvg deliver <lifePackId>
 - 相同幂等键不会创建第二个收费任务。
 - 进程重启后可继续轮询。
 - submission_unknown 不会自动重复 POST。
+- `cvg reconcile-job <jobId>` 只列出已配置模型的 Ark 任务候选；人工核对后通过 `--provider-task-id` 显式绑定，再交给 `resume`，系统不会自动猜测匹配。
 
 ### 第五批：下载、QC 和条件式后期
 
@@ -391,8 +399,9 @@ cvg deliver <lifePackId>
 - render revision 和 delivery revision 不覆盖旧资产。
 - 过去、当天和未来内容日期都能被显式领取。
 - 不传目标日期时仍领取最早的 approved/frozen 内容包。
-- 普通迁移和运行命令拒绝远程明文连接。
-- 隔离远程写验证只操作随机验证 Schema，并在成功或失败后清理。
+- 未设置显式运行许可时迁移和运行命令拒绝远程明文连接。
+- 显式许可只适用于 `vedio-appdb.cat_video`。
+- 正式运行验证保留表，只清理本次 UUID 数据。
 
 ### 任务
 
@@ -425,8 +434,8 @@ cvg deliver <lifePackId>
 
 - Windows 是本地开发、验证和可选运行环境；同一 LifePack 在同一工作目录完成。
 - 远程 PostgreSQL、单 Worker、每天三条，但执行时间不固定。
-- 正式数据库连接必须启用 SSL 或经过安全隧道。
-- 当前明文公网连接允许只读 doctor 和一次隔离验证 Schema 写测，不允许正式迁移或业务运行。
+- 正式数据库默认应启用 SSL 或安全隧道；当前明文运行是用户明确接受的临时架构债务。
+- 当前例外允许 `vedio-appdb.cat_video` 保存正式计划、Ark任务和媒体元数据，仍要求固定 Schema 与显式开关。
 - DailyLifePack 在 V1 由人工或现有模板准备并批准。
 - 每条默认10秒，允许8至15秒。
 - 默认 `single_pass + native audio + validate_then_passthrough`。

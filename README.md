@@ -19,4 +19,5 @@ uv run pytest -q
 uv run cvg --help
 ```
 
-真实生成必须同时具备安全 PostgreSQL、最新 Alembic revision、ffprobe、批准的 Canon、当前会话中的 `ARK_API_KEY`，并在命令中显式使用 `--allow-paid-generation`。ffmpeg 只在后续条件式媒体修复时需要。
+当前远程 `vedio-appdb.cat_video` 已允许在显式
+`CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true` 时通过明文 PostgreSQL 运行；诊断会持续标记该临时架构债务。真实生成还必须具备最新 Alembic revision、ffprobe、批准的 Canon、`ARK_API_KEY`，并在命令中显式使用 `--allow-paid-generation`。ffmpeg 只在后续条件式媒体修复时需要。

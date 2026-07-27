@@ -110,6 +110,8 @@ sha256(
 
 相同幂等键只恢复已有任务。创建请求已经发送但没有取得 task ID 时，标记 `submission_unknown` 并人工对账，不自动重复 POST。
 
+视频任务通过 `cvg reconcile-job <jobId>` 只读列出 Ark 候选；人工确认唯一 task ID 后再用 `--provider-task-id` 显式绑定。该命令不会创建 Ark 任务，不需要付费开关，但需要 `ARK_API_KEY`。绑定后由 `resume` 继续处理。
+
 供应商状态标准化为：
 
 - `queued`
@@ -183,7 +185,7 @@ output/YYYY-MM-DD/{lifePackId}/delivery-r{deliveryRevision}/
 
 ## 可选自动化
 
-自动化不是每日生产的必经阶段。需要无人值守时，可由 Windows Task Scheduler、Linux cron/systemd 或其他运行器在任意时间调用 `cvg run-next`；需要指定某天时调用 `cvg run-next --target-date YYYY-MM-DD`。调度器不能直接改数据库状态，也不能绕过内容批准、SSL、Alembic revision 或收费任务幂等检查。
+自动化不是每日生产的必经阶段。需要无人值守时，可由 Windows Task Scheduler、Linux cron/systemd 或其他运行器在任意时间调用 `cvg run-next`；需要指定某天时调用 `cvg run-next --target-date YYYY-MM-DD`。调度器不能直接改数据库状态，也不能绕过内容批准、数据库传输安全门、Alembic revision 或收费任务幂等检查。
 
 ## 失败处理
 

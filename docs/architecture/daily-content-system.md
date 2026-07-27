@@ -65,7 +65,7 @@ flowchart LR
 
 ### 持久化层
 
-远程 PostgreSQL 的独立 `cat_video` Schema 保存计划、Slot、Variant、生成任务、媒体资产元数据、交付包和连续事件。视频二进制仍保存在本地文件系统，所有历史 revision 只追加，不覆盖。运行命令必须先验证数据库名称、PostgreSQL 版本、SSL 会话和 Alembic revision。
+远程 PostgreSQL 的独立 `cat_video` Schema 保存计划、Slot、Variant、生成任务、媒体资产元数据、交付包和连续事件。视频二进制仍保存在本地文件系统，所有历史 revision 只追加，不覆盖。运行命令必须先验证数据库名称、PostgreSQL版本、传输状态和 Alembic revision。当前 `vedio-appdb.cat_video` 经显式授权允许明文运行并在诊断中持续告警；未来启用 SSL 时只更改连接配置。
 
 ### 交付层
 

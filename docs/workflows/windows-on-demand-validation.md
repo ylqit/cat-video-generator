@@ -50,25 +50,28 @@ uv run pytest -m postgres
 
 Docker/Testcontainers 是开发回归手段，不是日常生成视频的运行前提。
 
-## 3. 临时注入 PostgreSQL 配置
+## 3. 本地 `.env` 配置
 
-不要把真实密码写进 `.env.example`、PowerShell 脚本或命令历史。使用当前 PowerShell 进程的临时环境变量：
+不要把真实密码写进 `.env.example`、PowerShell 脚本或命令历史。
+真实值写在已被 `.gitignore` 排除的 `.env`：
 
-```powershell
-$env:CAT_VIDEO_DB_HOST = "<database-host>"
-$env:CAT_VIDEO_DB_PORT = "5432"
-$env:CAT_VIDEO_DB_NAME = "vedio-appdb"
-$env:CAT_VIDEO_DB_USER = "postgres"
-$env:CAT_VIDEO_DB_SSLMODE = "disable"
-$databasePassword = Read-Host "PostgreSQL password" -AsSecureString
-$env:CAT_VIDEO_DB_PASSWORD = [Net.NetworkCredential]::new("", $databasePassword).Password
+```dotenv
+CAT_VIDEO_DB_HOST=<database-host>
+CAT_VIDEO_DB_PORT=5432
+CAT_VIDEO_DB_NAME=vedio-appdb
+CAT_VIDEO_DB_USER=postgres
+CAT_VIDEO_DB_PASSWORD=<password>
+CAT_VIDEO_DB_SSLMODE=disable
+CAT_VIDEO_DB_SCHEMA=cat_video
+CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true
 ```
 
-`CAT_VIDEO_DB_PASSWORD` 在子进程环境中仍是明文，只是不会进入命令历史。完成验证后必须从当前会话清除：
+CLI 启动时自动读取当前工作目录的 `.env`，但不会覆盖 PowerShell 已有
+环境变量。需要临时覆盖密码时仍可使用安全输入：
 
 ```powershell
-Remove-Item Env:\CAT_VIDEO_DB_PASSWORD -ErrorAction SilentlyContinue
-$databasePassword = $null
+$databasePassword = Read-Host "PostgreSQL password" -AsSecureString
+$env:CAT_VIDEO_DB_PASSWORD = [Net.NetworkCredential]::new("", $databasePassword).Password
 ```
 
 ## 4. 明文只读诊断
@@ -86,35 +89,39 @@ uv run cvg doctor --allow-insecure-readonly-smoke
 - 配置 Schema 权限与 Alembic revision。
 - 连接池再次取用。
 
-当前连接未加密时，报告必须包含未使用 SSL 的警告。该命令不创建 Schema、表或业务记录。
+当前连接未加密时，报告必须包含 `transport_security=plaintext`、
+`insecure_runtime_authorized=true` 和临时架构债务警告。该命令不创建
+Schema、表或业务记录。
 
-## 5. 一次性隔离写入验证
+## 5. 正式 Schema 迁移与验证
 
-用户明确接受临时公网明文写测时，执行：
+当前已明确授权 `vedio-appdb.cat_video` 使用明文连接。执行：
+
+```powershell
+uv run cvg db upgrade
+uv run cvg db current
+uv run cvg db validate-runtime
+```
+
+安全边界：
+
+1. 明文正式运行只匹配数据库 `vedio-appdb` 和 Schema `cat_video`。
+2. 必须显式设置 `CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true`。
+3. 已有非空 Schema 没有 Alembic 版本表时拒绝自动接管。
+4. `db upgrade` 只向最新 revision 升级，不执行 downgrade 或清空。
+5. `db validate-runtime` 对比表、字段、类型、主外键、CHECK、唯一约束和索引。
+6. 事务、幂等和 `SKIP LOCKED` 测试使用唯一 `validationRunId`。
+7. 验证结束只删除本次 UUID 数据，正式表和业务数据保留。
+8. 该命令不读取 `ARK_API_KEY`，不调用 Seedream 或 Seedance。
+
+一次性随机 Schema 命令仍保留用于其他服务器的隔离技术诊断：
 
 ```powershell
 uv run cvg db validate-remote --allow-insecure-write-test
 ```
 
-该命令的安全边界：
-
-1. 生成唯一 `cat_video_validation_<runId>` Schema 名。
-2. 确认实际数据库名称和最低 PostgreSQL 版本。
-3. 拒绝复用任何已经存在的 Schema。
-4. 只在随机验证 Schema 中运行 Alembic。
-5. 验证事务回滚、morning/1排序约束、生成任务幂等和 `FOR UPDATE SKIP LOCKED`。
-6. 不读取 `ARK_API_KEY`，不调用 Seedream 或 Seedance。
-7. 完成后执行 `DROP SCHEMA ... CASCADE`，只删除本次创建的精确 Schema。
-8. 如果清理连接失败，错误会返回待检查的完整验证 Schema 名；不得扩大删除范围。
-
-该开关不会授权以下命令通过明文连接：
-
-```powershell
-uv run cvg db upgrade
-uv run cvg run-next --allow-paid-generation
-```
-
-两条命令都必须继续失败。正式 `cat_video` Schema 的迁移和业务运行仍要求 `sslmode=require|verify-ca|verify-full` 或安全隧道。
+未来启用 TLS 后改为 `CAT_VIDEO_DB_SSLMODE=require` 并关闭明文许可，不需要
+迁移 `cat_video` 数据。
 
 ## 6. 按内容日期领取
 
@@ -150,7 +157,7 @@ Arguments: run cvg run-next
 Start in: D:\soft\code\OpenGit\cat-video-generator
 ```
 
-调度时间可由运营自由调整。任务不能直接更新 PostgreSQL，也不能绕过计划批准、SSL检查、Alembic revision、依赖状态或幂等键。
+调度时间可由运营自由调整。任务不能直接更新 PostgreSQL，也不能绕过计划批准、数据库传输安全门、Alembic revision、依赖状态或幂等键。
 
 ## 8. 验证检查表
 
@@ -158,9 +165,10 @@ Start in: D:\soft\code\OpenGit\cat-video-generator
 - `cvg run-next --help` 显示 `--target-date`。
 - 非法日期在连接数据库前失败。
 - 只读 doctor 不创建任何对象。
-- 隔离写测返回所有 checks 为 `true` 且 `cleanup_succeeded=true`。
-- 数据库中不残留 `cat_video_validation_*` Schema。
-- 普通迁移和运行命令仍拒绝明文远程连接。
+- `db current` 返回 `ready_for_runtime=true`。
+- `db validate-runtime` 的结构、事务、幂等、锁和清理 checks 全为 `true`。
+- 正式 `cat_video` 表保留，验证 UUID 数据不存在。
+- 缺少 `CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true` 时明文迁移和运行仍拒绝。
 - ffprobe 可发现；如准备执行条件式修复，ffmpeg 也可发现。
 - 全仓不存在运行时 Mock Provider、Mock 视频路径或 Provider 模式切换。
 - 任何输出和异常都不显示数据库密码。
@@ -171,9 +179,9 @@ Start in: D:\soft\code\OpenGit\cat-video-generator
 | --- | --- |
 | `Missing required database environment variables` | 在同一个 PowerShell 会话补齐数据库环境变量 |
 | `connection refused` 或超时 | 检查主机、端口、防火墙和 PostgreSQL监听配置 |
-| `Unencrypted PostgreSQL is restricted` | 普通运行必须启用 SSL/隧道；临时验证只能使用专用命令 |
+| `Unencrypted PostgreSQL is restricted` | 检查固定数据库、`cat_video` Schema 和显式明文运行开关；或启用 SSL/隧道 |
 | `validation schema cleanup failed` | 只检查错误中给出的精确 `cat_video_validation_*` Schema，不使用宽泛删除 |
-| Alembic revision 不匹配 | 在安全连接上执行正式 `cvg db upgrade` |
+| Alembic revision 不匹配 | 执行受控 `cvg db upgrade`；已有未知对象时先人工核对 |
 | 找不到 ffmpeg/ffprobe | 安装工具并重新打开 PowerShell，使新的 `PATH` 生效 |
 | 重复收费风险 | 检查 GenerationJob 幂等记录，不能直接重放供应商 POST |
 | 下载中断 | 恢复 `.part`/任务状态，不能把不完整文件当成最终 MP4 |
