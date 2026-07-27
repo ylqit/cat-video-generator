@@ -15,7 +15,12 @@ from cat_video_generator.contracts import (
     validate_daily_life_pack,
 )
 from cat_video_generator.generation import PackGenerationService
-from cat_video_generator.state import StateTransitionError, transition_pack
+from cat_video_generator.state import (
+    StateTransitionError,
+    transition_pack,
+    transition_slot,
+    transition_variant,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TRAVEL_EXAMPLE = (
@@ -91,7 +96,7 @@ def test_generation_service_rejects_incompatible_agent_plan_before_database() ->
         }
     )
 
-    with pytest.raises(ConfigurationError, match="large or max"):
+    with pytest.raises(ConfigurationError, match="large, max"):
         PackGenerationService(None, incompatible, gateway=object())  # type: ignore[arg-type]
 
 
@@ -118,6 +123,20 @@ def test_pack_state_machine_rejects_skipped_states() -> None:
 
     with pytest.raises(StateTransitionError):
         transition_pack(record, "ready")
+
+
+def test_failed_records_only_reenter_explicit_recovery_states() -> None:
+    pack = Record("failed")
+    slot = Record("failed")
+    variant = Record("failed")
+
+    transition_pack(pack, "rendering")
+    transition_slot(slot, "planned")
+    transition_variant(variant, "planned")
+
+    assert pack.status == "rendering"
+    assert slot.status == "planned"
+    assert variant.status == "planned"
 
 
 def test_validate_pack_cli_is_database_and_provider_free() -> None:
@@ -171,4 +190,14 @@ def test_reconcile_job_is_a_non_paid_explicit_cli_entrypoint() -> None:
 
     assert result.exit_code == 0
     assert "--provider-task-id" in result.stdout
+    assert "--allow-paid-generation" not in result.stdout
+
+
+def test_retry_slot_is_explicit_and_non_paid() -> None:
+    runner = CliRunner()
+    result = runner.invoke(app, ["retry-slot", "--help"])
+
+    assert result.exit_code == 0
+    assert "--slot" in result.stdout
+    assert "--reason" in result.stdout
     assert "--allow-paid-generation" not in result.stdout

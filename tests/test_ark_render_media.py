@@ -55,8 +55,8 @@ def _episode(slot: str) -> dict:
 
 def test_render_plan_compiles_direct_references() -> None:
     plan = compile_render_plan(
-        _episode("morning"),
-        plan_revision=1,
+        _episode("evening"),
+        plan_revision=2,
         render_revision=1,
         references=VisualReferences(
             person_asset_id="person-v1",
@@ -71,6 +71,42 @@ def test_render_plan_compiles_direct_references() -> None:
     assert "无角色对白" in plan["videoPrompt"]
 
 
+def test_travel_pack_exercises_all_visual_input_modes() -> None:
+    references = VisualReferences(
+        person_asset_id="person-v1",
+        cat_asset_id="cat-v1",
+        style_asset_ids=("storybook-pencil-v1",),
+    )
+    morning = compile_render_plan(
+        _episode("morning"),
+        plan_revision=2,
+        render_revision=1,
+        references=references,
+        scene_keyframe_asset_ids=("approved-first-frame",),
+    )
+    noon = compile_render_plan(
+        _episode("noon"),
+        plan_revision=2,
+        render_revision=1,
+        references=references,
+        scene_keyframe_asset_ids=(
+            "approved-first-frame",
+            "approved-last-frame",
+        ),
+    )
+    evening = compile_render_plan(
+        _episode("evening"),
+        plan_revision=2,
+        render_revision=1,
+        references=references,
+    )
+
+    assert morning["durationMs"] == 8000
+    assert morning["visualInputMode"] == "generated_first_frame"
+    assert noon["visualInputMode"] == "generated_first_last_frames"
+    assert evening["visualInputMode"] == "direct_references"
+
+
 def test_exact_ending_requires_two_reviewed_keyframes() -> None:
     episode = _episode("noon")
     references = VisualReferences(
@@ -82,14 +118,14 @@ def test_exact_ending_requires_two_reviewed_keyframes() -> None:
     with pytest.raises(ContentValidationError, match="exactly 2"):
         compile_render_plan(
             episode,
-            plan_revision=1,
+            plan_revision=2,
             render_revision=1,
             references=references,
         )
 
     plan = compile_render_plan(
         episode,
-        plan_revision=1,
+        plan_revision=2,
         render_revision=1,
         references=references,
         scene_keyframe_asset_ids=("first-frame", "last-frame"),

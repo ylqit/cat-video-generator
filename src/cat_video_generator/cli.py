@@ -20,6 +20,7 @@ from .commands.delivery import deliver
 from .commands.generation import (
     reconcile_job,
     resume,
+    retry_slot,
     run_next,
     run_pack,
     status,
@@ -38,6 +39,7 @@ app.command()(review)
 app.command()(status)
 app.command("run-next")(run_next)
 app.command("run-pack")(run_pack)
+app.command("retry-slot")(retry_slot)
 app.command()(resume)
 app.command("reconcile-job")(reconcile_job)
 app.command()(deliver)

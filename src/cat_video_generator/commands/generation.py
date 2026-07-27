@@ -9,6 +9,11 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from ..ark_provider import ArkMediaProvider
 from ..config import ConfigurationError, RuntimeSettings
+from ..content_service import (
+    ContentNotFoundError,
+    retry_failed_slot,
+)
+from ..contracts import ContentConflictError, ContentValidationError
 from ..doctor import DatabasePreflightError
 from ..generation import OrchestrationError, PackGenerationService
 from ..generation.jobs import ArkJobExecutor
@@ -131,6 +136,42 @@ def run_pack(
         ConfigurationError,
         DatabasePreflightError,
         OrchestrationError,
+        SQLAlchemyError,
+    ) as exc:
+        abort_operation(exc)
+    echo_json(payload)
+
+
+def retry_slot(
+    life_pack_id: str,
+    slot: str = typer.Option(..., "--slot"),
+    reason: str = typer.Option(..., "--reason"),
+) -> None:
+    try:
+        with (
+            database_context() as context,
+            context.session_factory.begin() as session,
+        ):
+            event = retry_failed_slot(
+                session,
+                life_pack_id=life_pack_id,
+                slot_name=slot,
+                reason=reason,
+            )
+            payload = {
+                "lifePackId": life_pack_id,
+                "slot": slot,
+                "fromRenderRevision": event.from_render_revision,
+                "toRenderRevision": event.to_render_revision,
+                "retryEventId": str(event.id),
+                "status": "planned",
+            }
+    except (
+        ConfigurationError,
+        ContentConflictError,
+        ContentNotFoundError,
+        ContentValidationError,
+        DatabasePreflightError,
         SQLAlchemyError,
     ) as exc:
         abort_operation(exc)

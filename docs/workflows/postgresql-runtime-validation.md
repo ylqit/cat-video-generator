@@ -6,7 +6,7 @@
 - 数据库：`vedio-appdb`。
 - Schema：`cat_video`。
 - PostgreSQL：16.13。
-- Alembic：`0002_content_and_reviews`。
+- Alembic：`0003_slot_retry_events`。
 - 传输：明文，`sslInUse=false`。
 - 授权：`CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true`。
 
@@ -22,8 +22,9 @@ uv run cvg db current
 uv run cvg db validate-runtime
 ```
 
-首次迁移创建 `0001_postgresql` 和 `0002_content_and_reviews`。第二次
-`db upgrade` 为 no-op，证明迁移幂等。
+首次迁移创建 `0001_postgresql` 和 `0002_content_and_reviews`；本次真实
+烟测前新增 `0003_slot_retry_events`，用于审计供应商终态任务的人工恢复。
+重复 `db upgrade` 为 no-op，证明迁移幂等。
 
 两次运行验证均通过：
 
@@ -37,10 +38,10 @@ uv run cvg db validate-runtime
 - 交付事务原子性通过。
 - 本次验证 UUID 数据清理通过。
 
-稳定 Schema 指纹：
+当前 Schema 指纹：
 
 ```text
-c19272059a31a5e5d1555abbbff406b7118a02d622b63b38a67e1538e5ad05c4
+fa35a1bc9e9f800b1974bde927b7fa6d907235b3c11b5f5164012cf3ed32f847
 ```
 
 ## 已准备的正式烟测数据
@@ -52,17 +53,20 @@ c19272059a31a5e5d1555abbbff406b7118a02d622b63b38a67e1538e5ad05c4
 - `storybook-pencil-v1`：裁剪后的彩铅绘本画风。
 - `life-2026-07-24-seaside-travel`：三时段旅游 LifePack。
 
-morning Episode 已调整为8秒、`observation`、`direct_references`。验收时
-LifePack 保持 `approved`，三个 Slot 保持 `planned`，数据库中没有
-GenerationJob 或 MediaAsset。凭据状态不在本文档记录；付费命令必须先通过
-当前 Ark 访问 profile、凭据、媒体工具和显式付费开关的完整预检。
+`planRevision=2` 的 morning Episode 为8秒、`observation`、
+`generated_first_frame`。两张历史首帧均已批准；三次视频 Create 分别使用
+Seedance 2.0-mini、被截断的1.5名称和用户确认的完整1.5名称，均由供应商
+返回 `UnsupportedModel`，没有 task ID 或 MP4。数据库已保留 GenerationJob、
+MediaAsset、审核与 SlotRetryEvent 历史，noon/evening 仍未生成。
 
-准备好 Agent Plan Large/Max 的整套配置后，唯一下一步：
+当前不得直接重复运行付费命令。必须先在供应商控制台确认当前 Key 所属
+账号的实际 Agent Plan 套餐与视频模型权益，然后执行带人工原因的恢复：
 
 ```powershell
-uv run cvg run-pack life-2026-07-24-seaside-travel `
+uv run cvg retry-slot life-2026-07-24-seaside-travel `
   --slot morning `
-  --allow-paid-generation
+  --reason "Provider video entitlement verified after UnsupportedModel"
 ```
 
-该命令先在正式 PostgreSQL 写入幂等任务意图，再调用一次真实 Seedance。
+恢复后才可再次显式执行 `run-pack --allow-paid-generation`。完整烟测明细
+见[Agent Plan morning 真实烟测记录](../validation/agent-plan-morning-smoke-2026-07-27.md)。

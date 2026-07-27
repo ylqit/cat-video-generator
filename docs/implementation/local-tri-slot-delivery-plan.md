@@ -76,7 +76,7 @@ DailyLifePack
 1. CLI 从被忽略的 `.env` 读取连接，PowerShell 环境变量具有更高优先级。
 2. 运行只读 doctor，确认 PostgreSQL版本、数据库、用户、`pg_stat_ssl` 和明文授权状态。
 3. `cvg db upgrade` 在空 Schema 上创建正式 `cat_video`；已有未知对象且无 Alembic 版本表时拒绝接管。
-4. 迁移到 `0002_content_and_reviews`，保留十张业务表和版本表。
+4. 迁移到 `0003_slot_retry_events`，保留核心业务表、显式重试审计表和版本表。
 5. `cvg db current` 确认 Schema 权限和 Alembic head。
 6. `cvg db validate-runtime` 对比字段、类型、约束和索引，并执行事务、幂等、`SKIP LOCKED` 和交付原子性检查。
 7. 验证记录只按本次 UUID 清理，不删除 Schema 或既有业务数据。

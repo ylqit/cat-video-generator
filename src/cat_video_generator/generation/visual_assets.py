@@ -103,6 +103,28 @@ class VisualAssetService:
         )
         for clip_index, frame_role in enumerate(required_roles):
             with self._session_factory.begin() as session:
+                approved = session.execute(
+                    select(MediaAsset)
+                    .join(
+                        GenerationJob,
+                        MediaAsset.generation_job_id == GenerationJob.id,
+                    )
+                    .where(
+                        MediaAsset.episode_variant_id == variant_id,
+                        MediaAsset.asset_kind
+                        == f"scene_keyframe_{frame_role}",
+                        MediaAsset.qc_status == "passed",
+                        MediaAsset.review_status == "approved",
+                        GenerationJob.render_revision <= render_revision,
+                    )
+                    .order_by(
+                        GenerationJob.render_revision.desc(),
+                        MediaAsset.created_at.desc(),
+                    )
+                    .limit(1)
+                ).scalar_one_or_none()
+                if approved is not None:
+                    continue
                 existing = session.execute(
                     select(MediaAsset)
                     .join(
@@ -117,15 +139,7 @@ class VisualAssetService:
                         GenerationJob.render_revision == render_revision,
                     )
                 ).scalars().all()
-                approved = next(
-                    (
-                        asset
-                        for asset in existing
-                        if asset.review_status == "approved"
-                    ),
-                    None,
-                )
-                if approved is not None or existing:
+                if existing:
                     continue
                 slot = session.get_one(DailySlot, slot_id)
                 if slot.status == "planned":
@@ -184,7 +198,11 @@ class VisualAssetService:
                 ),
                 MediaAsset.qc_status == "passed",
                 MediaAsset.review_status == "approved",
-                GenerationJob.render_revision == render_revision,
+                GenerationJob.render_revision <= render_revision,
+            )
+            .order_by(
+                GenerationJob.render_revision.desc(),
+                MediaAsset.created_at.desc(),
             )
         ).scalars().all()
 
@@ -195,7 +213,9 @@ class VisualAssetService:
     ) -> list[MediaAsset]:
         if mode is VisualInputMode.DIRECT_REFERENCES:
             return []
-        by_kind = {asset.asset_kind: asset for asset in assets}
+        by_kind: dict[str, MediaAsset] = {}
+        for asset in assets:
+            by_kind.setdefault(asset.asset_kind, asset)
         kinds = ["scene_keyframe_first"]
         if mode is VisualInputMode.GENERATED_FIRST_LAST_FRAMES:
             kinds.append("scene_keyframe_last")

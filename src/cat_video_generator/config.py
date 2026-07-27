@@ -35,8 +35,10 @@ _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _ARK_AGENT_PLAN_BASE_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
 _ARK_STANDARD_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 _ARK_AGENT_PLAN_IMAGE_MODEL = "doubao-seedream-5.0-lite"
-_ARK_AGENT_PLAN_VIDEO_MODEL = "doubao-seedance-2.0-mini"
-_ARK_AGENT_PLAN_VIDEO_TIERS = frozenset({"large", "max"})
+_ARK_AGENT_PLAN_VIDEO_TIERS = {
+    "doubao-seedance-1.5-pro-即将下线": ("medium", "large", "max"),
+    "doubao-seedance-2.0-mini": ("large", "max"),
+}
 _SCHEMA_NAME_PATTERN = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 _REMOTE_VALIDATION_SCHEMA_PATTERN = re.compile(
     r"cat_video_validation_[0-9a-f]{12}"
@@ -174,15 +176,21 @@ class RuntimeSettings:
                     "Agent Plan requires ARK_IMAGE_MODEL="
                     f"{_ARK_AGENT_PLAN_IMAGE_MODEL}."
                 )
-            if self.ark_video_model != _ARK_AGENT_PLAN_VIDEO_MODEL:
+            supported_video_tiers = _ARK_AGENT_PLAN_VIDEO_TIERS.get(
+                self.ark_video_model
+            )
+            if supported_video_tiers is None:
                 issues.append(
-                    "Agent Plan requires ARK_VIDEO_MODEL="
-                    f"{_ARK_AGENT_PLAN_VIDEO_MODEL}."
+                    "Agent Plan requires ARK_VIDEO_MODEL to be one of: "
+                    + ", ".join(_ARK_AGENT_PLAN_VIDEO_TIERS)
+                    + "."
                 )
-            if self.ark_agent_plan_tier not in _ARK_AGENT_PLAN_VIDEO_TIERS:
+            elif self.ark_agent_plan_tier not in supported_video_tiers:
                 issues.append(
-                    "Seedance 2.0-mini on Agent Plan requires "
-                    "ARK_AGENT_PLAN_TIER=large or max."
+                    f"{self.ark_video_model} on Agent Plan requires "
+                    "ARK_AGENT_PLAN_TIER="
+                    + ", ".join(supported_video_tiers)
+                    + "."
                 )
             return tuple(issues)
 
@@ -250,9 +258,15 @@ class RuntimeSettings:
                 else self.ark_access_mode.value
             ),
             "agentPlanTier": self.ark_agent_plan_tier,
+            "agentPlanTierVerification": (
+                "declared_only"
+                if self.ark_access_mode is ArkAccessMode.AGENT_PLAN
+                else None
+            ),
             "endpointProfile": self.endpoint_profile,
             "generationConfigurationValid": not configuration_issues,
             "generationConfigurationIssues": list(configuration_issues),
+            "providerEntitlementVerification": "not_performed",
             "arkBaseUrl": self.ark_base_url,
             "arkImageModel": self.ark_image_model,
             "arkVideoModel": self.ark_video_model,

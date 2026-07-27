@@ -62,7 +62,7 @@ uv run cvg db validate-runtime
 ```
 
 当前实际验收结果为 PostgreSQL 16.13、`sslInUse=false`、
-`0002_content_and_reviews`，表结构、事务回滚、Slot约束、幂等、
+`0003_slot_retry_events`，表结构、事务回滚、Slot约束、幂等、
 `SKIP LOCKED` 和交付原子性全部通过。`validate-runtime` 只清理自身
 UUID 标记的数据，保留正式表和既有业务记录。
 
@@ -97,6 +97,9 @@ uv run cvg status life-2026-07-24-seaside-travel
 ```
 
 `validate-pack` 不连接模型也不写数据库。`approve-pack` 只冻结内容，不产生费用。
+当前旅游示例是 `planRevision=2`：morning 强制合成首帧、noon 强制首尾帧、
+evening 保留直接主体参考。数据库中的 revision 1 保持不可变；烟测必须使用
+显式 `run-pack`，不要用 `run-next` 领取旧 revision。
 
 ## 6. 配置 Agent Plan 并执行第一条真实烟测
 
@@ -117,7 +120,10 @@ uv run cvg run-pack life-2026-07-24-seaside-travel --slot morning --allow-paid-g
 
 `doctor` 必须显示 `arkAccessMode=agent_plan`、
 `agentPlanTier=large|max`、`endpointProfile=agent_plan` 和
-`generationConfigurationValid=true`。报告不会显示 Key。
+`generationConfigurationValid=true`。其中套餐为本地声明，报告同时显示
+`agentPlanTierVerification=declared_only` 和
+`providerEntitlementVerification=not_performed`；报告不会显示 Key，也不
+保证 Key 所属账号已实际开通 Large/Max。
 
 如果以后切换到标准按量 Ark，必须一次替换整组 Mode、Base URL、模型和
 Key；`ARK_AGENT_PLAN_TIER` 必须删除：
@@ -135,16 +141,20 @@ Agent Plan Key、标准 Ark Key 与 Coding Plan Key 不可混用。配置层无�
 Key 字符串判断类型；供应商鉴权失败时终止且不重试。切换模式不会迁移
 PostgreSQL 或本地媒体。
 
-首条8秒 smoke Episode 的四项视觉风险均为 false，所以走 `direct_references`：
+首条8秒 smoke Episode 要求精确开场，所以先走
+`generated_first_frame`：
 
 1. 数据库先写入唯一 `GenerationJob(submitting)`。
-2. 本地三张 Canon 图片转为内存中的 Base64 data URL；完整 Base64 不写日志或数据库。
-3. Seedance Create 使用 `reference_image`、720p、9:16、8秒、`generate_audio=true`、`watermark=false`。
-4. 请求不发送 `frames`、`camera_fixed`、`service_tier` 或 `seed`。
-5. 获得 task ID 后短事务写入 `queued`，随后轮询 `queued/running/succeeded`。
-6. 成功 URL 立即流式下载到 `.part`，计算 SHA-256 后原子进入 `var/assets/generated/sha256/`。
-7. ffprobe 检查 MP4、H.264、AAC、720×1280、8～15秒和音轨。
-8. 通过后进入 `content_review`，不会自动交付。
+2. Seedream 使用人物、猫咪和画风三张 Canon 生成一张海边合成首帧。
+3. 首帧下载、QC 后进入 `keyframe_review`；未批准前不得创建 Seedance 任务。
+4. 批准首帧并再次运行命令后，Seedance Create 只发送该首帧，使用720p、
+   9:16、8秒、`generate_audio=true`、`watermark=false`。
+5. 请求不发送 `frames`、`camera_fixed`、`service_tier` 或 `seed`。
+6. 获得 task ID 后短事务写入 `queued`，随后轮询 `queued/running/succeeded`。
+7. 成功 URL 立即流式下载到 `.part`，计算 SHA-256 后原子进入
+   `var/assets/generated/sha256/`。
+8. ffprobe 检查 MP4、H.264、AAC、720×1280、8～15秒和音轨；通过后进入
+   `content_review`，不会自动交付。
 
 执行后查看待审核资产：
 
@@ -181,6 +191,18 @@ uv run cvg resume <lifePackId> --allow-paid-generation
 ```
 
 `resume` 只处理已经存在的 keyframe/video job、轮询、下载和 QC。它不会为 `planned` Slot 创建新收费任务，也不会重新 POST `submission_unknown`。幂等键由 `episodeId + renderRevision + jobType + clipIndex + normalizedInputHash` 派生；规范化输入包含访问模式和供应商 profile，因此 Agent Plan 与标准 Ark 不会错误复用任务。
+
+只有 `failed/expired/cancelled` 供应商终态允许人工创建新 render revision：
+
+```powershell
+uv run cvg retry-slot <lifePackId> --slot morning `
+  --reason "operator confirmed terminal provider failure"
+```
+
+该命令不调用 Ark，也不需要付费开关。它保留旧 Job、资产与错误记录，在
+`slot_retry_events` 写入原/新 revision、终态 Job 和人工原因，然后把
+Slot/Variant 恢复到 `planned`。`submission_unknown` 必须继续使用
+`reconcile-job`，不能通过 `retry-slot` 绕过。
 
 若 Create 请求已经发送但没有拿到 task ID，状态变为 `submission_unknown`。此时必须在 Ark 控制台或任务列表人工对账，不能直接重跑付费 POST。
 

@@ -16,6 +16,7 @@ def test_all_tables_are_isolated_in_cat_video_schema() -> None:
         "media_assets",
         "reference_assets",
         "review_decisions",
+        "slot_retry_events",
     }
 
     assert {table.name for table in Base.metadata.tables.values()} == expected
@@ -24,8 +25,8 @@ def test_all_tables_are_isolated_in_cat_video_schema() -> None:
     } == {SCHEMA_NAME}
 
 
-def test_initial_migration_is_the_only_head() -> None:
-    assert expected_alembic_head() == "0002_content_and_reviews"
+def test_slot_retry_migration_is_the_only_head() -> None:
+    assert expected_alembic_head() == "0003_slot_retry_events"
 
 
 def test_selected_variant_constraint_is_deferred_until_both_tables_exist() -> None:

@@ -19,7 +19,7 @@ _PACK_TRANSITIONS: Mapping[str, frozenset[str]] = {
     "rendering": frozenset({"ready", "failed"}),
     "ready": frozenset({"delivered"}),
     "delivered": frozenset(),
-    "failed": frozenset(),
+    "failed": frozenset({"rendering"}),
 }
 
 _SLOT_TRANSITIONS: Mapping[str, frozenset[str]] = {
@@ -30,7 +30,7 @@ _SLOT_TRANSITIONS: Mapping[str, frozenset[str]] = {
     "media_qc": frozenset({"content_review", "failed"}),
     "content_review": frozenset({"planned", "ready", "failed"}),
     "ready": frozenset(),
-    "failed": frozenset(),
+    "failed": frozenset({"planned"}),
 }
 
 _VARIANT_TRANSITIONS: Mapping[str, frozenset[str]] = {
@@ -38,7 +38,7 @@ _VARIANT_TRANSITIONS: Mapping[str, frozenset[str]] = {
     "active": frozenset({"ready", "rejected", "failed"}),
     "ready": frozenset(),
     "rejected": frozenset(),
-    "failed": frozenset(),
+    "failed": frozenset({"planned"}),
 }
 
 _JOB_TRANSITIONS: Mapping[str, frozenset[str]] = {

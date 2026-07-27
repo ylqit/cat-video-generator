@@ -28,6 +28,7 @@
 - [每日生产工作流](workflows/daily-production.md)
 - [Windows 按需执行与验证](workflows/windows-on-demand-validation.md)
 - [正式 PostgreSQL 运行验收记录](workflows/postgresql-runtime-validation.md)
+- [Agent Plan morning 真实烟测记录](validation/agent-plan-morning-smoke-2026-07-27.md)
 - [本地视频交付包](delivery/local-video-package.md)
 - [三时段生活流](content/tri-slot-life-stream.md)
 - [系列、角色与世界 Bible](content/series-bible.md)
@@ -50,4 +51,11 @@
 
 当前仓库已经落地真实 Ark 模块化单体链路：内容与 Canon 导入、审核、视觉风险决策、按需 Seedream、Seedance 异步任务、即时下载、SHA-256 不可变存储、ffprobe QC、人工审核、continuation 等待/fallback、1/2/3 本地交付和恢复接口。LifePack 编排、视觉资产、Ark 任务执行和 CLI 已形成独立职责边界。运行时可选 Agent Plan 与标准 Ark 两种真实 API profile，不存在 Mock Provider 或 Mock 配置；自动测试只在进程内替换 SDK/HTTP 边界，不形成可选择的业务链路。
 
-正式 `vedio-appdb.cat_video` 已在用户明确授权下通过明文连接迁移到 `0002_content_and_reviews`，结构、事务、幂等和并发验证均通过。该例外必须同时满足固定数据库、固定 Schema 和 `CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true`；切换 SSL 后关闭该开关即可，不需要搬迁数据。当前尚未执行真实收费生成，仍要求 `ARK_API_KEY` 和显式 `--allow-paid-generation`。详见[真实 Ark 链路运行手册](workflows/ark-real-chain-runbook.md)。
+正式 `vedio-appdb.cat_video` 已在用户明确授权下通过明文连接迁移；当前目标
+revision 为 `0003_slot_retry_events`，增加了终态任务的显式人工重试审计。
+该例外必须同时满足固定数据库、固定 Schema 和
+`CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true`；切换 SSL 后关闭该开关即可，不
+需要搬迁数据。真实生成仍要求 `ARK_API_KEY` 和显式
+`--allow-paid-generation`。首帧真实生成已验证；当前 Key 的视频请求被
+供应商以 `UnsupportedModel` 拒绝，尚无 MP4，必须先核实实际视频权益，
+不得直接重复付费提交。详见[真实 Ark 链路运行手册](workflows/ark-real-chain-runbook.md)。

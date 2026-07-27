@@ -178,6 +178,24 @@ def test_agent_plan_runtime_requires_supported_visual_profile(
     }
 
 
+@pytest.mark.parametrize("tier", ["medium", "large", "max"])
+def test_agent_plan_accepts_seedance_1_5_for_supported_tiers(
+    tier: str,
+) -> None:
+    configured = RuntimeSettings.from_env(
+        {
+            "ARK_ACCESS_MODE": "agent_plan",
+            "ARK_AGENT_PLAN_TIER": tier,
+            "ARK_API_KEY": "test-only-key",
+            "ARK_BASE_URL": AGENT_PLAN_URL,
+            "ARK_IMAGE_MODEL": "doubao-seedream-5.0-lite",
+            "ARK_VIDEO_MODEL": "doubao-seedance-1.5-pro-即将下线",
+        }
+    )
+
+    configured.validate_for_ark_access()
+
+
 @pytest.mark.parametrize("tier", ["", "small", "medium"])
 def test_agent_plan_rejects_tiers_without_seedance_2_support(
     tier: str,
@@ -193,7 +211,23 @@ def test_agent_plan_rejects_tiers_without_seedance_2_support(
         }
     )
 
-    with pytest.raises(ConfigurationError, match="large or max"):
+    with pytest.raises(ConfigurationError, match="large, max"):
+        configured.validate_for_ark_access()
+
+
+def test_agent_plan_rejects_small_tier_for_seedance_1_5() -> None:
+    configured = RuntimeSettings.from_env(
+        {
+            "ARK_ACCESS_MODE": "agent_plan",
+            "ARK_AGENT_PLAN_TIER": "small",
+            "ARK_API_KEY": "test-only-key",
+            "ARK_BASE_URL": AGENT_PLAN_URL,
+            "ARK_IMAGE_MODEL": "doubao-seedream-5.0-lite",
+            "ARK_VIDEO_MODEL": "doubao-seedance-1.5-pro-即将下线",
+        }
+    )
+
+    with pytest.raises(ConfigurationError, match="medium, large, max"):
         configured.validate_for_ark_access()
 
 
@@ -301,9 +335,11 @@ def test_preflight_reports_profile_without_secret_material() -> None:
 
     assert report["arkAccessMode"] == "agent_plan"
     assert report["agentPlanTier"] == "large"
+    assert report["agentPlanTierVerification"] == "declared_only"
     assert report["endpointProfile"] == "agent_plan"
     assert report["generationConfigurationValid"] is True
     assert report["generationConfigurationIssues"] == []
+    assert report["providerEntitlementVerification"] == "not_performed"
     assert "never-print-agent-plan-key" not in rendered
 
 

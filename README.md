@@ -22,7 +22,13 @@ uv run cvg --help
 
 Agent Plan 默认使用 `/api/plan/v3`、Seedream 5.0 Lite 和 Seedance
 2.0-mini；标准 Ark 使用 `/api/v3` 和自身已开通的 Model ID 或 Endpoint
-ID。两套配置和 Key 不能混用，访问模式会进入任务幂等输入。
+ID。两套配置和 Key 不能混用，访问模式会进入任务幂等输入。操作者也可
+显式使用完整 Agent Plan 名称
+`doubao-seedance-1.5-pro-即将下线`，程序不会自动截断或降级模型。
 
 当前远程 `vedio-appdb.cat_video` 已允许在显式
 `CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true` 时通过明文 PostgreSQL 运行；诊断会持续标记该临时架构债务。真实生成还必须具备最新 Alembic revision、ffprobe、批准的 Canon、`ARK_API_KEY`，并在命令中显式使用 `--allow-paid-generation`。ffmpeg 只在后续条件式媒体修复时需要。
+
+2026-07-27 的真实烟测已生成并批准首帧，但当前 Agent Plan Key 对三个
+视频模型字符串均返回 `UnsupportedModel`，因此尚无 morning MP4。完整
+记录见[Agent Plan morning 真实烟测记录](docs/validation/agent-plan-morning-smoke-2026-07-27.md)。

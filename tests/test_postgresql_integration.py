@@ -18,6 +18,7 @@ from cat_video_generator.content_service import (
     approve_daily_life_pack,
     import_daily_life_pack,
     import_reference_asset,
+    retry_failed_slot,
     review_reference_asset,
 )
 from cat_video_generator.db import create_database_engine, create_session_factory
@@ -36,6 +37,7 @@ from cat_video_generator.models import (
     EpisodeVariant,
     GenerationJob,
     MediaAsset,
+    SlotRetryEvent,
 )
 from cat_video_generator.remote_validation import validate_remote_database
 from cat_video_generator.repository import (
@@ -121,7 +123,7 @@ def test_migration_schema_and_doctor(
 
     assert report.ready_for_runtime is True
     assert report.pool_healthy is True
-    assert report.alembic_revision == "0002_content_and_reviews"
+    assert report.alembic_revision == "0003_slot_retry_events"
     assert table_names == {
         "alembic_version",
         "continuity_events",
@@ -134,6 +136,7 @@ def test_migration_schema_and_doctor(
         "media_assets",
         "reference_assets",
         "review_decisions",
+        "slot_retry_events",
     }
 
 
@@ -243,6 +246,82 @@ def test_pack_import_is_idempotent_and_canon_review_is_audited(
                 reason="identity checked",
             )
             assert asset.status == "approved"
+    finally:
+        engine.dispose()
+
+
+def test_terminal_job_retry_is_audited_and_advances_render_revision(
+    migrated_database: DatabaseSettings,
+) -> None:
+    engine = create_database_engine(migrated_database, DatabaseOperation.TEST)
+    factory = create_session_factory(engine)
+    try:
+        with factory.begin() as session:
+            pack = add_pack(
+                session,
+                "life-retry-terminal",
+                status="rendering",
+            )
+            slot = add_slot(session, pack, "morning", 1)
+            slot.status = "failed"
+            variant = add_variant(session, slot, "ep-retry-terminal")
+            variant.status = "failed"
+            variant.last_error = "provider_failed"
+            slot.last_error = "provider_failed"
+            job = GenerationJob(
+                episode_variant_id=variant.id,
+                render_revision=1,
+                job_type="video",
+                clip_index=0,
+                normalized_input_hash="1" * 64,
+                idempotency_key="2" * 64,
+                provider="volcengine-agent-plan",
+                status="failed",
+                attempt_no=1,
+                request_snapshot_json={},
+                error_code="InternalServiceError",
+            )
+            session.add(job)
+
+        with factory.begin() as session:
+            event = retry_failed_slot(
+                session,
+                life_pack_id="life-retry-terminal",
+                slot_name="morning",
+                reason="operator confirmed terminal provider failure",
+            )
+            assert event.from_render_revision == 1
+            assert event.to_render_revision == 2
+
+        with factory() as session:
+            slot = session.execute(
+                select(DailySlot).where(
+                    DailySlot.daily_life_pack_id
+                    == select(DailyLifePack.id)
+                    .where(
+                        DailyLifePack.life_pack_id
+                        == "life-retry-terminal"
+                    )
+                    .scalar_subquery(),
+                    DailySlot.slot == "morning",
+                )
+            ).scalar_one()
+            variant = session.execute(
+                select(EpisodeVariant).where(
+                    EpisodeVariant.daily_slot_id == slot.id
+                )
+            ).scalar_one()
+            events = session.execute(select(SlotRetryEvent)).scalars().all()
+            assert slot.status == "planned"
+            assert slot.last_error is None
+            assert variant.status == "planned"
+            assert variant.active_render_revision == 2
+            assert variant.last_error is None
+            assert len(events) == 1
+            assert (
+                events[0].reason
+                == "operator confirmed terminal provider failure"
+            )
     finally:
         engine.dispose()
 

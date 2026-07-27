@@ -22,9 +22,11 @@ from .models import (
     DailyLifePack,
     DailySlot,
     EpisodeVariant,
+    GenerationJob,
     MediaAsset,
     ReferenceAsset,
     ReviewDecision,
+    SlotRetryEvent,
 )
 from .state import (
     transition_pack,
@@ -148,6 +150,93 @@ def approve_daily_life_pack(session: Session, life_pack_id: str) -> DailyLifePac
     pack.approved_at = datetime.now(UTC)
     session.flush()
     return pack
+
+
+def retry_failed_slot(
+    session: Session,
+    *,
+    life_pack_id: str,
+    slot_name: str,
+    reason: str,
+) -> SlotRetryEvent:
+    if slot_name not in _SLOT_ORDER:
+        raise ContentValidationError(
+            "slot must be morning, noon, or evening."
+        )
+    normalized_reason = reason.strip()
+    if not normalized_reason:
+        raise ContentValidationError("Retry reason cannot be empty.")
+
+    pack = latest_pack(session, life_pack_id, for_update=True)
+    slot = session.execute(
+        select(DailySlot)
+        .where(
+            DailySlot.daily_life_pack_id == pack.id,
+            DailySlot.slot == slot_name,
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
+    if slot is None:
+        raise ContentNotFoundError(
+            f"Slot {slot_name!r} does not exist in LifePack {life_pack_id!r}."
+        )
+    if slot.status != "failed":
+        raise ContentConflictError(
+            f"Only a failed Slot can be retried; current status is "
+            f"{slot.status!r}."
+        )
+
+    failed_variants = session.execute(
+        select(EpisodeVariant)
+        .where(
+            EpisodeVariant.daily_slot_id == slot.id,
+            EpisodeVariant.status == "failed",
+        )
+        .order_by(EpisodeVariant.updated_at.desc())
+        .with_for_update()
+    ).scalars().all()
+    if len(failed_variants) != 1:
+        raise ContentConflictError(
+            "Retry requires exactly one failed EpisodeVariant in the Slot."
+        )
+    variant = failed_variants[0]
+    terminal_job = session.execute(
+        select(GenerationJob)
+        .where(
+            GenerationJob.episode_variant_id == variant.id,
+            GenerationJob.status.in_(("failed", "expired", "cancelled")),
+        )
+        .order_by(GenerationJob.created_at.desc())
+        .with_for_update()
+        .limit(1)
+    ).scalar_one_or_none()
+    if terminal_job is None:
+        raise ContentConflictError(
+            "Retry requires a failed, expired, or cancelled provider job. "
+            "Use reconcile-job for submission_unknown tasks."
+        )
+
+    from_revision = variant.active_render_revision
+    to_revision = from_revision + 1
+    event = SlotRetryEvent(
+        daily_slot_id=slot.id,
+        episode_variant_id=variant.id,
+        generation_job_id=terminal_job.id,
+        from_render_revision=from_revision,
+        to_render_revision=to_revision,
+        reason=normalized_reason,
+    )
+    session.add(event)
+    variant.active_render_revision = to_revision
+    variant.render_plan_json = None
+    variant.last_error = None
+    slot.last_error = None
+    transition_variant(variant, "planned")
+    transition_slot(slot, "planned")
+    if pack.status == "failed":
+        transition_pack(pack, "rendering")
+    session.flush()
+    return event
 
 
 def import_reference_asset(

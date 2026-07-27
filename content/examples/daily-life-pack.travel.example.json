@@ -30,7 +30,7 @@
     "sharedMood": "curious-and-relaxed",
     "chapterId": "chapter-seaside-week-v1"
   },
-  "planRevision": 1,
+  "planRevision": 2,
   "status": "approved",
   "slots": {
     "morning": {
@@ -43,7 +43,7 @@
       "durationMs": 8000,
       "clipKind": "observation",
       "visualControl": {
-        "requiresExactOpening": false,
+        "requiresExactOpening": true,
         "requiresExactEnding": false,
         "complexSubjectInteraction": false,
         "criticalPropState": false

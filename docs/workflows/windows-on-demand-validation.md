@@ -104,12 +104,14 @@ Ark 静态预检同时返回：
 
 - `arkAccessMode=agent_plan`。
 - `agentPlanTier=large` 或 `max`。
+- `agentPlanTierVerification=declared_only`。
 - `endpointProfile=agent_plan`。
 - `generationConfigurationValid=true`。
+- `providerEntitlementVerification=not_performed`。
 
 这些字段只说明 URL、模式、套餐和模型组合自洽，不会调用供应商，也不会
-验证 Key 类型。输出不包含 Key 或完整鉴权信息。无前缀的 `API_KEY` 和
-`BASE_URL` 不会被读取。
+验证 Key 类型、Key 所属账号或真实套餐权益。输出不包含 Key 或完整鉴权
+信息。无前缀的 `API_KEY` 和 `BASE_URL` 不会被读取。
 
 ## 5. 正式 Schema 迁移与验证
 
@@ -205,7 +207,7 @@ Start in: D:\soft\code\OpenGit\cat-video-generator
 | Alembic revision 不匹配 | 执行受控 `cvg db upgrade`；已有未知对象时先人工核对 |
 | 找不到 ffmpeg/ffprobe | 安装工具并重新打开 PowerShell，使新的 `PATH` 生效 |
 | `generationConfigurationValid=false` | 整组检查 `ARK_ACCESS_MODE`、套餐、Base URL 和两个模型；不要混用 Agent Plan 与标准 Ark 配置 |
-| Agent Plan 套餐为 Small/Medium | 升级至 Large/Max；本项目不降级到 Seedance 1.5 |
+| Agent Plan 套餐为 Small/Medium | 默认2.0-mini链路需升级至Large/Max；仅在操作者明确选择时允许完整名称 `doubao-seedance-1.5-pro-即将下线`，不会自动降级 |
 | Ark 鉴权失败 | 确认 Key 属于当前访问模式；Agent Plan、标准 Ark 和 Coding Plan Key 不能混用 |
 | 重复收费风险 | 检查 GenerationJob 幂等记录，不能直接重放供应商 POST |
 | 下载中断 | 恢复 `.part`/任务状态，不能把不完整文件当成最终 MP4 |

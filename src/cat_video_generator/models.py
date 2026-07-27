@@ -350,6 +350,80 @@ class GenerationJob(Base):
     downloaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class SlotRetryEvent(Base):
+    __tablename__ = "slot_retry_events"
+    __table_args__ = (
+        CheckConstraint(
+            "from_render_revision >= 1",
+            name="ck_slot_retry_events_from_revision",
+        ),
+        CheckConstraint(
+            "to_render_revision = from_render_revision + 1",
+            name="ck_slot_retry_events_revision_step",
+        ),
+        CheckConstraint(
+            "length(btrim(reason)) > 0",
+            name="ck_slot_retry_events_reason",
+        ),
+        ForeignKeyConstraint(
+            ["daily_slot_id", "episode_variant_id"],
+            [
+                f"{SCHEMA_NAME}.episode_variants.daily_slot_id",
+                f"{SCHEMA_NAME}.episode_variants.id",
+            ],
+            name="fk_slot_retry_events_slot_variant",
+        ),
+        UniqueConstraint(
+            "generation_job_id",
+            name="uq_slot_retry_events_generation_job",
+        ),
+        UniqueConstraint(
+            "episode_variant_id",
+            "to_render_revision",
+            name="uq_slot_retry_events_variant_revision",
+        ),
+        Index(
+            "ix_slot_retry_events_slot_created",
+            "daily_slot_id",
+            "created_at",
+        ),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    daily_slot_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=False,
+    )
+    episode_variant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=False,
+    )
+    generation_job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.generation_jobs.id"),
+        nullable=False,
+    )
+    from_render_revision: Mapped[int] = mapped_column(
+        SmallInteger,
+        nullable=False,
+    )
+    to_render_revision: Mapped[int] = mapped_column(
+        SmallInteger,
+        nullable=False,
+    )
+    reason: Mapped[str] = mapped_column(String(500), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
 class MediaAsset(Base):
     __tablename__ = "media_assets"
     __table_args__ = (
