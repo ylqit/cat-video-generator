@@ -79,3 +79,8 @@ uv run cvg retry-slot life-2026-07-24-seaside-travel `
 终态失败；只读任务列表没有其他 queued/running 任务。当前仍无 MP4，
 下一步是在同一 API Key 账号处理视频任务限额或配额。详见
 [标准 Ark morning 真实烟测记录](../validation/standard-ark-morning-smoke-2026-07-27.md)。
+
+限额解除后，revision 3 render revision 4 复用批准首帧并成功生成10.08秒
+MP4；GenerationJob、Provider task ID、SHA-256、H.264/AAC媒体属性和
+`qc_status=passed` 已写入正式 `cat_video`。视频当前保持
+`review_status=pending`，等待操作者完成最终音画审核。
