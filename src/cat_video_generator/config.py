@@ -1,3 +1,9 @@
+"""环境配置与安全门。
+
+配置只负责解析、路径发现和连接准入，不加载业务Schema，也不判断Episode
+内容。PowerShell环境变量始终优先于本地`.env`。
+"""
+
 from __future__ import annotations
 
 import os
@@ -13,7 +19,7 @@ from sqlalchemy import URL
 
 
 class ConfigurationError(ValueError):
-    """Raised when runtime configuration is incomplete or unsafe."""
+    """运行环境不完整或违反安全边界。"""
 
 
 class DatabaseOperation(StrEnum):
@@ -21,31 +27,38 @@ class DatabaseOperation(StrEnum):
     MIGRATION = "migration"
     RUNTIME = "runtime"
     TEST = "test"
-    REMOTE_VALIDATION = "remote_validation"
 
 
 class ArkAccessMode(StrEnum):
-    AGENT_PLAN = "agent_plan"
     STANDARD = "standard"
+    AGENT_PLAN = "agent_plan"
 
 
-_SECURE_SSL_MODES = frozenset({"require", "verify-ca", "verify-full"})
-_SUPPORTED_SSL_MODES = _SECURE_SSL_MODES | {"disable"}
-_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
-_ARK_AGENT_PLAN_BASE_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
-_ARK_STANDARD_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-_ARK_AGENT_PLAN_IMAGE_MODEL = "doubao-seedream-5.0-lite"
-_ARK_VIDEO_RESOLUTIONS = ("480p", "720p", "1080p")
-_ARK_AGENT_PLAN_VIDEO_TIERS = {
-    "doubao-seedance-1.5-pro": ("medium", "large", "max"),
-    "doubao-seedance-1.5-pro-即将下线": ("medium", "large", "max"),
-    "doubao-seedance-2.0-mini": ("large", "max"),
-}
-_SCHEMA_NAME_PATTERN = re.compile(r"[a-z_][a-z0-9_]{0,62}")
-_REMOTE_VALIDATION_SCHEMA_PATTERN = re.compile(r"cat_video_validation_[0-9a-f]{12}")
+class KeyframeReviewMode(StrEnum):
+    """关键帧语义审核是否阻断后续收费视频任务。"""
+
+    TECHNICAL_AUTO = "technical_auto"
+    MANUAL = "manual"
 
 
-def _read_bool(value: str | None, *, default: bool = False) -> bool:
+_STANDARD_URL = "https://ark.cn-beijing.volces.com/api/v3"
+_AGENT_PLAN_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
+_IMAGE_MODEL = "doubao-seedream-5-0-260128"
+_VIDEO_MODEL = "doubao-seedance-2-0-mini-260615"
+_SSL_MODES = {"disable", "require", "verify-ca", "verify-full"}
+_SCHEMA_PATTERN = re.compile(r"[a-z_][a-z0-9_]{0,62}")
+
+
+def load_local_env(path: Path | None = None) -> bool:
+    """加载本地秘密文件，但不覆盖调用者当前会话。"""
+
+    env_path = Path.cwd() / ".env" if path is None else path
+    return bool(
+        env_path.is_file() and load_dotenv(dotenv_path=env_path, override=False)
+    )
+
+
+def _bool(value: str | None, *, default: bool = False) -> bool:
     if value is None:
         return default
     normalized = value.strip().lower()
@@ -53,28 +66,50 @@ def _read_bool(value: str | None, *, default: bool = False) -> bool:
         return True
     if normalized in {"0", "false", "no", "off"}:
         return False
-    raise ConfigurationError(f"Invalid boolean value: {value!r}")
+    raise ConfigurationError(f"无效布尔值: {value!r}")
 
 
-def load_local_env(path: Path | None = None) -> bool:
-    """Load the local CLI environment without overriding the caller's session."""
-    env_path = Path.cwd() / ".env" if path is None else path
-    if not env_path.is_file():
-        return False
-    return load_dotenv(dotenv_path=env_path, override=False)
+def _number(
+    values: Mapping[str, str],
+    name: str,
+    default: str,
+    value_type: type[int] | type[float],
+) -> int | float:
+    try:
+        return value_type(values.get(name, default))
+    except ValueError as exc:
+        raise ConfigurationError(f"{name}必须是数值") from exc
+
+
+def _executable(
+    configured: str | None,
+    command: str,
+    search_path: str,
+) -> Path | None:
+    if configured and configured.strip():
+        path = Path(configured).expanduser()
+        return path if path.is_file() else None
+    discovered = shutil.which(command, path=search_path)
+    return None if discovered is None else Path(discovered)
 
 
 @dataclass(frozen=True, slots=True)
 class RuntimeSettings:
+    """Ark、媒体与导演运行配置。"""
+
     ark_api_key: str | None
-    ark_access_mode: ArkAccessMode | None
-    ark_agent_plan_tier: str | None
+    ark_access_mode: ArkAccessMode
     ark_base_url: str
     ark_image_model: str
     ark_video_model: str
+    ark_planning_model: str
+    ark_structured_output_mode: str
     ark_video_resolution: str
     ark_poll_interval_seconds: float
     ark_task_timeout_seconds: float
+    candidate_count: int
+    keyframe_review_mode: KeyframeReviewMode
+    configuration_warnings: tuple[str, ...]
     ffmpeg_path: Path | None
     ffprobe_path: Path | None
     work_root: Path
@@ -88,179 +123,159 @@ class RuntimeSettings:
     ) -> RuntimeSettings:
         values = os.environ if environ is None else environ
         try:
-            poll_interval = float(values.get("ARK_POLL_INTERVAL_SECONDS", "10"))
-            task_timeout = float(values.get("ARK_TASK_TIMEOUT_SECONDS", "1800"))
+            access_mode = ArkAccessMode(
+                values.get("ARK_ACCESS_MODE", "standard").strip().lower()
+            )
         except ValueError as exc:
             raise ConfigurationError(
-                "ARK_POLL_INTERVAL_SECONDS and ARK_TASK_TIMEOUT_SECONDS "
-                "must be numeric."
+                "ARK_ACCESS_MODE必须是standard或agent_plan"
             ) from exc
-        if poll_interval <= 0 or task_timeout <= 0:
-            raise ConfigurationError(
-                "Ark poll interval and task timeout must be greater than zero."
+        poll_interval = float(_number(values, "ARK_POLL_INTERVAL_SECONDS", "10", float))
+        timeout = float(_number(values, "ARK_TASK_TIMEOUT_SECONDS", "1800", float))
+        candidate_count = int(_number(values, "DAILY_PLAN_CANDIDATE_COUNT", "1", int))
+        if poll_interval <= 0 or timeout <= 0:
+            raise ConfigurationError("Ark轮询间隔和超时必须大于0")
+        if candidate_count != 1:
+            raise ConfigurationError("分层导演模式下DAILY_PLAN_CANDIDATE_COUNT必须为1")
+        review_mode_value = (
+            values.get(
+                "KEYFRAME_REVIEW_MODE",
+                "technical_auto",
             )
-        access_mode_value = values.get("ARK_ACCESS_MODE", "").strip().lower()
+            .strip()
+            .lower()
+        )
+        configuration_warnings: list[str] = []
+        if review_mode_value == "auto":
+            review_mode_value = "technical_auto"
+            configuration_warnings.append(
+                "KEYFRAME_REVIEW_MODE=auto已映射为technical_auto，请更新.env"
+            )
         try:
-            access_mode = (
-                None if not access_mode_value else ArkAccessMode(access_mode_value)
-            )
+            keyframe_review_mode = KeyframeReviewMode(review_mode_value)
         except ValueError as exc:
             raise ConfigurationError(
-                "ARK_ACCESS_MODE must be agent_plan or standard."
+                "KEYFRAME_REVIEW_MODE必须是technical_auto或manual"
             ) from exc
-        tier_value = values.get("ARK_AGENT_PLAN_TIER", "").strip().lower()
+        structured_mode = values.get(
+            "ARK_RESPONSES_STRUCTURED_OUTPUT_MODE",
+            "json_object_schema_prompt",
+        ).strip()
+        if structured_mode not in {"json_schema", "json_object_schema_prompt"}:
+            raise ConfigurationError("无效Ark结构化输出模式")
         return cls(
             ark_api_key=values.get("ARK_API_KEY") or None,
             ark_access_mode=access_mode,
-            ark_agent_plan_tier=tier_value or None,
-            ark_base_url=values.get("ARK_BASE_URL", _ARK_STANDARD_BASE_URL).rstrip("/"),
+            ark_base_url=values.get("ARK_BASE_URL", _STANDARD_URL).rstrip("/"),
             ark_image_model=values.get(
-                "ARK_IMAGE_MODEL", "doubao-seedream-5-0-pro-260628"
-            ),
-            ark_video_model=values.get("ARK_VIDEO_MODEL", "doubao-seedance-2-0-260128"),
-            ark_video_resolution=values.get("ARK_VIDEO_RESOLUTION", "480p")
+                "ARK_IMAGE_MODEL",
+                "doubao-seedream-5-0-260128",
+            ).strip(),
+            ark_video_model=values.get(
+                "ARK_VIDEO_MODEL",
+                "doubao-seedance-2-0-mini-260615",
+            ).strip(),
+            ark_planning_model=values.get(
+                "ARK_PLANNING_MODEL",
+                "doubao-seed-2-1-pro-260628",
+            ).strip(),
+            ark_structured_output_mode=structured_mode,
+            ark_video_resolution=values.get(
+                "ARK_VIDEO_RESOLUTION",
+                "720p",
+            )
             .strip()
             .lower(),
             ark_poll_interval_seconds=poll_interval,
-            ark_task_timeout_seconds=task_timeout,
-            ffmpeg_path=_resolve_executable(
+            ark_task_timeout_seconds=timeout,
+            candidate_count=candidate_count,
+            keyframe_review_mode=keyframe_review_mode,
+            configuration_warnings=tuple(configuration_warnings),
+            ffmpeg_path=_executable(
                 values.get("FFMPEG_PATH"),
                 "ffmpeg",
-                search_path=values.get("PATH", ""),
+                values.get("PATH", ""),
             ),
-            ffprobe_path=_resolve_executable(
+            ffprobe_path=_executable(
                 values.get("FFPROBE_PATH"),
                 "ffprobe",
-                search_path=values.get("PATH", ""),
+                values.get("PATH", ""),
             ),
             work_root=Path(values.get("MEDIA_WORK_ROOT", "var/work")),
             asset_root=Path(values.get("MEDIA_ASSET_ROOT", "var/assets")),
             delivery_root=Path(values.get("DELIVERY_OUTPUT_ROOT", "output")),
         )
 
-    def validate_for_generation(self, *, allow_paid_generation: bool) -> None:
-        if not allow_paid_generation:
-            raise ConfigurationError("Ark generation requires --allow-paid-generation.")
-        self.validate_for_ark_access()
-        if self.ffprobe_path is None:
-            raise ConfigurationError(
-                "ffprobe is required for media QC. Set FFPROBE_PATH or add "
-                "ffprobe to PATH. ffmpeg is optional until a conditional media "
-                "repair is requested."
-            )
-
-    def validate_for_ark_access(self) -> None:
-        """Require one internally consistent endpoint, model, tier, and key."""
-        issues = self.ark_configuration_issues()
-        if issues:
-            raise ConfigurationError("; ".join(issues))
-        if not self.ark_api_key:
-            raise ConfigurationError("ARK_API_KEY is required for Ark access.")
-
-    def ark_configuration_issues(self) -> tuple[str, ...]:
-        issues: list[str] = []
-        if self.ark_video_resolution not in _ARK_VIDEO_RESOLUTIONS:
-            issues.append(
-                "ARK_VIDEO_RESOLUTION must be one of: "
-                + ", ".join(_ARK_VIDEO_RESOLUTIONS)
-                + "."
-            )
-        if self.ark_access_mode is None:
-            issues.append("ARK_ACCESS_MODE must be explicitly configured.")
-            return tuple(issues)
-        if self.ark_access_mode is ArkAccessMode.AGENT_PLAN:
-            if self.ark_base_url != _ARK_AGENT_PLAN_BASE_URL:
-                issues.append(
-                    f"Agent Plan requires ARK_BASE_URL={_ARK_AGENT_PLAN_BASE_URL}."
-                )
-            if self.ark_image_model != _ARK_AGENT_PLAN_IMAGE_MODEL:
-                issues.append(
-                    "Agent Plan requires ARK_IMAGE_MODEL="
-                    f"{_ARK_AGENT_PLAN_IMAGE_MODEL}."
-                )
-            supported_video_tiers = _ARK_AGENT_PLAN_VIDEO_TIERS.get(
-                self.ark_video_model
-            )
-            if supported_video_tiers is None:
-                issues.append(
-                    "Agent Plan requires ARK_VIDEO_MODEL to be one of: "
-                    + ", ".join(_ARK_AGENT_PLAN_VIDEO_TIERS)
-                    + "."
-                )
-            elif self.ark_agent_plan_tier not in supported_video_tiers:
-                issues.append(
-                    f"{self.ark_video_model} on Agent Plan requires "
-                    "ARK_AGENT_PLAN_TIER=" + ", ".join(supported_video_tiers) + "."
-                )
-            return tuple(issues)
-
-        if self.ark_base_url != _ARK_STANDARD_BASE_URL:
-            issues.append(
-                f"Standard Ark requires ARK_BASE_URL={_ARK_STANDARD_BASE_URL}."
-            )
-        if self.ark_agent_plan_tier is not None:
-            issues.append("ARK_AGENT_PLAN_TIER must be empty in standard mode.")
-        if not self.ark_image_model.strip():
-            issues.append("ARK_IMAGE_MODEL must be configured in standard mode.")
-        if not self.ark_video_model.strip():
-            issues.append("ARK_VIDEO_MODEL must be configured in standard mode.")
-        return tuple(issues)
-
     @property
     def provider_profile(self) -> str:
-        if self.ark_access_mode is ArkAccessMode.AGENT_PLAN:
-            return "volcengine-agent-plan"
-        if self.ark_access_mode is ArkAccessMode.STANDARD:
-            return "volcengine-ark-standard"
-        return "volcengine-ark-unconfigured"
+        return (
+            "volcengine-agent-plan"
+            if self.ark_access_mode is ArkAccessMode.AGENT_PLAN
+            else "volcengine-ark-standard"
+        )
 
-    @property
-    def endpoint_profile(self) -> str:
-        if self.ark_base_url == _ARK_AGENT_PLAN_BASE_URL:
-            return "agent_plan"
-        if self.ark_base_url == _ARK_STANDARD_BASE_URL:
-            return "standard"
-        return "unknown"
+    def validate_for_ark_access(self) -> None:
+        """拒绝混用访问模式、Base URL或空模型。"""
 
-    def request_profile_snapshot(self) -> dict[str, str]:
-        if self.ark_access_mode is None:
-            raise ConfigurationError("ARK_ACCESS_MODE must be explicitly configured.")
-        snapshot = {
-            "accessMode": self.ark_access_mode.value,
-            "providerProfile": self.provider_profile,
-        }
-        if self.ark_access_mode is ArkAccessMode.AGENT_PLAN:
-            if self.ark_agent_plan_tier is None:
-                raise ConfigurationError(
-                    "ARK_AGENT_PLAN_TIER is required in Agent Plan mode."
-                )
-            snapshot["agentPlanTier"] = self.ark_agent_plan_tier
-        return snapshot
+        expected_url = (
+            _AGENT_PLAN_URL
+            if self.ark_access_mode is ArkAccessMode.AGENT_PLAN
+            else _STANDARD_URL
+        )
+        issues: list[str] = []
+        if self.ark_base_url != expected_url:
+            issues.append(f"{self.ark_access_mode.value}必须使用{expected_url}")
+        if not self.ark_api_key:
+            issues.append("缺少ARK_API_KEY")
+        if not all(
+            (
+                self.ark_image_model,
+                self.ark_video_model,
+                self.ark_planning_model,
+            )
+        ):
+            issues.append("Ark图片、视频和规划模型都必须配置")
+        if self.ark_image_model != _IMAGE_MODEL:
+            issues.append(f"当前生产只允许图片模型{_IMAGE_MODEL}")
+        if self.ark_video_model != _VIDEO_MODEL:
+            issues.append(f"当前生产只允许视频模型{_VIDEO_MODEL}")
+        if self.ark_video_resolution not in {"480p", "720p"}:
+            issues.append("ARK_VIDEO_RESOLUTION必须是480p或720p")
+        if issues:
+            raise ConfigurationError("; ".join(issues))
+
+    def validate_for_generation(self, *, allow_paid_generation: bool) -> None:
+        if not allow_paid_generation:
+            raise ConfigurationError("Ark调用需要--allow-paid-generation")
+        self.validate_for_ark_access()
+        if self.ffprobe_path is None:
+            raise ConfigurationError("视频生成要求ffprobe可用")
 
     def preflight_report(self) -> dict[str, object]:
-        configuration_issues = self.ark_configuration_issues()
+        try:
+            self.validate_for_ark_access()
+            issues: list[str] = []
+        except ConfigurationError as exc:
+            issues = [str(exc)]
         return {
             "provider": self.provider_profile,
             "arkApiKeyConfigured": bool(self.ark_api_key),
-            "arkAccessMode": (
-                None if self.ark_access_mode is None else self.ark_access_mode.value
+            "arkAccessMode": self.ark_access_mode.value,
+            "arkBaseUrlProfile": (
+                "agent_plan"
+                if self.ark_base_url == _AGENT_PLAN_URL
+                else "standard"
+                if self.ark_base_url == _STANDARD_URL
+                else "unknown"
             ),
-            "agentPlanTier": self.ark_agent_plan_tier,
-            "agentPlanTierVerification": (
-                "declared_only"
-                if self.ark_access_mode is ArkAccessMode.AGENT_PLAN
-                else None
-            ),
-            "endpointProfile": self.endpoint_profile,
-            "generationConfigurationValid": not configuration_issues,
-            "generationConfigurationIssues": list(configuration_issues),
-            "providerEntitlementVerification": "not_performed",
-            "arkBaseUrl": self.ark_base_url,
             "arkImageModel": self.ark_image_model,
             "arkVideoModel": self.ark_video_model,
+            "arkPlanningModel": self.ark_planning_model,
             "arkVideoResolution": self.ark_video_resolution,
-            "arkPollIntervalSeconds": self.ark_poll_interval_seconds,
-            "arkTaskTimeoutSeconds": self.ark_task_timeout_seconds,
+            "keyframeReviewMode": self.keyframe_review_mode.value,
+            "configurationWarnings": list(self.configuration_warnings),
+            "generationConfigurationValid": not issues,
+            "generationConfigurationIssues": issues,
             "ffmpeg": None if self.ffmpeg_path is None else str(self.ffmpeg_path),
             "ffprobe": None if self.ffprobe_path is None else str(self.ffprobe_path),
             "workRoot": str(self.work_root),
@@ -269,38 +284,19 @@ class RuntimeSettings:
         }
 
 
-def _optional_path(value: str | None) -> Path | None:
-    if value is None or not value.strip():
-        return None
-    return Path(value).expanduser()
-
-
-def _resolve_executable(
-    value: str | None,
-    command: str,
-    *,
-    search_path: str,
-) -> Path | None:
-    explicit = _optional_path(value)
-    if explicit is not None:
-        return explicit if explicit.is_file() else None
-    discovered = shutil.which(command, path=search_path)
-    return None if discovered is None else Path(discovered)
-
-
 @dataclass(frozen=True, slots=True)
 class DatabaseSettings:
+    """远程PostgreSQL连接和临时明文运行许可。"""
+
     host: str
     port: int
     database: str
     user: str
     password: str
-    sslmode: str = "require"
-    allow_insecure_readonly_smoke: bool = False
-    allow_insecure_local_tests: bool = False
-    allow_insecure_remote_write_test: bool = False
-    allow_insecure_runtime: bool = False
-    schema: str = "cat_video"
+    sslmode: str
+    schema: str
+    allow_insecure_runtime: bool
+    allow_insecure_readonly_smoke: bool
     minimum_server_version: int = 140000
 
     @classmethod
@@ -309,58 +305,41 @@ class DatabaseSettings:
         environ: Mapping[str, str] | None = None,
     ) -> DatabaseSettings:
         values = os.environ if environ is None else environ
-        required = {
-            "host": "CAT_VIDEO_DB_HOST",
-            "database": "CAT_VIDEO_DB_NAME",
-            "user": "CAT_VIDEO_DB_USER",
-            "password": "CAT_VIDEO_DB_PASSWORD",
-        }
-        missing = [
-            env_name for env_name in required.values() if not values.get(env_name)
-        ]
+        names = (
+            "CAT_VIDEO_DB_HOST",
+            "CAT_VIDEO_DB_NAME",
+            "CAT_VIDEO_DB_USER",
+            "CAT_VIDEO_DB_PASSWORD",
+        )
+        missing = [name for name in names if not values.get(name)]
         if missing:
-            raise ConfigurationError(
-                "Missing required database environment variables: "
-                + ", ".join(sorted(missing))
-            )
-
-        try:
-            port = int(values.get("CAT_VIDEO_DB_PORT", "5432"))
-        except ValueError as exc:
-            raise ConfigurationError("CAT_VIDEO_DB_PORT must be an integer") from exc
+            raise ConfigurationError("缺少数据库配置: " + ", ".join(missing))
+        port = int(_number(values, "CAT_VIDEO_DB_PORT", "5432", int))
         if not 1 <= port <= 65535:
-            raise ConfigurationError("CAT_VIDEO_DB_PORT must be between 1 and 65535")
-
+            raise ConfigurationError("CAT_VIDEO_DB_PORT超出有效范围")
         sslmode = values.get("CAT_VIDEO_DB_SSLMODE", "require").strip().lower()
-        if sslmode not in _SUPPORTED_SSL_MODES:
-            supported = ", ".join(sorted(_SUPPORTED_SSL_MODES))
-            raise ConfigurationError(
-                f"CAT_VIDEO_DB_SSLMODE must be one of: {supported}"
-            )
-
+        if sslmode not in _SSL_MODES:
+            raise ConfigurationError("不支持的CAT_VIDEO_DB_SSLMODE")
         return cls(
-            host=values[required["host"]],
+            host=values["CAT_VIDEO_DB_HOST"],
             port=port,
-            database=values[required["database"]],
-            user=values[required["user"]],
-            password=values[required["password"]],
+            database=values["CAT_VIDEO_DB_NAME"],
+            user=values["CAT_VIDEO_DB_USER"],
+            password=values["CAT_VIDEO_DB_PASSWORD"],
             sslmode=sslmode,
             schema=values.get("CAT_VIDEO_DB_SCHEMA", "cat_video").strip(),
-            allow_insecure_readonly_smoke=_read_bool(
-                values.get("CAT_VIDEO_ALLOW_INSECURE_READONLY_SMOKE")
-            ),
-            allow_insecure_local_tests=_read_bool(
-                values.get("CAT_VIDEO_ALLOW_INSECURE_LOCAL_TESTS")
-            ),
-            allow_insecure_runtime=_read_bool(
+            allow_insecure_runtime=_bool(
                 values.get("CAT_VIDEO_ALLOW_INSECURE_RUNTIME")
+            ),
+            allow_insecure_readonly_smoke=_bool(
+                values.get("CAT_VIDEO_ALLOW_INSECURE_READONLY_SMOKE")
             ),
         )
 
     @property
     def url(self) -> URL:
         return URL.create(
-            drivername="postgresql+psycopg",
+            "postgresql+psycopg",
             username=self.user,
             password=self.password,
             host=self.host,
@@ -368,59 +347,22 @@ class DatabaseSettings:
             database=self.database,
         )
 
-    @property
-    def redacted_url(self) -> str:
-        return self.url.render_as_string(hide_password=True)
-
-    @property
-    def secure_transport(self) -> bool:
-        return self.sslmode in _SECURE_SSL_MODES
-
-    @property
-    def insecure_local_test_allowed(self) -> bool:
-        return (
-            self.sslmode == "disable"
-            and self.allow_insecure_local_tests
-            and self.host.lower() in _LOOPBACK_HOSTS
-            and self.database.lower().startswith("test")
-        )
-
-    @property
-    def insecure_remote_write_test_allowed(self) -> bool:
-        return (
-            self.sslmode == "disable"
-            and self.allow_insecure_remote_write_test
-            and _REMOTE_VALIDATION_SCHEMA_PATTERN.fullmatch(self.schema) is not None
-        )
-
-    @property
-    def insecure_runtime_allowed(self) -> bool:
-        return (
-            self.sslmode == "disable"
-            and self.allow_insecure_runtime
-            and self.database == "vedio-appdb"
-            and self.schema == "cat_video"
-        )
-
     def validate_for(self, operation: DatabaseOperation) -> None:
-        if _SCHEMA_NAME_PATTERN.fullmatch(self.schema) is None:
-            raise ConfigurationError(
-                "Database schema must contain only lowercase letters, digits, "
-                "and underscores, start with a letter or underscore, and be at "
-                "most 63 characters."
-            )
-        if self.secure_transport:
+        if _SCHEMA_PATTERN.fullmatch(self.schema) is None:
+            raise ConfigurationError("数据库Schema名称不合法")
+        if self.sslmode != "disable":
             return
-        if (
-            operation is DatabaseOperation.READ_ONLY_SMOKE
-            and self.allow_insecure_readonly_smoke
-        ):
-            return
-        if (
-            operation is DatabaseOperation.REMOTE_VALIDATION
-            and self.insecure_remote_write_test_allowed
-        ):
-            return
+        if operation is DatabaseOperation.READ_ONLY_SMOKE:
+            if self.allow_insecure_readonly_smoke:
+                return
+            # 正式明文运行许可比只读诊断许可更强；doctor可以复用该授权，
+            # 但仍限定在用户明确批准的vedio-appdb.cat_video。
+            if (
+                self.allow_insecure_runtime
+                and self.database == "vedio-appdb"
+                and self.schema == "cat_video"
+            ):
+                return
         if (
             operation
             in {
@@ -428,22 +370,11 @@ class DatabaseSettings:
                 DatabaseOperation.RUNTIME,
                 DatabaseOperation.TEST,
             }
-            and self.insecure_local_test_allowed
-        ):
-            return
-        if (
-            operation
-            in {
-                DatabaseOperation.MIGRATION,
-                DatabaseOperation.RUNTIME,
-            }
-            and self.insecure_runtime_allowed
+            and self.allow_insecure_runtime
+            and self.database == "vedio-appdb"
+            and self.schema == "cat_video"
         ):
             return
         raise ConfigurationError(
-            "Unencrypted PostgreSQL is restricted to an explicitly enabled "
-            "read-only smoke test, isolated remote validation, local test, or "
-            "the explicitly authorized vedio-appdb.cat_video runtime. Enable "
-            "SSL/tunneling or set CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true for "
-            "that exact temporary runtime."
+            "明文PostgreSQL只允许显式授权的vedio-appdb.cat_video运行"
         )

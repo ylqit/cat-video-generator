@@ -10,3 +10,8 @@ htmlcov/
 var/
 output/
 *.part
+docs/设计脚本教程/
+
+# Web frontend
+web/node_modules/
+web/dist/

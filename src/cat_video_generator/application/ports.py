@@ -1,0 +1,414 @@
+"""Application层允许依赖的外部边界协议。
+
+这里只为数据库、Ark、资产存储和媒体探测等真正的生命周期边界建立协议，
+不为路径拼接或单次函数转发创建抽象。
+"""
+
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass, field
+from datetime import date
+from pathlib import Path
+from typing import Any, Protocol
+
+from ..domain.contracts import (
+    DayBrief,
+    DailyProductionPlan,
+    EpisodePlan,
+    Slot,
+    VideoInputPlan,
+)
+from ..domain.workflow import EpisodeStatus, RunStatus, StepKind, StepStatus
+
+
+@dataclass(frozen=True, slots=True)
+class DirectorResult:
+    """Ark导演的一次结构化输出。"""
+
+    payload: dict[str, Any]
+    response_id: str
+    model: str
+    request_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class ImageResult:
+    """同步图片生成结果。"""
+
+    url: str
+    model: str
+
+
+@dataclass(frozen=True, slots=True)
+class VideoTaskResult:
+    """异步视频任务的可持久化状态。"""
+
+    task_id: str
+    status: str
+    video_url: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StoredRun:
+    id: uuid.UUID
+    content_date: date
+    status: str
+    plan: DailyProductionPlan | None
+
+
+@dataclass(frozen=True, slots=True)
+class StoredEpisode:
+    id: uuid.UUID
+    run_id: uuid.UUID
+    plan: EpisodePlan
+    status: EpisodeStatus
+    selected_video_asset_id: uuid.UUID | None
+
+
+@dataclass(frozen=True, slots=True)
+class StoredStep:
+    id: uuid.UUID
+    run_id: uuid.UUID
+    episode_id: uuid.UUID | None
+    kind: StepKind
+    status: StepStatus
+    attempt: int
+    provider_task_id: str | None
+    model: str | None
+    request_summary: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class StoredAsset:
+    id: uuid.UUID
+    run_id: uuid.UUID | None
+    episode_id: uuid.UUID | None
+    step_id: uuid.UUID | None
+    role: str
+    media_type: str
+    scope: str
+    status: str
+    path: Path
+    sha256: str
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class LandedAsset:
+    path: Path
+    sha256: str
+    byte_size: int
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryBuild:
+    """原子构建完成的本地交付包。"""
+
+    path: Path
+    manifest_sha256: str
+    items: tuple[dict[str, str | int], ...]
+
+
+class GatewayError(RuntimeError):
+    """Application可理解的外部调用错误基类。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        retryable: bool,
+        submission_unknown: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+        self.submission_unknown = submission_unknown
+
+
+class DirectorGateway(Protocol):
+    """一次调用只返回一个结构化导演对象。"""
+
+    @property
+    def model(self) -> str: ...
+
+    def generate_structured(
+        self,
+        *,
+        prompt: str,
+        schema: dict[str, Any],
+        output_name: str,
+    ) -> DirectorResult: ...
+
+
+class MediaGenerationGateway(Protocol):
+    """Ark Seedream和Seedance的供应商边界。"""
+
+    @property
+    def image_model(self) -> str: ...
+
+    @property
+    def video_model(self) -> str: ...
+
+    def generate_image(
+        self,
+        *,
+        prompt: str,
+        reference_paths: tuple[Path, ...],
+    ) -> ImageResult: ...
+
+    def submit_video(
+        self,
+        *,
+        prompt: str,
+        input_plan: VideoInputPlan,
+        input_paths: tuple[Path, ...],
+    ) -> VideoTaskResult: ...
+
+    def get_video_task(self, task_id: str) -> VideoTaskResult: ...
+
+
+class WorkflowRepository(Protocol):
+    """工作流唯一持久化端口。"""
+
+    def create_draft_run(self, content_date: date) -> uuid.UUID: ...
+
+    def create_step_intent(
+        self,
+        *,
+        run_id: uuid.UUID,
+        episode_id: uuid.UUID | None,
+        parent_step_id: uuid.UUID | None,
+        kind: StepKind,
+        attempt: int,
+        provider: str | None,
+        model: str | None,
+        input_hash: str,
+        request_summary: dict[str, Any],
+    ) -> StoredStep: ...
+
+    def save_prompt(
+        self,
+        *,
+        step_id: uuid.UUID,
+        parent_prompt_id: uuid.UUID | None,
+        purpose: str,
+        model: str,
+        text: str,
+    ) -> uuid.UUID: ...
+
+    def finish_director_step(
+        self,
+        *,
+        step_id: uuid.UUID,
+        response_id: str,
+        request_hash: str,
+        output: dict[str, Any],
+    ) -> None: ...
+
+    def fail_step(
+        self,
+        step_id: uuid.UUID,
+        *,
+        code: str,
+        message: str,
+        submission_unknown: bool = False,
+    ) -> None: ...
+
+    def finalize_plan(
+        self,
+        *,
+        run_id: uuid.UUID,
+        plan: DailyProductionPlan,
+        selected_candidate: int,
+    ) -> None: ...
+
+    def save_planning_context(
+        self,
+        *,
+        run_id: uuid.UUID,
+        day_brief: DayBrief,
+        day_step_id: uuid.UUID,
+        day_prompt_id: uuid.UUID,
+        episode_drafts: dict[str, dict[str, Any]],
+    ) -> None: ...
+
+    def get_planning_context(self, run_id: uuid.UUID) -> dict[str, Any]: ...
+
+    def next_director_attempt(
+        self,
+        *,
+        run_id: uuid.UUID,
+        phase: str,
+        slot: Slot | None,
+    ) -> int: ...
+
+    def replace_episode_plan(
+        self,
+        *,
+        run_id: uuid.UUID,
+        episode: EpisodePlan,
+    ) -> None: ...
+
+    def get_run(self, run_id: uuid.UUID) -> StoredRun: ...
+
+    def get_episode(self, run_id: uuid.UUID, slot: Slot) -> StoredEpisode: ...
+
+    def list_episodes(self, run_id: uuid.UUID) -> tuple[StoredEpisode, ...]: ...
+
+    def get_step(self, step_id: uuid.UUID) -> StoredStep: ...
+
+    def list_resumable_steps(
+        self,
+        run_id: uuid.UUID | None,
+    ) -> tuple[StoredStep, ...]: ...
+
+    def list_assets(
+        self,
+        *,
+        run_id: uuid.UUID | None = None,
+        episode_id: uuid.UUID | None = None,
+        roles: tuple[str, ...] = (),
+        statuses: tuple[str, ...] = (),
+    ) -> tuple[StoredAsset, ...]: ...
+
+    def set_episode_status(
+        self,
+        episode_id: uuid.UUID,
+        target: EpisodeStatus,
+    ) -> None: ...
+
+    def set_run_status(self, run_id: uuid.UUID, target: RunStatus) -> None: ...
+
+    def set_step_status(
+        self,
+        step_id: uuid.UUID,
+        target: StepStatus,
+        *,
+        provider_task_id: str | None = None,
+        request_summary_patch: dict[str, Any] | None = None,
+    ) -> None: ...
+
+    def save_asset(
+        self,
+        *,
+        run_id: uuid.UUID | None,
+        episode_id: uuid.UUID | None,
+        step_id: uuid.UUID | None,
+        role: str,
+        scope: str,
+        status: str,
+        media_type: str,
+        landed: LandedAsset,
+        metadata: dict[str, Any],
+    ) -> StoredAsset: ...
+
+    def select_video_asset(
+        self,
+        *,
+        episode_id: uuid.UUID,
+        asset_id: uuid.UUID,
+    ) -> None: ...
+
+    def record_review(
+        self,
+        *,
+        step_id: uuid.UUID,
+        asset_id: uuid.UUID | None,
+        source: str,
+        decision: str,
+        reason: str | None,
+        warnings: list[dict[str, Any]],
+        evidence: dict[str, Any],
+    ) -> uuid.UUID: ...
+
+    def set_asset_status(self, asset_id: uuid.UUID, status: str) -> None: ...
+
+    def next_delivery_revision(self, run_id: uuid.UUID) -> int: ...
+
+    def save_delivery(
+        self,
+        *,
+        run_id: uuid.UUID,
+        revision: int,
+        local_path: Path,
+        manifest_sha256: str,
+        items: tuple[dict[str, Any], ...],
+    ) -> uuid.UUID: ...
+
+    def workflow_graph(self, run_id: uuid.UUID) -> dict[str, Any]: ...
+
+    def list_run_summaries(self, limit: int, offset: int) -> list[dict[str, Any]]: ...
+
+    def prompt_detail(self, prompt_id: uuid.UUID) -> dict[str, Any]: ...
+
+    def asset_detail(self, asset_id: uuid.UUID) -> StoredAsset: ...
+
+    def episode_detail(self, episode_id: uuid.UUID) -> dict[str, Any]: ...
+
+    def step_detail(self, step_id: uuid.UUID) -> dict[str, Any]: ...
+
+    def list_delivery_packages(
+        self,
+        run_id: uuid.UUID,
+    ) -> list[dict[str, Any]]: ...
+
+    def delivery_package_detail(
+        self,
+        package_id: uuid.UUID,
+    ) -> dict[str, Any]: ...
+
+    def health(self) -> dict[str, Any]: ...
+
+
+class AssetStore(Protocol):
+    """下载和本地不可变媒体的所有权边界。"""
+
+    def download(
+        self,
+        url: str,
+        *,
+        suffix: str,
+    ) -> LandedAsset: ...
+
+    def import_local(self, path: Path) -> LandedAsset: ...
+
+    def crop_local(
+        self,
+        path: Path,
+        *,
+        box: tuple[int, int, int, int],
+    ) -> LandedAsset: ...
+
+    def build_delivery(
+        self,
+        *,
+        content_date: date,
+        run_id: uuid.UUID,
+        revision: int,
+        items: tuple[tuple[Slot, StoredAsset], ...],
+    ) -> DeliveryBuild: ...
+
+
+class MediaProbe(Protocol):
+    """技术媒体检查边界。"""
+
+    def inspect_image(self, path: Path) -> dict[str, Any]: ...
+
+    def inspect_reference(
+        self,
+        path: Path,
+        *,
+        media_type: str,
+    ) -> dict[str, Any]: ...
+
+    def inspect_video(
+        self,
+        path: Path,
+        *,
+        expected_duration_seconds: int,
+        expected_resolution: str,
+    ) -> dict[str, Any]: ...

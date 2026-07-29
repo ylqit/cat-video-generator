@@ -5,9 +5,13 @@ from logging.config import fileConfig
 from sqlalchemy import Connection, text
 
 from alembic import context
-from cat_video_generator.config import DatabaseOperation, DatabaseSettings
-from cat_video_generator.db import create_database_engine
-from cat_video_generator.models import Base
+from cat_video_generator.config import (
+    DatabaseOperation,
+    DatabaseSettings,
+    load_local_env,
+)
+from cat_video_generator.infrastructure.db.models import Base
+from cat_video_generator.infrastructure.db.session import create_database_engine
 
 config = context.config
 if config.config_file_name is not None:
@@ -45,6 +49,9 @@ def run_migrations_online() -> None:
         _run_migrations(provided_connection, provided_schema)
         return
 
+    # 独立执行``alembic upgrade``时也复用CLI的配置优先级：
+    # PowerShell环境变量优先，缺失值才从被Git忽略的.env补齐。
+    load_local_env()
     settings = DatabaseSettings.from_env()
     engine = create_database_engine(settings, DatabaseOperation.MIGRATION)
     try:

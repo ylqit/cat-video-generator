@@ -1,36 +1,117 @@
 # Cat Video Generator
 
-人物与猫咪三时段生活流视频的本地生产与交付系统。
+面向“固定人物 + 固定灰白猫”的三时段本地视频生产系统。系统在任意时间生成某个
+内容日期的 morning、noon、evening 三条视频，最终只交付本地 MP4 与
+`manifest.json`，不包含小程序、CDN、定时发布或自动上传。
 
-- 运行时只接入真实火山方舟 API，不提供 Mock Provider；支持标准按量 Ark
-  与 Agent Plan 两种显式访问模式，当前默认标准 Ark API。
-- 低风险内容直接使用批准的人物、猫咪和画风参考；高风险内容按需调用 Seedream 生成首帧或首尾帧。
-- 每个 Episode 由 Seedance 单次生成8～15秒竖屏原生音视频。
-- PostgreSQL 保存计划、任务、审核和交付元数据；图片、视频与交付包保存在本机。
-- 最终输出固定为 `01-morning.mp4`、`02-noon.mp4`、`03-evening.mp4` 和 `manifest.json`。
-- 不包含微信小程序、HTTP API、对象存储、CDN 或定时发布。
+当前生产链路只有一条：
 
-完整设计见[文档总览](docs/README.md)，首次真实测试按[真实 Ark 链路运行手册](docs/workflows/ark-real-chain-runbook.md)执行。
+```text
+总导演生成不可变DayBrief
+→ 上午/中午/傍晚导演依次独立生成三个Episode
+→ 生成有序VideoInputPlan
+→ 选择多模态参考/严格首帧/严格首尾帧
+→ 按需调用Seedream
+→ 编译精简Seedance Prompt
+→ Seedance单次生成8～15秒音视频
+→ 技术QC与人工审核
+→ 01/02/03本地交付
+```
 
-基础验证：
+## 技术选择
+
+- Python 3.12/3.13。
+- PostgreSQL 是工作流、Prompt 和媒体元数据的唯一事实来源。
+- SQLAlchemy 2 + Alembic 管理八张核心表。
+- Pydantic 只表达当前业务契约，不保留 V1～V5 版本分派。
+- Ark Responses、Seedream、Seedance 通过一个网关接入。
+- FastAPI 提供本机查询、媒体读取与逐请求付费许可的生产控制。
+- 视频文件以 SHA-256 内容寻址方式保存在本地，不写入数据库。
+- 不使用 LangGraph、AgentScope、PydanticAI、Celery、Redis 或微服务。
+
+## 快速开始（Windows PowerShell）
 
 ```powershell
 uv sync --extra test
-uv run pytest -q
-uv run cvg --help
+uv run cvg doctor
+
+uv run cvg canon import --role person --file "主题示例\人物本体.png"
+uv run cvg canon import --role cat --file "主题示例\猫咪本体.png"
+uv run cvg canon import --role style --file "画风示例\示例.png"
+
+uv run cvg plan-day `
+  --target-date 2026-08-01 `
+  --allow-paid-generation
+
+uv run cvg run-day <runId> --allow-paid-generation
+uv run cvg status <runId>
+uv run cvg review <assetId> --approve --reason "人工观看通过"
+uv run cvg deliver <runId>
 ```
 
-标准 Ark 默认使用 `/api/v3`、Seedream 5.0 Lite 和
-`doubao-seedance-2-0-mini-260615`；Agent Plan 使用 `/api/plan/v3`
-及其套餐模型别名。两套配置和 Key 不能混用，访问模式会进入任务幂等输入。操作者也可
-显式使用 `doubao-seedance-1.5-pro` 或
-`doubao-seedance-1.5-pro-即将下线`；程序按配置原样提交，不会自动截断、
-追加后缀或降级模型。
+`plan-day` 本身会调用付费文本模型，所以也要求显式付费许可。`run-day` 默认按
+1、2、3推进三条 Episode，也可用 `--slot morning` 定向验证一条。
+一次规划固定调用四次导演：一条总方向和三条时段细化，不用一个超长 Prompt
+同时写完三条分镜。某个时段需要修改时只执行：
 
-当前远程 `vedio-appdb.cat_video` 已允许在显式
-`CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true` 时通过明文 PostgreSQL 运行；诊断会持续标记该临时架构债务。真实生成还必须具备最新 Alembic revision、ffprobe、批准的 Canon、`ARK_API_KEY`，并在命令中显式使用 `--allow-paid-generation`。ffmpeg 只在后续条件式媒体修复时需要。
+```powershell
+uv run cvg replan-episode <runId> `
+  --slot noon `
+  --reason "修正纸袋承重与水果回袋动作" `
+  --allow-paid-generation
+```
 
-2026-07-27 已切换标准 Ark，并使用新的10秒内容 revision。标准视频请求
-已到达 `doubao-seedance-2-0-mini-260615`；模型开通与限额解除后已成功
-生成、下载并通过技术 QC 的 morning MP4，当前等待最终人工音画审核。详见
-[标准 Ark morning 真实烟测记录](docs/validation/standard-ark-morning-smoke-2026-07-27.md)。
+人物只要求主要面貌、发型和体型可辨识为同一个人；猫咪保持同一只灰白猫的脸型、
+体型和主要斑纹。眼睛服从参考素材整体画风，不再硬编码某一种眼睛拓扑。
+`KEYFRAME_REVIEW_MODE=technical_auto` 是当前非阻断默认值，数据库会明确记录
+语义审核被跳过；量产前可切换为 `manual`。
+
+Episode确实需要动作、声音、场景或元素参考时，可以先导入批准素材：
+
+```powershell
+uv run cvg reference import --episode-id <episodeId> `
+  --role motion --file "references\gentle-walk.mp4"
+
+uv run cvg reference import --episode-id <episodeId> `
+  --role atmosphere --file "references\morning-ambience.mp3"
+```
+
+## Web 前端（本地可视化生产台）
+
+`web/` 提供 Vue3 + Element Plus 的分镜卡片式前端：展示每个分镜的剧本、
+出场资产、分镜图与完整 Prompt，并可直接在页面执行规划、按 slot 生成、
+审核与交付。规划与生成以后台任务推进，页面轮询刷新状态。
+
+```powershell
+# 终端一：启动完整HTTP接口（含写端点，仅监听127.0.0.1）
+uv run cvg api
+
+# 终端二：开发模式启动前端（代理到8765）
+cd web
+npm install
+npm run dev    # http://127.0.0.1:5173
+```
+
+生产模式可单进程托管：`npm run build` 后
+`uv run cvg api --static-dir web/dist`，浏览器直接访问 8765。
+纯观察场景可用 `uv run cvg api --read-only` 退回只读接口。
+
+## 文档
+
+- [文档索引](docs/README.md)
+- [架构决策](docs/architecture/ADR-001-explicit-workflow.md)
+- [从导演到三条视频的完整流程](docs/workflows/complete-production.md)
+- [Windows运行手册](docs/workflows/windows-runbook.md)
+- [火山方舟多模态能力基线](docs/providers/volcengine-multimodal.md)
+- [本机只读HTTP接口](docs/http-api.md)
+- [原始设计脚本教程](docs/设计脚本教程)
+
+## 安全边界
+
+- `.env`、数据库密码、Ark Key、签名下载 URL 与 Base64 不进入 Git、日志或
+  Manifest。
+- Ark 调用前必须先在 PostgreSQL 保存 Step 与完整 Prompt。
+- `submission_unknown` 不得自动重复 POST，必须先人工对账。
+- 当前明文 PostgreSQL 仅由 `CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true`
+  显式放行；后续启用 TLS 或隧道只需修改连接配置。
+- 所有通过 QC 的供应商 MP4 直接保存，不强制 FFmpeg 重编码。
