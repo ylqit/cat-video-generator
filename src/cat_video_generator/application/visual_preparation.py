@@ -13,7 +13,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from ..domain.contracts import VideoInputMode
-from ..domain.prompts import compile_image_prompt
+from ..domain.prompts import CompiledPrompt, compile_image_prompt
 from ..domain.review_prompts import compile_keyframe_review_prompt
 from ..domain.visual_profiles import (
     SeriesVisualProfile,
@@ -90,6 +90,7 @@ class VisualPreparationService:
         episode: StoredEpisode,
         *,
         allow_unverified_keyframes: bool,
+        prompt_overrides: dict[str, str] | None = None,
     ) -> tuple[StoredAsset, ...] | None:
         """返回Seedance实际输入；``None``表示关键帧等待人工审核。"""
 
@@ -106,6 +107,7 @@ class VisualPreparationService:
             selection,
             target="first_frame",
             allow_unverified_keyframes=allow_unverified_keyframes,
+            prompt_override=(prompt_overrides or {}).get("first_frame"),
         )
         if first.status == "candidate":
             return None
@@ -124,6 +126,7 @@ class VisualPreparationService:
             last_selection,
             target="last_frame",
             allow_unverified_keyframes=allow_unverified_keyframes,
+            prompt_override=(prompt_overrides or {}).get("last_frame"),
         )
         if last.status == "candidate":
             return None
@@ -182,6 +185,7 @@ class VisualPreparationService:
         *,
         target: str,
         allow_unverified_keyframes: bool,
+        prompt_override: str | None = None,
         attempt: int = 1,
         retry_of_step_id: uuid.UUID | None = None,
         retry_reason: str | None = None,
@@ -205,6 +209,16 @@ class VisualPreparationService:
                 retry_feedback=retry_reason,
             )
         )
+        has_override = prompt_override is not None and bool(prompt_override.strip())
+        if has_override:
+            assert prompt_override is not None
+            override_text = prompt_override.strip()
+            compiled = CompiledPrompt(
+                text=override_text,
+                char_count=len(override_text),
+                utf8_bytes=len(override_text.encode("utf-8")),
+                warnings=(),
+            )
         base_input_hash = _input_hash(
             base_compiled.text,
             *(asset.sha256 for asset in selection.assets),
@@ -213,10 +227,12 @@ class VisualPreparationService:
             compiled.text,
             *(asset.sha256 for asset in selection.assets),
         )
+        # 编辑版按真实文本哈希复用：同一编辑重复触发命中既有帧（幂等不重复扣费），
+        # 不同编辑产生新哈希自然重新生成；无编辑时按基础Prompt哈希复用。
         reusable = self._repository.find_reusable_asset(
             episode_id=episode.id,
             role=target,
-            input_hash=base_input_hash,
+            input_hash=input_hash if has_override else base_input_hash,
             statuses=("candidate", "approved", "ready"),
         )
         if reusable is not None:

@@ -10,52 +10,31 @@ import asyncio
 import json
 import uuid
 from collections.abc import Callable
-from datetime import date
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel, ConfigDict, Field
 
 from ..application.ports import GatewayError
 from ..domain.contracts import Slot
+from .api_schemas import (
+    CANON_ROLES as _CANON_ROLES,
+    DEFAULT_PLANNING_CONTEXT as _DEFAULT_PLANNING_CONTEXT,
+    IMAGE_SUFFIXES as _IMAGE_SUFFIXES,
+    REFERENCE_ROLES as _REFERENCE_ROLES,
+    REFERENCE_SUFFIXES as _REFERENCE_SUFFIXES,
+    CompareResolutionRequest,
+    DeriveCropRequest,
+    GenerateKeyframesRequest,
+    GenerateRequest,
+    PaidRequest,
+    PlanRequest,
+    PromptOverridesRequest,
+    ReplanRequest,
+    RetryStepRequest,
+    ReviewRequest,
+)
 from .jobs import JobConflictError, JobRecord, JobRegistry
-
-_CANON_ROLES = frozenset({"person", "cat", "style"})
-_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp"})
-_DEFAULT_PLANNING_CONTEXT = "根据日期、天气和角色习惯设计自然的一天。"
-
-
-class PlanRequest(BaseModel):
-    """触发全天规划的请求体；付费许可缺省为拒绝。"""
-
-    model_config = ConfigDict(populate_by_name=True)
-
-    target_date: date = Field(alias="targetDate")
-    planning_context: str | None = Field(None, alias="planningContext")
-    candidate_count: int | None = Field(None, alias="candidateCount", ge=1, le=5)
-    allow_paid_generation: bool = Field(False, alias="allowPaidGeneration")
-
-
-class GenerateRequest(BaseModel):
-    """按时段或全天生成的请求体；slot为空表示推进全天。"""
-
-    model_config = ConfigDict(populate_by_name=True)
-
-    slot: Slot | None = None
-    allow_paid_generation: bool = Field(False, alias="allowPaidGeneration")
-    allow_unverified_keyframes: bool = Field(
-        False,
-        alias="allowUnverifiedKeyframes",
-    )
-    allow_multi_clip: bool = Field(False, alias="allowMultiClip")
-
-
-class ReviewRequest(BaseModel):
-    """人工审核决定；理由必填以保留审计线索。"""
-
-    approve: bool
-    reason: str = Field(min_length=1, max_length=500)
 
 
 def create_write_router(
@@ -65,6 +44,8 @@ def create_write_router(
     assets: Any,
     delivery: Any,
     queries: Any,
+    retry: Any,
+    resolution_compare: Any,
     job_registry: JobRegistry,
     default_candidate_count: int,
     upload_dir: Path,
@@ -96,12 +77,22 @@ def create_write_router(
                 ),
                 allow_paid_generation=True,
             )
-            return {
+            payload: dict[str, Any] = {
                 "runId": str(result.run_id),
                 "selectedCandidate": result.selected_candidate,
                 "candidateCount": result.candidate_count,
                 "plan": result.plan.model_dump(mode="json"),
             }
+            if request.auto_generate_keyframes:
+                # 同一付费串行门内链式生成三集首末帧；创作台默认路径。
+                payload["keyframes"] = production.prepare_keyframes_only(
+                    result.run_id,
+                    allow_paid_generation=True,
+                    allow_unverified_keyframes=(
+                        request.allow_unverified_keyframes
+                    ),
+                )
+            return payload
 
         record = _submit(
             job_registry,
@@ -229,6 +220,213 @@ def create_write_router(
     def job_detail(job_id: str) -> dict[str, Any]:
         return _not_found(lambda: job_registry.get(job_id).to_dict())
 
+    @router.post("/steps/{step_id}/retry", status_code=202)
+    def retry_step(step_id: uuid.UUID, request: RetryStepRequest) -> dict[str, Any]:
+        if not request.allow_paid_generation:
+            raise HTTPException(
+                status_code=422,
+                detail="重试可能调用付费模型，必须显式确认allowPaidGeneration",
+            )
+
+        def task() -> dict[str, Any]:
+            result = retry.retry_step(
+                step_id,
+                reason=request.reason,
+                allow_paid_generation=True,
+                allow_unverified_keyframes=request.allow_unverified_keyframes,
+            )
+            return _jsonable(result)
+
+        record = _submit(
+            job_registry,
+            kind="retry_step",
+            dedup_key=f"retry:{step_id}",
+            fn=task,
+        )
+        return _accepted(record)
+
+    @router.post("/runs/{run_id}/resume-planning", status_code=202)
+    def resume_planning(
+        run_id: uuid.UUID,
+        request: PaidRequest,
+    ) -> dict[str, Any]:
+        if not request.allow_paid_generation:
+            raise HTTPException(
+                status_code=422,
+                detail="恢复规划可能调用付费模型，必须显式确认allowPaidGeneration",
+            )
+
+        def task() -> dict[str, Any]:
+            result = planning.resume_planning(
+                run_id,
+                allow_paid_generation=True,
+            )
+            return _jsonable(result)
+
+        record = _submit(
+            job_registry,
+            kind="resume_planning",
+            dedup_key=f"resume-planning:{run_id}",
+            fn=task,
+        )
+        return _accepted(record)
+
+    @router.post("/runs/{run_id}/episodes/{slot}/replan", status_code=202)
+    def replan_episode(
+        run_id: uuid.UUID,
+        slot: Slot,
+        request: ReplanRequest,
+    ) -> dict[str, Any]:
+        if not request.allow_paid_generation:
+            raise HTTPException(
+                status_code=422,
+                detail="局部重规划调用付费模型，必须显式确认allowPaidGeneration",
+            )
+
+        def task() -> dict[str, Any]:
+            result = planning.replan_episode(
+                run_id,
+                slot=slot,
+                reason=request.reason,
+                allow_paid_generation=True,
+            )
+            return _jsonable(result)
+
+        record = _submit(
+            job_registry,
+            kind="replan_episode",
+            dedup_key=f"replan:{run_id}:{slot.value}",
+            fn=task,
+        )
+        return _accepted(record)
+
+    @router.post("/episodes/{episode_id}/references", status_code=201)
+    async def import_episode_reference(
+        episode_id: uuid.UUID,
+        role: str = Form(...),  # noqa: B008
+        semantic_key: str = Form(...),  # noqa: B008
+        file: UploadFile = File(...),  # noqa: B008
+    ) -> dict:
+        if role not in _REFERENCE_ROLES:
+            raise HTTPException(
+                status_code=422,
+                detail="参考资产role必须是element、scene、motion或atmosphere",
+            )
+        suffix = Path(file.filename or "").suffix.lower()
+        if suffix not in _REFERENCE_SUFFIXES[role]:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{role}参考资产不允许{suffix or '无扩展名'}格式",
+            )
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        temporary = upload_dir / f"{uuid.uuid4().hex}{suffix}"
+        try:
+            temporary.write_bytes(await file.read())
+            return await _run_sync(
+                lambda: assets.import_episode_reference(
+                    episode_id=episode_id,
+                    role=role,
+                    path=temporary,
+                    semantic_key=semantic_key,
+                )
+            )
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @router.post("/canon/{asset_id}/derive-crop", status_code=201)
+    async def derive_crop(
+        asset_id: uuid.UUID,
+        request: DeriveCropRequest,
+    ) -> dict:
+        return await _run_sync(
+            lambda: assets.derive_canon_crop(
+                source_asset_id=asset_id,
+                role=request.role,
+                box=request.box,
+                subject_free=request.subject_free,
+                semantic_key=request.semantic_key,
+                view=request.view,
+            )
+        )
+
+    @router.post("/runs/{run_id}/compare-resolution", status_code=202)
+    def compare_resolution(
+        run_id: uuid.UUID,
+        request: CompareResolutionRequest,
+    ) -> dict[str, Any]:
+        if not request.allow_paid_generation:
+            raise HTTPException(
+                status_code=422,
+                detail="分辨率对比调用付费模型，必须显式确认allowPaidGeneration",
+            )
+
+        def task() -> dict[str, Any]:
+            result = resolution_compare.compare(
+                run_id,
+                resolution=request.resolution,
+                allow_paid_generation=True,
+                allow_multi_clip=request.allow_multi_clip,
+            )
+            return _jsonable(result)
+
+        record = _submit(
+            job_registry,
+            kind="compare_resolution",
+            dedup_key=f"compare:{run_id}:{request.resolution}",
+            fn=task,
+        )
+        return _accepted(record)
+
+    @router.put("/episodes/{episode_id}/prompt-overrides")
+    async def save_prompt_overrides(
+        episode_id: uuid.UUID,
+        request: PromptOverridesRequest,
+    ) -> dict[str, Any]:
+        await _run_sync(
+            lambda: production.save_prompt_overrides(
+                episode_id,
+                overrides=request.overrides,
+            )
+        )
+        return {"episodeId": str(episode_id), "saved": True}
+
+    @router.post("/episodes/{episode_id}/keyframes", status_code=202)
+    def generate_keyframes(
+        episode_id: uuid.UUID,
+        request: GenerateKeyframesRequest,
+    ) -> dict[str, Any]:
+        if not request.allow_paid_generation:
+            raise HTTPException(
+                status_code=422,
+                detail="关键帧生成调用付费模型，必须显式确认allowPaidGeneration",
+            )
+        try:
+            episode = queries.episode(episode_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        run_id = uuid.UUID(episode["runId"])
+        slot = Slot(episode["slot"])
+        overrides = request.overrides
+
+        def task() -> dict[str, Any]:
+            return production.prepare_keyframes_only(
+                run_id,
+                slot=slot,
+                prompt_overrides=(
+                    None if overrides is None else {slot.value: overrides}
+                ),
+                allow_paid_generation=True,
+                allow_unverified_keyframes=request.allow_unverified_keyframes,
+            )
+
+        record = _submit(
+            job_registry,
+            kind="prepare_keyframes",
+            dedup_key=f"keyframes:{episode_id}",
+            fn=task,
+        )
+        return _accepted(record)
+
     return router
 
 
@@ -257,6 +455,24 @@ def _accepted(record: JobRecord) -> dict[str, Any]:
         "dedupKey": record.dedup_key,
         "status": record.status,
     }
+
+
+def _jsonable(result: Any) -> Any:
+    """把Service返回值规整为可JSON序列化结构。"""
+
+    if result is None or isinstance(result, (str, int, float, bool)):
+        return result
+    if isinstance(result, uuid.UUID):
+        return str(result)
+    if hasattr(result, "model_dump"):
+        return result.model_dump(mode="json")
+    if hasattr(result, "_asdict"):
+        return _jsonable(result._asdict())
+    if isinstance(result, dict):
+        return {str(key): _jsonable(value) for key, value in result.items()}
+    if isinstance(result, (list, tuple)):
+        return [_jsonable(item) for item in result]
+    return str(result)
 
 
 async def _run_sync(operation: Callable[[], Any]) -> Any:

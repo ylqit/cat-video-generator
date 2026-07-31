@@ -135,6 +135,7 @@ class Episode(Base):
     title: Mapped[str] = mapped_column(String(160), nullable=False)
     script_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     video_input_mode: Mapped[str] = mapped_column(String(40), nullable=False)
+    prompt_overrides_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,

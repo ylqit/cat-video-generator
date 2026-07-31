@@ -1,9 +1,11 @@
 import type {
   CanonAsset,
   DeliveryPackageDto,
+  EpisodePromptPreview,
   Job,
   JobAccepted,
   PromptFull,
+  PromptOverrides,
   RunGraph,
   RunSummary,
 } from "./types";
@@ -62,11 +64,15 @@ export interface PlanPayload {
   planningContext?: string;
   candidateCount?: number;
   allowPaidGeneration: boolean;
+  autoGenerateKeyframes?: boolean;
+  allowUnverifiedKeyframes?: boolean;
 }
 
 export interface GeneratePayload {
   slot: "morning" | "noon" | "evening" | null;
   allowPaidGeneration: boolean;
+  allowUnverifiedKeyframes?: boolean;
+  allowMultiClip?: boolean;
 }
 
 export const api = {
@@ -92,9 +98,18 @@ export const api = {
       manifestSha256: string;
     }>(`/runs/${runId}/deliver`),
   listCanon: () => request<CanonAsset[]>("/canon"),
-  uploadCanon: async (role: string, file: File) => {
+  uploadCanon: async (
+    role: string,
+    semanticKey: string,
+    view: string | null,
+    file: File,
+  ) => {
     const form = new FormData();
     form.append("role", role);
+    form.append("semantic_key", semanticKey);
+    if (view !== null) {
+      form.append("view", view);
+    }
     form.append("file", file);
     const response = await fetch(`${BASE}/canon`, {
       method: "POST",
@@ -111,6 +126,95 @@ export const api = {
     request<Record<string, unknown>>(`/deliveries/${packageId}/manifest`),
   job: (jobId: string) => request<Job>(`/jobs/${jobId}`),
   listJobs: () => request<Job[]>("/jobs"),
+  health: () => request<Record<string, unknown>>("/health"),
+  retryStep: (
+    stepId: string,
+    reason: string,
+    allowPaidGeneration: boolean,
+    allowUnverifiedKeyframes = false,
+  ) =>
+    post<JobAccepted>(`/steps/${stepId}/retry`, {
+      reason,
+      allowPaidGeneration,
+      allowUnverifiedKeyframes,
+    }),
+  resumePlanning: (runId: string, allowPaidGeneration: boolean) =>
+    post<JobAccepted>(`/runs/${runId}/resume-planning`, {
+      allowPaidGeneration,
+    }),
+  replanEpisode: (
+    runId: string,
+    slot: string,
+    reason: string,
+    allowPaidGeneration: boolean,
+  ) =>
+    post<JobAccepted>(`/runs/${runId}/episodes/${slot}/replan`, {
+      reason,
+      allowPaidGeneration,
+    }),
+  uploadReference: async (
+    episodeId: string,
+    role: string,
+    semanticKey: string,
+    file: File,
+  ) => {
+    const form = new FormData();
+    form.append("role", role);
+    form.append("semantic_key", semanticKey);
+    form.append("file", file);
+    const response = await fetch(`${BASE}/episodes/${episodeId}/references`, {
+      method: "POST",
+      body: form,
+    });
+    if (!response.ok) {
+      await parseError(response);
+    }
+    return (await response.json()) as { assetId: string; role: string };
+  },
+  deriveCrop: (
+    assetId: string,
+    payload: {
+      role: string;
+      semanticKey: string;
+      box?: [number, number, number, number];
+      subjectFree?: boolean;
+      view?: string;
+    },
+  ) => post<{ assetId: string }>(`/canon/${assetId}/derive-crop`, payload),
+  compareResolution: (
+    runId: string,
+    resolution: "480p" | "720p",
+    allowPaidGeneration: boolean,
+    allowMultiClip = false,
+  ) =>
+    post<JobAccepted>(`/runs/${runId}/compare-resolution`, {
+      resolution,
+      allowPaidGeneration,
+      allowMultiClip,
+    }),
+  getPromptPreview: (episodeId: string, resolution: "480p" | "720p" = "480p") =>
+    request<EpisodePromptPreview>(
+      `/episodes/${episodeId}/prompt-preview?resolution=${resolution}`,
+    ),
+  savePromptOverrides: (episodeId: string, overrides: PromptOverrides) =>
+    request<{ episodeId: string; saved: boolean }>(
+      `/episodes/${episodeId}/prompt-overrides`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ overrides }),
+      },
+    ),
+  generateKeyframes: (
+    episodeId: string,
+    allowPaidGeneration: boolean,
+    overrides?: PromptOverrides,
+    allowUnverifiedKeyframes = false,
+  ) =>
+    post<JobAccepted>(`/episodes/${episodeId}/keyframes`, {
+      allowPaidGeneration,
+      allowUnverifiedKeyframes,
+      overrides: overrides ?? null,
+    }),
 };
 
 export function assetContentUrl(assetId: string): string {

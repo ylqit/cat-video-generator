@@ -29,6 +29,7 @@ def test_compact_migration_has_multimodal_upgrade() -> None:
         "0002_multimodal_input.py",
         "0003_asset_semantic_key.py",
         "0004_planning_review.py",
+        "0005_episode_prompt_overrides.py",
     ]
     assert 'revision: str = "0001_compact_workflow"' in versions[0].read_text(
         encoding="utf-8"
@@ -42,9 +43,13 @@ def test_compact_migration_has_multimodal_upgrade() -> None:
     assert 'revision: str = "0004_planning_review"' in versions[3].read_text(
         encoding="utf-8"
     )
+    assert (
+        'revision: str = "0005_episode_prompt_overrides"'
+        in versions[4].read_text(encoding="utf-8")
+    )
     # 真实旧库曾把 metadata_json 建成 TEXT；显式转 jsonb 后兼容两种历史表型。
     assert "metadata_json::jsonb" in versions[2].read_text(encoding="utf-8")
-    assert ALEMBIC_HEAD == "0004_planning_review"
+    assert ALEMBIC_HEAD == "0005_episode_prompt_overrides"
 
 
 def test_episode_uses_video_input_mode_column() -> None:

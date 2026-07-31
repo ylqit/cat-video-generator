@@ -15,6 +15,13 @@ export const useCanonStore = defineStore("canon", {
       return (role: string) =>
         [...this.items].reverse().find((item) => item.role === role);
     },
+    /** 按语义键（如 person:side）取最新一张Canon图，适配三视图。 */
+    bySemanticKey(): (semanticKey: string) => CanonAsset | undefined {
+      return (semanticKey: string) =>
+        [...this.items]
+          .reverse()
+          .find((item) => item.semanticKey === semanticKey);
+    },
   },
   actions: {
     async fetch(force = false) {
@@ -24,8 +31,13 @@ export const useCanonStore = defineStore("canon", {
       this.items = await api.listCanon();
       this.loaded = true;
     },
-    async upload(role: string, file: File) {
-      await api.uploadCanon(role, file);
+    async upload(
+      role: string,
+      semanticKey: string,
+      view: string | null,
+      file: File,
+    ) {
+      await api.uploadCanon(role, semanticKey, view, file);
       await this.fetch(true);
     },
   },

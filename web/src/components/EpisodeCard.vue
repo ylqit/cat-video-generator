@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { ElMessage } from "element-plus";
+import { computed, ref } from "vue";
 
+import { api, ApiError } from "../api/client";
 import type {
   AssetDto,
   EpisodeDto,
@@ -9,11 +11,11 @@ import type {
   StepDto,
 } from "../api/types";
 import { useCanonStore } from "../stores/canon";
+import AssetReviewPanel from "./AssetReviewPanel.vue";
 import AssetThumb from "./AssetThumb.vue";
 import GenerateButton from "./GenerateButton.vue";
 import PromptCollapse from "./PromptCollapse.vue";
 import StatusBadge from "./StatusBadge.vue";
-import VideoReviewPanel from "./VideoReviewPanel.vue";
 
 const props = defineProps<{
   runId: string;
@@ -44,6 +46,20 @@ const STATUS_FLOW = [
   "ready",
 ];
 
+/** 参考资产上传可用的role与对应文件类型说明。 */
+const REFERENCE_ROLE_LABEL: Record<string, string> = {
+  element: "元素参考图",
+  scene: "场景参考图",
+  motion: "动作参考视频",
+  atmosphere: "氛围参考音频",
+};
+const REFERENCE_ACCEPT: Record<string, string> = {
+  element: "image/*",
+  scene: "image/*",
+  motion: "video/*",
+  atmosphere: "audio/*",
+};
+
 const episodeAssets = computed(() =>
   props.assets.filter((asset) => asset.episodeId === props.episode.id),
 );
@@ -54,6 +70,14 @@ const frameAssets = computed(() =>
 );
 const videoAsset = computed(() =>
   [...episodeAssets.value].reverse().find((asset) => asset.role === "video"),
+);
+const segmentAssets = computed(() =>
+  episodeAssets.value
+    .filter((asset) => asset.role === "video_segment")
+    .sort((a, b) => a.id.localeCompare(b.id)),
+);
+const referenceAssets = computed(() =>
+  episodeAssets.value.filter((asset) => asset.role in REFERENCE_ROLE_LABEL),
 );
 const episodeSteps = computed(() =>
   props.steps.filter((step) => step.episodeId === props.episode.id),
@@ -80,15 +104,97 @@ const activeIndex = computed(() => {
   return index === -1 ? 0 : index;
 });
 const script = computed(() => props.episode.script);
-const referenceRoles = computed(
-  () => script.value.required_reference_roles ?? ["person", "cat", "style"],
+const canonRoles = computed(() =>
+  (script.value.required_reference_roles ?? ["person", "cat", "style"]).filter(
+    (role) => ["person", "cat", "style"].includes(role),
+  ),
 );
+
+/** 剧本声明的Canon语义键（三视图/画风），优先于裸role展示。 */
+const canonKeys = computed(() => {
+  const declared = (script.value.reference_semantic_keys ?? []).filter((key) =>
+    /^(person|cat|style):/.test(key),
+  );
+  return declared.length ? declared : canonRoles.value;
+});
+
+function canonAssetFor(key: string) {
+  return key.includes(":")
+    ? canon.bySemanticKey(key)
+    : canon.latestByRole(key);
+}
+
+/** 剧本声明但本集尚未导入的element/scene等参考role。 */
+const missingReferenceRoles = computed(() => {
+  const required = (script.value.required_reference_roles ?? []).filter(
+    (role) => role in REFERENCE_ROLE_LABEL,
+  );
+  const present = new Set(referenceAssets.value.map((asset) => asset.role));
+  return required.filter((role) => !present.has(role));
+});
+
+const uploadRole = ref("element");
+const uploadKey = ref("");
+const uploadFile = ref<File | null>(null);
+const uploading = ref(false);
+
+const replanVisible = ref(false);
+const replanReason = ref("");
+const replanPaid = ref(false);
+const replanning = ref(false);
+
+/** 局部重规划本集（保留其他集），需人工理由与付费授权。 */
+async function submitReplan() {
+  replanning.value = true;
+  try {
+    await api.replanEpisode(props.runId, props.episode.slot, replanReason.value, true);
+    ElMessage.success("重规划任务已提交");
+    replanVisible.value = false;
+    replanReason.value = "";
+    replanPaid.value = false;
+    emit("changed");
+  } catch (error) {
+    ElMessage.error(error instanceof ApiError ? error.message : String(error));
+  } finally {
+    replanning.value = false;
+  }
+}
+
+function onReferenceFile(event: Event) {
+  const input = event.target as HTMLInputElement;
+  uploadFile.value = input.files?.[0] ?? null;
+}
+
+/** 导入Episode级参考资产（element/scene/motion/atmosphere）。 */
+async function uploadReference() {
+  if (!uploadFile.value || !uploadKey.value.trim()) {
+    ElMessage.warning("请选择文件并填写语义键");
+    return;
+  }
+  uploading.value = true;
+  try {
+    await api.uploadReference(
+      props.episode.id,
+      uploadRole.value,
+      uploadKey.value.trim(),
+      uploadFile.value,
+    );
+    ElMessage.success("参考资产已导入");
+    uploadFile.value = null;
+    uploadKey.value = "";
+    emit("changed");
+  } catch (error) {
+    ElMessage.error(error instanceof ApiError ? error.message : String(error));
+  } finally {
+    uploading.value = false;
+  }
+}
 </script>
 
 <template>
   <el-card shadow="never" style="background: #16181d; border-color: #26282e">
     <template #header>
-      <div style="display: flex; align-items: center; gap: 10px">
+      <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
         <el-tag effect="dark" size="small">#{{ episode.sortOrder }}</el-tag>
         <el-tag type="info" size="small">
           {{ SLOT_LABEL[episode.slot] ?? episode.slot }}
@@ -96,7 +202,26 @@ const referenceRoles = computed(
         <strong>{{ episode.title }}</strong>
         <span class="muted">{{ script.duration_seconds }}s</span>
         <StatusBadge :status="episode.status" />
+        <el-tag size="small" type="info">{{ episode.videoInputMode }}</el-tag>
+        <el-tag
+          v-if="episode.generationStrategy !== 'single_pass'"
+          size="small"
+          type="warning"
+        >
+          {{ episode.generationStrategy }}
+        </el-tag>
+        <el-tag
+          v-if="episode.renderRiskLevel && episode.renderRiskLevel !== 'low'"
+          :type="episode.renderRiskLevel === 'high' ? 'danger' : 'warning'"
+          size="small"
+        >
+          渲染风险·{{ episode.renderRiskLevel }}
+        </el-tag>
+        <span v-if="episode.nextAction" class="muted" style="font-size: 12px">
+          下一步：{{ episode.nextAction }}
+        </span>
         <div style="flex: 1" />
+        <el-button size="small" @click="replanVisible = true">重规划</el-button>
         <GenerateButton
           :run-id="runId"
           :slot="episode.slot as 'morning' | 'noon' | 'evening'"
@@ -151,32 +276,124 @@ const referenceRoles = computed(
         </li>
       </ol>
       <div><strong>结尾：</strong>{{ script.ending }}</div>
+      <div v-if="script.segments?.length" style="margin-top: 6px">
+        <strong>分段：</strong>
+        <el-tag
+          v-for="segment in script.segments"
+          :key="segment.order"
+          size="small"
+          type="info"
+          style="margin-right: 6px"
+        >
+          段{{ segment.order }} · {{ segment.duration_seconds }}s
+          <template v-if="segment.requires_tail_link"> · 尾帧衔接</template>
+        </el-tag>
+      </div>
       <PromptCollapse :prompts="videoPrompts" title="完整视频Prompt" />
       <PromptCollapse :prompts="imagePrompts" title="完整图片Prompt" />
     </div>
 
     <div class="section">
       <div class="section-title">出场资产</div>
-      <template v-for="role in referenceRoles" :key="role">
+      <template v-for="key in canonKeys" :key="key">
         <AssetThumb
-          v-if="canon.latestByRole(role)"
-          :asset-id="canon.latestByRole(role)!.id"
-          :label="role"
+          v-if="canonAssetFor(key)"
+          :asset-id="canonAssetFor(key)!.id"
+          :label="key"
         />
         <el-tag v-else type="danger" size="small" style="margin-right: 6px">
-          缺少{{ role }}
+          缺少{{ key }}
         </el-tag>
       </template>
     </div>
 
     <div v-if="frameAssets.length" class="section">
       <div class="section-title">分镜图</div>
-      <AssetThumb
-        v-for="asset in frameAssets"
-        :key="asset.id"
-        :asset-id="asset.id"
-        :label="asset.role === 'first_frame' ? '首帧' : '尾帧'"
-      />
+      <div style="display: flex; gap: 16px; flex-wrap: wrap">
+        <div v-for="asset in frameAssets" :key="asset.id">
+          <div class="muted" style="font-size: 12px; margin-bottom: 4px">
+            {{ asset.role === "first_frame" ? "首帧" : "尾帧" }}
+          </div>
+          <AssetReviewPanel
+            :asset="asset"
+            :reviews="reviews"
+            :max-width="220"
+            @reviewed="emit('changed')"
+          />
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">
+        Episode 参考资产
+        <el-tag
+          v-for="role in missingReferenceRoles"
+          :key="role"
+          type="danger"
+          size="small"
+          style="margin-left: 6px"
+        >
+          缺少{{ REFERENCE_ROLE_LABEL[role] }}
+        </el-tag>
+      </div>
+      <template v-if="referenceAssets.length">
+        <AssetThumb
+          v-for="asset in referenceAssets"
+          :key="asset.id"
+          :asset-id="asset.id"
+          :label="asset.semanticKey ?? asset.role"
+        />
+      </template>
+      <div
+        style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 8px"
+      >
+        <el-select v-model="uploadRole" size="small" style="width: 150px">
+          <el-option
+            v-for="(label, key) in REFERENCE_ROLE_LABEL"
+            :key="key"
+            :label="label"
+            :value="key"
+          />
+        </el-select>
+        <el-input
+          v-model="uploadKey"
+          size="small"
+          placeholder="语义键，如 element:paper_crane"
+          style="width: 200px"
+        />
+        <input
+          type="file"
+          :accept="REFERENCE_ACCEPT[uploadRole]"
+          style="font-size: 12px"
+          @change="onReferenceFile"
+        />
+        <el-button
+          size="small"
+          :loading="uploading"
+          :disabled="!uploadFile || !uploadKey.trim()"
+          @click="uploadReference"
+        >
+          导入参考
+        </el-button>
+      </div>
+    </div>
+
+    <div v-if="segmentAssets.length" class="section">
+      <div class="section-title">视频片段（multi-clip）</div>
+      <div style="display: flex; gap: 16px; flex-wrap: wrap">
+        <div v-for="(asset, index) in segmentAssets" :key="asset.id">
+          <div class="muted" style="font-size: 12px; margin-bottom: 4px">
+            片段 {{ index + 1 }}
+          </div>
+          <AssetReviewPanel
+            :asset="asset"
+            :reviews="reviews"
+            :max-width="220"
+            @reviewed="emit('changed')"
+          />
+        </div>
+      </div>
     </div>
 
     <div class="section">
@@ -185,7 +402,7 @@ const referenceRoles = computed(
         Ark任务：{{ videoStep.providerTaskId }}
         <StatusBadge :status="videoStep.status" style="margin-left: 6px" />
       </div>
-      <VideoReviewPanel
+      <AssetReviewPanel
         v-if="videoAsset"
         :asset="videoAsset"
         :reviews="reviews"
@@ -193,6 +410,37 @@ const referenceRoles = computed(
       />
       <span v-else class="muted">尚未生成视频</span>
     </div>
+
+    <el-dialog v-model="replanVisible" title="局部重规划本集" width="480px">
+      <el-form label-width="90px">
+        <el-form-item label="重规划理由" required>
+          <el-input
+            v-model="replanReason"
+            type="textarea"
+            :rows="3"
+            placeholder="至少4个字；将记录到审计链，例如：午间主事件与服饰变化冲突"
+          />
+        </el-form-item>
+        <el-form-item>
+          <el-checkbox v-model="replanPaid">
+            <span style="color: #f56c6c">
+              我已知晓重规划将产生 Ark 付费模型调用
+            </span>
+          </el-checkbox>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="replanVisible = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="replanning"
+          :disabled="replanReason.trim().length < 4 || !replanPaid"
+          @click="submitReplan"
+        >
+          提交重规划
+        </el-button>
+      </template>
+    </el-dialog>
   </el-card>
 </template>
 

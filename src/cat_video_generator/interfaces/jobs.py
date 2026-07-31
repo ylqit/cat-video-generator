@@ -18,7 +18,17 @@ from typing import Any
 
 from ..application.ports import GatewayError
 
-PAID_KINDS = frozenset({"plan_day", "run_day"})
+PAID_KINDS = frozenset(
+    {
+        "plan_day",
+        "run_day",
+        "resume_planning",
+        "replan_episode",
+        "compare_resolution",
+        "retry_step",
+        "prepare_keyframes",
+    }
+)
 
 _ACTIVE_STATUSES = frozenset({"queued", "running"})
 

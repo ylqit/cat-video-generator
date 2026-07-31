@@ -57,6 +57,18 @@ def create_app(
     def episode_detail(episode_id: uuid.UUID) -> dict:
         return _not_found(lambda: query_service.episode(episode_id))
 
+    @app.get("/api/v1/episodes/{episode_id}/prompt-preview")
+    def episode_prompt_preview(
+        episode_id: uuid.UUID,
+        resolution: str = Query("480p", pattern=r"^(480p|720p)$"),
+    ) -> dict:
+        return _not_found(
+            lambda: query_service.prompt_preview(
+                episode_id,
+                resolution=resolution,
+            )
+        )
+
     @app.get("/api/v1/steps/{step_id}")
     def step_detail(step_id: uuid.UUID) -> dict:
         return _not_found(lambda: query_service.step(step_id))
@@ -121,6 +133,8 @@ def create_full_app(
             assets=container.assets,
             delivery=container.delivery,
             queries=container.queries,
+            retry=container.retry,
+            resolution_compare=container.resolution_comparison,
             job_registry=job_registry,
             default_candidate_count=runtime.candidate_count,
             upload_dir=runtime.work_root / "uploads",

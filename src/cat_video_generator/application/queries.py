@@ -5,6 +5,12 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from ..domain.contracts import EpisodePlan
+from ..domain.prompts import compile_image_prompt, compile_video_prompt_preview
+from ..domain.visual_profiles import (
+    DEFAULT_SERIES_VISUAL_PROFILE,
+    DEFAULT_STYLE_PROFILE,
+)
 from .ports import StoredAsset, WorkflowRepository
 
 
@@ -46,6 +52,68 @@ class QueryService:
 
         return self._repository.episode_detail(episode_id)
 
+    def prompt_preview(
+        self,
+        episode_id: uuid.UUID,
+        *,
+        resolution: str = "480p",
+    ) -> dict[str, Any]:
+        """实时编译首末帧与视频Prompt；纯函数预览，不创建Step或收费任务。
+
+        参考素材顺序与VisualPreparationService.select_references保持一致，
+        页面编辑后的覆盖文本原样附回，便于对照。
+        """
+
+        detail = self._repository.episode_detail(episode_id)
+        episode = EpisodePlan.model_validate(detail["script"])
+        first_view = (
+            episode.shots[0].dominant_view.value if episode.shots else "front"
+        )
+        view = first_view if first_view in {"front", "side", "back"} else "front"
+        style_profile = DEFAULT_STYLE_PROFILE
+        reference_keys = tuple(
+            dict.fromkeys(
+                (
+                    f"person:{view}",
+                    f"cat:{view}",
+                    style_profile.line_reference_key,
+                    (
+                        style_profile.indoor_reference_key
+                        if episode.style_context == "indoor"
+                        else style_profile.outdoor_reference_key
+                    ),
+                    *episode.reference_semantic_keys,
+                )
+            )
+        )
+        first = compile_image_prompt(
+            episode,
+            target="first_frame",
+            reference_roles=reference_keys,
+            style_profile=style_profile,
+            series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
+        )
+        last = compile_image_prompt(
+            episode,
+            target="last_frame",
+            reference_roles=reference_keys,
+            style_profile=style_profile,
+            series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
+        )
+        video = compile_video_prompt_preview(
+            episode,
+            resolution=resolution,
+            style_profile=style_profile,
+        )
+        return {
+            "episodeId": str(episode_id),
+            "slot": detail["slot"],
+            "firstFrame": first.text,
+            "lastFrame": last.text,
+            "video": video.text,
+            "overrides": self._repository.get_prompt_overrides(episode_id),
+        }
+
     def step(self, step_id: uuid.UUID) -> dict[str, Any]:
         """返回收费意图、Ark task ID 与恢复状态。"""
 
@@ -63,6 +131,7 @@ class QueryService:
             {
                 "id": str(asset.id),
                 "role": asset.role,
+                "semanticKey": asset.semantic_key,
                 "scope": asset.scope,
                 "status": asset.status,
                 "sha256": asset.sha256,

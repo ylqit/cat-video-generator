@@ -37,6 +37,13 @@ onMounted(() => {
         </template>
       </el-table-column>
       <el-table-column prop="selectedCandidate" label="选中候选" width="90" align="center" />
+      <el-table-column label="下一步" min-width="160" show-overflow-tooltip>
+        <template #default="{ row }">
+          <span class="muted" style="font-size: 12px">
+            {{ row.nextAction ?? "—" }}
+          </span>
+        </template>
+      </el-table-column>
       <el-table-column prop="createdAt" label="创建时间" width="200">
         <template #default="{ row }">
           {{ new Date(row.createdAt).toLocaleString() }}

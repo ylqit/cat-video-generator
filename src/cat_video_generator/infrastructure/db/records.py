@@ -130,6 +130,7 @@ def episode_dict(row: Episode) -> dict[str, Any]:
         "selectedVideoAssetId": (
             None if row.selected_video_asset_id is None else str(row.selected_video_asset_id)
         ),
+        "promptOverrides": row.prompt_overrides_json or {},
         "script": plan.model_dump(mode="json"),
     }
 

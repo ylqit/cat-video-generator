@@ -134,3 +134,27 @@ class PlanPersistenceMixin:
             run.plan_json = DailyProductionPlan.model_validate(payload).model_dump(
                 mode="json"
             )
+
+    def get_prompt_overrides(self, episode_id: uuid.UUID) -> dict[str, str]:
+        """读取页面编辑后的Prompt覆盖；缺省为空字典。"""
+
+        with self._sessions() as session:  # type: ignore[attr-defined]
+            row = _required(session, Episode, episode_id)
+            raw = row.prompt_overrides_json or {}
+            return {
+                str(key): str(value)
+                for key, value in raw.items()
+                if isinstance(value, str) and value.strip()
+            }
+
+    def save_prompt_overrides(
+        self,
+        *,
+        episode_id: uuid.UUID,
+        overrides: dict[str, str] | None,
+    ) -> None:
+        """持久化页面编辑的Prompt覆盖；``None``或空字典表示清除。"""
+
+        with self._sessions.begin() as session:  # type: ignore[attr-defined]
+            row = _required(session, Episode, episode_id)
+            row.prompt_overrides_json = overrides or None

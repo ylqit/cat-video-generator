@@ -15,7 +15,6 @@ const submitting = ref(false);
 const form = reactive({
   targetDate: "",
   planningContext: "",
-  candidateCount: 3,
   allowPaidGeneration: false,
 });
 
@@ -34,7 +33,6 @@ async function submit() {
     const accepted = await api.createPlan({
       targetDate: form.targetDate,
       planningContext: form.planningContext || undefined,
-      candidateCount: form.candidateCount,
       allowPaidGeneration: true,
     });
     jobs.track(accepted);
@@ -87,9 +85,6 @@ defineExpose({ open });
           :rows="3"
           placeholder="留空则使用默认：根据日期、天气和角色习惯设计自然的一天。"
         />
-      </el-form-item>
-      <el-form-item label="候选数量">
-        <el-input-number v-model="form.candidateCount" :min="1" :max="5" />
       </el-form-item>
       <el-form-item>
         <el-checkbox v-model="form.allowPaidGeneration">

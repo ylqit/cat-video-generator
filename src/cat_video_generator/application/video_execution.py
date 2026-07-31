@@ -18,7 +18,11 @@ from ..domain.contracts import (
     VideoInputMode,
 )
 from ..domain.media import MediaSource, build_video_input_plan
-from ..domain.prompts import compile_segment_video_prompt, compile_video_prompt
+from ..domain.prompts import (
+    CompiledPrompt,
+    compile_segment_video_prompt,
+    compile_video_prompt,
+)
 from ..domain.visual_profiles import StyleProfile
 from ..domain.workflow import EpisodeStatus, StepKind, StepStatus
 from .errors import StepRetryRequired
@@ -89,14 +93,21 @@ class VideoExecutionService:
         inputs: tuple[StoredAsset, ...],
         *,
         allow_multi_clip: bool,
+        prompt_override: str | None = None,
     ) -> dict[str, Any]:
         """执行本集配置的策略；multi_clip必须由调用者再次显式授权。"""
 
         if episode.plan.generation_strategy is GenerationStrategy.MULTI_CLIP:
             if not allow_multi_clip:
                 raise ValueError("multi_clip必须显式提供--allow-multi-clip")
+            if prompt_override is not None and prompt_override.strip():
+                raise ValueError("multi_clip分段Prompt由系统逐段编译，不支持整体覆盖")
             return self._generate_multi_clip(episode, inputs)
-        return self._generate_single_pass(episode, inputs)
+        return self._generate_single_pass(
+            episode,
+            inputs,
+            prompt_override=prompt_override,
+        )
 
     def resume_step(
         self,
@@ -112,6 +123,7 @@ class VideoExecutionService:
         episode: StoredEpisode,
         inputs: tuple[StoredAsset, ...],
         *,
+        prompt_override: str | None = None,
         attempt: int = 1,
         retry_of_step_id: str | None = None,
         retry_reason: str | None = None,
@@ -139,6 +151,14 @@ class VideoExecutionService:
             input_plan=input_plan,
             style_profile=self._style_profile,
         )
+        if prompt_override is not None and prompt_override.strip():
+            override_text = prompt_override.strip()
+            compiled = CompiledPrompt(
+                text=override_text,
+                char_count=len(override_text),
+                utf8_bytes=len(override_text.encode("utf-8")),
+                warnings=(),
+            )
         input_hash = _input_hash(
             compiled.text,
             input_plan.model_dump_json(),
