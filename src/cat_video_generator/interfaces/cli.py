@@ -14,6 +14,7 @@ from typing import Any
 
 import typer
 
+from ..application.planning import PlanningReviewRequired
 from ..bootstrap import (
     build_diagnostic_container,
     build_local_container,
@@ -50,13 +51,22 @@ def doctor() -> None:
 @canon_app.command("import")
 def canon_import(
     role: str = typer.Option(..., "--role"),
+    semantic_key: str = typer.Option(..., "--semantic-key"),
+    view: str | None = typer.Option(None, "--view"),
     file: Path = typer.Option(..., "--file"),  # noqa: B008
 ) -> None:
     """导入批准的人物、猫咪或画风Canon。"""
 
     container = build_local_container()
     try:
-        _echo(container.assets.import_canon(role=role, path=file))
+        _echo(
+            container.assets.import_canon(
+                role=role,
+                path=file,
+                semantic_key=semantic_key,
+                view=view,
+            )
+        )
     finally:
         container.close()
 
@@ -71,6 +81,8 @@ def canon_derive_crop(
         help="left,top,right,bottom；person/cat留空时自动裁左侧正面视图",
     ),
     subject_free: bool = typer.Option(False, "--subject-free"),
+    semantic_key: str = typer.Option(..., "--semantic-key"),
+    view: str | None = typer.Option(None, "--view"),
 ) -> None:
     """从批准Canon确定性裁出单视图，不调用Ark。"""
 
@@ -91,6 +103,8 @@ def canon_derive_crop(
                 role=role,
                 box=parsed_box,
                 subject_free=subject_free,
+                semantic_key=semantic_key,
+                view=view,
             )
         )
     finally:
@@ -101,6 +115,7 @@ def canon_derive_crop(
 def reference_import(
     episode_id: uuid.UUID = typer.Option(..., "--episode-id"),
     role: str = typer.Option(..., "--role"),
+    semantic_key: str = typer.Option(..., "--semantic-key"),
     file: Path = typer.Option(..., "--file"),  # noqa: B008
 ) -> None:
     """导入Episode专用的场景、元素、动作视频或氛围音频。"""
@@ -112,6 +127,7 @@ def reference_import(
                 episode_id=episode_id,
                 role=role,
                 path=file,
+                semantic_key=semantic_key,
             )
         )
     finally:
@@ -139,16 +155,19 @@ def plan_day(
             parsed_date = date.fromisoformat(target_date)
         except ValueError as exc:
             raise typer.BadParameter("--target-date 必须使用 YYYY-MM-DD") from exc
-        result = container.planning.plan_day(
-            target_date=parsed_date,
-            planning_context=context,
-            candidate_count=(
-                candidate_count
-                if candidate_count is not None
-                else container.runtime_settings.candidate_count
-            ),
-            allow_paid_generation=allow_paid_generation,
-        )
+        try:
+            result = container.planning.plan_day(
+                target_date=parsed_date,
+                planning_context=context,
+                candidate_count=(
+                    candidate_count
+                    if candidate_count is not None
+                    else container.runtime_settings.candidate_count
+                ),
+                allow_paid_generation=allow_paid_generation,
+            )
+        except PlanningReviewRequired as exc:
+            _emit_planning_review(exc)
         _echo(
             {
                 "runId": str(result.run_id),
@@ -175,18 +194,52 @@ def replan_episode(
 
     container = build_runtime_container(allow_paid_generation=allow_paid_generation)
     try:
-        result = container.planning.replan_episode(
-            run_id,
-            slot=slot,
-            reason=reason,
-            allow_paid_generation=allow_paid_generation,
-        )
+        try:
+            result = container.planning.replan_episode(
+                run_id,
+                slot=slot,
+                reason=reason,
+                allow_paid_generation=allow_paid_generation,
+            )
+        except PlanningReviewRequired as exc:
+            _emit_planning_review(exc)
         _echo(
             {
                 "runId": str(result.run_id),
                 "slot": result.slot.value,
                 "attempt": result.attempt,
                 "episode": result.episode.model_dump(mode="json"),
+            }
+        )
+    finally:
+        container.close()
+
+
+@app.command("resume-planning")
+def resume_planning(
+    run_id: uuid.UUID = typer.Argument(...),
+    allow_paid_generation: bool = typer.Option(
+        False,
+        "--allow-paid-generation",
+    ),
+) -> None:
+    """复用已完成的DayBrief，继续失败或未生成的时段导演。"""
+
+    container = build_runtime_container(allow_paid_generation=allow_paid_generation)
+    try:
+        try:
+            result = container.planning.resume_planning(
+                run_id,
+                allow_paid_generation=allow_paid_generation,
+            )
+        except PlanningReviewRequired as exc:
+            _emit_planning_review(exc)
+        _echo(
+            {
+                "runId": str(result.run_id),
+                "selectedCandidate": result.selected_candidate,
+                "candidateCount": result.candidate_count,
+                "plan": result.plan.model_dump(mode="json"),
             }
         )
     finally:
@@ -201,6 +254,11 @@ def run_day(
         False,
         "--allow-paid-generation",
     ),
+    allow_unverified_keyframes: bool = typer.Option(
+        False,
+        "--allow-unverified-keyframes",
+    ),
+    allow_multi_clip: bool = typer.Option(False, "--allow-multi-clip"),
 ) -> None:
     """生成全天或指定时段。"""
 
@@ -211,6 +269,31 @@ def run_day(
                 run_id,
                 slot=slot,
                 allow_paid_generation=allow_paid_generation,
+                allow_unverified_keyframes=allow_unverified_keyframes,
+                allow_multi_clip=allow_multi_clip,
+            )
+        )
+    finally:
+        container.close()
+
+
+@app.command("compare-resolution")
+def compare_resolution(
+    run_id: uuid.UUID = typer.Argument(...),
+    resolution: str = typer.Option("720p", "--resolution"),
+    allow_paid_generation: bool = typer.Option(
+        False,
+        "--allow-paid-generation",
+    ),
+) -> None:
+    """冻结原Prompt和素材，仅生成另一分辨率的独立候选视频。"""
+
+    container = build_runtime_container(allow_paid_generation=allow_paid_generation)
+    try:
+        _echo(
+            container.resolution_comparison.compare_run(
+                run_id,
+                resolution=resolution,
             )
         )
     finally:
@@ -233,6 +316,38 @@ def resume(
         container.close()
 
 
+@app.command("retry-step")
+def retry_step(
+    step_id: uuid.UUID = typer.Argument(...),
+    reason: str = typer.Option(..., "--reason"),
+    allow_paid_generation: bool = typer.Option(
+        False,
+        "--allow-paid-generation",
+    ),
+    allow_unverified_keyframes: bool = typer.Option(
+        False,
+        "--allow-unverified-keyframes",
+    ),
+) -> None:
+    """显式重试一个终态步骤；run-day永远不会替代本命令自动重试。"""
+
+    container = build_runtime_container(
+        allow_paid_generation=allow_paid_generation,
+        require_paid_permission=allow_paid_generation,
+    )
+    try:
+        _echo(
+            container.retry.retry_step(
+                step_id,
+                reason=reason,
+                allow_paid_generation=allow_paid_generation,
+                allow_unverified_keyframes=allow_unverified_keyframes,
+            )
+        )
+    finally:
+        container.close()
+
+
 @app.command()
 def status(run_id: uuid.UUID | None = typer.Argument(None)) -> None:
     """查询工作流图或最近Run。"""
@@ -240,9 +355,7 @@ def status(run_id: uuid.UUID | None = typer.Argument(None)) -> None:
     container = build_query_container()
     try:
         _echo(
-            container.queries.list_runs()
-            if run_id is None
-            else container.queries.run_graph(run_id)
+            container.queries.list_runs() if run_id is None else container.queries.run_graph(run_id)
         )
     finally:
         container.close()
@@ -352,6 +465,24 @@ def serve_api(
 
 def _echo(value: Any) -> None:
     typer.echo(json.dumps(value, ensure_ascii=False, indent=2, default=str))
+
+
+def _emit_planning_review(exc: PlanningReviewRequired) -> None:
+    """把预期的人工规划状态输出为稳定JSON，而不是暴露Python调用栈。"""
+
+    _echo(
+        {
+            "runId": str(exc.run_id),
+            "status": "planning_review",
+            "slot": exc.slot.value,
+            "contradictions": list(exc.errors),
+            "nextAction": (
+                f"cvg replan-episode {exc.run_id} --slot {exc.slot.value} "
+                "--reason <人工修改理由> --allow-paid-generation"
+            ),
+        }
+    )
+    raise typer.Exit(code=2)
 
 
 app.add_typer(canon_app, name="canon")

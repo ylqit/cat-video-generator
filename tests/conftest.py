@@ -4,6 +4,14 @@ from datetime import date
 
 import pytest
 
+from cat_video_generator.domain.continuity import (
+    ActionTransition,
+    DominantView,
+    SceneAnchor,
+    ShotBoundaryState,
+    TrackedEntity,
+    VisibleWorldPlan,
+)
 from cat_video_generator.domain.contracts import (
     ActionStage,
     AppearancePlan,
@@ -27,23 +35,28 @@ def _episode(
     return EpisodePlan(
         slot=slot,
         title=title,
-        main_event=f"{title}中女孩和灰白猫完成一个清晰生活事件",
+        event_key=f"{slot.value}-event",
+        location_key=f"{slot.value}-location",
+        main_event=f"{title}中中性儿童和灰白猫完成一个清晰生活事件",
         scene=f"{title}对应的单一自然生活场景，空间边界清楚且可拍摄",
         cast=["person", "cat"],
         appearance=appearance,
         actions=[
             ActionStage(
                 order=1,
-                action="女孩和灰白猫进入画面并注意到当前环境中的变化",
+                actor_id="person",
+                action="中性儿童和灰白猫进入画面并注意到当前环境中的变化",
                 visible_result="观众明确理解人物、猫咪和本段活动目标",
             ),
             ActionStage(
                 order=2,
-                action="女孩继续主要活动，灰白猫以一次自然反应回应她",
+                actor_id="person",
+                action="中性儿童继续主要活动，灰白猫以一次自然反应回应",
                 visible_result="角色关系和事件状态产生可见变化",
             ),
             ActionStage(
                 order=3,
+                actor_id="cat",
                 action="两者带着刚刚形成的结果继续自然移动离开当前构图",
                 visible_result="事件获得主动收束而不是原地静止互看",
             ),
@@ -54,17 +67,19 @@ def _episode(
                 action_orders=[1],
                 framing="中景",
                 camera_move=CameraMove.FOLLOW,
-                direction="平稳跟随女孩和灰白猫进入当前生活场景",
+                dominant_view=DominantView.FRONT,
+                direction="平稳跟随中性儿童和灰白猫进入当前生活场景",
             ),
             ShotPlan(
                 order=2,
                 action_orders=[2, 3],
                 framing="中近景",
                 camera_move=CameraMove.PULL,
+                dominant_view=DominantView.SIDE,
                 direction="展示角色回应以及主动离开构图的结果",
             ),
         ],
-        ending="女孩继续迈步，灰白猫自然跟上，环境仍有轻微连续响应",
+        ending="中性儿童继续迈步，灰白猫自然跟上，环境仍有轻微连续响应",
         duration_seconds=10,
         video_input_mode=input_mode,
         critical_relations=[
@@ -75,6 +90,63 @@ def _episode(
                 final_state="画面结束仍为同一人一猫",
             )
         ],
+        visible_world=VisibleWorldPlan(
+            scene_anchors=[
+                SceneAnchor(
+                    anchor_id="path",
+                    display_name="场景地面与行走路径",
+                    anchor_type="ground",
+                )
+            ],
+            tracked_entities=[
+                TrackedEntity(
+                    entity_id="person",
+                    display_name="中性儿童",
+                    entity_type="person",
+                    appearance_signature="同一面貌、短发和儿童比例",
+                    initial_anchor_id="path",
+                ),
+                TrackedEntity(
+                    entity_id="cat",
+                    display_name="灰白猫",
+                    entity_type="cat",
+                    appearance_signature="同一脸型和主要灰白斑纹",
+                    initial_anchor_id="path",
+                ),
+            ],
+            action_transitions=[
+                ActionTransition(
+                    action_order=1,
+                    shot_order=1,
+                    actor_id="person",
+                    no_state_change=True,
+                ),
+                ActionTransition(
+                    action_order=2,
+                    shot_order=2,
+                    actor_id="person",
+                    no_state_change=True,
+                ),
+                ActionTransition(
+                    action_order=3,
+                    shot_order=2,
+                    actor_id="cat",
+                    no_state_change=True,
+                ),
+            ],
+            shot_boundary_states=[
+                ShotBoundaryState(
+                    after_shot_order=1,
+                    next_shot_order=2,
+                    visible_entity_ids=["person", "cat"],
+                    entity_anchor_ids={"person": "path", "cat": "path"},
+                    appearance_layers={
+                        "person": ["本时段完整服装"],
+                        "cat": ["固定灰白斑纹"],
+                    },
+                )
+            ],
+        ),
     )
 
 

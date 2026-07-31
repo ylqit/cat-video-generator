@@ -37,6 +37,7 @@ class ArkAccessMode(StrEnum):
 class KeyframeReviewMode(StrEnum):
     """关键帧语义审核是否阻断后续收费视频任务。"""
 
+    SEMANTIC_AUTO = "semantic_auto"
     TECHNICAL_AUTO = "technical_auto"
     MANUAL = "manual"
 
@@ -44,15 +45,28 @@ class KeyframeReviewMode(StrEnum):
 _STANDARD_URL = "https://ark.cn-beijing.volces.com/api/v3"
 _AGENT_PLAN_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
 _IMAGE_MODEL = "doubao-seedream-5-0-260128"
-_VIDEO_MODEL = "doubao-seedance-2-0-mini-260615"
+_VIDEO_MODELS = frozenset(
+    {
+        "doubao-seedance-2-0-mini-260615",
+        "doubao-seedance-2-0-260128",
+    }
+)
 _SSL_MODES = {"disable", "require", "verify-ca", "verify-full"}
 _SCHEMA_PATTERN = re.compile(r"[a-z_][a-z0-9_]{0,62}")
+_SOURCE_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _config_root() -> Path:
+    """优先使用调用目录中的.env，否则回到源码项目根。"""
+
+    working = Path.cwd().resolve()
+    return working if (working / ".env").is_file() else _SOURCE_PROJECT_ROOT
 
 
 def load_local_env(path: Path | None = None) -> bool:
     """加载本地秘密文件，但不覆盖调用者当前会话。"""
 
-    env_path = Path.cwd() / ".env" if path is None else path
+    env_path = _config_root() / ".env" if path is None else path
     return bool(
         env_path.is_file() and load_dotenv(dotenv_path=env_path, override=False)
     )
@@ -103,23 +117,28 @@ class RuntimeSettings:
     ark_image_model: str
     ark_video_model: str
     ark_planning_model: str
+    ark_review_model: str
     ark_structured_output_mode: str
     ark_video_resolution: str
     ark_poll_interval_seconds: float
     ark_task_timeout_seconds: float
     candidate_count: int
     keyframe_review_mode: KeyframeReviewMode
+    video_semantic_review_mode: str
     configuration_warnings: tuple[str, ...]
     ffmpeg_path: Path | None
     ffprobe_path: Path | None
     work_root: Path
     asset_root: Path
     delivery_root: Path
+    event_seed_root: Path
 
     @classmethod
     def from_env(
         cls,
         environ: Mapping[str, str] | None = None,
+        *,
+        config_root: Path | None = None,
     ) -> RuntimeSettings:
         values = os.environ if environ is None else environ
         try:
@@ -140,7 +159,7 @@ class RuntimeSettings:
         review_mode_value = (
             values.get(
                 "KEYFRAME_REVIEW_MODE",
-                "technical_auto",
+                "semantic_auto",
             )
             .strip()
             .lower()
@@ -155,14 +174,39 @@ class RuntimeSettings:
             keyframe_review_mode = KeyframeReviewMode(review_mode_value)
         except ValueError as exc:
             raise ConfigurationError(
-                "KEYFRAME_REVIEW_MODE必须是technical_auto或manual"
+                "KEYFRAME_REVIEW_MODE必须是semantic_auto、technical_auto或manual"
             ) from exc
+        video_review_mode = values.get(
+            "VIDEO_SEMANTIC_REVIEW_MODE",
+            "diagnostic",
+        ).strip().lower()
+        if video_review_mode not in {"off", "diagnostic"}:
+            raise ConfigurationError(
+                "VIDEO_SEMANTIC_REVIEW_MODE必须是off或diagnostic"
+            )
         structured_mode = values.get(
             "ARK_RESPONSES_STRUCTURED_OUTPUT_MODE",
             "json_object_schema_prompt",
         ).strip()
         if structured_mode not in {"json_schema", "json_object_schema_prompt"}:
             raise ConfigurationError("无效Ark结构化输出模式")
+        resolved_config_root = (
+            _config_root()
+            if config_root is None
+            else config_root.expanduser().resolve()
+        )
+        configured_seed_root = Path(
+            values.get("CAT_VIDEO_EVENT_SEED_ROOT", "content/events")
+        ).expanduser()
+        event_seed_root = (
+            configured_seed_root.resolve()
+            if configured_seed_root.is_absolute()
+            else (resolved_config_root / configured_seed_root).resolve()
+        )
+        if not event_seed_root.is_dir():
+            configuration_warnings.append(
+                f"事件种子目录不存在：{event_seed_root}；导演将使用原创模式"
+            )
         return cls(
             ark_api_key=values.get("ARK_API_KEY") or None,
             ark_access_mode=access_mode,
@@ -179,6 +223,10 @@ class RuntimeSettings:
                 "ARK_PLANNING_MODEL",
                 "doubao-seed-2-1-pro-260628",
             ).strip(),
+            ark_review_model=values.get(
+                "ARK_REVIEW_MODEL",
+                "doubao-seed-2-1-pro-260628",
+            ).strip(),
             ark_structured_output_mode=structured_mode,
             ark_video_resolution=values.get(
                 "ARK_VIDEO_RESOLUTION",
@@ -190,6 +238,7 @@ class RuntimeSettings:
             ark_task_timeout_seconds=timeout,
             candidate_count=candidate_count,
             keyframe_review_mode=keyframe_review_mode,
+            video_semantic_review_mode=video_review_mode,
             configuration_warnings=tuple(configuration_warnings),
             ffmpeg_path=_executable(
                 values.get("FFMPEG_PATH"),
@@ -204,6 +253,7 @@ class RuntimeSettings:
             work_root=Path(values.get("MEDIA_WORK_ROOT", "var/work")),
             asset_root=Path(values.get("MEDIA_ASSET_ROOT", "var/assets")),
             delivery_root=Path(values.get("DELIVERY_OUTPUT_ROOT", "output")),
+            event_seed_root=event_seed_root,
         )
 
     @property
@@ -232,13 +282,17 @@ class RuntimeSettings:
                 self.ark_image_model,
                 self.ark_video_model,
                 self.ark_planning_model,
+                self.ark_review_model,
             )
         ):
             issues.append("Ark图片、视频和规划模型都必须配置")
         if self.ark_image_model != _IMAGE_MODEL:
             issues.append(f"当前生产只允许图片模型{_IMAGE_MODEL}")
-        if self.ark_video_model != _VIDEO_MODEL:
-            issues.append(f"当前生产只允许视频模型{_VIDEO_MODEL}")
+        if self.ark_video_model not in _VIDEO_MODELS:
+            issues.append(
+                "ARK_VIDEO_MODEL必须使用已登记能力档案："
+                + "、".join(sorted(_VIDEO_MODELS))
+            )
         if self.ark_video_resolution not in {"480p", "720p"}:
             issues.append("ARK_VIDEO_RESOLUTION必须是480p或720p")
         if issues:
@@ -250,6 +304,8 @@ class RuntimeSettings:
         self.validate_for_ark_access()
         if self.ffprobe_path is None:
             raise ConfigurationError("视频生成要求ffprobe可用")
+        if self.video_semantic_review_mode == "diagnostic" and self.ffmpeg_path is None:
+            raise ConfigurationError("视频语义诊断要求ffmpeg可用以均匀抽帧")
 
     def preflight_report(self) -> dict[str, object]:
         try:
@@ -271,9 +327,13 @@ class RuntimeSettings:
             "arkImageModel": self.ark_image_model,
             "arkVideoModel": self.ark_video_model,
             "arkPlanningModel": self.ark_planning_model,
+            "arkReviewModel": self.ark_review_model,
             "arkVideoResolution": self.ark_video_resolution,
             "keyframeReviewMode": self.keyframe_review_mode.value,
+            "videoSemanticReviewMode": self.video_semantic_review_mode,
             "configurationWarnings": list(self.configuration_warnings),
+            "eventSeedRoot": str(self.event_seed_root),
+            "eventSeedRootAvailable": self.event_seed_root.is_dir(),
             "generationConfigurationValid": not issues,
             "generationConfigurationIssues": issues,
             "ffmpeg": None if self.ffmpeg_path is None else str(self.ffmpeg_path),

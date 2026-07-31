@@ -44,6 +44,11 @@ class GenerateRequest(BaseModel):
 
     slot: Slot | None = None
     allow_paid_generation: bool = Field(False, alias="allowPaidGeneration")
+    allow_unverified_keyframes: bool = Field(
+        False,
+        alias="allowUnverifiedKeyframes",
+    )
+    allow_multi_clip: bool = Field(False, alias="allowMultiClip")
 
 
 class ReviewRequest(BaseModel):
@@ -120,6 +125,8 @@ def create_write_router(
                 run_id,
                 slot=request.slot,
                 allow_paid_generation=True,
+                allow_unverified_keyframes=request.allow_unverified_keyframes,
+                allow_multi_clip=request.allow_multi_clip,
             )
 
         record = _submit(
@@ -156,6 +163,8 @@ def create_write_router(
     @router.post("/canon", status_code=201)
     async def import_canon(
         role: str = Form(...),  # noqa: B008
+        semantic_key: str = Form(...),  # noqa: B008
+        view: str | None = Form(None),  # noqa: B008
         file: UploadFile = File(...),  # noqa: B008
     ) -> dict:
         if role not in _CANON_ROLES:
@@ -174,7 +183,12 @@ def create_write_router(
         try:
             temporary.write_bytes(await file.read())
             return await _run_sync(
-                lambda: assets.import_canon(role=role, path=temporary)
+                lambda: assets.import_canon(
+                    role=role,
+                    path=temporary,
+                    semantic_key=semantic_key,
+                    view=view,
+                )
             )
         finally:
             temporary.unlink(missing_ok=True)

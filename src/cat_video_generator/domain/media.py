@@ -30,6 +30,7 @@ class MediaSource:
     media_type: str
     sha256: str
     metadata: dict[str, Any]
+    semantic_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +42,7 @@ class SeedanceCapabilities:
     video_limit: int = 3
     audio_limit: int = 3
     business_asset_limit: int = 5
-    min_duration_seconds: int = 8
+    min_duration_seconds: int = 4
     max_duration_seconds: int = 15
     resolutions: tuple[str, ...] = ("480p", "720p")
 
@@ -49,6 +50,16 @@ class SeedanceCapabilities:
 SEEDANCE_MINI_CAPABILITIES = SeedanceCapabilities(
     model="doubao-seedance-2-0-mini-260615"
 )
+SEEDANCE_FULL_CAPABILITIES = SeedanceCapabilities(
+    model="doubao-seedance-2-0-260128"
+)
+SEEDANCE_CAPABILITY_PROFILES = {
+    item.model: item
+    for item in (
+        SEEDANCE_MINI_CAPABILITIES,
+        SEEDANCE_FULL_CAPABILITIES,
+    )
+}
 
 _ROLE_PURPOSE = {
     "person": MediaPurpose.IDENTITY,
@@ -95,7 +106,8 @@ def build_video_input_plan(
     model: str,
     resolution: str,
     sources: tuple[MediaSource, ...],
-    capabilities: SeedanceCapabilities = SEEDANCE_MINI_CAPABILITIES,
+    duration_seconds: int | None = None,
+    capabilities: SeedanceCapabilities | None = None,
 ) -> VideoInputPlan:
     """从已批准素材构建Ark请求与Prompt共用的有序绑定。
 
@@ -103,25 +115,37 @@ def build_video_input_plan(
     必需输入无法表达时都在收费任务意图创建前失败。
     """
 
-    if model != capabilities.model:
-        raise ValueError(f"当前能力档案只允许{capabilities.model}，实际为{model}")
-    if resolution not in capabilities.resolutions:
-        raise ValueError(f"Seedance Mini不支持分辨率{resolution}")
+    selected_capabilities = (
+        capabilities
+        if capabilities is not None
+        else SEEDANCE_CAPABILITY_PROFILES.get(model)
+    )
+    if selected_capabilities is None:
+        raise ValueError(f"视频模型{model}没有已登记的Seedance能力档案")
+    if model != selected_capabilities.model:
+        raise ValueError(
+            f"当前能力档案只允许{selected_capabilities.model}，实际为{model}"
+        )
+    if resolution not in selected_capabilities.resolutions:
+        raise ValueError(f"Seedance模型{model}不支持分辨率{resolution}")
+    selected_duration = (
+        episode.duration_seconds if duration_seconds is None else duration_seconds
+    )
     if not (
-        capabilities.min_duration_seconds
-        <= episode.duration_seconds
-        <= capabilities.max_duration_seconds
+        selected_capabilities.min_duration_seconds
+        <= selected_duration
+        <= selected_capabilities.max_duration_seconds
     ):
-        raise ValueError("产品视频时长必须在8至15秒")
+        raise ValueError("Seedance任务时长必须在4至15秒")
 
     selected = _select_sources(episode.video_input_mode, sources)
     if (
         episode.video_input_mode is VideoInputMode.MULTIMODAL_REFERENCE
-        and len(selected) > capabilities.business_asset_limit
+        and len(selected) > selected_capabilities.business_asset_limit
     ):
         raise ValueError("多模态参考超过5项重要素材，必须删减弱相关输入或重新规划")
 
-    counters = {item: 0 for item in MediaModality}
+    counters = dict.fromkeys(MediaModality, 0)
     bindings: list[MediaBinding] = []
     for source in selected:
         _validate_source_metadata(source)
@@ -142,6 +166,7 @@ def build_video_input_plan(
             MediaBinding(
                 asset_id=source.asset_id,
                 source_role=source.role,
+                semantic_key=source.semantic_key,
                 modality=modality,
                 purpose=purpose,
                 provider_role=provider_role,
@@ -152,14 +177,14 @@ def build_video_input_plan(
             )
         )
 
-    _validate_counts(counters, capabilities)
+    _validate_counts(counters, selected_capabilities)
     if bindings and all(item.modality is MediaModality.AUDIO for item in bindings):
         raise ValueError("Seedance不支持纯音频或没有视觉素材的文本加音频输入")
     return VideoInputPlan(
         model=model,
         input_mode=episode.video_input_mode,
         resolution=resolution,
-        duration_seconds=episode.duration_seconds,
+        duration_seconds=selected_duration,
         bindings=bindings,
     )
 

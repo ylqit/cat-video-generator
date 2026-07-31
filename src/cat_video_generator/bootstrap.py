@@ -12,14 +12,24 @@ from sqlalchemy import Engine
 
 from .application.assets import AssetService
 from .application.delivery import DeliveryService
+from .application.event_seeds import EventSeedCatalog
 from .application.planning import PlanningService
 from .application.production import ProductionService
 from .application.queries import QueryService
+from .application.resolution_comparison import ResolutionComparisonService
+from .application.retry import RetryService
+from .application.video_diagnostic import VideoDiagnosticService
+from .application.video_execution import VideoExecutionService
+from .application.visual_preparation import VisualPreparationService
 from .config import (
     DatabaseOperation,
     DatabaseSettings,
     RuntimeSettings,
     load_local_env,
+)
+from .domain.visual_profiles import (
+    DEFAULT_SERIES_VISUAL_PROFILE,
+    DEFAULT_STYLE_PROFILE,
 )
 from .infrastructure.ark.gateway import ArkGateway
 from .infrastructure.db.repositories import SqlAlchemyWorkflowRepository
@@ -28,6 +38,7 @@ from .infrastructure.db.session import (
     create_session_factory,
     ensure_database_ready,
 )
+from .infrastructure.media.finalizer import FfmpegMediaFinalizer
 from .infrastructure.media.qc import FfprobeMediaProbe
 from .infrastructure.media.storage import LocalAssetStore
 
@@ -51,6 +62,8 @@ class RuntimeContainer(QueryContainer):
     delivery: DeliveryService
     planning: PlanningService
     production: ProductionService
+    resolution_comparison: ResolutionComparisonService
+    retry: RetryService
     runtime_settings: RuntimeSettings
 
 
@@ -115,6 +128,58 @@ def build_runtime_container(
         delivery_root=runtime.delivery_root,
     )
     probe = FfprobeMediaProbe(runtime.ffprobe_path)
+    finalizer = (
+        None
+        if runtime.ffmpeg_path is None
+        else FfmpegMediaFinalizer(
+            ffmpeg_path=runtime.ffmpeg_path,
+            work_root=runtime.work_root,
+        )
+    )
+    diagnostic = (
+        None
+        if finalizer is None
+        else VideoDiagnosticService(
+            repository=repository,
+            review_gateway=gateway,
+            media_finalizer=finalizer,
+            mode=runtime.video_semantic_review_mode,
+        )
+    )
+    visual_preparation = VisualPreparationService(
+        repository=repository,
+        media_gateway=gateway,
+        visual_review_gateway=gateway,
+        asset_store=store,
+        media_probe=probe,
+        provider_name=runtime.provider_profile,
+        keyframe_review_mode=runtime.keyframe_review_mode,
+        series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
+        style_profile=DEFAULT_STYLE_PROFILE,
+    )
+    video_execution = VideoExecutionService(
+        repository=repository,
+        media_gateway=gateway,
+        asset_store=store,
+        media_probe=probe,
+        provider_name=runtime.provider_profile,
+        resolution=runtime.ark_video_resolution,
+        media_finalizer=finalizer,
+        video_diagnostic=diagnostic,
+        poll_interval_seconds=runtime.ark_poll_interval_seconds,
+        task_timeout_seconds=runtime.ark_task_timeout_seconds,
+        style_profile=DEFAULT_STYLE_PROFILE,
+    )
+    resolution_comparison = ResolutionComparisonService(
+        repository=repository,
+        media_gateway=gateway,
+        asset_store=store,
+        media_probe=probe,
+        provider_name=runtime.provider_profile,
+        video_diagnostic=diagnostic,
+        poll_interval_seconds=runtime.ark_poll_interval_seconds,
+        task_timeout_seconds=runtime.ark_task_timeout_seconds,
+    )
     return RuntimeContainer(
         engine=engine,
         queries=QueryService(repository),
@@ -128,17 +193,23 @@ def build_runtime_container(
             repository=repository,
             director=gateway,
             provider_name=runtime.provider_profile,
+            event_seed_catalog=EventSeedCatalog(runtime.event_seed_root),
+            series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
+            style_profile=DEFAULT_STYLE_PROFILE,
+            video_resolution=runtime.ark_video_resolution,
         ),
         production=ProductionService(
             repository=repository,
-            media_gateway=gateway,
-            asset_store=store,
-            media_probe=probe,
-            provider_name=runtime.provider_profile,
-            resolution=runtime.ark_video_resolution,
-            keyframe_review_mode=runtime.keyframe_review_mode,
-            poll_interval_seconds=runtime.ark_poll_interval_seconds,
-            task_timeout_seconds=runtime.ark_task_timeout_seconds,
+            visual_preparation=visual_preparation,
+            video_execution=video_execution,
+            resolution_comparison=resolution_comparison,
+        ),
+        resolution_comparison=resolution_comparison,
+        retry=RetryService(
+            repository=repository,
+            visual_preparation=visual_preparation,
+            video_execution=video_execution,
+            resolution_comparison=resolution_comparison,
         ),
         runtime_settings=runtime,
     )

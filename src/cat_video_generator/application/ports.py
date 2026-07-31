@@ -13,9 +13,10 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ..domain.contracts import (
-    DayBrief,
     DailyProductionPlan,
+    DayBrief,
     EpisodePlan,
+    RecentContentSummary,
     Slot,
     VideoInputPlan,
 )
@@ -52,6 +53,38 @@ class VideoTaskResult:
 
 
 @dataclass(frozen=True, slots=True)
+class VisualReviewResult:
+    """Ark视觉审核的结构化判断；证据不包含原图Base64。"""
+
+    identity_ok: bool
+    style_ok: bool
+    world_state_ok: bool
+    scene_topology_ok: bool
+    confidence: float
+    violations: tuple[str, ...]
+    evidence: tuple[str, ...]
+    response_id: str
+    model: str
+    request_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class VideoDiagnosticResult:
+    """抽帧序列的非阻断语义诊断；最终批准权仍属于人工内容审核。"""
+
+    identity_ok: bool
+    style_ok: bool
+    world_continuity_ok: bool
+    narrative_order_ok: bool
+    confidence: float
+    violations: tuple[str, ...]
+    evidence: tuple[str, ...]
+    response_id: str
+    model: str
+    request_hash: str
+
+
+@dataclass(frozen=True, slots=True)
 class StoredRun:
     id: uuid.UUID
     content_date: date
@@ -82,6 +115,18 @@ class StoredStep:
 
 
 @dataclass(frozen=True, slots=True)
+class StoredPrompt:
+    """数据库中一次真实供应商调用对应的不可变Prompt。"""
+
+    id: uuid.UUID
+    step_id: uuid.UUID
+    purpose: str
+    model: str
+    text: str
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class StoredAsset:
     id: uuid.UUID
     run_id: uuid.UUID | None
@@ -94,6 +139,7 @@ class StoredAsset:
     path: Path
     sha256: str
     metadata: dict[str, Any]
+    semantic_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +156,24 @@ class DeliveryBuild:
     path: Path
     manifest_sha256: str
     items: tuple[dict[str, str | int], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FinalizedMedia:
+    """条件式后期生成的临时媒体及所采用的最小修复策略。"""
+
+    path: Path
+    policy: str
+    duration_trimmed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewCommitResult:
+    """一次原子审核提交的结果；重复同一决定返回原记录。"""
+
+    review_id: uuid.UUID
+    decision: str
+    idempotent: bool
 
 
 class GatewayError(RuntimeError):
@@ -171,6 +235,27 @@ class MediaGenerationGateway(Protocol):
     def get_video_task(self, task_id: str) -> VideoTaskResult: ...
 
 
+class VisualReviewGateway(Protocol):
+    """关键帧语义审核的独立Ark边界。"""
+
+    @property
+    def review_model(self) -> str: ...
+
+    def review_keyframe(
+        self,
+        *,
+        prompt: str,
+        image_path: Path,
+    ) -> VisualReviewResult: ...
+
+    def diagnose_video_frames(
+        self,
+        *,
+        prompt: str,
+        frame_paths: tuple[Path, ...],
+    ) -> VideoDiagnosticResult: ...
+
+
 class WorkflowRepository(Protocol):
     """工作流唯一持久化端口。"""
 
@@ -209,6 +294,17 @@ class WorkflowRepository(Protocol):
         output: dict[str, Any],
     ) -> None: ...
 
+    def fail_director_step(
+        self,
+        *,
+        step_id: uuid.UUID,
+        response_id: str,
+        request_hash: str,
+        output: dict[str, Any],
+        code: str,
+        message: str,
+    ) -> None: ...
+
     def fail_step(
         self,
         step_id: uuid.UUID,
@@ -234,7 +330,14 @@ class WorkflowRepository(Protocol):
         day_step_id: uuid.UUID,
         day_prompt_id: uuid.UUID,
         episode_drafts: dict[str, dict[str, Any]],
+        planning_metadata: dict[str, Any],
     ) -> None: ...
+
+    def list_recent_completed_summaries(
+        self,
+        *,
+        limit: int,
+    ) -> tuple[RecentContentSummary, ...]: ...
 
     def get_planning_context(self, run_id: uuid.UUID) -> dict[str, Any]: ...
 
@@ -244,6 +347,14 @@ class WorkflowRepository(Protocol):
         run_id: uuid.UUID,
         phase: str,
         slot: Slot | None,
+    ) -> int: ...
+
+    def next_step_attempt(
+        self,
+        *,
+        episode_id: uuid.UUID,
+        kind: StepKind,
+        operation_key: str,
     ) -> int: ...
 
     def replace_episode_plan(
@@ -261,6 +372,18 @@ class WorkflowRepository(Protocol):
 
     def get_step(self, step_id: uuid.UUID) -> StoredStep: ...
 
+    def latest_retryable_step(
+        self,
+        episode_id: uuid.UUID,
+    ) -> StoredStep | None: ...
+
+    def get_prompt_for_step(
+        self,
+        step_id: uuid.UUID,
+        *,
+        purpose: str,
+    ) -> StoredPrompt: ...
+
     def list_resumable_steps(
         self,
         run_id: uuid.UUID | None,
@@ -273,7 +396,17 @@ class WorkflowRepository(Protocol):
         episode_id: uuid.UUID | None = None,
         roles: tuple[str, ...] = (),
         statuses: tuple[str, ...] = (),
+        semantic_keys: tuple[str, ...] = (),
     ) -> tuple[StoredAsset, ...]: ...
+
+    def find_reusable_asset(
+        self,
+        *,
+        episode_id: uuid.UUID,
+        role: str,
+        input_hash: str,
+        statuses: tuple[str, ...],
+    ) -> StoredAsset | None: ...
 
     def set_episode_status(
         self,
@@ -299,6 +432,7 @@ class WorkflowRepository(Protocol):
         episode_id: uuid.UUID | None,
         step_id: uuid.UUID | None,
         role: str,
+        semantic_key: str | None,
         scope: str,
         status: str,
         media_type: str,
@@ -324,6 +458,17 @@ class WorkflowRepository(Protocol):
         warnings: list[dict[str, Any]],
         evidence: dict[str, Any],
     ) -> uuid.UUID: ...
+
+    def commit_asset_review(
+        self,
+        *,
+        asset_id: uuid.UUID,
+        source: str,
+        decision: str,
+        reason: str | None,
+        warnings: list[dict[str, Any]],
+        evidence: dict[str, Any],
+    ) -> ReviewCommitResult: ...
 
     def set_asset_status(self, asset_id: uuid.UUID, status: str) -> None: ...
 
@@ -411,4 +556,27 @@ class MediaProbe(Protocol):
         *,
         expected_duration_seconds: int,
         expected_resolution: str,
+        minimum_duration_seconds: int = 8,
+        maximum_duration_seconds: int = 15,
+        duration_tolerance_ms: int = 1000,
     ) -> dict[str, Any]: ...
+
+
+class MediaFinalizer(Protocol):
+    """只有显式多片段或媒体不兼容时才调用的 FFmpeg 边界。"""
+
+    def concat(
+        self,
+        parts: tuple[StoredAsset, StoredAsset],
+        *,
+        target_duration_seconds: int,
+    ) -> FinalizedMedia: ...
+
+    def extract_last_frame(self, source: StoredAsset) -> Path: ...
+
+    def extract_review_frames(
+        self,
+        source: StoredAsset,
+        *,
+        count: int,
+    ) -> tuple[Path, ...]: ...

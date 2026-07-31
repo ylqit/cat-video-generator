@@ -15,9 +15,10 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from alembic import command
 from alembic.config import Config
 from sqlalchemy import Connection, Engine, inspect, text
+
+from alembic import command
 
 from .archive_import import import_archive
 from .session import ALEMBIC_HEAD

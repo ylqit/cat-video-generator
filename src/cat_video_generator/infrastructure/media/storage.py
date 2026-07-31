@@ -52,20 +52,19 @@ class LocalAssetStore:
             with httpx.Client(
                 follow_redirects=True,
                 timeout=httpx.Timeout(120.0, connect=15.0),
-            ) as client:
-                with client.stream("GET", url) as response:
-                    response.raise_for_status()
-                    with temporary.open("xb") as output:
-                        for chunk in response.iter_bytes():
-                            if not chunk:
-                                continue
-                            output.write(chunk)
-                            digest.update(chunk)
-                            byte_size += len(chunk)
-                            if byte_size > self._max_bytes:
-                                raise AssetStorageError("供应商媒体超过大小上限")
-                        output.flush()
-                        os.fsync(output.fileno())
+            ) as client, client.stream("GET", url) as response:
+                response.raise_for_status()
+                with temporary.open("xb") as output:
+                    for chunk in response.iter_bytes():
+                        if not chunk:
+                            continue
+                        output.write(chunk)
+                        digest.update(chunk)
+                        byte_size += len(chunk)
+                        if byte_size > self._max_bytes:
+                            raise AssetStorageError("供应商媒体超过大小上限")
+                    output.flush()
+                    os.fsync(output.fileno())
             if byte_size == 0:
                 raise AssetStorageError("供应商返回了空文件")
             sha256 = digest.hexdigest()

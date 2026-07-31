@@ -7,20 +7,25 @@ from pydantic import ValidationError
 
 from cat_video_generator.domain.contracts import (
     CriticalRelation,
-    DayBrief,
     DailyProductionPlan,
+    DayBrief,
+    EpisodeDirectorDraft,
+    GenerationStrategy,
     MediaBinding,
     MediaModality,
     MediaPurpose,
     ProviderMediaRole,
+    SegmentPlan,
     SlotBrief,
     VideoInputMode,
     VideoInputPlan,
 )
 from cat_video_generator.domain.prompts import (
     PromptBudgetError,
+    PromptCompilationError,
     compile_day_director_prompt,
     compile_episode_director_prompt,
+    compile_segment_video_prompt,
     compile_video_prompt,
 )
 from cat_video_generator.domain.rules import select_video_input_mode
@@ -145,18 +150,40 @@ def test_video_prompt_is_focused_and_uses_shot_order(
         input_plan=_input_plan(daily_plan, slot_index=1),
     )
     for heading in (
-        "【整体设定与素材绑定】",
-        "【镜头顺序】",
-        "【质量、物理与声音】",
+        "【输出、画风与素材绑定】",
+        "【顺序动作】",
+        "【可见世界状态与切镜连续性】",
     ):
         assert heading in prompt.text
     assert "镜头1" in prompt.text
     assert "00:" not in prompt.text
     assert "@图片1" in prompt.text
-    assert "<主体1>" in prompt.text
+    assert "<主体1>" not in prompt.text
+    assert "人物执行" in prompt.text
     assert "纯黑竖椭圆眼睛" not in prompt.text
     assert "眼白、虹膜" not in prompt.text
     assert prompt.char_count <= 1400
+
+
+def test_episode_draft_normalizes_unambiguous_provider_shape(daily_plan) -> None:
+    payload = daily_plan.episodes[0].model_dump(
+        exclude={
+            "slot",
+            "cast",
+            "video_input_mode",
+            "required_reference_roles",
+        }
+    )
+    payload["shot_boundary_states"] = payload["visible_world"].pop(
+        "shot_boundary_states"
+    )
+    for transition in payload["visible_world"]["action_transitions"]:
+        transition["continuous_shot"] = False
+    draft = EpisodeDirectorDraft.model_validate(payload)
+    assert draft.visible_world.shot_boundary_states
+    assert all(
+        item.continuous_shot for item in draft.visible_world.action_transitions
+    )
 
 
 def test_video_prompt_over_budget_never_gets_truncated(
@@ -214,6 +241,9 @@ def test_director_prompts_split_day_and_one_episode(
         previous_state_summaries=("上午已经结束并离开橱窗",),
     )
     assert "只输出一个" in episode_prompt
+    assert "不要因为交互次数较多而删减合理剧情" in episode_prompt
+    assert "VisibleWorldPlan的状态链完整自洽" in episode_prompt
+    assert "最多两个发生位置" not in episode_prompt
     assert "EpisodeDirectorDraft" in episode_prompt
     assert "required_reference_roles" in episode_prompt
     assert "由本地系统确定" in episode_prompt
@@ -249,10 +279,145 @@ def test_video_input_mode_is_only_upgraded_for_endpoint_risk(
             ],
         }
     )
-    assert select_video_input_mode(containment) is VideoInputMode.STRICT_FIRST_LAST
+    assert select_video_input_mode(containment) is VideoInputMode.MULTIMODAL_REFERENCE
 
 
-def test_simple_episode_uses_one_paragraph_prompt(
+def test_multi_clip_uses_two_disjoint_hard_cut_segments(
+    daily_plan: DailyProductionPlan,
+) -> None:
+    base = daily_plan.episodes[0]
+    episode = base.model_copy(
+        update={
+            "generation_strategy": GenerationStrategy.MULTI_CLIP,
+            "segments": [
+                SegmentPlan(
+                    order=1,
+                    shot_order=1,
+                    action_orders=[1],
+                    duration_seconds=4,
+                ),
+                SegmentPlan(
+                    order=2,
+                    shot_order=2,
+                    action_orders=[2, 3],
+                    duration_seconds=6,
+                ),
+            ],
+        }
+    )
+    episode = type(base).model_validate(episode.model_dump())
+    input_plan = _input_plan(daily_plan, slot_index=0).model_copy(
+        update={"duration_seconds": 4}
+    )
+
+    compiled = compile_segment_video_prompt(
+        episode,
+        episode.segments[0],
+        input_plan=input_plan,
+    )
+
+    assert "镜头1" in compiled.text
+    assert "镜头2" not in compiled.text
+    assert episode.actions[0].action in compiled.text
+    assert episode.actions[1].action not in compiled.text
+
+
+def test_multi_clip_rejects_overlapping_actions(
+    daily_plan: DailyProductionPlan,
+) -> None:
+    data = daily_plan.episodes[0].model_dump()
+    data.update(
+        {
+            "generation_strategy": "multi_clip",
+            "segments": [
+                {
+                    "order": 1,
+                    "shot_order": 1,
+                    "action_orders": [1, 2],
+                    "duration_seconds": 4,
+                },
+                {
+                    "order": 2,
+                    "shot_order": 2,
+                    "action_orders": [2, 3],
+                    "duration_seconds": 6,
+                },
+            ],
+        }
+    )
+    with pytest.raises(ValidationError, match="重复"):
+        type(daily_plan.episodes[0]).model_validate(data)
+
+
+def test_multi_clip_rejects_segment_shot_mismatch(
+    daily_plan: DailyProductionPlan,
+) -> None:
+    data = daily_plan.episodes[0].model_dump()
+    data.update(
+        {
+            "generation_strategy": "multi_clip",
+            "segments": [
+                {
+                    "order": 1,
+                    "shot_order": 2,
+                    "action_orders": [1],
+                    "duration_seconds": 4,
+                },
+                {
+                    "order": 2,
+                    "shot_order": 1,
+                    "action_orders": [2, 3],
+                    "duration_seconds": 6,
+                },
+            ],
+        }
+    )
+    with pytest.raises(ValidationError, match="一一对应"):
+        type(daily_plan.episodes[0]).model_validate(data)
+
+
+def test_segment_prompt_invalid_object_raises_business_error(
+    daily_plan: DailyProductionPlan,
+) -> None:
+    base = daily_plan.episodes[0]
+    episode = base.model_copy(
+        update={
+            "generation_strategy": GenerationStrategy.MULTI_CLIP,
+            "segments": [
+                SegmentPlan(
+                    order=1,
+                    shot_order=1,
+                    action_orders=[1],
+                    duration_seconds=4,
+                ),
+                SegmentPlan(
+                    order=2,
+                    shot_order=2,
+                    action_orders=[2, 3],
+                    duration_seconds=6,
+                ),
+            ],
+        }
+    )
+    invalid = SegmentPlan.model_construct(
+        order=1,
+        shot_order=3,
+        action_orders=[1],
+        duration_seconds=4,
+        requires_tail_link=False,
+    )
+    input_plan = _input_plan(daily_plan, slot_index=0).model_copy(
+        update={"duration_seconds": 4}
+    )
+    with pytest.raises(PromptCompilationError, match="不存在的镜头"):
+        compile_segment_video_prompt(
+            episode,
+            invalid,
+            input_plan=input_plan,
+        )
+
+
+def test_simple_episode_still_uses_five_focused_sections(
     daily_plan: DailyProductionPlan,
 ) -> None:
     episode = daily_plan.episodes[0].model_copy(
@@ -270,5 +435,6 @@ def test_simple_episode_uses_one_paragraph_prompt(
         update={"duration_seconds": episode.duration_seconds}
     )
     prompt = compile_video_prompt(episode, input_plan=plan)
-    assert "【镜头顺序】" not in prompt.text
-    assert "\n" not in prompt.text
+    assert "【顺序动作】" in prompt.text
+    assert "【可见世界状态与切镜连续性】" in prompt.text
+    assert prompt.char_count <= 1400

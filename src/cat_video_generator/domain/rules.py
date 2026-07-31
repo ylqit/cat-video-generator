@@ -11,12 +11,19 @@ from datetime import date
 from enum import StrEnum
 from typing import Iterable, Mapping
 
+from .continuity import assess_visible_world
 from .contracts import (
-    DayBrief,
     DailyProductionPlan,
+    DayBrief,
     EpisodePlan,
+    GenerationStrategy,
+    RecentContentSummary,
     SlotBrief,
     VideoInputMode,
+)
+from .visual_profiles import (
+    DEFAULT_SERIES_VISUAL_PROFILE,
+    SeriesVisualProfile,
 )
 
 
@@ -39,6 +46,7 @@ def validate_plan_gate(
     plan: DailyProductionPlan,
     *,
     expected_date: date | None = None,
+    series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
 ) -> tuple[GateIssue, ...]:
     """检查全天结构和跨时段外观逻辑。"""
 
@@ -72,32 +80,27 @@ def validate_plan_gate(
                 level=IssueLevel.HARD,
             )
         )
-    forbidden_eye_terms = (
-        "眼白",
-        "虹膜",
-        "写实瞳孔",
-        "glassy eye",
-        "realistic pupil",
-    )
     for episode in plan.episodes:
-        searchable = " ".join(
-            (
-                episode.main_event,
-                episode.scene,
-                episode.ending,
-                *(stage.action for stage in episode.actions),
-                *(stage.visible_result for stage in episode.actions),
-            )
-        ).lower()
-        if any(term in searchable for term in forbidden_eye_terms):
+        searchable = _episode_script_text(episode)
+        identity_rewrites = tuple(
+            term.lower()
+            for term in series_profile.forbidden_identity_rewrites
+        )
+        if _contains_identity_rewrite(searchable, identity_rewrites):
             issues.append(
                 GateIssue(
                     gate="identity",
-                    code="forbidden_eye_topology",
-                    message=(f"{episode.slot.value}脚本要求了与Canon冲突的眼睛结构。"),
+                    code="gendered_identity_rewrite",
+                    message=(
+                        f"{episode.slot.value}脚本把中性儿童改写为性别化身份或"
+                        "改变了固定发长。"
+                    ),
                     level=IssueLevel.HARD,
                 )
             )
+        count_issue = _fixed_cast_count_issue(episode, searchable)
+        if count_issue is not None:
+            issues.append(count_issue)
     return tuple(issues)
 
 
@@ -106,10 +109,32 @@ def validate_episode_against_brief(
     *,
     day_brief: DayBrief,
     slot_brief: SlotBrief,
+    series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
 ) -> tuple[GateIssue, ...]:
     """检查时段导演没有越过总导演边界或省略共享元素状态。"""
 
     issues: list[GateIssue] = []
+    count_issue = _fixed_cast_count_issue(
+        episode,
+        _episode_script_text(episode),
+    )
+    if count_issue is not None:
+        issues.append(count_issue)
+    identity_rewrites = tuple(
+        term.lower() for term in series_profile.forbidden_identity_rewrites
+    )
+    if _contains_identity_rewrite(_episode_script_text(episode), identity_rewrites):
+        issues.append(
+            GateIssue(
+                gate="identity",
+                code="gendered_identity_rewrite",
+                message=(
+                    f"{episode.slot.value}脚本把中性儿童改写为性别化身份或"
+                    "改变了固定发长。"
+                ),
+                level=IssueLevel.HARD,
+            )
+        )
     if episode.slot is not slot_brief.slot:
         issues.append(
             GateIssue(
@@ -143,7 +168,124 @@ def validate_episode_against_brief(
                 level=IssueLevel.HARD,
             )
         )
+    assert episode.visible_world is not None
+    world_report = assess_visible_world(episode.visible_world)
+    for message in world_report.contradictions:
+        issues.append(
+            GateIssue(
+                gate="continuity",
+                code="visible_world_contradiction",
+                message=message,
+                level=IssueLevel.HARD,
+            )
+        )
+    for message in world_report.render_risk_reasons:
+        issues.append(
+            GateIssue(
+                gate="render",
+                code="visible_world_render_risk",
+                message=message,
+                level=IssueLevel.WARNING,
+            )
+        )
+    action_orders = {item.order for item in episode.actions}
+    transition_orders = {
+        item.action_order for item in episode.visible_world.action_transitions
+    }
+    if transition_orders != action_orders:
+        issues.append(
+            GateIssue(
+                gate="continuity",
+                code="missing_action_transition",
+                message="VisibleWorldPlan必须为每个动作阶段提供一条状态转换。",
+                level=IssueLevel.HARD,
+            )
+        )
+    for transition in episode.visible_world.action_transitions:
+        if not transition.no_state_change and transition.state_entity_id is None:
+            issues.append(
+                GateIssue(
+                    gate="continuity",
+                    code="missing_state_entity",
+                    message=(
+                        f"动作{transition.action_order}必须显式声明stateEntityId，"
+                        "纯观察动作则声明noStateChange"
+                    ),
+                    level=IssueLevel.HARD,
+                )
+            )
+    shot_orders = {item.order for item in episode.shots}
+    if any(
+        item.shot_order not in shot_orders
+        for item in episode.visible_world.action_transitions
+    ):
+        issues.append(
+            GateIssue(
+                gate="continuity",
+                code="unknown_transition_shot",
+                message="VisibleWorldPlan动作引用了不存在的镜头。",
+                level=IssueLevel.HARD,
+            )
+        )
     return tuple(issues)
+
+
+def _episode_script_text(episode: EpisodePlan) -> str:
+    world_text: tuple[str, ...] = ()
+    if episode.visible_world is not None:
+        world_text = tuple(
+            value
+            for item in episode.visible_world.tracked_entities
+            for value in (item.display_name, item.appearance_signature)
+        )
+    return " ".join(
+        (
+            episode.main_event,
+            episode.scene,
+            episode.appearance.description,
+            episode.ending,
+            *(stage.action for stage in episode.actions),
+            *(stage.visible_result for stage in episode.actions),
+            *(shot.framing for shot in episode.shots),
+            *(shot.direction for shot in episode.shots),
+            *world_text,
+        )
+    ).lower()
+
+
+def _contains_identity_rewrite(
+    text: str,
+    forbidden_terms: tuple[str, ...],
+) -> bool:
+    """在执行文本中查找身份改写，同时保护与人物无关的固定复合词。"""
+
+    protected_terms = ("少年宫", "马尾松")
+    scrubbed = text
+    for protected in protected_terms:
+        scrubbed = scrubbed.replace(protected, "")
+    return any(term in scrubbed for term in forbidden_terms)
+
+
+def _fixed_cast_count_issue(
+    episode: EpisodePlan,
+    searchable: str,
+) -> GateIssue | None:
+    extra_person_terms = (
+        "两人一猫",
+        "两个人一只猫",
+        "两名儿童",
+        "两个儿童",
+        "第二个儿童",
+        "第二名儿童",
+    )
+    if not any(term in searchable for term in extra_person_terms):
+        return None
+    return GateIssue(
+        gate="identity",
+        code="fixed_cast_count_mismatch",
+        message=f"{episode.slot.value}脚本把固定一人一猫改写成了额外人物。",
+        level=IssueLevel.HARD,
+    )
 
 
 def validate_input_gate(
@@ -168,21 +310,137 @@ def validate_input_gate(
 def select_video_input_mode(episode: EpisodePlan) -> VideoInputMode:
     """选择满足本集端点精度需求的最低Seedance输入模式。
 
-    身份、画风和普通元素优先走多模态参考；只有关键包含、交接或空间边界的
-    结果状态必须精确时才切到严格首尾帧，避免把帧锚定误当成通用身份方案。
+    身份、画风和普通元素优先走多模态参考。包含、交接或边界关系本身不再
+    自动升级首尾帧；只有导演显式声明端点构图需要精确锚定时才使用严格模式。
     """
 
     if episode.video_input_mode is VideoInputMode.STRICT_FIRST_LAST:
         return VideoInputMode.STRICT_FIRST_LAST
-    high_risk_relations = {"containment", "handoff", "boundary"}
-    if any(
-        relation.relation in high_risk_relations
-        for relation in episode.critical_relations
-    ):
-        return VideoInputMode.STRICT_FIRST_LAST
     if episode.video_input_mode is VideoInputMode.STRICT_FIRST_FRAME:
         return VideoInputMode.STRICT_FIRST_FRAME
     return VideoInputMode.MULTIMODAL_REFERENCE
+
+
+def validate_generation_strategy(episode: EpisodePlan) -> tuple[GateIssue, ...]:
+    """验证分段只用于两个天然硬切镜头，不能成为自动失败重试。"""
+
+    if episode.generation_strategy is GenerationStrategy.SINGLE_PASS:
+        return ()
+    issues: list[GateIssue] = []
+    if len(episode.shots) != 2 or len(episode.segments) != 2:
+        issues.append(
+            GateIssue(
+                gate="render",
+                code="invalid_multi_clip_shape",
+                message="multi_clip必须由两个天然硬切镜头和两个片段组成。",
+                level=IssueLevel.HARD,
+            )
+        )
+        return tuple(issues)
+    if any(item.duration_seconds < 4 for item in episode.segments):
+        issues.append(
+            GateIssue(
+                gate="render",
+                code="segment_too_short",
+                message="multi_clip每段至少4秒。",
+                level=IssueLevel.HARD,
+            )
+        )
+    assert episode.visible_world is not None
+    if episode.segments[1].requires_tail_link:
+        boundaries = {
+            (item.after_shot_order, item.next_shot_order)
+            for item in episode.visible_world.shot_boundary_states
+        }
+        if (1, 2) not in boundaries:
+            issues.append(
+                GateIssue(
+                    gate="render",
+                    code="missing_segment_boundary_state",
+                    message="连续空间第二段必须声明镜头1到镜头2的状态继承",
+                    level=IssueLevel.HARD,
+                )
+            )
+    action_to_shot = {
+        item.action_order: item.shot_order
+        for item in episode.visible_world.action_transitions
+    }
+    for transition in episode.visible_world.action_transitions:
+        if (
+            transition.continuous_shot
+            and transition.action_order in action_to_shot
+            and any(
+                transition.action_order in segment.action_orders
+                and segment.shot_order != action_to_shot[transition.action_order]
+                for segment in episode.segments
+            )
+        ):
+            issues.append(
+                GateIssue(
+                    gate="render",
+                    code="physical_change_crosses_cut",
+                    message="高风险物理变化不能跨multi_clip切点。",
+                    level=IssueLevel.HARD,
+                )
+            )
+    return tuple(issues)
+
+
+def validate_recent_cooldown(
+    plan: DailyProductionPlan,
+    recent_summaries: Iterable[RecentContentSummary],
+) -> tuple[GateIssue, ...]:
+    """按结构化键检查全天冷却，不再用中文子串猜测。"""
+
+    return tuple(
+        issue
+        for episode in plan.episodes
+        for issue in validate_episode_cooldown(episode, recent_summaries)
+    )
+
+
+def validate_episode_cooldown(
+    episode: EpisodePlan,
+    recent_summaries: Iterable[RecentContentSummary],
+) -> tuple[GateIssue, ...]:
+    """在每个时段导演返回后立即检查事件、地点和关键元素冷却。"""
+
+    recent = tuple(recent_summaries)
+    event_keys = {key for item in recent for key in item.event_keys}
+    location_keys = {key for item in recent for key in item.location_keys}
+    element_keys = {
+        key for item in recent for key in item.element_semantic_keys
+    }
+    issues: list[GateIssue] = []
+    if episode.event_key and episode.event_key in event_keys:
+        issues.append(
+            GateIssue(
+                gate="planning",
+                code="recent_event_repeat",
+                message=f"{episode.slot.value}事件键仍在近期冷却期。",
+                level=IssueLevel.HARD,
+            )
+        )
+    if episode.location_key and episode.location_key in location_keys:
+        issues.append(
+            GateIssue(
+                gate="planning",
+                code="recent_location_repeat",
+                message=f"{episode.slot.value}地点键仍在近期冷却期。",
+                level=IssueLevel.HARD,
+            )
+        )
+    current_elements = set(episode.reference_semantic_keys)
+    if current_elements and current_elements.issubset(element_keys):
+        issues.append(
+            GateIssue(
+                gate="planning",
+                code="recent_prop_set_repeat",
+                message=f"{episode.slot.value}关键元素组合仍在冷却期。",
+                level=IssueLevel.HARD,
+            )
+        )
+    return tuple(issues)
 
 
 def validate_critical_continuity(

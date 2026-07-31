@@ -30,15 +30,26 @@ class FfprobeMediaProbe:
             with Image.open(path) as image:
                 width, height = image.size
                 image_format = (image.format or "").lower()
+                rgb = image.convert("RGB")
+                edges = (
+                    [rgb.getpixel((0, y)) for y in range(height)]
+                    + [rgb.getpixel((width - 1, y)) for y in range(height)]
+                    + [rgb.getpixel((x, 0)) for x in range(width)]
+                    + [rgb.getpixel((x, height - 1)) for x in range(width)]
+                )
         except (OSError, ValueError) as exc:
             raise MediaQcError(f"图片不可读取: {exc}") from exc
         if image_format not in {"png", "jpeg", "webp"}:
             raise MediaQcError(f"不支持的图片格式: {image_format}")
+        dark_edge_ratio = sum(max(pixel) <= 8 for pixel in edges) / len(edges)
         return {
             "passed": True,
             "format": image_format,
             "width": width,
             "height": height,
+            "ratio": width / height,
+            "darkEdgeRatio": round(dark_edge_ratio, 4),
+            "blackBorderDetected": dark_edge_ratio >= 0.45,
         }
 
     def inspect_video(
@@ -47,6 +58,9 @@ class FfprobeMediaProbe:
         *,
         expected_duration_seconds: int,
         expected_resolution: str,
+        minimum_duration_seconds: int = 8,
+        maximum_duration_seconds: int = 15,
+        duration_tolerance_ms: int = 1000,
     ) -> dict[str, Any]:
         payload = self._ffprobe(path)
         streams = payload.get("streams", [])
@@ -90,8 +104,11 @@ class FfprobeMediaProbe:
             failures.append("ratio_not_9_16")
         if (
             duration_ms is None
-            or not 8000 <= duration_ms <= 15000
-            or abs(duration_ms - expected_duration_seconds * 1000) > 1000
+            or not minimum_duration_seconds * 1000
+            <= duration_ms
+            <= maximum_duration_seconds * 1000
+            or abs(duration_ms - expected_duration_seconds * 1000)
+            > duration_tolerance_ms
         ):
             failures.append("duration_invalid")
         return {
@@ -100,6 +117,14 @@ class FfprobeMediaProbe:
             "container": format_info.get("format_name"),
             "videoCodec": None if video is None else video.get("codec_name"),
             "audioCodec": None if audio is None else audio.get("codec_name"),
+            "frameRate": None if video is None else video.get("avg_frame_rate"),
+            "timeBase": None if video is None else video.get("time_base"),
+            "pixelFormat": None if video is None else video.get("pix_fmt"),
+            "audioSampleRate": None if audio is None else audio.get("sample_rate"),
+            "audioChannels": None if audio is None else audio.get("channels"),
+            "audioChannelLayout": (
+                None if audio is None else audio.get("channel_layout")
+            ),
             "width": width,
             "height": height,
             "durationMs": duration_ms,

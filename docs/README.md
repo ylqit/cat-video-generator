@@ -6,7 +6,8 @@
 - [完整三时段生产流程](workflows/complete-production.md)
 - [Windows运行手册](workflows/windows-runbook.md)
 - [火山方舟多模态能力与Prompt基线](providers/volcengine-multimodal.md)
-- [FastAPI只读接口](http-api.md)
+- [本地FastAPI接口](http-api.md)
+- [可见世界融合改造Checklist](checklists/visible-world-integration.md)
 - [用户提供的设计脚本教程](设计脚本教程)
 - [Seedance 2.0工程化Prompt规则](SKILL.md)
 

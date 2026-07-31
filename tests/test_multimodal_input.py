@@ -15,7 +15,7 @@ from cat_video_generator.domain.contracts import (
     VideoInputPlan,
 )
 from cat_video_generator.domain.media import MediaSource, build_video_input_plan
-from cat_video_generator.infrastructure.ark.gateway import ArkGateway
+from cat_video_generator.infrastructure.ark.gateway import ArkGateway, ArkGatewayError
 
 
 def _source(
@@ -69,6 +69,24 @@ def test_multimodal_plan_uses_stable_per_modality_aliases(daily_plan) -> None:
         ProviderMediaRole.REFERENCE_VIDEO,
         ProviderMediaRole.REFERENCE_AUDIO,
     ]
+
+
+def test_full_seedance_profile_uses_same_product_input_contract(daily_plan) -> None:
+    episode = daily_plan.episodes[0].model_copy(
+        update={"video_input_mode": VideoInputMode.MULTIMODAL_REFERENCE}
+    )
+    plan = build_video_input_plan(
+        episode,
+        model="doubao-seedance-2-0-260128",
+        resolution="480p",
+        sources=(
+            _source("person", "image", index=1),
+            _source("cat", "image", index=2),
+            _source("style", "image", index=3),
+        ),
+    )
+    assert plan.model == "doubao-seedance-2-0-260128"
+    assert plan.resolution == "480p"
 
 
 def test_strict_first_last_rejects_extra_reference_media(daily_plan) -> None:
@@ -157,6 +175,43 @@ class _Tasks:
 class _Client:
     def __init__(self) -> None:
         self.content_generation = SimpleNamespace(tasks=_Tasks())
+
+
+class _IncompleteResponses:
+    def __init__(self) -> None:
+        self.request = None
+
+    def create(self, **kwargs):
+        self.request = kwargs
+        return SimpleNamespace(
+            status="incomplete",
+            incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+        )
+
+
+def test_director_disables_thinking_and_reports_incomplete_reason() -> None:
+    settings = RuntimeSettings.from_env(
+        {
+            "ARK_API_KEY": "test-key",
+            "ARK_ACCESS_MODE": "standard",
+            "ARK_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
+            "ARK_IMAGE_MODEL": "doubao-seedream-5-0-260128",
+            "ARK_VIDEO_MODEL": "doubao-seedance-2-0-mini-260615",
+            "ARK_PLANNING_MODEL": "director-model",
+            "PATH": "",
+        }
+    )
+    responses = _IncompleteResponses()
+    client = SimpleNamespace(responses=responses)
+    gateway = ArkGateway(settings, client=client)
+    with pytest.raises(ArkGatewayError, match="max_output_tokens") as error:
+        gateway.generate_structured(
+            prompt="生成一天方向",
+            schema={"type": "object", "properties": {}},
+            output_name="DayBrief",
+        )
+    assert error.value.retryable is True
+    assert responses.request["thinking"] == {"type": "disabled"}
 
 
 def test_gateway_maps_image_video_audio_content(tmp_path) -> None:

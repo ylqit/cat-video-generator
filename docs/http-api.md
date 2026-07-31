@@ -48,6 +48,11 @@ POST /api/v1/runs/{runId}/deliver           # 构建本地交付包
 
 - 规划与生成必须在请求体携带 `"allowPaidGeneration": true`，否则直接
   `422`，等价于 CLI 的 `--allow-paid-generation`。
+- `generate`还支持`"allowUnverifiedKeyframes": true`和
+  `"allowMultiClip": true`，分别对应实验性技术关键帧放行和显式双片段路径；
+  它们都不能代替付费许可，也不是默认值。
+- Canon上传必须同时提交`semantic_key`；人物或猫咪视角资产还应提交
+  `view=front|side|back`。新Run不按笼统role回退选择素材。
 - `plans`、`generate`、`resume` 立即返回 `202 {jobId, dedupKey}`，服务端
   在线程池中推进并落库；前端轮询 `/runs/{runId}/graph` 观察分镜状态，
   轮询 `/jobs/{jobId}` 获取任务级结果与错误。相同 `dedupKey` 的活跃任务
@@ -67,6 +72,8 @@ POST /api/v1/runs/{runId}/deliver           # 构建本地交付包
 - 实际持久化 Prompt（展开时经 `/prompts/{promptId}` 拉取全文）。
 - 分镜图、视频资产（`/assets/{assetId}/content` 直接播放）、QC 与
   审核结果。
+- `VisibleWorldPlan`校验、实际资产语义键、关键帧语义审核、生成策略与
+  视频抽帧诊断证据。
 
 ## 可选令牌
 

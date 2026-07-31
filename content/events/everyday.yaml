@@ -1,0 +1,21 @@
+events:
+  - seed_id: window-light-follow
+    direction: 角色在室内追随一小段移动光影，环境变化触发猫咪一次自然回应
+    slots: [morning, noon]
+    weather_tags: [晴, 阳光]
+    context_tags: [居家, 室内]
+  - seed_id: wind-carried-small-object
+    direction: 微风推动一个轻小物体，人物与猫咪围绕同一主事件观察并解决
+    slots: [morning, noon, evening]
+    weather_tags: [风, 微风]
+    context_tags: [公园, 郊游, 户外]
+  - seed_id: shared-sound-discovery
+    direction: 一段环境声音先出现，人物与猫咪循声发现来源并得到轻量回报
+    slots: [morning, noon, evening]
+    weather_tags: []
+    context_tags: []
+  - seed_id: cat-social-reaction
+    direction: 灰白猫与一名临时动物配角发生一次玩耍反应，人物只观察不承担第二任务
+    slots: [noon, evening]
+    weather_tags: []
+    context_tags: [社区, 公园, 院子]

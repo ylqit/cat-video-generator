@@ -16,6 +16,7 @@ class WorkflowTransitionError(ValueError):
 
 class RunStatus(StrEnum):
     DRAFT = "draft"
+    PLANNING_REVIEW = "planning_review"
     PLANNED = "planned"
     GENERATING = "generating"
     REVIEWING = "reviewing"
@@ -61,7 +62,18 @@ class StepStatus(StrEnum):
 
 
 _RUN_TRANSITIONS = {
-    RunStatus.DRAFT: {RunStatus.PLANNED, RunStatus.FAILED, RunStatus.ARCHIVED},
+    RunStatus.DRAFT: {
+        RunStatus.PLANNING_REVIEW,
+        RunStatus.PLANNED,
+        RunStatus.FAILED,
+        RunStatus.ARCHIVED,
+    },
+    RunStatus.PLANNING_REVIEW: {
+        RunStatus.DRAFT,
+        RunStatus.PLANNED,
+        RunStatus.FAILED,
+        RunStatus.ARCHIVED,
+    },
     RunStatus.PLANNED: {
         RunStatus.GENERATING,
         RunStatus.FAILED,
@@ -85,7 +97,13 @@ _RUN_TRANSITIONS = {
         RunStatus.ARCHIVED,
     },
     RunStatus.DELIVERED: {RunStatus.ARCHIVED},
-    RunStatus.FAILED: {RunStatus.GENERATING, RunStatus.ARCHIVED},
+    # 初始导演链失败后可复用已成功的DayBrief继续补齐Episode，再回到planned。
+    RunStatus.FAILED: {
+        RunStatus.PLANNING_REVIEW,
+        RunStatus.PLANNED,
+        RunStatus.GENERATING,
+        RunStatus.ARCHIVED,
+    },
     RunStatus.ARCHIVED: set(),
 }
 

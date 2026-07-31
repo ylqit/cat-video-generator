@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from ...config import DatabaseOperation, DatabaseSettings
 from .models import SCHEMA_NAME
 
-ALEMBIC_HEAD = "0002_multimodal_input"
+ALEMBIC_HEAD = "0004_planning_review"
 
 
 def create_database_engine(

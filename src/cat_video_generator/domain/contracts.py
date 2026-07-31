@@ -9,9 +9,30 @@ from __future__ import annotations
 from datetime import date
 from enum import StrEnum
 from typing import Annotated, Any, Literal
-from uuid import UUID
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, Field, model_validator
+
+from .continuity import DominantView, VisibleWorldPlan
+from .contract_base import StrictModel
+from .media_contracts import (
+    MediaBinding,
+    MediaModality,
+    MediaPurpose,
+    ProviderMediaRole,
+    VideoInputMode,
+    VideoInputPlan,
+)
+from .provider_normalization import normalize_episode_draft_payload
+
+__all__ = [
+    "MediaBinding",
+    "MediaModality",
+    "MediaPurpose",
+    "ProviderMediaRole",
+    "StrictModel",
+    "VideoInputMode",
+    "VideoInputPlan",
+]
 
 
 class Slot(StrEnum):
@@ -28,45 +49,6 @@ class Slot(StrEnum):
             Slot.NOON: 2,
             Slot.EVENING: 3,
         }[self]
-
-
-class VideoInputMode(StrEnum):
-    """Seedance输入模式；严格帧锚定与多模态参考保持互斥。"""
-
-    MULTIMODAL_REFERENCE = "multimodal_reference"
-    STRICT_FIRST_FRAME = "strict_first_frame"
-    STRICT_FIRST_LAST = "strict_first_last"
-
-
-class MediaModality(StrEnum):
-    """Ark视频任务支持的三类参考媒体。"""
-
-    IMAGE = "image"
-    VIDEO = "video"
-    AUDIO = "audio"
-
-
-class MediaPurpose(StrEnum):
-    """素材在本条视频中的业务用途，而不是供应商字段名。"""
-
-    IDENTITY = "identity"
-    STYLE = "style"
-    ELEMENT = "element"
-    SCENE = "scene"
-    MOTION = "motion"
-    ATMOSPHERE = "atmosphere"
-    SEMANTIC_OPENING = "semantic_opening"
-    SEMANTIC_ENDING = "semantic_ending"
-
-
-class ProviderMediaRole(StrEnum):
-    """Ark content数组中的媒体角色。"""
-
-    REFERENCE_IMAGE = "reference_image"
-    REFERENCE_VIDEO = "reference_video"
-    REFERENCE_AUDIO = "reference_audio"
-    FIRST_FRAME = "first_frame"
-    LAST_FRAME = "last_frame"
 
 
 class AppearanceContinuity(StrEnum):
@@ -87,14 +69,11 @@ class CameraMove(StrEnum):
     TRACK = "track"
 
 
-class StrictModel(BaseModel):
-    """禁止静默接收导演临时发明的字段，避免契约再次失控。"""
+class GenerationStrategy(StrEnum):
+    """一条Episode的供应商任务组织方式。"""
 
-    model_config = ConfigDict(
-        extra="forbid",
-        str_strip_whitespace=True,
-        populate_by_name=True,
-    )
+    SINGLE_PASS = "single_pass"
+    MULTI_CLIP = "multi_clip"
 
 
 class AppearancePlan(StrictModel):
@@ -136,6 +115,10 @@ class ActionStage(StrictModel):
     """一个连续动作阶段；不是独立视频，也不是精确逐帧剪辑点。"""
 
     order: Annotated[int, Field(ge=1, le=4)]
+    actor_id: Annotated[
+        str,
+        Field(pattern=r"^(person|cat|guest|environment)$"),
+    ]
     action: Annotated[str, Field(min_length=6, max_length=280)]
     visible_result: Annotated[str, Field(min_length=4, max_length=180)]
 
@@ -150,111 +133,13 @@ class ShotPlan(StrictModel):
     )
     framing: Annotated[str, Field(min_length=2, max_length=80)]
     camera_move: CameraMove
+    dominant_view: DominantView = DominantView.MIXED
     direction: Annotated[str, Field(min_length=4, max_length=180)]
 
     @model_validator(mode="after")
     def validate_actions(self) -> ShotPlan:
         if len(set(self.action_orders)) != len(self.action_orders):
             raise ValueError("同一镜头不能重复引用动作阶段")
-        return self
-
-
-class MediaBinding(StrictModel):
-    """Prompt素材别名与Ark content项共用的唯一绑定记录。"""
-
-    asset_id: UUID
-    source_role: Annotated[
-        str,
-        Field(pattern=r"^[a-z][a-z0-9_]{1,63}$"),
-    ]
-    modality: MediaModality
-    purpose: MediaPurpose
-    provider_role: ProviderMediaRole
-    ordinal: Annotated[int, Field(ge=1, le=9)]
-    prompt_alias: Annotated[
-        str,
-        Field(pattern=r"^@(图片|视频|音频)[1-9]$"),
-    ]
-    required: bool = True
-    sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
-
-    @model_validator(mode="after")
-    def validate_prompt_alias(self) -> MediaBinding:
-        labels = {
-            MediaModality.IMAGE: "图片",
-            MediaModality.VIDEO: "视频",
-            MediaModality.AUDIO: "音频",
-        }
-        expected = f"@{labels[self.modality]}{self.ordinal}"
-        if self.prompt_alias != expected:
-            raise ValueError(f"素材别名必须与模态和顺序一致，期望{expected}")
-        return self
-
-
-class VideoInputPlan(StrictModel):
-    """一次Seedance任务最终使用的模型、规格与有序多模态输入。"""
-
-    model: Annotated[str, Field(min_length=3, max_length=200)]
-    input_mode: VideoInputMode
-    resolution: Literal["480p", "720p"]
-    duration_seconds: Annotated[int, Field(ge=8, le=15)]
-    native_audio: bool = True
-    prompt_dialect: Literal["seedance_skill_v1"] = "seedance_skill_v1"
-    bindings: list[MediaBinding] = Field(default_factory=list, max_length=15)
-
-    @model_validator(mode="after")
-    def validate_bindings(self) -> VideoInputPlan:
-        aliases = [item.prompt_alias for item in self.bindings]
-        if len(set(aliases)) != len(aliases):
-            raise ValueError("多模态素材别名不能重复")
-        asset_ids = [item.asset_id for item in self.bindings]
-        if len(set(asset_ids)) != len(asset_ids):
-            raise ValueError("同一资产不能重复绑定到一个视频任务")
-
-        by_modality = {
-            modality: [item for item in self.bindings if item.modality is modality]
-            for modality in MediaModality
-        }
-        limits = {
-            MediaModality.IMAGE: 9,
-            MediaModality.VIDEO: 3,
-            MediaModality.AUDIO: 3,
-        }
-        for modality, items in by_modality.items():
-            if len(items) > limits[modality]:
-                raise ValueError(f"{modality.value}素材数量不能超过{limits[modality]}")
-            if [item.ordinal for item in items] != list(range(1, len(items) + 1)):
-                raise ValueError("同一模态的素材序号必须从1开始连续递增")
-
-        if self.bindings and not (
-            by_modality[MediaModality.IMAGE] or by_modality[MediaModality.VIDEO]
-        ):
-            raise ValueError("音频参考必须与图片或视频视觉输入共同使用")
-
-        if self.input_mode is VideoInputMode.MULTIMODAL_REFERENCE:
-            expected_roles = {
-                MediaModality.IMAGE: ProviderMediaRole.REFERENCE_IMAGE,
-                MediaModality.VIDEO: ProviderMediaRole.REFERENCE_VIDEO,
-                MediaModality.AUDIO: ProviderMediaRole.REFERENCE_AUDIO,
-            }
-            if any(
-                item.provider_role is not expected_roles[item.modality]
-                for item in self.bindings
-            ):
-                raise ValueError("多模态参考模式只能使用reference媒体角色")
-            return self
-
-        if self.input_mode is VideoInputMode.STRICT_FIRST_FRAME:
-            expected = [ProviderMediaRole.FIRST_FRAME]
-        else:
-            expected = [
-                ProviderMediaRole.FIRST_FRAME,
-                ProviderMediaRole.LAST_FRAME,
-            ]
-        if [item.provider_role for item in self.bindings] != expected or any(
-            item.modality is not MediaModality.IMAGE for item in self.bindings
-        ):
-            raise ValueError("严格帧模式只能按顺序发送对应的图片帧")
         return self
 
 
@@ -303,6 +188,31 @@ class ElementUse(StrictModel):
     final_state: Annotated[str, Field(min_length=2, max_length=180)]
 
 
+class SceneProp(StrictModel):
+    """本时段场景中会出现的家具或道具及其初始空间位置。
+
+    镜头与首尾帧中命名的具体物体必须先在这里建账，避免画面中出现
+    未申报物体或已申报物体无故消失。
+    """
+
+    name: Annotated[str, Field(min_length=2, max_length=30)]
+    placement: Annotated[str, Field(min_length=2, max_length=80)]
+    final_placement: Annotated[str, Field(min_length=2, max_length=80)] | None = None
+
+
+class SegmentPlan(StrictModel):
+    """显式multi_clip时的一个自然硬切片段。"""
+
+    order: Annotated[int, Field(ge=1, le=2)]
+    shot_order: Annotated[int, Field(ge=1, le=3)]
+    action_orders: list[Annotated[int, Field(ge=1, le=4)]] = Field(
+        min_length=1,
+        max_length=4,
+    )
+    duration_seconds: Annotated[int, Field(ge=4, le=11)]
+    requires_tail_link: bool = False
+
+
 class SlotBrief(StrictModel):
     """总导演交给单个时段导演的边界，不包含具体分镜。"""
 
@@ -336,8 +246,11 @@ class EpisodeDirectorDraft(StrictModel):
     """时段导演只负责创意字段；固定ID和输入顺序由本地组装。"""
 
     title: Annotated[str, Field(min_length=2, max_length=80)]
+    event_key: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{1,79}$")
+    location_key: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{1,79}$")
     main_event: Annotated[str, Field(min_length=6, max_length=260)]
     scene: Annotated[str, Field(min_length=6, max_length=320)]
+    style_context: Literal["indoor", "outdoor"] = "outdoor"
     appearance: AppearancePlan
     actions: list[ActionStage] = Field(min_length=2, max_length=4)
     shots: list[ShotPlan] = Field(min_length=1, max_length=3)
@@ -349,15 +262,39 @@ class EpisodeDirectorDraft(StrictModel):
         default_factory=list,
         max_length=6,
     )
+    scene_inventory: list[SceneProp] = Field(default_factory=list, max_length=10)
+    visible_world: VisibleWorldPlan
+    # 两个关键物体需要同屏时应制作一张组合元素图，避免人物、猫咪和双画风之外
+    # 再塞入多张弱相关参考，导致 Seedream 输入超过 3～5 张注意力预算。
+    reference_semantic_keys: list[str] = Field(default_factory=list, max_length=1)
+    generation_strategy: GenerationStrategy = GenerationStrategy.SINGLE_PASS
+    segments: list[SegmentPlan] = Field(default_factory=list, max_length=2)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_provider_shape(cls, value: Any) -> Any:
+        """修正Ark JSON对象模式下可确定推导的字段位置，不改写剧情语义。"""
+
+        return normalize_episode_draft_payload(value)
 
     def finalize(self, slot: Slot) -> EpisodePlan:
         """补齐不可由导演自由改写的协议字段。"""
 
+        extra_roles = [
+            key.split(":", 1)[0]
+            for key in self.reference_semantic_keys
+            if key.split(":", 1)[0] in {"element", "scene"}
+        ]
         return EpisodePlan(
             slot=slot,
             cast=["person", "cat"],
             video_input_mode=VideoInputMode.MULTIMODAL_REFERENCE,
-            required_reference_roles=["person", "cat", "style"],
+            required_reference_roles=[
+                "person",
+                "cat",
+                "style",
+                *dict.fromkeys(extra_roles),
+            ],
             **self.model_dump(),
         )
 
@@ -367,8 +304,17 @@ class EpisodePlan(StrictModel):
 
     slot: Slot
     title: Annotated[str, Field(min_length=2, max_length=80)]
+    event_key: str | None = Field(
+        default=None,
+        pattern=r"^[a-z0-9][a-z0-9_-]{1,79}$",
+    )
+    location_key: str | None = Field(
+        default=None,
+        pattern=r"^[a-z0-9][a-z0-9_-]{1,79}$",
+    )
     main_event: Annotated[str, Field(min_length=6, max_length=260)]
     scene: Annotated[str, Field(min_length=6, max_length=320)]
+    style_context: Literal["indoor", "outdoor"] = "outdoor"
     cast: list[Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{1,79}$")]] = Field(
         min_length=2, max_length=3
     )
@@ -397,6 +343,37 @@ class EpisodePlan(StrictModel):
         default_factory=list,
         max_length=6,
     )
+    scene_inventory: list[SceneProp] = Field(default_factory=list, max_length=10)
+    visible_world: VisibleWorldPlan | None = None
+    reference_semantic_keys: list[str] = Field(default_factory=list, max_length=1)
+    generation_strategy: GenerationStrategy = GenerationStrategy.SINGLE_PASS
+    segments: list[SegmentPlan] = Field(default_factory=list, max_length=2)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_visible_world(cls, value: Any) -> Any:
+        """兼容历史Episode；新导演草稿仍必须显式声明每个动作主体。"""
+
+        if not isinstance(value, dict):
+            return value
+        migrated = dict(value)
+        migrated["actions"] = [
+            (
+                {"actor_id": "person", **item}
+                if isinstance(item, dict) and "actor_id" not in item
+                else item
+            )
+            for item in migrated.get("actions", [])
+        ]
+        if migrated.get("visible_world") is None:
+            props = [
+                SceneProp.model_validate(item)
+                for item in migrated.get("scene_inventory", [])
+            ]
+            migrated["visible_world"] = VisibleWorldPlan.from_scene_props(
+                props
+            ).model_dump(mode="json")
+        return migrated
 
     @model_validator(mode="after")
     def validate_episode(self) -> EpisodePlan:
@@ -410,17 +387,29 @@ class EpisodePlan(StrictModel):
             self.required_reference_roles
         ):
             raise ValueError("required_reference_roles不能重复")
+        if len(set(self.reference_semantic_keys)) != len(
+            self.reference_semantic_keys
+        ):
+            raise ValueError("reference_semantic_keys不能重复")
+        for semantic_key in self.reference_semantic_keys:
+            prefix = semantic_key.split(":", 1)[0]
+            if prefix not in {"element", "scene"}:
+                raise ValueError("Episode附加参考只能使用element或scene语义键")
+            if prefix not in self.required_reference_roles:
+                raise ValueError("reference_semantic_keys必须对应required_reference_roles")
         orders = [stage.order for stage in self.actions]
         if orders != list(range(1, len(self.actions) + 1)):
             raise ValueError("动作阶段order必须从1开始连续递增")
         shot_orders = [shot.order for shot in self.shots]
         if shot_orders and shot_orders != list(range(1, len(self.shots) + 1)):
             raise ValueError("镜头order必须从1开始连续递增")
-        referenced_actions = {
+        referenced_actions = [
             action_order for shot in self.shots for action_order in shot.action_orders
-        }
-        if referenced_actions and referenced_actions != set(orders):
+        ]
+        if referenced_actions and set(referenced_actions) != set(orders):
             raise ValueError("镜头计划必须完整且仅引用现有动作阶段")
+        if len(referenced_actions) != len(set(referenced_actions)):
+            raise ValueError("每个动作阶段只能归属于一个镜头")
         if len(set(self.shared_element_ids)) != len(self.shared_element_ids):
             raise ValueError("shared_element_ids不能重复")
         used_ids = [item.element_id for item in self.element_uses]
@@ -428,6 +417,46 @@ class EpisodePlan(StrictModel):
             raise ValueError("element_uses不能重复引用同一元素")
         if used_ids and set(used_ids) != set(self.shared_element_ids):
             raise ValueError("element_uses必须完整对应shared_element_ids")
+        prop_names = [prop.name for prop in self.scene_inventory]
+        if len(set(prop_names)) != len(prop_names):
+            raise ValueError("scene_inventory道具名称不能重复")
+        if self.visible_world is None:
+            raise ValueError("Episode必须包含VisibleWorldPlan")
+        if self.generation_strategy is GenerationStrategy.SINGLE_PASS:
+            if self.segments:
+                raise ValueError("single_pass不能声明分段计划")
+        else:
+            if self.video_input_mode is not VideoInputMode.MULTIMODAL_REFERENCE:
+                raise ValueError("multi_clip天然硬切片段必须使用multimodal_reference")
+            if len(self.segments) != 2:
+                raise ValueError("multi_clip必须且只能声明两个片段")
+            if [item.order for item in self.segments] != [1, 2]:
+                raise ValueError("multi_clip片段order必须为1、2")
+            if sum(item.duration_seconds for item in self.segments) != (
+                self.duration_seconds
+            ):
+                raise ValueError("multi_clip片段总时长必须等于Episode时长")
+            if len(self.shots) != 2:
+                raise ValueError("multi_clip只允许两个天然硬切镜头")
+            if [item.shot_order for item in self.segments] != [
+                item.order for item in self.shots
+            ]:
+                raise ValueError("multi_clip片段必须按顺序与两个镜头一一对应")
+            segment_actions = [
+                order for segment in self.segments for order in segment.action_orders
+            ]
+            if len(segment_actions) != len(set(segment_actions)):
+                raise ValueError("multi_clip动作阶段不能跨片段重复")
+            for segment, shot in zip(self.segments, self.shots, strict=True):
+                if segment.action_orders != shot.action_orders:
+                    raise ValueError("multi_clip片段动作必须与对应镜头完全一致")
+            if self.segments[0].requires_tail_link:
+                raise ValueError("只有第二个片段可以要求继承前段真实尾帧")
+            covered = {
+                order for segment in self.segments for order in segment.action_orders
+            }
+            if covered != set(orders):
+                raise ValueError("multi_clip片段必须完整覆盖动作阶段")
         return self
 
 
@@ -462,3 +491,13 @@ class DailyProductionPlan(StrictModel):
                         f"共享元素{element_id}没有声明用于{episode.slot.value}"
                     )
         return self
+
+
+class RecentContentSummary(StrictModel):
+    """一个已批准或已交付Run用于冷却的结构化摘要。"""
+
+    content_date: date
+    event_keys: tuple[str, ...] = ()
+    location_keys: tuple[str, ...] = ()
+    element_semantic_keys: tuple[str, ...] = ()
+    summary_text: str = Field(min_length=1, max_length=2000)

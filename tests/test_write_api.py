@@ -38,12 +38,22 @@ class FakeProduction:
     def __init__(self) -> None:
         self.run_day_calls: list[dict] = []
 
-    def run_day(self, run_id, *, slot, allow_paid_generation):
+    def run_day(
+        self,
+        run_id,
+        *,
+        slot,
+        allow_paid_generation,
+        allow_unverified_keyframes,
+        allow_multi_clip,
+    ):
         self.run_day_calls.append(
             {
                 "runId": run_id,
                 "slot": slot,
                 "allowPaidGeneration": allow_paid_generation,
+                "allowUnverifiedKeyframes": allow_unverified_keyframes,
+                "allowMultiClip": allow_multi_clip,
             }
         )
         return {"runId": str(run_id), "episodes": []}
@@ -67,9 +77,16 @@ class FakeAssets:
             "decision": "approved" if approve else "rejected",
         }
 
-    def import_canon(self, *, role, path):
+    def import_canon(self, *, role, path, semantic_key, view):
         assert path.is_file()
-        self.import_calls.append({"role": role, "path": path})
+        self.import_calls.append(
+            {
+                "role": role,
+                "path": path,
+                "semanticKey": semantic_key,
+                "view": view,
+            }
+        )
         return {
             "assetId": str(uuid.uuid4()),
             "role": role,
@@ -266,7 +283,7 @@ def test_canon_upload_saves_and_imports(tmp_path: Path) -> None:
     client = _client(tmp_path, assets=assets)
     response = client.post(
         "/api/v1/canon",
-        data={"role": "cat"},
+        data={"role": "cat", "semantic_key": "cat:front", "view": "front"},
         files={"file": ("cat.png", b"png-bytes", "image/png")},
     )
     assert response.status_code == 201
@@ -280,13 +297,13 @@ def test_canon_rejects_bad_role_and_suffix(tmp_path: Path) -> None:
     client = _client(tmp_path)
     bad_role = client.post(
         "/api/v1/canon",
-        data={"role": "dog"},
+        data={"role": "dog", "semantic_key": "dog:front", "view": "front"},
         files={"file": ("dog.png", b"x", "image/png")},
     )
     assert bad_role.status_code == 422
     bad_suffix = client.post(
         "/api/v1/canon",
-        data={"role": "cat"},
+        data={"role": "cat", "semantic_key": "cat:front", "view": "front"},
         files={"file": ("cat.txt", b"x", "text/plain")},
     )
     assert bad_suffix.status_code == 422

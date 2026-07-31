@@ -298,6 +298,13 @@ class Asset(Base):
         ),
         Index("ix_assets_sha256_role", "sha256", "role"),
         Index("ix_assets_run_episode_role", "production_run_id", "episode_id", "role"),
+        Index(
+            "ix_assets_semantic_selection",
+            "scope",
+            "semantic_key",
+            "status",
+            "created_at",
+        ),
         {"schema": SCHEMA_NAME},
     )
 
@@ -319,6 +326,7 @@ class Asset(Base):
         ForeignKey(f"{SCHEMA_NAME}.workflow_steps.id", ondelete="SET NULL"),
     )
     role: Mapped[str] = mapped_column(String(64), nullable=False)
+    semantic_key: Mapped[str | None] = mapped_column(String(160))
     scope: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False)
     media_type: Mapped[str] = mapped_column(String(32), nullable=False)

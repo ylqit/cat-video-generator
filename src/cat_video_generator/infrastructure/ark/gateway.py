@@ -23,10 +23,13 @@ from ...application.ports import (
     DirectorResult,
     GatewayError,
     ImageResult,
+    VideoDiagnosticResult,
     VideoTaskResult,
+    VisualReviewResult,
 )
 from ...config import RuntimeSettings
 from ...domain.contracts import MediaModality, VideoInputPlan
+from .review_schemas import KEYFRAME_REVIEW_SCHEMA, VIDEO_DIAGNOSTIC_SCHEMA
 
 
 class ArkGatewayError(GatewayError):
@@ -76,6 +79,10 @@ class ArkGateway:
     def video_model(self) -> str:
         return self._settings.ark_video_model
 
+    @property
+    def review_model(self) -> str:
+        return self._settings.ark_review_model
+
     def generate_structured(
         self,
         *,
@@ -104,16 +111,29 @@ class ArkGateway:
                 text={"format": text_format},
                 temperature=0.35,
                 max_output_tokens=8000,
+                # 导演结果必须是短小、可校验的JSON。关闭隐藏思考，避免推理内容
+                # 消耗输出预算后只返回incomplete，创意约束仍由分层Prompt承担。
+                thinking={"type": "disabled"},
                 store=False,
                 timeout=180.0,
             )
         except ArkAPIError as exc:
             raise _provider_error(exc, submission=True) from exc
         if response.status != "completed":
+            incomplete_reason = getattr(
+                getattr(response, "incomplete_details", None),
+                "reason",
+                "",
+            )
+            suffix = f"，原因={incomplete_reason}" if incomplete_reason else ""
             raise ArkGatewayError(
-                f"Ark导演任务状态为{response.status!r}",
-                code="director_not_completed",
-                retryable=False,
+                f"Ark导演任务状态为{response.status!r}{suffix}",
+                code=(
+                    f"director_incomplete_{incomplete_reason}"
+                    if response.status == "incomplete" and incomplete_reason
+                    else "director_not_completed"
+                ),
+                retryable=incomplete_reason == "max_output_tokens",
             )
         try:
             payload = json.loads(_response_text(response))
@@ -166,6 +186,169 @@ class ArkGateway:
             url=response.data[0].url,
             model=getattr(response, "model", self.image_model),
         )
+
+    def review_keyframe(
+        self,
+        *,
+        prompt: str,
+        image_path: Path,
+    ) -> VisualReviewResult:
+        """使用独立视觉模型审核关键帧，不复用导演输出语义。"""
+
+        schema = KEYFRAME_REVIEW_SCHEMA
+        instructions, text_format = self._structured_output(
+            prompt,
+            schema,
+            "KeyframeSemanticReview",
+        )
+        image_sha256 = hashlib.sha256(image_path.read_bytes()).hexdigest()
+        request_hash = _json_hash(
+            {
+                "model": self.review_model,
+                "instructions": instructions,
+                "schema": schema,
+                "imageSha256": image_sha256,
+            }
+        )
+        try:
+            response = self._client.responses.create(
+                model=self.review_model,
+                instructions=instructions,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "审核这张关键帧并只返回结构化结果。",
+                            },
+                            {
+                                "type": "input_image",
+                                "image_url": _asset_data_url(image_path),
+                            },
+                        ],
+                    }
+                ],
+                text={"format": text_format},
+                temperature=0,
+                max_output_tokens=1800,
+                thinking={"type": "disabled"},
+                store=False,
+                timeout=180.0,
+            )
+        except ArkAPIError as exc:
+            raise _provider_error(exc, submission=True) from exc
+        if response.status != "completed":
+            raise ArkGatewayError(
+                f"Ark关键帧审核状态为{response.status!r}",
+                code="visual_review_not_completed",
+                retryable=False,
+            )
+        try:
+            payload = json.loads(_response_text(response))
+            return VisualReviewResult(
+                identity_ok=bool(payload["identityOk"]),
+                style_ok=bool(payload["styleOk"]),
+                world_state_ok=bool(payload["worldStateOk"]),
+                scene_topology_ok=bool(payload["sceneTopologyOk"]),
+                confidence=float(payload["confidence"]),
+                violations=tuple(str(item) for item in payload["violations"]),
+                evidence=tuple(str(item) for item in payload["evidence"]),
+                response_id=response.id,
+                model=response.model,
+                request_hash=request_hash,
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ArkGatewayError(
+                "Ark关键帧审核没有返回合法结构。",
+                code="invalid_visual_review_output",
+                retryable=False,
+            ) from exc
+
+    def diagnose_video_frames(
+        self,
+        *,
+        prompt: str,
+        frame_paths: tuple[Path, ...],
+    ) -> VideoDiagnosticResult:
+        """按时间顺序审核抽帧序列；诊断结果不直接批准最终视频。"""
+
+        if not 4 <= len(frame_paths) <= 12:
+            raise ArkGatewayError(
+                "视频语义诊断需要4至12张有序抽帧",
+                code="invalid_video_review_frame_count",
+                retryable=False,
+            )
+        schema = VIDEO_DIAGNOSTIC_SCHEMA
+        instructions, text_format = self._structured_output(
+            prompt,
+            schema,
+            "VideoSemanticDiagnostic",
+        )
+        frame_hashes = [
+            hashlib.sha256(path.read_bytes()).hexdigest() for path in frame_paths
+        ]
+        request_hash = _json_hash(
+            {
+                "model": self.review_model,
+                "instructions": instructions,
+                "schema": schema,
+                "orderedFrameSha256": frame_hashes,
+            }
+        )
+        content: list[dict[str, str]] = [
+            {
+                "type": "input_text",
+                "text": "以下图片按视频时间顺序排列，请只返回结构化诊断。",
+            }
+        ]
+        content.extend(
+            {
+                "type": "input_image",
+                "image_url": _asset_data_url(path),
+            }
+            for path in frame_paths
+        )
+        try:
+            response = self._client.responses.create(
+                model=self.review_model,
+                instructions=instructions,
+                input=[{"role": "user", "content": content}],
+                text={"format": text_format},
+                temperature=0,
+                max_output_tokens=2400,
+                thinking={"type": "disabled"},
+                store=False,
+                timeout=240.0,
+            )
+        except ArkAPIError as exc:
+            raise _provider_error(exc, submission=True) from exc
+        if response.status != "completed":
+            raise ArkGatewayError(
+                f"Ark视频语义诊断状态为{response.status!r}",
+                code="video_diagnostic_not_completed",
+                retryable=False,
+            )
+        try:
+            payload = json.loads(_response_text(response))
+            return VideoDiagnosticResult(
+                identity_ok=bool(payload["identityOk"]),
+                style_ok=bool(payload["styleOk"]),
+                world_continuity_ok=bool(payload["worldContinuityOk"]),
+                narrative_order_ok=bool(payload["narrativeOrderOk"]),
+                confidence=float(payload["confidence"]),
+                violations=tuple(str(item) for item in payload["violations"]),
+                evidence=tuple(str(item) for item in payload["evidence"]),
+                response_id=response.id,
+                model=response.model,
+                request_hash=request_hash,
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ArkGatewayError(
+                "Ark视频语义诊断没有返回合法结构。",
+                code="invalid_video_diagnostic_output",
+                retryable=False,
+            ) from exc
 
     def submit_video(
         self,

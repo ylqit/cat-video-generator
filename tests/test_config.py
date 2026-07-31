@@ -50,7 +50,7 @@ def test_runtime_settings_require_paid_permission_and_valid_resolution() -> None
         "DAILY_PLAN_CANDIDATE_COUNT": "1",
     }
     settings = RuntimeSettings.from_env(values)
-    assert settings.keyframe_review_mode.value == "technical_auto"
+    assert settings.keyframe_review_mode.value == "semantic_auto"
     assert settings.configuration_warnings == ()
     with pytest.raises(ConfigurationError, match="allow-paid-generation"):
         settings.validate_for_generation(allow_paid_generation=False)
@@ -70,10 +70,26 @@ def test_legacy_auto_review_mode_maps_with_warning() -> None:
     assert "更新.env" in settings.configuration_warnings[0]
 
 
-def test_current_runtime_rejects_unprofiled_media_models() -> None:
+def test_runtime_accepts_full_seedance_profile_and_rejects_unknown_model() -> None:
     values = {
         "ARK_API_KEY": "test-key",
         "ARK_VIDEO_MODEL": "doubao-seedance-2-0-260128",
     }
-    with pytest.raises(ConfigurationError, match="Mini|mini"):
+    RuntimeSettings.from_env(values).validate_for_ark_access()
+    values["ARK_VIDEO_MODEL"] = "unknown-video-model"
+    with pytest.raises(ConfigurationError, match="能力档案"):
         RuntimeSettings.from_env(values).validate_for_ark_access()
+
+
+def test_event_seed_root_resolves_from_explicit_config_root(tmp_path) -> None:
+    config_root = tmp_path / "project"
+    seed_root = config_root / "content" / "events"
+    seed_root.mkdir(parents=True)
+
+    settings = RuntimeSettings.from_env(
+        {"CAT_VIDEO_EVENT_SEED_ROOT": "content/events"},
+        config_root=config_root,
+    )
+
+    assert settings.event_seed_root == seed_root.resolve()
+    assert settings.configuration_warnings == ()
