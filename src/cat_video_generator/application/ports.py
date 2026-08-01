@@ -14,12 +14,11 @@ from typing import Any, Protocol
 
 from ..domain.contracts import (
     DailyProductionPlan,
-    DayBrief,
     EpisodePlan,
     RecentContentSummary,
     Slot,
-    VideoInputPlan,
 )
+from ..domain.rendering import VideoInputPlan
 from ..domain.workflow import EpisodeStatus, RunStatus, StepKind, StepStatus
 
 
@@ -111,7 +110,8 @@ class StoredStep:
     attempt: int
     provider_task_id: str | None
     model: str | None
-    request_summary: dict[str, Any] = field(default_factory=dict)
+    operation_key: str
+    input_snapshot: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,15 +156,6 @@ class DeliveryBuild:
     path: Path
     manifest_sha256: str
     items: tuple[dict[str, str | int], ...]
-
-
-@dataclass(frozen=True, slots=True)
-class FinalizedMedia:
-    """条件式后期生成的临时媒体及所采用的最小修复策略。"""
-
-    path: Path
-    policy: str
-    duration_trimmed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,266 +247,91 @@ class VisualReviewGateway(Protocol):
     ) -> VideoDiagnosticResult: ...
 
 
-class WorkflowRepository(Protocol):
-    """工作流唯一持久化端口。"""
+class PlanningStore(Protocol):
+    """导演规划所需的最小持久化能力。"""
 
     def create_draft_run(self, content_date: date) -> uuid.UUID: ...
-
-    def create_step_intent(
-        self,
-        *,
-        run_id: uuid.UUID,
-        episode_id: uuid.UUID | None,
-        parent_step_id: uuid.UUID | None,
-        kind: StepKind,
-        attempt: int,
-        provider: str | None,
-        model: str | None,
-        input_hash: str,
-        request_summary: dict[str, Any],
-    ) -> StoredStep: ...
-
-    def save_prompt(
-        self,
-        *,
-        step_id: uuid.UUID,
-        parent_prompt_id: uuid.UUID | None,
-        purpose: str,
-        model: str,
-        text: str,
-    ) -> uuid.UUID: ...
-
-    def finish_director_step(
-        self,
-        *,
-        step_id: uuid.UUID,
-        response_id: str,
-        request_hash: str,
-        output: dict[str, Any],
-    ) -> None: ...
-
-    def fail_director_step(
-        self,
-        *,
-        step_id: uuid.UUID,
-        response_id: str,
-        request_hash: str,
-        output: dict[str, Any],
-        code: str,
-        message: str,
-    ) -> None: ...
-
-    def fail_step(
-        self,
-        step_id: uuid.UUID,
-        *,
-        code: str,
-        message: str,
-        submission_unknown: bool = False,
-    ) -> None: ...
-
-    def finalize_plan(
-        self,
-        *,
-        run_id: uuid.UUID,
-        plan: DailyProductionPlan,
-        selected_candidate: int,
-    ) -> None: ...
-
-    def save_planning_context(
-        self,
-        *,
-        run_id: uuid.UUID,
-        day_brief: DayBrief,
-        day_step_id: uuid.UUID,
-        day_prompt_id: uuid.UUID,
-        episode_drafts: dict[str, dict[str, Any]],
-        planning_metadata: dict[str, Any],
-    ) -> None: ...
-
+    def create_step_intent(self, **kwargs: Any) -> StoredStep: ...
+    def save_prompt(self, **kwargs: Any) -> uuid.UUID: ...
+    def finish_director_step(self, **kwargs: Any) -> None: ...
+    def fail_director_step(self, **kwargs: Any) -> None: ...
+    def fail_step(self, step_id: uuid.UUID, **kwargs: Any) -> None: ...
+    def finalize_plan(self, **kwargs: Any) -> None: ...
+    def save_planning_context(self, **kwargs: Any) -> None: ...
     def list_recent_completed_summaries(
-        self,
-        *,
-        limit: int,
+        self, *, limit: int
     ) -> tuple[RecentContentSummary, ...]: ...
-
     def get_planning_context(self, run_id: uuid.UUID) -> dict[str, Any]: ...
-
     def next_director_attempt(
-        self,
-        *,
-        run_id: uuid.UUID,
-        phase: str,
-        slot: Slot | None,
+        self, *, run_id: uuid.UUID, phase: str, slot: Slot | None
     ) -> int: ...
-
-    def next_step_attempt(
-        self,
-        *,
-        episode_id: uuid.UUID,
-        kind: StepKind,
-        operation_key: str,
-    ) -> int: ...
-
-    def replace_episode_plan(
-        self,
-        *,
-        run_id: uuid.UUID,
-        episode: EpisodePlan,
-    ) -> None: ...
-
-    def get_prompt_overrides(self, episode_id: uuid.UUID) -> dict[str, str]: ...
-
-    def save_prompt_overrides(
-        self,
-        *,
-        episode_id: uuid.UUID,
-        overrides: dict[str, str] | None,
-    ) -> None: ...
-
+    def replace_episode_plan(self, **kwargs: Any) -> None: ...
     def get_run(self, run_id: uuid.UUID) -> StoredRun: ...
-
-    def get_episode(self, run_id: uuid.UUID, slot: Slot) -> StoredEpisode: ...
-
-    def list_episodes(self, run_id: uuid.UUID) -> tuple[StoredEpisode, ...]: ...
-
     def get_step(self, step_id: uuid.UUID) -> StoredStep: ...
-
-    def latest_retryable_step(
-        self,
-        episode_id: uuid.UUID,
-    ) -> StoredStep | None: ...
-
-    def get_prompt_for_step(
-        self,
-        step_id: uuid.UUID,
-        *,
-        purpose: str,
-    ) -> StoredPrompt: ...
-
-    def list_resumable_steps(
-        self,
-        run_id: uuid.UUID | None,
-    ) -> tuple[StoredStep, ...]: ...
-
-    def list_assets(
-        self,
-        *,
-        run_id: uuid.UUID | None = None,
-        episode_id: uuid.UUID | None = None,
-        roles: tuple[str, ...] = (),
-        statuses: tuple[str, ...] = (),
-        semantic_keys: tuple[str, ...] = (),
-    ) -> tuple[StoredAsset, ...]: ...
-
-    def find_reusable_asset(
-        self,
-        *,
-        episode_id: uuid.UUID,
-        role: str,
-        input_hash: str,
-        statuses: tuple[str, ...],
-    ) -> StoredAsset | None: ...
-
-    def set_episode_status(
-        self,
-        episode_id: uuid.UUID,
-        target: EpisodeStatus,
-    ) -> None: ...
-
+    def set_step_status(self, step_id: uuid.UUID, target: StepStatus, **kwargs: Any) -> None: ...
     def set_run_status(self, run_id: uuid.UUID, target: RunStatus) -> None: ...
+    def record_review(self, **kwargs: Any) -> uuid.UUID: ...
 
-    def set_step_status(
-        self,
-        step_id: uuid.UUID,
-        target: StepStatus,
-        *,
-        provider_task_id: str | None = None,
-        request_summary_patch: dict[str, Any] | None = None,
+
+class ProductionStore(Protocol):
+    """媒体生产、恢复、审核与交付所需的持久化能力。"""
+
+    def create_step_intent(self, **kwargs: Any) -> StoredStep: ...
+    def save_prompt(self, **kwargs: Any) -> uuid.UUID: ...
+    def fail_step(self, step_id: uuid.UUID, **kwargs: Any) -> None: ...
+    def next_step_attempt(
+        self, *, episode_id: uuid.UUID, kind: StepKind, operation_key: str
+    ) -> int: ...
+    def replace_episode_plan(self, **kwargs: Any) -> None: ...
+    def get_prompt_overrides(self, episode_id: uuid.UUID) -> dict[str, str]: ...
+    def save_prompt_overrides(self, **kwargs: Any) -> None: ...
+    def get_run(self, run_id: uuid.UUID) -> StoredRun: ...
+    def get_episode(self, run_id: uuid.UUID, slot: Slot) -> StoredEpisode: ...
+    def list_episodes(self, run_id: uuid.UUID) -> tuple[StoredEpisode, ...]: ...
+    def get_step(self, step_id: uuid.UUID) -> StoredStep: ...
+    def latest_retryable_step(self, episode_id: uuid.UUID) -> StoredStep | None: ...
+    def get_prompt_for_step(
+        self, step_id: uuid.UUID, *, purpose: str
+    ) -> StoredPrompt: ...
+    def list_resumable_steps(
+        self, run_id: uuid.UUID | None
+    ) -> tuple[StoredStep, ...]: ...
+    def list_assets(self, **kwargs: Any) -> tuple[StoredAsset, ...]: ...
+    def find_reusable_asset(self, **kwargs: Any) -> StoredAsset | None: ...
+    def set_episode_status(
+        self, episode_id: uuid.UUID, target: EpisodeStatus
     ) -> None: ...
-
-    def save_asset(
-        self,
-        *,
-        run_id: uuid.UUID | None,
-        episode_id: uuid.UUID | None,
-        step_id: uuid.UUID | None,
-        role: str,
-        semantic_key: str | None,
-        scope: str,
-        status: str,
-        media_type: str,
-        landed: LandedAsset,
-        metadata: dict[str, Any],
-    ) -> StoredAsset: ...
-
-    def select_video_asset(
-        self,
-        *,
-        episode_id: uuid.UUID,
-        asset_id: uuid.UUID,
-    ) -> None: ...
-
-    def record_review(
-        self,
-        *,
-        step_id: uuid.UUID,
-        asset_id: uuid.UUID | None,
-        source: str,
-        decision: str,
-        reason: str | None,
-        warnings: list[dict[str, Any]],
-        evidence: dict[str, Any],
-    ) -> uuid.UUID: ...
-
-    def commit_asset_review(
-        self,
-        *,
-        asset_id: uuid.UUID,
-        source: str,
-        decision: str,
-        reason: str | None,
-        warnings: list[dict[str, Any]],
-        evidence: dict[str, Any],
-    ) -> ReviewCommitResult: ...
-
+    def set_run_status(self, run_id: uuid.UUID, target: RunStatus) -> None: ...
+    def set_step_status(self, step_id: uuid.UUID, target: StepStatus, **kwargs: Any) -> None: ...
+    def save_asset(self, **kwargs: Any) -> StoredAsset: ...
+    def select_video_asset(self, **kwargs: Any) -> None: ...
+    def record_review(self, **kwargs: Any) -> uuid.UUID: ...
+    def commit_asset_review(self, **kwargs: Any) -> ReviewCommitResult: ...
     def set_asset_status(self, asset_id: uuid.UUID, status: str) -> None: ...
-
+    def asset_detail(self, asset_id: uuid.UUID) -> StoredAsset: ...
+    def episode_detail(self, episode_id: uuid.UUID) -> dict[str, Any]: ...
     def next_delivery_revision(self, run_id: uuid.UUID) -> int: ...
+    def save_delivery(self, **kwargs: Any) -> uuid.UUID: ...
 
-    def save_delivery(
-        self,
-        *,
-        run_id: uuid.UUID,
-        revision: int,
-        local_path: Path,
-        manifest_sha256: str,
-        items: tuple[dict[str, Any], ...],
-    ) -> uuid.UUID: ...
+
+class QueryStore(Protocol):
+    """CLI和HTTP共享查询所需的只读能力。"""
 
     def workflow_graph(self, run_id: uuid.UUID) -> dict[str, Any]: ...
-
     def list_run_summaries(self, limit: int, offset: int) -> list[dict[str, Any]]: ...
-
     def prompt_detail(self, prompt_id: uuid.UUID) -> dict[str, Any]: ...
-
     def asset_detail(self, asset_id: uuid.UUID) -> StoredAsset: ...
-
     def episode_detail(self, episode_id: uuid.UUID) -> dict[str, Any]: ...
-
     def step_detail(self, step_id: uuid.UUID) -> dict[str, Any]: ...
-
-    def list_delivery_packages(
-        self,
-        run_id: uuid.UUID,
-    ) -> list[dict[str, Any]]: ...
-
-    def delivery_package_detail(
-        self,
-        package_id: uuid.UUID,
-    ) -> dict[str, Any]: ...
-
+    def list_assets(self, **kwargs: Any) -> tuple[StoredAsset, ...]: ...
+    def get_prompt_overrides(self, episode_id: uuid.UUID) -> dict[str, str]: ...
+    def list_delivery_packages(self, run_id: uuid.UUID) -> list[dict[str, Any]]: ...
+    def delivery_package_detail(self, package_id: uuid.UUID) -> dict[str, Any]: ...
     def health(self) -> dict[str, Any]: ...
+
+
+class WorkflowRepository(PlanningStore, ProductionStore, QueryStore, Protocol):
+    """基础设施组合实现遵循的完整能力集合；Application不直接依赖它。"""
 
 
 class AssetStore(Protocol):
@@ -571,17 +387,8 @@ class MediaProbe(Protocol):
     ) -> dict[str, Any]: ...
 
 
-class MediaFinalizer(Protocol):
-    """只有显式多片段或媒体不兼容时才调用的 FFmpeg 边界。"""
-
-    def concat(
-        self,
-        parts: tuple[StoredAsset, StoredAsset],
-        *,
-        target_duration_seconds: int,
-    ) -> FinalizedMedia: ...
-
-    def extract_last_frame(self, source: StoredAsset) -> Path: ...
+class ReviewFrameExtractor(Protocol):
+    """只为最终视频语义诊断抽帧，不承担拼接或转码。"""
 
     def extract_review_frames(
         self,

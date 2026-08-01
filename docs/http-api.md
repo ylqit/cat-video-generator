@@ -1,4 +1,4 @@
-# FastAPI本机接口
+# FastAPI 本机接口
 
 启动：
 
@@ -6,11 +6,9 @@
 uv run cvg api
 ```
 
-默认地址：`http://127.0.0.1:8765`。默认启动完整接口（只读 + 写端点 +
-后台任务），`--read-only` 退回纯只读模式，`--static-dir web/dist` 可让
-同一进程托管前端构建产物。
+默认监听 `http://127.0.0.1:8765`。`--read-only` 只启用查询路由；`--static-dir web/dist` 可托管前端构建产物。
 
-## 只读路由
+## 查询路由
 
 ```text
 GET /api/v1/health
@@ -18,6 +16,7 @@ GET /api/v1/runs
 GET /api/v1/runs/{runId}
 GET /api/v1/runs/{runId}/graph
 GET /api/v1/episodes/{episodeId}
+GET /api/v1/episodes/{episodeId}/prompt-preview
 GET /api/v1/steps/{stepId}
 GET /api/v1/prompts/{promptId}
 GET /api/v1/assets/{assetId}
@@ -29,54 +28,33 @@ GET /api/v1/jobs
 GET /api/v1/jobs/{jobId}
 ```
 
-CLI 与 HTTP 共用 `QueryService`，不会各自推测状态。
+CLI 和 HTTP 共用 `QueryService`。媒体读取会验证路径属于资产根或交付根，路径越界返回 `403`。
 
-`/assets/{assetId}/content` 只允许读取配置的资产根目录或交付根目录中的
-文件。即使数据库中出现异常路径，越界访问也返回 `403`。交付包
-`manifest.json` 的读取同样受交付根目录白名单约束。
-
-## 写路由（生产控制）
+## 生产控制路由
 
 ```text
-POST /api/v1/plans                          # 全天规划（后台任务）
-POST /api/v1/runs/{runId}/generate          # 按slot或全天生成（后台任务）
-POST /api/v1/runs/{runId}/resume            # 恢复在途供应商任务（后台任务，不扣费）
-POST /api/v1/assets/{assetId}/review        # 人工审核，body: {approve, reason}
-POST /api/v1/canon                          # multipart上传person/cat/style图
-POST /api/v1/runs/{runId}/deliver           # 构建本地交付包
+POST /api/v1/plans
+POST /api/v1/runs/{runId}/generate
+POST /api/v1/runs/{runId}/resume
+POST /api/v1/runs/{runId}/resume-planning
+POST /api/v1/runs/{runId}/episodes/{slot}/replan
+POST /api/v1/steps/{stepId}/retry
+POST /api/v1/assets/{assetId}/review
+POST /api/v1/canon
+POST /api/v1/canon/{assetId}/derive-crop
+POST /api/v1/episodes/{episodeId}/references
+PUT  /api/v1/episodes/{episodeId}/prompt-overrides
+POST /api/v1/episodes/{episodeId}/keyframes
+POST /api/v1/runs/{runId}/deliver
 ```
 
-- 规划与生成必须在请求体携带 `"allowPaidGeneration": true`，否则直接
-  `422`，等价于 CLI 的 `--allow-paid-generation`。
-- `generate`还支持`"allowUnverifiedKeyframes": true`和
-  `"allowMultiClip": true`，分别对应实验性技术关键帧放行和显式双片段路径；
-  它们都不能代替付费许可，也不是默认值。
-- Canon上传必须同时提交`semantic_key`；人物或猫咪视角资产还应提交
-  `view=front|side|back`。新Run不按笼统role回退选择素材。
-- `plans`、`generate`、`resume` 立即返回 `202 {jobId, dedupKey}`，服务端
-  在线程池中推进并落库；前端轮询 `/runs/{runId}/graph` 观察分镜状态，
-  轮询 `/jobs/{jobId}` 获取任务级结果与错误。相同 `dedupKey` 的活跃任务
-  重复提交返回 `409`；付费任务在进程内串行执行，防止重复扣费。
-- 错误映射：参数或状态非法 `422`、记录不存在 `404`、供应商错误 `502`、
-  任务冲突 `409`。
-- `submission_unknown` 步骤保持冻结，`resume` 也不会重复 POST，必须人工
-  对账。
+- 规划、生成和收费重试必须显式提交 `allowPaidGeneration=true`。
+- `generate` 可指定 morning/noon/evening；不提供分段或分辨率实验参数。
+- `retry` 只接受失败、过期或取消的终态 Step；`submission_unknown` 仍冻结。
+- Canon 与 Episode 参考素材必须携带 `semantic_key`。
+- 规划和生成返回 `202 {jobId, dedupKey}`，前端轮询 Job 与 Run graph。
+- 最终视频由人工审核，API 不会自动完成交付。
 
-## 前端数据源
+JobRegistry 只在本进程执行后台函数和去重活跃请求；Run、Episode、Step、Prompt、Asset 的持久状态全部来自 PostgreSQL。
 
-本地前端（`web/`，Vue3 + Element Plus）以 `/runs/{runId}/graph` 为主
-数据源展示：
-
-- 三个 Episode 的 1、2、3 顺序与状态机进度。
-- 每个 Step 的状态和 Ark task ID。
-- 实际持久化 Prompt（展开时经 `/prompts/{promptId}` 拉取全文）。
-- 分镜图、视频资产（`/assets/{assetId}/content` 直接播放）、QC 与
-  审核结果。
-- `VisibleWorldPlan`校验、实际资产语义键、关键帧语义审核、生成策略与
-  视频抽帧诊断证据。
-
-## 可选令牌
-
-服务只监听 `127.0.0.1`，本机使用不需要认证。若设置环境变量
-`CAT_VIDEO_API_TOKEN`，所有 `/api/` 请求必须携带
-`Authorization: Bearer <token>`。
+若设置 `CAT_VIDEO_API_TOKEN`，所有 `/api/` 请求必须携带 `Authorization: Bearer <token>`。

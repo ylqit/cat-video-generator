@@ -1,7 +1,7 @@
-"""Seedance任务、下载与视频技术QC用例。
+"""Seedance single-pass提交、轮询、下载、技术QC与语义诊断。
 
-本模块只拥有视频收费任务的幂等、轮询和落盘生命周期。参考图选择与关键帧审核
-由 ``VisualPreparationService`` 完成，Run/Episode顺序由 ``ProductionService`` 编排。
+本服务拥有完整视频任务的一条生命周期。它不选择剧情、不生成关键帧，也不自动重试
+收费请求；失败后只能由 ``retry-step`` 创建新attempt。
 """
 
 from __future__ import annotations
@@ -10,185 +10,173 @@ import hashlib
 import json
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
-from ..domain.contracts import (
-    GenerationStrategy,
-    SegmentPlan,
-    VideoInputMode,
-)
-from ..domain.media import MediaSource, build_video_input_plan
-from ..domain.prompts import (
-    CompiledPrompt,
-    compile_segment_video_prompt,
-    compile_video_prompt,
-)
+from ..domain.prompts import CompiledPrompt, compile_video_diagnostic_prompt, compile_video_prompt
+from ..domain.rendering import MediaSource, build_video_input_plan
+from ..domain.snapshots import VideoInputSnapshot
 from ..domain.visual_profiles import StyleProfile
 from ..domain.workflow import EpisodeStatus, StepKind, StepStatus
 from .errors import StepRetryRequired
-from .multi_clip_finalization import MultiClipFinalization
 from .ports import (
     AssetStore,
     GatewayError,
-    MediaFinalizer,
     MediaGenerationGateway,
     MediaProbe,
+    ProductionStore,
+    ReviewFrameExtractor,
     StoredAsset,
     StoredEpisode,
     StoredStep,
-    WorkflowRepository,
+    VisualReviewGateway,
 )
-from .video_diagnostic import VideoDiagnosticService
-from .video_landing import VideoAssetLandingService, segment_semantic_key
 
 
 class VideoExecutionService:
-    """执行一次完整Seedance成片并将原始MP4保存为候选资产。"""
+    """把一个已准备好视觉输入的Episode推进到人工内容审核。"""
 
     def __init__(
         self,
         *,
-        repository: WorkflowRepository,
+        repository: ProductionStore,
         media_gateway: MediaGenerationGateway,
         asset_store: AssetStore,
         media_probe: MediaProbe,
         provider_name: str,
         resolution: str,
         style_profile: StyleProfile,
-        media_finalizer: MediaFinalizer | None = None,
-        video_diagnostic: VideoDiagnosticService | None = None,
+        review_gateway: VisualReviewGateway | None = None,
+        frame_extractor: ReviewFrameExtractor | None = None,
+        diagnostic_mode: str = "off",
         poll_interval_seconds: float = 10,
         task_timeout_seconds: float = 1800,
     ) -> None:
+        if diagnostic_mode not in {"off", "diagnostic"}:
+            raise ValueError("视频语义诊断模式必须是off或diagnostic")
+        if diagnostic_mode == "diagnostic" and (
+            review_gateway is None or frame_extractor is None
+        ):
+            raise ValueError("diagnostic模式需要审核网关和抽帧能力")
         self._repository = repository
         self._gateway = media_gateway
+        self._asset_store = asset_store
+        self._probe = media_probe
         self._provider_name = provider_name
         self._resolution = resolution
-        self._multi_clip_finalization = (
-            None
-            if media_finalizer is None
-            else MultiClipFinalization(
-                repository=repository,
-                asset_store=asset_store,
-                media_probe=media_probe,
-                media_finalizer=media_finalizer,
-                resolution=resolution,
-                video_diagnostic=video_diagnostic,
-            )
-        )
-        self._landing = VideoAssetLandingService(
-            repository=repository,
-            asset_store=asset_store,
-            media_probe=media_probe,
-            resolution=resolution,
-            video_diagnostic=video_diagnostic,
-        )
+        self._style_profile = style_profile
+        self._review_gateway = review_gateway
+        self._frame_extractor = frame_extractor
+        self._diagnostic_mode = diagnostic_mode
         self._poll_interval = poll_interval_seconds
         self._task_timeout = task_timeout_seconds
-        self._style_profile = style_profile
 
     def execute(
         self,
         episode: StoredEpisode,
         inputs: tuple[StoredAsset, ...],
         *,
-        allow_multi_clip: bool,
         prompt_override: str | None = None,
     ) -> dict[str, Any]:
-        """执行本集配置的策略；multi_clip必须由调用者再次显式授权。"""
+        """创建或复用唯一single-pass收费意图。"""
 
-        if episode.plan.generation_strategy is GenerationStrategy.MULTI_CLIP:
-            if not allow_multi_clip:
-                raise ValueError("multi_clip必须显式提供--allow-multi-clip")
-            if prompt_override is not None and prompt_override.strip():
-                raise ValueError("multi_clip分段Prompt由系统逐段编译，不支持整体覆盖")
-            return self._generate_multi_clip(episode, inputs)
-        return self._generate_single_pass(
+        return self._generate(
             episode,
             inputs,
             prompt_override=prompt_override,
+            attempt=1,
         )
 
-    def resume_step(
+    def resume_step(self, episode: StoredEpisode, step: StoredStep) -> dict[str, Any]:
+        """只轮询已有task ID；submission_unknown不进入本方法。"""
+
+        return self._finish(episode, step)
+
+    def retry_video(
         self,
         episode: StoredEpisode,
-        step: StoredStep,
+        original_step: StoredStep,
+        *,
+        reason: str,
     ) -> dict[str, Any]:
-        """只轮询已有task ID，绝不重新提交收费POST。"""
+        """显式创建同一剧本的新收费attempt，旧Step和Prompt永久保留。"""
 
-        return self._finish_video_step(episode, step)
+        if original_step.operation_key != "video:single_pass":
+            raise ValueError("只支持重试single-pass视频步骤")
+        snapshot = VideoInputSnapshot.model_validate(original_step.input_snapshot)
+        inputs = tuple(
+            self._repository.asset_detail(asset_id) for asset_id in snapshot.input_asset_ids
+        )
+        prompt = self._repository.get_prompt_for_step(
+            original_step.id,
+            purpose="video",
+        ).text
+        attempt = self._repository.next_step_attempt(
+            episode_id=episode.id,
+            kind=StepKind.VIDEO,
+            operation_key=original_step.operation_key,
+        )
+        if episode.status is EpisodeStatus.FAILED:
+            self._repository.set_episode_status(episode.id, EpisodeStatus.VIDEO_PENDING)
+            episode = self._repository.get_episode(episode.run_id, episode.plan.slot)
+        return self._generate(
+            episode,
+            inputs,
+            prompt_override=prompt,
+            attempt=attempt,
+            retry_of_step_id=original_step.id,
+            retry_reason=reason,
+        )
 
-    def _generate_single_pass(
+    def _generate(
         self,
         episode: StoredEpisode,
         inputs: tuple[StoredAsset, ...],
         *,
-        prompt_override: str | None = None,
-        attempt: int = 1,
-        retry_of_step_id: str | None = None,
+        prompt_override: str | None,
+        attempt: int,
+        retry_of_step_id: uuid.UUID | None = None,
         retry_reason: str | None = None,
     ) -> dict[str, Any]:
         input_plan = build_video_input_plan(
-            episode.plan,
-            model=self._gateway.video_model,
+            input_mode=episode.plan.script.video_input_mode,
             resolution=self._resolution,
-            sources=tuple(
-                MediaSource(
-                    asset_id=asset.id,
-                    role=asset.role,
-                    media_type=asset.media_type,
-                    sha256=asset.sha256,
-                    metadata=asset.metadata,
-                    semantic_key=asset.semantic_key,
-                )
-                for asset in inputs
-            ),
+            duration_seconds=episode.plan.script.duration_seconds,
+            sources=tuple(_media_source(asset) for asset in inputs),
         )
-        assets_by_id = {asset.id: asset for asset in inputs}
-        ordered_inputs = tuple(assets_by_id[binding.asset_id] for binding in input_plan.bindings)
+        by_id = {item.id: item for item in inputs}
+        ordered_inputs = tuple(by_id[item.asset_id] for item in input_plan.bindings)
         compiled = compile_video_prompt(
             episode.plan,
             input_plan=input_plan,
             style_profile=self._style_profile,
         )
         if prompt_override is not None and prompt_override.strip():
-            override_text = prompt_override.strip()
-            compiled = CompiledPrompt(
-                text=override_text,
-                char_count=len(override_text),
-                utf8_bytes=len(override_text.encode("utf-8")),
-                warnings=(),
-            )
+            compiled = _override_prompt(prompt_override)
         input_hash = _input_hash(
             compiled.text,
             input_plan.model_dump_json(),
-            *(asset.sha256 for asset in ordered_inputs),
+            *(item.sha256 for item in ordered_inputs),
         )
-        operation_key = "video:single_pass"
+        prompt_sha = hashlib.sha256(compiled.text.encode("utf-8")).hexdigest()
+        snapshot = VideoInputSnapshot(
+            prompt_sha256=prompt_sha,
+            input_plan=input_plan,
+            input_asset_ids=tuple(item.id for item in ordered_inputs),
+            retry_of_step_id=retry_of_step_id,
+            retry_reason=retry_reason,
+        )
         step = self._repository.create_step_intent(
             run_id=episode.run_id,
             episode_id=episode.id,
             parent_step_id=None,
             kind=StepKind.VIDEO,
             attempt=attempt,
+            operation_key="video:single_pass",
             provider=self._provider_name,
             model=self._gateway.video_model,
             input_hash=input_hash,
-            request_summary={
-                "operationKey": operation_key,
-                "generationStrategy": "single_pass",
-                "videoInputPlan": input_plan.model_dump(mode="json"),
-                "inputAssetIds": [str(asset.id) for asset in ordered_inputs],
-                "promptAliases": {
-                    binding.prompt_alias: {
-                        "assetId": str(binding.asset_id),
-                        "semanticKey": binding.semantic_key,
-                    }
-                    for binding in input_plan.bindings
-                },
-                "retryOfStepId": retry_of_step_id,
-                "retryReason": retry_reason,
-            },
+            input_snapshot=snapshot.model_dump(mode="json"),
         )
         self._repository.save_prompt(
             step_id=step.id,
@@ -198,229 +186,26 @@ class VideoExecutionService:
             text=compiled.text,
         )
         if step.status in {StepStatus.QUEUED, StepStatus.RUNNING}:
-            return self._finish_video_step(episode, step)
+            return self._finish(episode, step)
         if step.status is StepStatus.SUBMISSION_UNKNOWN:
-            raise RuntimeError("视频提交结果未知，必须先人工对账")
+            raise RuntimeError("视频提交结果未知，必须先对账，禁止重复POST")
         if step.status is StepStatus.SUCCEEDED:
-            return _episode_result(episode, "视频步骤已经成功")
-        if step.status in {
-            StepStatus.FAILED,
-            StepStatus.EXPIRED,
-            StepStatus.CANCELLED,
-        }:
-            raise StepRetryRequired(step.id, operation_key)
-
-        self._repository.set_episode_status(
-            episode.id,
-            EpisodeStatus.VIDEO_GENERATING,
-        )
-        # 先提交收费意图，再调用Ark；进程即使在HTTP响应前中断，幂等记录也会
-        # 阻止同一输入被盲目再次POST。
-        self._repository.set_step_status(step.id, StepStatus.SUBMITTING)
-        try:
-            task = self._gateway.submit_video(
-                prompt=compiled.text,
-                input_plan=input_plan,
-                input_paths=tuple(asset.path for asset in ordered_inputs),
-            )
-        except GatewayError as exc:
-            self._repository.fail_step(
-                step.id,
-                code=exc.code,
-                message=str(exc),
-                submission_unknown=exc.submission_unknown,
-            )
-            self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
-            raise
-        self._repository.set_step_status(
-            step.id,
-            StepStatus.QUEUED,
-            provider_task_id=task.task_id,
-        )
-        return self._finish_video_step(episode, self._repository.get_step(step.id))
-
-    def _generate_multi_clip(
-        self,
-        episode: StoredEpisode,
-        inputs: tuple[StoredAsset, ...],
-    ) -> dict[str, Any]:
-        """按人工批准边界逐段生成，最后才执行条件式 FFmpeg。
-
-        multi_clip 不是自动降级：同一 Episode 必须先存在被人工拒绝的单次成片，
-        并在新导演方案中明确声明两个天然硬切片段。每段都要人工批准后才会继续。
-        """
-
-        if self._multi_clip_finalization is None:
-            raise ValueError("multi_clip需要可用的FFmpeg，且必须在首次片段收费前配置")
-        rejected = self._repository.list_assets(
-            episode_id=episode.id,
-            roles=("video",),
-            statuses=("rejected",),
-        )
-        if not rejected:
-            raise ValueError("multi_clip只允许在同一Episode已有人工拒绝的single_pass后显式使用")
-
-        ready_parts: list[StoredAsset] = []
-        for segment in episode.plan.segments:
-            semantic_key = segment_semantic_key(episode, segment)
-            ready = self._repository.list_assets(
-                episode_id=episode.id,
-                statuses=("ready",),
-                semantic_keys=(semantic_key,),
-            )
-            if ready:
-                ready_parts.append(ready[0])
-                continue
-            awaiting = self._repository.list_assets(
-                episode_id=episode.id,
-                statuses=("candidate", "approved"),
-                semantic_keys=(semantic_key,),
-            )
-            if awaiting:
-                return {
-                    "episodeId": str(episode.id),
-                    "slot": episode.plan.slot.value,
-                    "status": "segment_review",
-                    "segmentOrder": segment.order,
-                    "assetId": str(awaiting[0].id),
-                    "localPath": str(awaiting[0].path),
-                }
-            segment_inputs = inputs
-            segment_mode = VideoInputMode.MULTIMODAL_REFERENCE
-            if segment.requires_tail_link:
-                if segment.order != 2 or not ready_parts:
-                    raise ValueError("连续空间片段只能把已批准的第一段尾帧用于第二段")
-                segment_inputs = (
-                    self._multi_clip_finalization.ensure_tail_frame(
-                        episode,
-                        ready_parts[0],
-                    ),
-                )
-                segment_mode = VideoInputMode.STRICT_FIRST_FRAME
-            return self._generate_segment(
-                episode,
-                segment,
-                segment_inputs,
-                input_mode=segment_mode,
-            )
-        return self._multi_clip_finalization.finalize(
-            episode,
-            (ready_parts[0], ready_parts[1]),
-        )
-
-    def _generate_segment(
-        self,
-        episode: StoredEpisode,
-        segment: SegmentPlan,
-        inputs: tuple[StoredAsset, ...],
-        *,
-        input_mode: VideoInputMode,
-        attempt: int = 1,
-        retry_of_step_id: str | None = None,
-        retry_reason: str | None = None,
-    ) -> dict[str, Any]:
-        plan_episode = episode.plan.model_copy(
-            update={
-                "video_input_mode": input_mode,
-                "generation_strategy": GenerationStrategy.SINGLE_PASS,
-                "segments": [],
-            }
-        )
-        input_plan = build_video_input_plan(
-            plan_episode,
-            model=self._gateway.video_model,
-            resolution=self._resolution,
-            duration_seconds=segment.duration_seconds,
-            sources=tuple(
-                MediaSource(
-                    asset_id=asset.id,
-                    role=asset.role,
-                    media_type=asset.media_type,
-                    sha256=asset.sha256,
-                    metadata=asset.metadata,
-                    semantic_key=asset.semantic_key,
-                )
-                for asset in inputs
-            ),
-        )
-        assets_by_id = {asset.id: asset for asset in inputs}
-        ordered_inputs = tuple(assets_by_id[binding.asset_id] for binding in input_plan.bindings)
-        compiled = compile_segment_video_prompt(
-            episode.plan,
-            segment,
-            input_plan=input_plan,
-            style_profile=self._style_profile,
-        )
-        input_hash = _input_hash(
-            "multi_clip",
-            str(segment.order),
-            compiled.text,
-            input_plan.model_dump_json(),
-            *(asset.sha256 for asset in ordered_inputs),
-        )
-        operation_key = f"video:segment:{segment.order}"
-        step = self._repository.create_step_intent(
-            run_id=episode.run_id,
-            episode_id=episode.id,
-            parent_step_id=None,
-            kind=StepKind.VIDEO,
-            attempt=attempt,
-            provider=self._provider_name,
-            model=self._gateway.video_model,
-            input_hash=input_hash,
-            request_summary={
-                "operationKey": operation_key,
-                "generationStrategy": "multi_clip",
-                "segmentOrder": segment.order,
-                "videoInputPlan": input_plan.model_dump(mode="json"),
-                "inputAssetIds": [str(asset.id) for asset in ordered_inputs],
-                "promptAliases": {
-                    binding.prompt_alias: {
-                        "assetId": str(binding.asset_id),
-                        "semanticKey": binding.semantic_key,
-                    }
-                    for binding in input_plan.bindings
-                },
-                "retryOfStepId": retry_of_step_id,
-                "retryReason": retry_reason,
-            },
-        )
-        self._repository.save_prompt(
-            step_id=step.id,
-            parent_prompt_id=None,
-            purpose=f"video_segment_{segment.order}",
-            model=self._gateway.video_model,
-            text=compiled.text,
-        )
-        if step.status in {StepStatus.QUEUED, StepStatus.RUNNING}:
-            return self._finish_video_step(episode, step)
-        if step.status is StepStatus.SUBMISSION_UNKNOWN:
-            raise RuntimeError("片段提交结果未知，必须先人工对账")
+            return _episode_result(episode, "视频步骤已经通过人工审核")
         if step.status is StepStatus.AWAITING_REVIEW:
-            return _episode_result(episode, f"片段{segment.order}等待人工审核")
-        if step.status is StepStatus.SUCCEEDED:
-            return _episode_result(episode, f"片段{segment.order}已经批准")
-        if step.status is not StepStatus.PENDING:
-            if step.status in {
-                StepStatus.FAILED,
-                StepStatus.EXPIRED,
-                StepStatus.CANCELLED,
-            }:
-                raise StepRetryRequired(step.id, operation_key)
-            raise ValueError(f"片段{segment.order}步骤状态{step.status.value}不可重复提交")
+            return _episode_result(episode, "视频等待人工内容审核")
+        if step.status in {StepStatus.FAILED, StepStatus.EXPIRED, StepStatus.CANCELLED}:
+            raise StepRetryRequired(step.id, step.operation_key)
 
         if episode.status is EpisodeStatus.VIDEO_PENDING:
-            self._repository.set_episode_status(
-                episode.id,
-                EpisodeStatus.VIDEO_GENERATING,
-            )
-        # 片段与完整视频使用同一收费幂等原则：先提交意图，再发送供应商 POST。
+            self._repository.set_episode_status(episode.id, EpisodeStatus.VIDEO_GENERATING)
+        # 先提交收费意图，再调用Ark。即使进程在HTTP响应前中断，该Step也会阻止
+        # run-day隐式创建第二次付费任务。
         self._repository.set_step_status(step.id, StepStatus.SUBMITTING)
         try:
             task = self._gateway.submit_video(
                 prompt=compiled.text,
                 input_plan=input_plan,
-                input_paths=tuple(asset.path for asset in ordered_inputs),
+                input_paths=tuple(item.path for item in ordered_inputs),
             )
         except GatewayError as exc:
             self._repository.fail_step(
@@ -435,14 +220,13 @@ class VideoExecutionService:
             step.id,
             StepStatus.QUEUED,
             provider_task_id=task.task_id,
+            input_snapshot_patch={"provider_task_status": task.status},
         )
-        return self._finish_video_step(episode, self._repository.get_step(step.id))
+        return self._finish(episode, self._repository.get_step(step.id))
 
-    def _finish_video_step(
-        self,
-        episode: StoredEpisode,
-        step: StoredStep,
-    ) -> dict[str, Any]:
+    def _finish(self, episode: StoredEpisode, step: StoredStep) -> dict[str, Any]:
+        if step.status is StepStatus.SUBMISSION_UNKNOWN:
+            raise RuntimeError("submission_unknown只能人工对账")
         if not step.provider_task_id:
             raise ValueError("恢复视频任务需要provider task ID")
         deadline = time.monotonic() + self._task_timeout
@@ -458,7 +242,11 @@ class VideoExecutionService:
             if task.status in {"queued", "running"}:
                 current = self._repository.get_step(step.id)
                 if task.status == "running" and current.status is StepStatus.QUEUED:
-                    self._repository.set_step_status(step.id, StepStatus.RUNNING)
+                    self._repository.set_step_status(
+                        step.id,
+                        StepStatus.RUNNING,
+                        input_snapshot_patch={"provider_task_status": task.status},
+                    )
                 time.sleep(self._poll_interval)
                 continue
             if task.status != "succeeded" or not task.video_url:
@@ -469,94 +257,157 @@ class VideoExecutionService:
                 )
                 self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
                 raise RuntimeError(task.error_message or "Seedance任务失败")
-            if step.request_summary.get("generationStrategy") == "multi_clip":
-                segment_order = int(step.request_summary["segmentOrder"])
-                segment = next(
-                    item for item in episode.plan.segments if item.order == segment_order
-                )
-                return self._landing.land_segment(
-                    episode,
-                    step,
-                    segment,
-                    task.video_url,
-                )
-            return self._landing.land_video(episode, step, task.video_url)
-        raise TimeoutError("等待Seedance任务超过配置时限，可稍后使用resume恢复")
+            return self._land_video(episode, step, task.video_url)
+        raise TimeoutError("等待Seedance任务超时，可稍后使用resume恢复")
 
-    def retry_video(
+    def _land_video(
         self,
         episode: StoredEpisode,
-        original_step: StoredStep,
-        *,
-        reason: str,
+        step: StoredStep,
+        video_url: str,
     ) -> dict[str, Any]:
-        """按原输入和Prompt语义显式创建收费视频新attempt。"""
-
-        operation_key = str(original_step.request_summary.get("operationKey", ""))
-        input_ids = original_step.request_summary.get("inputAssetIds", [])
-        inputs = tuple(
-            self._repository.asset_detail(uuid.UUID(str(value))) for value in input_ids
+        landed = self._asset_store.download(video_url, suffix=".mp4")
+        self._repository.set_episode_status(episode.id, EpisodeStatus.MEDIA_QC)
+        qc = self._probe.inspect_video(
+            landed.path,
+            expected_duration_seconds=episode.plan.script.duration_seconds,
+            expected_resolution=self._resolution,
         )
-        attempt = self._repository.next_step_attempt(
+        if not qc["passed"]:
+            self._repository.fail_step(
+                step.id,
+                code="media_qc_failed",
+                message=";".join(qc["failures"]),
+            )
+            self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
+            raise RuntimeError(f"视频技术QC失败: {qc['failures']}")
+        asset = self._repository.save_asset(
+            run_id=episode.run_id,
             episode_id=episode.id,
-            kind=StepKind.VIDEO,
-            operation_key=operation_key,
+            step_id=step.id,
+            role="video",
+            semantic_key=f"video:{episode.id}",
+            scope="episode",
+            status="candidate",
+            media_type="video",
+            landed=landed,
+            metadata=qc,
         )
-        if episode.status is EpisodeStatus.FAILED:
-            self._repository.set_episode_status(
-                episode.id,
-                EpisodeStatus.VIDEO_PENDING,
-            )
-            episode = self._repository.get_episode(
-                episode.run_id,
-                episode.plan.slot,
-            )
-        if operation_key == "video:single_pass":
-            return self._generate_single_pass(
-                episode,
-                inputs,
-                attempt=attempt,
-                retry_of_step_id=str(original_step.id),
-                retry_reason=reason,
-            )
-        if operation_key.startswith("video:segment:"):
-            segment_order = int(operation_key.rsplit(":", 1)[1])
-            segment = next(
-                item for item in episode.plan.segments if item.order == segment_order
-            )
-            input_plan = original_step.request_summary.get("videoInputPlan", {})
-            return self._generate_segment(
-                episode,
-                segment,
-                inputs,
-                input_mode=VideoInputMode(input_plan["input_mode"]),
-                attempt=attempt,
-                retry_of_step_id=str(original_step.id),
-                retry_reason=reason,
-            )
-        raise ValueError(f"不支持重试视频操作{operation_key!r}")
-
-    def retry_finalize(
-        self,
-        episode: StoredEpisode,
-        original_step: StoredStep,
-        *,
-        reason: str,
-    ) -> dict[str, Any]:
-        """显式重做multi_clip本地后期，不产生供应商请求。"""
-
-        if self._multi_clip_finalization is None:
-            raise ValueError("当前环境没有可用FFmpeg后期能力")
-        return self._multi_clip_finalization.retry_finalize(
-            episode,
-            original_step,
-            reason=reason,
+        current = self._repository.get_step(step.id)
+        if current.status is StepStatus.QUEUED:
+            self._repository.set_step_status(step.id, StepStatus.RUNNING)
+        self._repository.set_step_status(step.id, StepStatus.AWAITING_REVIEW)
+        self._repository.set_episode_status(episode.id, EpisodeStatus.CONTENT_REVIEW)
+        self._repository.record_review(
+            step_id=step.id,
+            asset_id=asset.id,
+            source="technical",
+            decision="pending",
+            reason="视频技术QC通过，等待人工内容审核",
+            warnings=[],
+            evidence={**qc, "semanticReviewStatus": "diagnostic_pending"},
         )
+        self._diagnose(episode, asset)
+        return {
+            "episodeId": str(episode.id),
+            "slot": episode.plan.slot.value,
+            "status": EpisodeStatus.CONTENT_REVIEW.value,
+            "assetId": str(asset.id),
+            "localPath": str(asset.path),
+        }
+
+    def _diagnose(self, episode: StoredEpisode, asset: StoredAsset) -> None:
+        if self._diagnostic_mode == "off":
+            return
+        assert self._review_gateway is not None
+        assert self._frame_extractor is not None
+        assert asset.step_id is not None
+        prompt = compile_video_diagnostic_prompt(episode.plan)
+        self._repository.save_prompt(
+            step_id=asset.step_id,
+            parent_prompt_id=None,
+            purpose="review",
+            model=self._review_gateway.review_model,
+            text=prompt,
+        )
+        frames: tuple[Path, ...] = ()
+        hashes: list[str] = []
+        try:
+            frames = self._frame_extractor.extract_review_frames(asset, count=8)
+            hashes = [hashlib.sha256(path.read_bytes()).hexdigest() for path in frames]
+            result = self._review_gateway.diagnose_video_frames(
+                prompt=prompt,
+                frame_paths=frames,
+            )
+            passed = all(
+                (
+                    result.identity_ok,
+                    result.style_ok,
+                    result.world_continuity_ok,
+                    result.narrative_order_ok,
+                )
+            )
+            decision = "approved" if passed and result.confidence >= 0.8 else "pending"
+            evidence = {
+                "identityOk": result.identity_ok,
+                "styleOk": result.style_ok,
+                "worldContinuityOk": result.world_continuity_ok,
+                "narrativeOrderOk": result.narrative_order_ok,
+                "confidence": result.confidence,
+                "violations": list(result.violations),
+                "observations": list(result.evidence),
+                "orderedFrameSha256": hashes,
+                "responseId": result.response_id,
+                "requestHash": result.request_hash,
+            }
+        except (GatewayError, OSError, RuntimeError, ValueError) as exc:
+            decision = "pending"
+            evidence = {
+                "semanticReviewStatus": "pending",
+                "orderedFrameSha256": hashes,
+                "diagnosticError": getattr(exc, "code", type(exc).__name__),
+            }
+        finally:
+            for frame in frames:
+                frame.unlink(missing_ok=True)
+        self._repository.record_review(
+            step_id=asset.step_id,
+            asset_id=asset.id,
+            source="ark_visual",
+            decision=decision,
+            reason="抽帧诊断仅提供证据，最终决定仍由人工作出",
+            warnings=[],
+            evidence=evidence,
+        )
+
+
+def _media_source(asset: StoredAsset) -> MediaSource:
+    if asset.semantic_key is None:
+        raise ValueError(f"视频输入资产{asset.id}缺少semantic_key")
+    return MediaSource(
+        asset_id=asset.id,
+        semantic_key=asset.semantic_key,
+        media_type=asset.media_type,
+        sha256=asset.sha256,
+        metadata=asset.metadata,
+    )
+
+
+def _override_prompt(value: str) -> CompiledPrompt:
+    text = value.strip()
+    if len(text) > 1600:
+        raise ValueError("视频Prompt覆盖超过1600字符")
+    return CompiledPrompt(
+        text=text,
+        char_count=len(text),
+        utf8_bytes=len(text.encode("utf-8")),
+        warnings=("prompt_length_warning",) if len(text) > 1400 else (),
+    )
+
 
 def _input_hash(*values: str) -> str:
-    return hashlib.sha256(
-        json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    payload = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _episode_result(episode: StoredEpisode, message: str) -> dict[str, Any]:

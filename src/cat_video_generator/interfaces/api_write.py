@@ -19,11 +19,20 @@ from ..application.ports import GatewayError
 from ..domain.contracts import Slot
 from .api_schemas import (
     CANON_ROLES as _CANON_ROLES,
+)
+from .api_schemas import (
     DEFAULT_PLANNING_CONTEXT as _DEFAULT_PLANNING_CONTEXT,
+)
+from .api_schemas import (
     IMAGE_SUFFIXES as _IMAGE_SUFFIXES,
+)
+from .api_schemas import (
     REFERENCE_ROLES as _REFERENCE_ROLES,
+)
+from .api_schemas import (
     REFERENCE_SUFFIXES as _REFERENCE_SUFFIXES,
-    CompareResolutionRequest,
+)
+from .api_schemas import (
     DeriveCropRequest,
     GenerateKeyframesRequest,
     GenerateRequest,
@@ -45,7 +54,6 @@ def create_write_router(
     delivery: Any,
     queries: Any,
     retry: Any,
-    resolution_compare: Any,
     job_registry: JobRegistry,
     default_candidate_count: int,
     upload_dir: Path,
@@ -88,9 +96,6 @@ def create_write_router(
                 payload["keyframes"] = production.prepare_keyframes_only(
                     result.run_id,
                     allow_paid_generation=True,
-                    allow_unverified_keyframes=(
-                        request.allow_unverified_keyframes
-                    ),
                 )
             return payload
 
@@ -116,8 +121,6 @@ def create_write_router(
                 run_id,
                 slot=request.slot,
                 allow_paid_generation=True,
-                allow_unverified_keyframes=request.allow_unverified_keyframes,
-                allow_multi_clip=request.allow_multi_clip,
             )
 
         record = _submit(
@@ -233,7 +236,6 @@ def create_write_router(
                 step_id,
                 reason=request.reason,
                 allow_paid_generation=True,
-                allow_unverified_keyframes=request.allow_unverified_keyframes,
             )
             return _jsonable(result)
 
@@ -349,34 +351,6 @@ def create_write_router(
             )
         )
 
-    @router.post("/runs/{run_id}/compare-resolution", status_code=202)
-    def compare_resolution(
-        run_id: uuid.UUID,
-        request: CompareResolutionRequest,
-    ) -> dict[str, Any]:
-        if not request.allow_paid_generation:
-            raise HTTPException(
-                status_code=422,
-                detail="分辨率对比调用付费模型，必须显式确认allowPaidGeneration",
-            )
-
-        def task() -> dict[str, Any]:
-            result = resolution_compare.compare(
-                run_id,
-                resolution=request.resolution,
-                allow_paid_generation=True,
-                allow_multi_clip=request.allow_multi_clip,
-            )
-            return _jsonable(result)
-
-        record = _submit(
-            job_registry,
-            kind="compare_resolution",
-            dedup_key=f"compare:{run_id}:{request.resolution}",
-            fn=task,
-        )
-        return _accepted(record)
-
     @router.put("/episodes/{episode_id}/prompt-overrides")
     async def save_prompt_overrides(
         episode_id: uuid.UUID,
@@ -416,7 +390,6 @@ def create_write_router(
                     None if overrides is None else {slot.value: overrides}
                 ),
                 allow_paid_generation=True,
-                allow_unverified_keyframes=request.allow_unverified_keyframes,
             )
 
         record = _submit(

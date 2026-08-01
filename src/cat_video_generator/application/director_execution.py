@@ -14,7 +14,7 @@ from pydantic import ValidationError
 
 from ..domain.contracts import Slot, StrictModel
 from ..domain.workflow import StepKind, StepStatus
-from .ports import DirectorGateway, GatewayError, StoredStep, WorkflowRepository
+from .ports import DirectorGateway, GatewayError, PlanningStore, StoredStep
 
 ContractT = TypeVar("ContractT", bound=StrictModel)
 
@@ -43,7 +43,7 @@ class DirectorInvoker:
     def __init__(
         self,
         *,
-        repository: WorkflowRepository,
+        repository: PlanningStore,
         director: DirectorGateway,
         provider_name: str,
     ) -> None:
@@ -68,22 +68,26 @@ class DirectorInvoker:
         """执行一个结构化导演调用；未知提交结果绝不自动重发。"""
 
         input_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        summary: dict[str, Any] = {"phase": phase}
-        if slot is not None:
-            summary["slot"] = slot.value
-        if repair_of_step_id is not None:
-            summary["directorRepairAttempted"] = True
-            summary["repairOfStepId"] = str(repair_of_step_id)
+        operation_key = "director:day" if slot is None else f"director:episode:{slot.value}"
+        snapshot: dict[str, Any] = {
+            "type": "director",
+            "phase": phase,
+            "slot": None if slot is None else slot.value,
+            "prompt_sha256": input_hash,
+            "output_contract": contract.__name__,
+            "repair_of_step_id": repair_of_step_id,
+        }
         step = self._repository.create_step_intent(
             run_id=run_id,
             episode_id=episode_id,
             parent_step_id=parent_step_id,
             kind=StepKind.DIRECTOR,
             attempt=attempt,
+            operation_key=operation_key,
             provider=self._provider_name,
             model=self._director.model,
             input_hash=input_hash,
-            request_summary=summary,
+            input_snapshot=snapshot,
         )
         prompt_id = self._repository.save_prompt(
             step_id=step.id,
@@ -93,7 +97,7 @@ class DirectorInvoker:
             text=prompt,
         )
         if step.status is StepStatus.SUCCEEDED:
-            saved = step.request_summary.get("directorOutput")
+            saved = step.input_snapshot.get("output")
             if not isinstance(saved, dict):
                 raise RuntimeError("导演步骤已成功但缺少持久化输出")
             return contract.model_validate(saved), step, prompt_id

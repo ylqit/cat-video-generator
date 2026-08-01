@@ -117,7 +117,7 @@ class ReviewPersistenceMixin:
             asset.status = (
                 (
                     "ready"
-                    if asset.role in {"video", "video_segment"}
+                    if asset.role == "video"
                     else "approved"
                 )
                 if decision == "approved"

@@ -254,11 +254,6 @@ def run_day(
         False,
         "--allow-paid-generation",
     ),
-    allow_unverified_keyframes: bool = typer.Option(
-        False,
-        "--allow-unverified-keyframes",
-    ),
-    allow_multi_clip: bool = typer.Option(False, "--allow-multi-clip"),
 ) -> None:
     """生成全天或指定时段。"""
 
@@ -269,31 +264,6 @@ def run_day(
                 run_id,
                 slot=slot,
                 allow_paid_generation=allow_paid_generation,
-                allow_unverified_keyframes=allow_unverified_keyframes,
-                allow_multi_clip=allow_multi_clip,
-            )
-        )
-    finally:
-        container.close()
-
-
-@app.command("compare-resolution")
-def compare_resolution(
-    run_id: uuid.UUID = typer.Argument(...),
-    resolution: str = typer.Option("720p", "--resolution"),
-    allow_paid_generation: bool = typer.Option(
-        False,
-        "--allow-paid-generation",
-    ),
-) -> None:
-    """冻结原Prompt和素材，仅生成另一分辨率的独立候选视频。"""
-
-    container = build_runtime_container(allow_paid_generation=allow_paid_generation)
-    try:
-        _echo(
-            container.resolution_comparison.compare_run(
-                run_id,
-                resolution=resolution,
             )
         )
     finally:
@@ -324,10 +294,6 @@ def retry_step(
         False,
         "--allow-paid-generation",
     ),
-    allow_unverified_keyframes: bool = typer.Option(
-        False,
-        "--allow-unverified-keyframes",
-    ),
 ) -> None:
     """显式重试一个终态步骤；run-day永远不会替代本命令自动重试。"""
 
@@ -341,7 +307,6 @@ def retry_step(
                 step_id,
                 reason=reason,
                 allow_paid_generation=allow_paid_generation,
-                allow_unverified_keyframes=allow_unverified_keyframes,
             )
         )
     finally:

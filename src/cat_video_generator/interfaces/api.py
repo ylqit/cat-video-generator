@@ -134,7 +134,6 @@ def create_full_app(
             delivery=container.delivery,
             queries=container.queries,
             retry=container.retry,
-            resolution_compare=container.resolution_comparison,
             job_registry=job_registry,
             default_candidate_count=runtime.candidate_count,
             upload_dir=runtime.work_root / "uploads",

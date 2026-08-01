@@ -28,7 +28,7 @@ from ...application.ports import (
     VisualReviewResult,
 )
 from ...config import RuntimeSettings
-from ...domain.contracts import MediaModality, VideoInputPlan
+from ...domain.rendering import MediaModality, VideoInputPlan
 from .review_schemas import KEYFRAME_REVIEW_SCHEMA, VIDEO_DIAGNOSTIC_SCHEMA
 
 
@@ -393,10 +393,10 @@ class ArkGateway:
             )
         try:
             response = self._client.content_generation.tasks.create(
-                model=input_plan.model,
+                model=self.video_model,
                 content=content,
                 return_last_frame=False,
-                generate_audio=input_plan.native_audio,
+                generate_audio=True,
                 watermark=False,
                 resolution=input_plan.resolution,
                 ratio="9:16",

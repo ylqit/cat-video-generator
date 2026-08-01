@@ -10,8 +10,7 @@ import uuid
 from typing import Any
 
 from ..domain.workflow import RunStatus, StepKind, StepStatus
-from .ports import WorkflowRepository
-from .resolution_comparison import ResolutionComparisonService
+from .ports import ProductionStore
 from .video_execution import VideoExecutionService
 from .visual_preparation import VisualPreparationService
 
@@ -22,15 +21,13 @@ class RetryService:
     def __init__(
         self,
         *,
-        repository: WorkflowRepository,
+        repository: ProductionStore,
         visual_preparation: VisualPreparationService,
         video_execution: VideoExecutionService,
-        resolution_comparison: ResolutionComparisonService,
     ) -> None:
         self._repository = repository
         self._visual_preparation = visual_preparation
         self._video_execution = video_execution
-        self._resolution_comparison = resolution_comparison
 
     def retry_step(
         self,
@@ -38,7 +35,6 @@ class RetryService:
         *,
         reason: str,
         allow_paid_generation: bool,
-        allow_unverified_keyframes: bool = False,
     ) -> dict[str, Any]:
         """验证终态和费用许可后，精确重做原业务操作。"""
 
@@ -57,18 +53,13 @@ class RetryService:
             )
         if step.episode_id is None:
             raise ValueError("当前retry-step只支持Episode媒体步骤")
-        operation_key = str(step.request_summary.get("operationKey", ""))
+        operation_key = step.operation_key
         paid = step.kind in {StepKind.IMAGE, StepKind.VIDEO}
         if paid and not allow_paid_generation:
             raise ValueError("Ark图片或视频重试需要--allow-paid-generation")
         supported = (
             (step.kind is StepKind.IMAGE and operation_key.startswith("image:"))
-            or operation_key.startswith("video:resolution_comparison:")
-            or (step.kind is StepKind.VIDEO and operation_key.startswith("video:"))
-            or (
-                step.kind is StepKind.QC
-                and operation_key == "qc:multi_clip_concat"
-            )
+            or (step.kind is StepKind.VIDEO and operation_key == "video:single_pass")
         )
         if not supported:
             raise ValueError(f"步骤operationKey={operation_key!r}不支持显式重试")
@@ -80,7 +71,6 @@ class RetryService:
         stored_run = self._repository.get_run(step.run_id)
         if (
             stored_run.status == RunStatus.FAILED.value
-            and not operation_key.startswith("video:resolution_comparison:")
         ):
             self._repository.set_run_status(step.run_id, RunStatus.GENERATING)
         if step.kind is StepKind.IMAGE and operation_key.startswith("image:"):
@@ -88,7 +78,6 @@ class RetryService:
                 episode,
                 step,
                 reason=reason,
-                allow_unverified_keyframes=allow_unverified_keyframes,
             )
             return {
                 "stepId": str(step_id),
@@ -96,20 +85,8 @@ class RetryService:
                 "assetId": str(asset.id),
                 "status": asset.status,
             }
-        if operation_key.startswith("video:resolution_comparison:"):
-            return self._resolution_comparison.retry_comparison(
-                episode,
-                step,
-                reason=reason,
-            )
-        if step.kind is StepKind.VIDEO and operation_key.startswith("video:"):
+        if step.kind is StepKind.VIDEO and operation_key == "video:single_pass":
             return self._video_execution.retry_video(
-                episode,
-                step,
-                reason=reason,
-            )
-        if step.kind is StepKind.QC and operation_key == "qc:multi_clip_concat":
-            return self._video_execution.retry_finalize(
                 episode,
                 step,
                 reason=reason,

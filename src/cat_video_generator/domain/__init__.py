@@ -7,12 +7,14 @@ FastAPI、Ark SDK 或本地文件系统。
 from .contracts import (
     ActionStage,
     AppearancePlan,
-    CriticalRelation,
     DailyProductionPlan,
     EpisodePlan,
-    MediaBinding,
+    EpisodeScript,
     SharedElement,
     Slot,
+)
+from .rendering import (
+    MediaBinding,
     VideoInputMode,
     VideoInputPlan,
 )
@@ -20,9 +22,9 @@ from .contracts import (
 __all__ = [
     "ActionStage",
     "AppearancePlan",
-    "CriticalRelation",
     "DailyProductionPlan",
     "EpisodePlan",
+    "EpisodeScript",
     "MediaBinding",
     "SharedElement",
     "Slot",

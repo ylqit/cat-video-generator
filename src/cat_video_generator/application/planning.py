@@ -15,8 +15,8 @@ from typing import Any
 from ..domain.contracts import (
     DailyProductionPlan,
     DayBrief,
-    EpisodeDirectorDraft,
     EpisodePlan,
+    EpisodeScript,
     RecentContentSummary,
     Slot,
     SlotBrief,
@@ -31,10 +31,8 @@ from ..domain.prompts import (
 )
 from ..domain.rules import (
     hard_failures,
-    select_video_input_mode,
     validate_episode_against_brief,
     validate_episode_cooldown,
-    validate_generation_strategy,
     validate_plan_gate,
 )
 from ..domain.visual_profiles import (
@@ -44,7 +42,7 @@ from ..domain.visual_profiles import (
 from ..domain.workflow import RunStatus
 from .director_execution import DirectorCandidateRejected, DirectorInvoker
 from .event_seeds import EventSeedCatalog
-from .ports import DirectorGateway, StoredStep, WorkflowRepository
+from .ports import DirectorGateway, PlanningStore, StoredStep
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,7 +90,7 @@ class PlanningService:
     def __init__(
         self,
         *,
-        repository: WorkflowRepository,
+        repository: PlanningStore,
         director: DirectorGateway,
         provider_name: str,
         series_profile: SeriesVisualProfile,
@@ -253,7 +251,10 @@ class PlanningService:
         for slot_brief in day_brief.slots:
             saved = drafts.get(slot_brief.slot.value)
             if saved is not None:
-                episode = EpisodePlan.model_validate(saved)
+                episode = EpisodePlan(
+                    slot=slot_brief.slot,
+                    script=EpisodeScript.model_validate(saved),
+                )
             else:
                 episode, _, _ = self._generate_episode(
                     run_id=run_id,
@@ -265,7 +266,7 @@ class PlanningService:
                     retry_reason=None,
                     recent_summaries=recent_summaries,
                 )
-                drafts[episode.slot.value] = episode.model_dump(mode="json")
+                drafts[episode.slot.value] = episode.script.model_dump(mode="json")
                 self._save_context(
                     run_id,
                     day_brief,
@@ -305,7 +306,6 @@ class PlanningService:
         if stored_run.status in {
             RunStatus.DELIVERED.value,
             RunStatus.READY.value,
-            RunStatus.ARCHIVED.value,
         }:
             raise ValueError(f"Run状态{stored_run.status}不允许重规划")
         context = self._repository.get_planning_context(run_id)
@@ -313,7 +313,7 @@ class PlanningService:
             raise ValueError("该Run没有分层导演DayBrief，不能局部重规划")
         day_brief = DayBrief.model_validate(context["dayBrief"])
         drafts = {
-            key: EpisodePlan.model_validate(value)
+            key: EpisodePlan(slot=Slot(key), script=EpisodeScript.model_validate(value))
             for key, value in context.get("episodeDrafts", {}).items()
         }
         if stored_run.plan is not None:
@@ -351,9 +351,7 @@ class PlanningService:
                 )
             raise
         drafts[slot.value] = episode
-        serialized = {
-            key: value.model_dump(mode="json") for key, value in drafts.items()
-        }
+        serialized = {key: value.script.model_dump(mode="json") for key, value in drafts.items()}
         self._save_context(
             run_id,
             day_brief,
@@ -438,7 +436,7 @@ class PlanningService:
                     slot=slot_brief.slot,
                     attempt=attempt,
                     prompt=prompt,
-                    contract=EpisodeDirectorDraft,
+                    contract=EpisodeScript,
                     repair_of_step_id=repair_of_step_id,
                 )
             except DirectorCandidateRejected as exc:
@@ -453,10 +451,7 @@ class PlanningService:
                     errors=validation_errors,
                 ) from exc
 
-            episode = draft.finalize(slot_brief.slot)
-            episode = episode.model_copy(
-                update={"video_input_mode": select_video_input_mode(episode)}
-            )
+            episode = EpisodePlan(slot=slot_brief.slot, script=draft)
             issues = (
                 *validate_episode_against_brief(
                     episode,
@@ -464,7 +459,6 @@ class PlanningService:
                     slot_brief=slot_brief,
                     series_profile=self._series_profile,
                 ),
-                *validate_generation_strategy(episode),
                 *validate_episode_cooldown(episode, recent_summaries),
             )
             failures = hard_failures(issues)
@@ -483,7 +477,7 @@ class PlanningService:
                 *(item.message for item in failures),
                 *((prompt_error,) if prompt_error is not None else ()),
             )
-            rejected_candidate = episode.model_dump(mode="json")
+            rejected_candidate = episode.script.model_dump(mode="json")
             repair_of_step_id = step.id
             self._repository.record_review(
                 step_id=step.id,
@@ -520,10 +514,7 @@ class PlanningService:
         episodes: list[EpisodePlan],
     ) -> DailyProductionPlan:
         plan = DailyProductionPlan(
-            content_date=day_brief.content_date,
-            theme=day_brief.theme,
-            day_context=day_brief.day_context,
-            shared_elements=day_brief.shared_elements,
+            day_brief=day_brief,
             episodes=episodes,
         )
         failures = hard_failures(
@@ -570,19 +561,11 @@ class PlanningService:
 def _parse_recent_summaries(
     values: object,
 ) -> tuple[RecentContentSummary, ...]:
-    """兼容旧Run中的字符串摘要；旧摘要只展示，不参与结构化冷却。"""
+    """从当前planning_json恢复严格的结构化近期摘要。"""
 
     if not isinstance(values, (list, tuple)):
         return ()
     result: list[RecentContentSummary] = []
     for value in values:
-        if isinstance(value, str):
-            result.append(
-                RecentContentSummary(
-                    content_date=date.min,
-                    summary_text=value,
-                )
-            )
-        else:
-            result.append(RecentContentSummary.model_validate(value))
+        result.append(RecentContentSummary.model_validate(value))
     return tuple(result)

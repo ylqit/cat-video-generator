@@ -71,11 +71,6 @@ const frameAssets = computed(() =>
 const videoAsset = computed(() =>
   [...episodeAssets.value].reverse().find((asset) => asset.role === "video"),
 );
-const segmentAssets = computed(() =>
-  episodeAssets.value
-    .filter((asset) => asset.role === "video_segment")
-    .sort((a, b) => a.id.localeCompare(b.id)),
-);
 const referenceAssets = computed(() =>
   episodeAssets.value.filter((asset) => asset.role in REFERENCE_ROLE_LABEL),
 );
@@ -104,18 +99,9 @@ const activeIndex = computed(() => {
   return index === -1 ? 0 : index;
 });
 const script = computed(() => props.episode.script);
-const canonRoles = computed(() =>
-  (script.value.required_reference_roles ?? ["person", "cat", "style"]).filter(
-    (role) => ["person", "cat", "style"].includes(role),
-  ),
-);
-
-/** 剧本声明的Canon语义键（三视图/画风），优先于裸role展示。 */
 const canonKeys = computed(() => {
-  const declared = (script.value.reference_semantic_keys ?? []).filter((key) =>
-    /^(person|cat|style):/.test(key),
-  );
-  return declared.length ? declared : canonRoles.value;
+  const style = script.value.style_context === "indoor" ? "style:indoor" : "style:outdoor";
+  return ["person:front", "cat:front", "style:line_texture", style];
 });
 
 function canonAssetFor(key: string) {
@@ -124,13 +110,13 @@ function canonAssetFor(key: string) {
     : canon.latestByRole(key);
 }
 
-/** 剧本声明但本集尚未导入的element/scene等参考role。 */
+/** 可见世界声明但本集尚未导入的元素/场景参考。 */
 const missingReferenceRoles = computed(() => {
-  const required = (script.value.required_reference_roles ?? []).filter(
-    (role) => role in REFERENCE_ROLE_LABEL,
-  );
-  const present = new Set(referenceAssets.value.map((asset) => asset.role));
-  return required.filter((role) => !present.has(role));
+  const requiredKeys = script.value.visible_world.entities
+    .map((entity) => entity.semantic_key)
+    .filter((key): key is string => Boolean(key && /^(element|scene):/.test(key)));
+  const present = new Set(referenceAssets.value.map((asset) => asset.semanticKey));
+  return requiredKeys.filter((key) => !present.has(key));
 });
 
 const uploadRole = ref("element");
@@ -203,20 +189,6 @@ async function uploadReference() {
         <span class="muted">{{ script.duration_seconds }}s</span>
         <StatusBadge :status="episode.status" />
         <el-tag size="small" type="info">{{ episode.videoInputMode }}</el-tag>
-        <el-tag
-          v-if="episode.generationStrategy !== 'single_pass'"
-          size="small"
-          type="warning"
-        >
-          {{ episode.generationStrategy }}
-        </el-tag>
-        <el-tag
-          v-if="episode.renderRiskLevel && episode.renderRiskLevel !== 'low'"
-          :type="episode.renderRiskLevel === 'high' ? 'danger' : 'warning'"
-          size="small"
-        >
-          渲染风险·{{ episode.renderRiskLevel }}
-        </el-tag>
         <span v-if="episode.nextAction" class="muted" style="font-size: 12px">
           下一步：{{ episode.nextAction }}
         </span>
@@ -276,19 +248,6 @@ async function uploadReference() {
         </li>
       </ol>
       <div><strong>结尾：</strong>{{ script.ending }}</div>
-      <div v-if="script.segments?.length" style="margin-top: 6px">
-        <strong>分段：</strong>
-        <el-tag
-          v-for="segment in script.segments"
-          :key="segment.order"
-          size="small"
-          type="info"
-          style="margin-right: 6px"
-        >
-          段{{ segment.order }} · {{ segment.duration_seconds }}s
-          <template v-if="segment.requires_tail_link"> · 尾帧衔接</template>
-        </el-tag>
-      </div>
       <PromptCollapse :prompts="videoPrompts" title="完整视频Prompt" />
       <PromptCollapse :prompts="imagePrompts" title="完整图片Prompt" />
     </div>
@@ -334,7 +293,7 @@ async function uploadReference() {
           size="small"
           style="margin-left: 6px"
         >
-          缺少{{ REFERENCE_ROLE_LABEL[role] }}
+          缺少{{ role }}
         </el-tag>
       </div>
       <template v-if="referenceAssets.length">
@@ -376,23 +335,6 @@ async function uploadReference() {
         >
           导入参考
         </el-button>
-      </div>
-    </div>
-
-    <div v-if="segmentAssets.length" class="section">
-      <div class="section-title">视频片段（multi-clip）</div>
-      <div style="display: flex; gap: 16px; flex-wrap: wrap">
-        <div v-for="(asset, index) in segmentAssets" :key="asset.id">
-          <div class="muted" style="font-size: 12px; margin-bottom: 4px">
-            片段 {{ index + 1 }}
-          </div>
-          <AssetReviewPanel
-            :asset="asset"
-            :reviews="reviews"
-            :max-width="220"
-            @reviewed="emit('changed')"
-          />
-        </div>
       </div>
     </div>
 

@@ -35,10 +35,6 @@ class PlanRequest(BaseModel):
     candidate_count: int | None = Field(None, alias="candidateCount", ge=1, le=5)
     allow_paid_generation: bool = Field(False, alias="allowPaidGeneration")
     auto_generate_keyframes: bool = Field(True, alias="autoGenerateKeyframes")
-    allow_unverified_keyframes: bool = Field(
-        False,
-        alias="allowUnverifiedKeyframes",
-    )
 
 
 class GenerateRequest(BaseModel):
@@ -48,11 +44,6 @@ class GenerateRequest(BaseModel):
 
     slot: Slot | None = None
     allow_paid_generation: bool = Field(False, alias="allowPaidGeneration")
-    allow_unverified_keyframes: bool = Field(
-        False,
-        alias="allowUnverifiedKeyframes",
-    )
-    allow_multi_clip: bool = Field(False, alias="allowMultiClip")
 
 
 class ReviewRequest(BaseModel):
@@ -77,10 +68,6 @@ class RetryStepRequest(BaseModel):
 
     reason: str = Field(min_length=4, max_length=500)
     allow_paid_generation: bool = Field(False, alias="allowPaidGeneration")
-    allow_unverified_keyframes: bool = Field(
-        False,
-        alias="allowUnverifiedKeyframes",
-    )
 
 
 class ReplanRequest(BaseModel):
@@ -104,16 +91,6 @@ class DeriveCropRequest(BaseModel):
     view: str | None = None
 
 
-class CompareResolutionRequest(BaseModel):
-    """对同一Episode用不同分辨率生成对比候选。"""
-
-    model_config = ConfigDict(populate_by_name=True)
-
-    resolution: str = Field(pattern=r"^(480p|720p)$")
-    allow_paid_generation: bool = Field(False, alias="allowPaidGeneration")
-    allow_multi_clip: bool = Field(False, alias="allowMultiClip")
-
-
 class PromptOverridesRequest(BaseModel):
     """主题创作台的Prompt编辑保存；键只允许首帧/尾帧/视频。"""
 
@@ -129,7 +106,3 @@ class GenerateKeyframesRequest(BaseModel):
 
     overrides: dict[str, str] | None = None
     allow_paid_generation: bool = Field(False, alias="allowPaidGeneration")
-    allow_unverified_keyframes: bool = Field(
-        False,
-        alias="allowUnverifiedKeyframes",
-    )

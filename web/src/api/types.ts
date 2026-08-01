@@ -1,7 +1,7 @@
 /** 与后端 camelCase 读模型对齐的接口类型。
  * 以 src/cat_video_generator/infrastructure/db/records.py 与
  * infrastructure/db/query_repository.py 的返回结构为准；
- * EpisodeScript 对应 domain/contracts.py 的 EpisodePlan（model_dump JSON）。
+ * EpisodeScript 对应 domain/contracts.py；slot由Episode关系字段单独返回。
  */
 
 export interface RunSummary {
@@ -9,18 +9,12 @@ export interface RunSummary {
   contentDate: string;
   theme: string | null;
   status: string;
-  selectedCandidate: number | null;
-  archivedSource: string | null;
   nextAction: string | null;
   createdAt: string;
   updatedAt: string;
   /** 以下字段仅 /runs/{id}/graph 响应存在 */
   worldConsistencyStatus?: string;
   contradictions?: string[];
-  renderRiskLevel?: string;
-  renderRiskReasons?: string[];
-  multiClipRecommended?: boolean;
-  directorRepairAttempted?: boolean;
 }
 
 export type AppearanceContinuity = "continue" | "changed";
@@ -39,6 +33,7 @@ export interface ActionStageDto {
   actor_id: ActorId;
   action: string;
   visible_result: string;
+  transitions: EntityTransitionDto[];
 }
 
 export type CameraMove = "fixed" | "follow" | "push" | "pull" | "pan" | "track";
@@ -53,81 +48,52 @@ export interface ShotPlanDto {
   direction: string;
 }
 
-export interface SegmentPlanDto {
-  order: number;
-  shot_order: number;
-  action_orders: number[];
-  duration_seconds: number;
-  requires_tail_link: boolean;
+export interface EntityStateDto {
+  anchor_id: string | null;
+  support_id: string | null;
+  container_id: string | null;
+  active: boolean;
+  appearance_signature: string;
 }
 
-export type RelationKind =
-  | "count"
-  | "support"
-  | "containment"
-  | "boundary"
-  | "handoff";
-
-export interface CriticalRelationDto {
-  subject: string;
-  relation: RelationKind;
-  initial_state: string;
-  final_state: string;
+export interface EntityTransitionDto {
+  entity_id: string;
+  before: EntityStateDto;
+  after: EntityStateDto;
+  reason: string;
 }
 
-export interface ElementUseDto {
-  element_id: string;
-  purpose: string;
-  initial_state: string;
-  final_state: string;
-}
-
-export interface ScenePropDto {
-  name: string;
-  placement: string;
-  final_placement: string | null;
-}
-
-/** VisibleWorldPlan 的完整结构见 domain/continuity.py；
- * 前端只做展示，保留松散结构。 */
 export interface VisibleWorldDto {
-  scene_anchors: Array<Record<string, unknown>>;
-  tracked_entities: Array<Record<string, unknown>>;
-  action_transitions: Array<Record<string, unknown>>;
-  shot_boundary_states: Array<Record<string, unknown>>;
+  anchors: Array<{ id: string; name: string; type: string }>;
+  entities: Array<{
+    id: string;
+    name: string;
+    type: string;
+    semantic_key: string | null;
+    initial_state: EntityStateDto;
+  }>;
 }
 
 export type VideoInputMode =
   | "multimodal_reference"
   | "strict_first_frame"
   | "strict_first_last";
-export type GenerationStrategy = "single_pass" | "multi_clip";
 export type StyleContext = "indoor" | "outdoor";
 
 export interface EpisodeScript {
-  slot: string;
   title: string;
-  event_key: string | null;
-  location_key: string | null;
+  event_key: string;
+  location_key: string;
   main_event: string;
   scene: string;
   style_context: StyleContext;
-  cast: string[];
   appearance: AppearancePlanDto;
   actions: ActionStageDto[];
   shots: ShotPlanDto[];
   ending: string;
   duration_seconds: number;
   video_input_mode: VideoInputMode;
-  required_reference_roles: string[];
-  shared_element_ids: string[];
-  element_uses: ElementUseDto[];
-  critical_relations: CriticalRelationDto[];
-  scene_inventory: ScenePropDto[];
-  visible_world: VisibleWorldDto | null;
-  reference_semantic_keys: string[];
-  generation_strategy: GenerationStrategy;
-  segments: SegmentPlanDto[];
+  visible_world: VisibleWorldDto;
 }
 
 export interface EpisodeDto {
@@ -138,12 +104,8 @@ export interface EpisodeDto {
   title: string;
   status: string;
   videoInputMode: string;
-  generationStrategy: GenerationStrategy;
   worldConsistencyStatus: string;
   contradictions: string[];
-  renderRiskLevel: string;
-  renderRiskReasons: string[];
-  multiClipRecommended: boolean;
   nextAction: string | null;
   selectedVideoAssetId: string | null;
   promptOverrides: Record<string, string>;
@@ -167,7 +129,8 @@ export interface StepDto {
   providerTaskId: string | null;
   model: string | null;
   inputHash: string;
-  requestSummary: Record<string, unknown>;
+  operationKey: string;
+  inputSnapshot: Record<string, unknown>;
   error: StepError | null;
   nextAction: string | null;
   createdAt: string;
@@ -187,8 +150,7 @@ export interface PromptDto {
 
 export interface PromptFull extends PromptDto {
   text: string;
-  inputPlan?: Record<string, unknown> | null;
-  promptAliases?: Record<string, string>;
+  inputSnapshot?: Record<string, unknown>;
 }
 
 export interface AssetDto {

@@ -16,8 +16,6 @@ const emit = defineEmits<{ submitted: [] }>();
 const jobs = useJobsStore();
 const confirming = ref(false);
 const paidConfirmed = ref(false);
-const allowMultiClip = ref(false);
-const allowUnverifiedKeyframes = ref(false);
 const submitting = ref(false);
 
 const dedupKey = computed(
@@ -27,8 +25,6 @@ const active = computed(() => jobs.isActive(dedupKey.value));
 
 function ask() {
   paidConfirmed.value = false;
-  allowMultiClip.value = false;
-  allowUnverifiedKeyframes.value = false;
   confirming.value = true;
 }
 
@@ -39,8 +35,6 @@ async function confirm() {
     const accepted = await api.generate(props.runId, {
       slot: props.slot,
       allowPaidGeneration: true,
-      allowMultiClip: allowMultiClip.value,
-      allowUnverifiedKeyframes: allowUnverifiedKeyframes.value,
     });
     jobs.track(accepted);
     confirming.value = false;
@@ -78,16 +72,6 @@ async function confirm() {
     <el-checkbox v-model="paidConfirmed">
       <span style="color: #f56c6c">我已知晓并确认本次付费生成</span>
     </el-checkbox>
-    <div style="margin-top: 10px">
-      <el-checkbox v-model="allowMultiClip">
-        允许分段生成（multi-clip，尾帧链式衔接）
-      </el-checkbox>
-    </div>
-    <div style="margin-top: 6px">
-      <el-checkbox v-model="allowUnverifiedKeyframes">
-        允许未验证关键帧（技术QC代替语义审核，风险自负）
-      </el-checkbox>
-    </div>
     <template #footer>
       <el-button @click="confirming = false">取消</el-button>
       <el-button

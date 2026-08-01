@@ -11,13 +11,13 @@ from ..domain.visual_profiles import (
     DEFAULT_SERIES_VISUAL_PROFILE,
     DEFAULT_STYLE_PROFILE,
 )
-from .ports import StoredAsset, WorkflowRepository
+from .ports import QueryStore, StoredAsset
 
 
 class QueryService:
     """稳定工作流读模型，避免不同接口各自猜测状态。"""
 
-    def __init__(self, repository: WorkflowRepository) -> None:
+    def __init__(self, repository: QueryStore) -> None:
         self._repository = repository
 
     def list_runs(
@@ -65,9 +65,11 @@ class QueryService:
         """
 
         detail = self._repository.episode_detail(episode_id)
-        episode = EpisodePlan.model_validate(detail["script"])
+        episode = EpisodePlan(slot=detail["slot"], script=detail["script"])
         first_view = (
-            episode.shots[0].dominant_view.value if episode.shots else "front"
+            episode.script.shots[0].dominant_view.value
+            if episode.script.shots
+            else "front"
         )
         view = first_view if first_view in {"front", "side", "back"} else "front"
         style_profile = DEFAULT_STYLE_PROFILE
@@ -82,7 +84,12 @@ class QueryService:
                         if episode.style_context == "indoor"
                         else style_profile.outdoor_reference_key
                     ),
-                    *episode.reference_semantic_keys,
+                    *(
+                        entity.semantic_key
+                        for entity in episode.script.visible_world.entities
+                        if entity.semantic_key is not None
+                        and entity.semantic_key.startswith(("element:", "scene:"))
+                    ),
                 )
             )
         )

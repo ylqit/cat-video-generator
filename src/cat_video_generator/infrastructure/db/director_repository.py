@@ -12,6 +12,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session, sessionmaker
 
+from ...domain.snapshots import DirectorInputSnapshot
 from ...domain.workflow import StepStatus, transition_step
 from .models import WorkflowStep
 from .query_repository import required_record
@@ -36,12 +37,14 @@ class DirectorStepPersistenceMixin:
                 StepStatus(row.status),
                 StepStatus.SUCCEEDED,
             ).value
-            row.request_summary_json = {
-                **row.request_summary_json,
-                "responseId": response_id,
-                "providerRequestHash": request_hash,
-                "directorOutput": output,
-            }
+            snapshot = DirectorInputSnapshot.model_validate(row.input_snapshot_json)
+            row.input_snapshot_json = snapshot.model_copy(
+                update={
+                    "response_id": response_id,
+                    "request_hash": request_hash,
+                    "output": output,
+                }
+            ).model_dump(mode="json")
             row.completed_at = datetime.now(timezone.utc)
 
     def fail_director_step(
@@ -62,11 +65,13 @@ class DirectorStepPersistenceMixin:
                 StepStatus(row.status),
                 StepStatus.FAILED,
             ).value
-            row.request_summary_json = {
-                **row.request_summary_json,
-                "responseId": response_id,
-                "providerRequestHash": request_hash,
-                "rejectedDirectorOutput": output,
-            }
+            snapshot = DirectorInputSnapshot.model_validate(row.input_snapshot_json)
+            row.input_snapshot_json = snapshot.model_copy(
+                update={
+                    "response_id": response_id,
+                    "request_hash": request_hash,
+                    "output": output,
+                }
+            ).model_dump(mode="json")
             row.error_json = {"code": code, "message": message}
             row.completed_at = datetime.now(timezone.utc)

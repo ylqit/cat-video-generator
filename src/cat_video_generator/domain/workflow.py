@@ -23,7 +23,6 @@ class RunStatus(StrEnum):
     READY = "ready"
     DELIVERED = "delivered"
     FAILED = "failed"
-    ARCHIVED = "archived"
 
 
 class EpisodeStatus(StrEnum):
@@ -35,16 +34,12 @@ class EpisodeStatus(StrEnum):
     CONTENT_REVIEW = "content_review"
     READY = "ready"
     FAILED = "failed"
-    ARCHIVED = "archived"
 
 
 class StepKind(StrEnum):
     DIRECTOR = "director"
     IMAGE = "image"
     VIDEO = "video"
-    QC = "qc"
-    REVIEW = "review"
-    DELIVERY = "delivery"
 
 
 class StepStatus(StrEnum):
@@ -58,7 +53,6 @@ class StepStatus(StrEnum):
     FAILED = "failed"
     EXPIRED = "expired"
     CANCELLED = "cancelled"
-    ARCHIVED = "archived"
 
 
 _RUN_TRANSITIONS = {
@@ -66,45 +60,37 @@ _RUN_TRANSITIONS = {
         RunStatus.PLANNING_REVIEW,
         RunStatus.PLANNED,
         RunStatus.FAILED,
-        RunStatus.ARCHIVED,
     },
     RunStatus.PLANNING_REVIEW: {
         RunStatus.DRAFT,
         RunStatus.PLANNED,
         RunStatus.FAILED,
-        RunStatus.ARCHIVED,
     },
     RunStatus.PLANNED: {
         RunStatus.GENERATING,
         RunStatus.FAILED,
-        RunStatus.ARCHIVED,
     },
     RunStatus.GENERATING: {
         RunStatus.REVIEWING,
         RunStatus.READY,
         RunStatus.FAILED,
-        RunStatus.ARCHIVED,
     },
     RunStatus.REVIEWING: {
         RunStatus.GENERATING,
         RunStatus.READY,
         RunStatus.FAILED,
-        RunStatus.ARCHIVED,
     },
     RunStatus.READY: {
         RunStatus.DELIVERED,
         RunStatus.FAILED,
-        RunStatus.ARCHIVED,
     },
-    RunStatus.DELIVERED: {RunStatus.ARCHIVED},
+    RunStatus.DELIVERED: set(),
     # 初始导演链失败后可复用已成功的DayBrief继续补齐Episode，再回到planned。
     RunStatus.FAILED: {
         RunStatus.PLANNING_REVIEW,
         RunStatus.PLANNED,
         RunStatus.GENERATING,
-        RunStatus.ARCHIVED,
     },
-    RunStatus.ARCHIVED: set(),
 }
 
 _EPISODE_TRANSITIONS = {
@@ -112,41 +98,33 @@ _EPISODE_TRANSITIONS = {
         EpisodeStatus.PREPARING_VISUALS,
         EpisodeStatus.VIDEO_PENDING,
         EpisodeStatus.FAILED,
-        EpisodeStatus.ARCHIVED,
     },
     EpisodeStatus.PREPARING_VISUALS: {
         EpisodeStatus.VIDEO_PENDING,
         EpisodeStatus.FAILED,
-        EpisodeStatus.ARCHIVED,
     },
     EpisodeStatus.VIDEO_PENDING: {
         EpisodeStatus.VIDEO_GENERATING,
         EpisodeStatus.FAILED,
-        EpisodeStatus.ARCHIVED,
     },
     EpisodeStatus.VIDEO_GENERATING: {
         EpisodeStatus.MEDIA_QC,
         EpisodeStatus.FAILED,
-        EpisodeStatus.ARCHIVED,
     },
     EpisodeStatus.MEDIA_QC: {
         EpisodeStatus.CONTENT_REVIEW,
         EpisodeStatus.FAILED,
-        EpisodeStatus.ARCHIVED,
     },
     EpisodeStatus.CONTENT_REVIEW: {
         EpisodeStatus.READY,
         EpisodeStatus.FAILED,
-        EpisodeStatus.ARCHIVED,
     },
-    EpisodeStatus.READY: {EpisodeStatus.ARCHIVED},
+    EpisodeStatus.READY: set(),
     EpisodeStatus.FAILED: {
         EpisodeStatus.PLANNED,
         EpisodeStatus.PREPARING_VISUALS,
         EpisodeStatus.VIDEO_PENDING,
-        EpisodeStatus.ARCHIVED,
     },
-    EpisodeStatus.ARCHIVED: set(),
 }
 
 _STEP_TRANSITIONS = {
@@ -154,7 +132,6 @@ _STEP_TRANSITIONS = {
         StepStatus.SUBMITTING,
         StepStatus.RUNNING,
         StepStatus.FAILED,
-        StepStatus.ARCHIVED,
     },
     StepStatus.SUBMITTING: {
         StepStatus.SUBMISSION_UNKNOWN,
@@ -188,11 +165,10 @@ _STEP_TRANSITIONS = {
         StepStatus.SUCCEEDED,
         StepStatus.FAILED,
     },
-    StepStatus.SUCCEEDED: {StepStatus.ARCHIVED},
-    StepStatus.FAILED: {StepStatus.ARCHIVED},
-    StepStatus.EXPIRED: {StepStatus.ARCHIVED},
-    StepStatus.CANCELLED: {StepStatus.ARCHIVED},
-    StepStatus.ARCHIVED: set(),
+    StepStatus.SUCCEEDED: set(),
+    StepStatus.FAILED: set(),
+    StepStatus.EXPIRED: set(),
+    StepStatus.CANCELLED: set(),
 }
 
 StatusT = TypeVar("StatusT", RunStatus, EpisodeStatus, StepStatus)

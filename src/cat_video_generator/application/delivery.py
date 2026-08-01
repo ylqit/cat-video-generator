@@ -7,7 +7,7 @@ from typing import Any
 
 from ..domain.contracts import Slot
 from ..domain.workflow import EpisodeStatus, RunStatus
-from .ports import AssetStore, WorkflowRepository
+from .ports import AssetStore, ProductionStore
 
 
 class DeliveryService:
@@ -16,7 +16,7 @@ class DeliveryService:
     def __init__(
         self,
         *,
-        repository: WorkflowRepository,
+        repository: ProductionStore,
         asset_store: AssetStore,
     ) -> None:
         self._repository = repository

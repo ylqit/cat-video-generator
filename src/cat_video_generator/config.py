@@ -29,21 +29,14 @@ class DatabaseOperation(StrEnum):
     TEST = "test"
 
 
-class ArkAccessMode(StrEnum):
-    STANDARD = "standard"
-    AGENT_PLAN = "agent_plan"
-
-
 class KeyframeReviewMode(StrEnum):
     """关键帧语义审核是否阻断后续收费视频任务。"""
 
     SEMANTIC_AUTO = "semantic_auto"
-    TECHNICAL_AUTO = "technical_auto"
     MANUAL = "manual"
 
 
 _STANDARD_URL = "https://ark.cn-beijing.volces.com/api/v3"
-_AGENT_PLAN_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
 _IMAGE_MODEL = "doubao-seedream-5-0-260128"
 _VIDEO_MODELS = frozenset(
     {
@@ -112,7 +105,6 @@ class RuntimeSettings:
     """Ark、媒体与导演运行配置。"""
 
     ark_api_key: str | None
-    ark_access_mode: ArkAccessMode
     ark_base_url: str
     ark_image_model: str
     ark_video_model: str
@@ -141,14 +133,6 @@ class RuntimeSettings:
         config_root: Path | None = None,
     ) -> RuntimeSettings:
         values = os.environ if environ is None else environ
-        try:
-            access_mode = ArkAccessMode(
-                values.get("ARK_ACCESS_MODE", "standard").strip().lower()
-            )
-        except ValueError as exc:
-            raise ConfigurationError(
-                "ARK_ACCESS_MODE必须是standard或agent_plan"
-            ) from exc
         poll_interval = float(_number(values, "ARK_POLL_INTERVAL_SECONDS", "10", float))
         timeout = float(_number(values, "ARK_TASK_TIMEOUT_SECONDS", "1800", float))
         candidate_count = int(_number(values, "DAILY_PLAN_CANDIDATE_COUNT", "1", int))
@@ -165,16 +149,11 @@ class RuntimeSettings:
             .lower()
         )
         configuration_warnings: list[str] = []
-        if review_mode_value == "auto":
-            review_mode_value = "technical_auto"
-            configuration_warnings.append(
-                "KEYFRAME_REVIEW_MODE=auto已映射为technical_auto，请更新.env"
-            )
         try:
             keyframe_review_mode = KeyframeReviewMode(review_mode_value)
         except ValueError as exc:
             raise ConfigurationError(
-                "KEYFRAME_REVIEW_MODE必须是semantic_auto、technical_auto或manual"
+                "KEYFRAME_REVIEW_MODE必须是semantic_auto或manual"
             ) from exc
         video_review_mode = values.get(
             "VIDEO_SEMANTIC_REVIEW_MODE",
@@ -209,7 +188,6 @@ class RuntimeSettings:
             )
         return cls(
             ark_api_key=values.get("ARK_API_KEY") or None,
-            ark_access_mode=access_mode,
             ark_base_url=values.get("ARK_BASE_URL", _STANDARD_URL).rstrip("/"),
             ark_image_model=values.get(
                 "ARK_IMAGE_MODEL",
@@ -258,23 +236,14 @@ class RuntimeSettings:
 
     @property
     def provider_profile(self) -> str:
-        return (
-            "volcengine-agent-plan"
-            if self.ark_access_mode is ArkAccessMode.AGENT_PLAN
-            else "volcengine-ark-standard"
-        )
+        return "volcengine-ark-standard"
 
     def validate_for_ark_access(self) -> None:
         """拒绝混用访问模式、Base URL或空模型。"""
 
-        expected_url = (
-            _AGENT_PLAN_URL
-            if self.ark_access_mode is ArkAccessMode.AGENT_PLAN
-            else _STANDARD_URL
-        )
         issues: list[str] = []
-        if self.ark_base_url != expected_url:
-            issues.append(f"{self.ark_access_mode.value}必须使用{expected_url}")
+        if self.ark_base_url != _STANDARD_URL:
+            issues.append(f"Ark标准API必须使用{_STANDARD_URL}")
         if not self.ark_api_key:
             issues.append("缺少ARK_API_KEY")
         if not all(
@@ -316,11 +285,8 @@ class RuntimeSettings:
         return {
             "provider": self.provider_profile,
             "arkApiKeyConfigured": bool(self.ark_api_key),
-            "arkAccessMode": self.ark_access_mode.value,
             "arkBaseUrlProfile": (
-                "agent_plan"
-                if self.ark_base_url == _AGENT_PLAN_URL
-                else "standard"
+                "standard"
                 if self.ark_base_url == _STANDARD_URL
                 else "unknown"
             ),
@@ -411,6 +377,15 @@ class DatabaseSettings:
         if _SCHEMA_PATTERN.fullmatch(self.schema) is None:
             raise ConfigurationError("数据库Schema名称不合法")
         if self.sslmode != "disable":
+            return
+        if (
+            operation is DatabaseOperation.TEST
+            and self.allow_insecure_runtime
+            and self.database == "vedio-appdb"
+            and re.fullmatch(r"cat_video_test_[a-f0-9]{12}", self.schema)
+        ):
+            # 远程集成测试只能进入本次随机Schema；正式cat_video和其他Schema
+            # 均不会被测试迁移、约束验证或清理逻辑触碰。
             return
         if operation is DatabaseOperation.READ_ONLY_SMOKE:
             if self.allow_insecure_readonly_smoke:

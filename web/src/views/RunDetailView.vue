@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ElMessage } from "element-plus";
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 
 import { api, ApiError } from "../api/client";
 import DeliveryPanel from "../components/DeliveryPanel.vue";
@@ -61,7 +61,7 @@ async function refresh() {
 
 const polling = usePolling(refresh, () => (isActive.value ? 5000 : 30000));
 
-/** 运行级诊断：世界一致性矛盾与渲染风险摘要。 */
+/** 运行级诊断只展示确定性的可见世界矛盾。 */
 const diagnostics = computed(() => {
   const run = graph.value?.run;
   if (!run) {
@@ -70,17 +70,6 @@ const diagnostics = computed(() => {
   const items: string[] = [];
   if (run.contradictions?.length) {
     items.push(`世界一致性矛盾：${run.contradictions.join("；")}`);
-  }
-  if (run.renderRiskLevel && run.renderRiskLevel !== "low") {
-    items.push(
-      `渲染风险·${run.renderRiskLevel}` +
-        (run.renderRiskReasons?.length
-          ? `：${run.renderRiskReasons.join("；")}`
-          : ""),
-    );
-  }
-  if (run.multiClipRecommended) {
-    items.push("导演建议改用 multi_clip 分段生成");
   }
   return items.length ? items : null;
 });
@@ -93,28 +82,6 @@ async function resumePlanning() {
     const accepted = await api.resumePlanning(props.id, true);
     jobs.track(accepted);
     ElMessage.success("恢复规划任务已提交");
-    await refresh();
-  } catch (error) {
-    ElMessage.error(error instanceof ApiError ? error.message : String(error));
-  }
-}
-
-const compareVisible = ref(false);
-const compareForm = reactive({
-  resolution: "480p" as "480p" | "720p",
-  allowPaidGeneration: false,
-});
-
-async function submitCompare() {
-  try {
-    const accepted = await api.compareResolution(
-      props.id,
-      compareForm.resolution,
-      true,
-    );
-    jobs.track(accepted);
-    compareVisible.value = false;
-    ElMessage.success("分辨率对比任务已提交");
     await refresh();
   } catch (error) {
     ElMessage.error(error instanceof ApiError ? error.message : String(error));
@@ -158,9 +125,6 @@ onMounted(() => {
         @click="resumePlanning"
       >
         恢复规划
-      </el-button>
-      <el-button size="small" @click="compareVisible = true">
-        分辨率对比
       </el-button>
       <el-button size="small" @click="resume">恢复在途任务</el-button>
       <GenerateButton
@@ -235,33 +199,6 @@ onMounted(() => {
       :can-deliver="graph.run.status === 'ready'"
     />
 
-    <el-dialog v-model="compareVisible" title="分辨率对比" width="440px">
-      <el-form label-width="110px">
-        <el-form-item label="对比分辨率">
-          <el-radio-group v-model="compareForm.resolution">
-            <el-radio value="480p">480p</el-radio>
-            <el-radio value="720p">720p</el-radio>
-          </el-radio-group>
-        </el-form-item>
-        <el-form-item>
-          <el-checkbox v-model="compareForm.allowPaidGeneration">
-            <span style="color: #f56c6c">
-              我已知晓本次对比将产生 Ark 付费模型调用
-            </span>
-          </el-checkbox>
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="compareVisible = false">取消</el-button>
-        <el-button
-          type="primary"
-          :disabled="!compareForm.allowPaidGeneration"
-          @click="submitCompare"
-        >
-          提交对比
-        </el-button>
-      </template>
-    </el-dialog>
   </div>
   <div v-else class="page" v-loading="true" style="min-height: 300px" />
 </template>

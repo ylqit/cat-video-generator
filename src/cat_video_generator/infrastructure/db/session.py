@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from ...config import DatabaseOperation, DatabaseSettings
 from .models import SCHEMA_NAME
 
-ALEMBIC_HEAD = "0005_episode_prompt_overrides"
+ALEMBIC_HEAD = "0006_core_simplification"
 
 
 def create_database_engine(

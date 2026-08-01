@@ -65,14 +65,11 @@ export interface PlanPayload {
   candidateCount?: number;
   allowPaidGeneration: boolean;
   autoGenerateKeyframes?: boolean;
-  allowUnverifiedKeyframes?: boolean;
 }
 
 export interface GeneratePayload {
   slot: "morning" | "noon" | "evening" | null;
   allowPaidGeneration: boolean;
-  allowUnverifiedKeyframes?: boolean;
-  allowMultiClip?: boolean;
 }
 
 export const api = {
@@ -131,12 +128,10 @@ export const api = {
     stepId: string,
     reason: string,
     allowPaidGeneration: boolean,
-    allowUnverifiedKeyframes = false,
   ) =>
     post<JobAccepted>(`/steps/${stepId}/retry`, {
       reason,
       allowPaidGeneration,
-      allowUnverifiedKeyframes,
     }),
   resumePlanning: (runId: string, allowPaidGeneration: boolean) =>
     post<JobAccepted>(`/runs/${runId}/resume-planning`, {
@@ -181,17 +176,6 @@ export const api = {
       view?: string;
     },
   ) => post<{ assetId: string }>(`/canon/${assetId}/derive-crop`, payload),
-  compareResolution: (
-    runId: string,
-    resolution: "480p" | "720p",
-    allowPaidGeneration: boolean,
-    allowMultiClip = false,
-  ) =>
-    post<JobAccepted>(`/runs/${runId}/compare-resolution`, {
-      resolution,
-      allowPaidGeneration,
-      allowMultiClip,
-    }),
   getPromptPreview: (episodeId: string, resolution: "480p" | "720p" = "480p") =>
     request<EpisodePromptPreview>(
       `/episodes/${episodeId}/prompt-preview?resolution=${resolution}`,
@@ -208,11 +192,9 @@ export const api = {
     episodeId: string,
     allowPaidGeneration: boolean,
     overrides?: PromptOverrides,
-    allowUnverifiedKeyframes = false,
   ) =>
     post<JobAccepted>(`/episodes/${episodeId}/keyframes`, {
       allowPaidGeneration,
-      allowUnverifiedKeyframes,
       overrides: overrides ?? null,
     }),
 };

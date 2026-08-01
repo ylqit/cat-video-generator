@@ -37,13 +37,11 @@ class PlanPersistenceMixin:
                 RunStatus(run.status),
                 RunStatus.PLANNED,
             ).value
-            run.theme = plan.theme
-            run.context_json = {
-                **run.context_json,
-                "dayContext": plan.day_context,
+            run.planning_json = {
+                **run.planning_json,
+                "dayBrief": plan.day_brief.model_dump(mode="json"),
+                "selectedCandidate": selected_candidate,
             }
-            run.plan_json = plan.model_dump(mode="json")
-            run.selected_candidate = selected_candidate
             existing = session.execute(
                 select(Episode.id).where(Episode.production_run_id == run_id)
             ).first()
@@ -54,9 +52,7 @@ class PlanPersistenceMixin:
                     production_run_id=run_id,
                     slot=episode.slot.value,
                     sort_order=episode.slot.sort_order,
-                    title=episode.title,
-                    script_json=episode.model_dump(mode="json"),
-                    video_input_mode=episode.video_input_mode.value,
+                    script_json=episode.script.model_dump(mode="json"),
                     status=EpisodeStatus.PLANNED.value,
                 )
                 for episode in plan.episodes
@@ -76,9 +72,8 @@ class PlanPersistenceMixin:
 
         with self._sessions.begin() as session:  # type: ignore[attr-defined]
             run = _required(session, ProductionRun, run_id)
-            run.theme = day_brief.theme
-            run.context_json = {
-                **run.context_json,
+            run.planning_json = {
+                **run.planning_json,
                 "dayBrief": day_brief.model_dump(mode="json"),
                 "dayDirectorStepId": str(day_step_id),
                 "dayDirectorPromptId": str(day_prompt_id),
@@ -88,7 +83,7 @@ class PlanPersistenceMixin:
 
     def get_planning_context(self, run_id: uuid.UUID) -> dict[str, Any]:
         with self._sessions() as session:  # type: ignore[attr-defined]
-            return dict(_required(session, ProductionRun, run_id).context_json)
+            return dict(_required(session, ProductionRun, run_id).planning_json)
 
     def replace_episode_plan(
         self,
@@ -116,24 +111,10 @@ class PlanPersistenceMixin:
                     current,
                     EpisodeStatus.PLANNED,
                 ).value
-            row.title = episode.title
-            row.script_json = episode.model_dump(mode="json")
-            row.video_input_mode = episode.video_input_mode.value
-            if run.plan_json is None:
-                raise ValueError("Run尚未形成完整方案")
-            plan = DailyProductionPlan.model_validate(run.plan_json)
-            payload = plan.model_dump(mode="json")
-            payload["episodes"] = [
-                (
-                    episode.model_dump(mode="json")
-                    if item.slot is episode.slot
-                    else item.model_dump(mode="json")
-                )
-                for item in plan.episodes
-            ]
-            run.plan_json = DailyProductionPlan.model_validate(payload).model_dump(
-                mode="json"
-            )
+            row.script_json = episode.script.model_dump(mode="json")
+            drafts = dict(run.planning_json.get("episodeDrafts", {}))
+            drafts[episode.slot.value] = episode.script.model_dump(mode="json")
+            run.planning_json = {**run.planning_json, "episodeDrafts": drafts}
 
     def get_prompt_overrides(self, episode_id: uuid.UUID) -> dict[str, str]:
         """读取页面编辑后的Prompt覆盖；缺省为空字典。"""

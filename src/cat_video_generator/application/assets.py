@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from ..domain.workflow import EpisodeStatus, RunStatus
-from .ports import AssetStore, MediaProbe, WorkflowRepository
+from .ports import AssetStore, MediaProbe, ProductionStore
 
 
 class AssetService:
@@ -17,7 +17,7 @@ class AssetService:
     def __init__(
         self,
         *,
-        repository: WorkflowRepository,
+        repository: ProductionStore,
         asset_store: AssetStore,
         media_probe: MediaProbe,
     ) -> None:

@@ -12,9 +12,13 @@ import uuid
 from dataclasses import dataclass, replace
 from typing import Any
 
-from ..domain.contracts import VideoInputMode
-from ..domain.prompts import CompiledPrompt, compile_image_prompt
-from ..domain.review_prompts import compile_keyframe_review_prompt
+from ..domain.prompts import (
+    CompiledPrompt,
+    compile_image_prompt,
+    compile_keyframe_review_prompt,
+)
+from ..domain.rendering import VideoInputMode
+from ..domain.snapshots import ImageInputSnapshot
 from ..domain.visual_profiles import (
     SeriesVisualProfile,
     StyleProfile,
@@ -26,11 +30,11 @@ from .ports import (
     GatewayError,
     MediaGenerationGateway,
     MediaProbe,
+    ProductionStore,
     StoredAsset,
     StoredEpisode,
     StoredStep,
     VisualReviewGateway,
-    WorkflowRepository,
 )
 
 
@@ -41,23 +45,6 @@ class ReferenceSelectionPlan:
     semantic_keys: tuple[str, ...]
     assets: tuple[StoredAsset, ...]
 
-    def summary(self) -> dict[str, Any]:
-        return {
-            "items": [
-                {
-                    "ordinal": index,
-                    "assetId": str(asset.id),
-                    "semanticKey": key,
-                    "role": asset.role,
-                    "sha256": asset.sha256,
-                }
-                for index, (key, asset) in enumerate(
-                    zip(self.semantic_keys, self.assets, strict=True),
-                    start=1,
-                )
-            ]
-        }
-
 
 class VisualPreparationService:
     """精确选图，并把关键帧推进到可用、待人工或明确拒绝。"""
@@ -65,7 +52,7 @@ class VisualPreparationService:
     def __init__(
         self,
         *,
-        repository: WorkflowRepository,
+        repository: ProductionStore,
         media_gateway: MediaGenerationGateway,
         visual_review_gateway: VisualReviewGateway,
         asset_store: AssetStore,
@@ -82,6 +69,8 @@ class VisualPreparationService:
         self._probe = media_probe
         self._provider_name = provider_name
         self._review_mode = str(keyframe_review_mode)
+        if self._review_mode not in {"semantic_auto", "manual"}:
+            raise ValueError("关键帧审核只允许semantic_auto或manual")
         self._series_profile = series_profile
         self._style_profile = style_profile
 
@@ -89,13 +78,12 @@ class VisualPreparationService:
         self,
         episode: StoredEpisode,
         *,
-        allow_unverified_keyframes: bool,
         prompt_overrides: dict[str, str] | None = None,
     ) -> tuple[StoredAsset, ...] | None:
         """返回Seedance实际输入；``None``表示关键帧等待人工审核。"""
 
         selection = self.select_references(episode)
-        if episode.plan.video_input_mode is VideoInputMode.MULTIMODAL_REFERENCE:
+        if episode.plan.script.video_input_mode is VideoInputMode.MULTIMODAL_REFERENCE:
             return selection.assets
         if episode.status in {EpisodeStatus.PLANNED, EpisodeStatus.FAILED}:
             self._repository.set_episode_status(
@@ -106,14 +94,13 @@ class VisualPreparationService:
             episode,
             selection,
             target="first_frame",
-            allow_unverified_keyframes=allow_unverified_keyframes,
             prompt_override=(prompt_overrides or {}).get("first_frame"),
         )
         if first.status == "candidate":
             return None
         if first.status == "rejected":
             raise RuntimeError("首帧语义审核失败，已阻断Seedance任务")
-        if episode.plan.video_input_mode is VideoInputMode.STRICT_FIRST_FRAME:
+        if episode.plan.script.video_input_mode is VideoInputMode.STRICT_FIRST_FRAME:
             return (first,)
 
         # 尾帧必须读取已经通过审核的首帧，使身份、空间和物体终态建立在同一画面上。
@@ -125,7 +112,6 @@ class VisualPreparationService:
             episode,
             last_selection,
             target="last_frame",
-            allow_unverified_keyframes=allow_unverified_keyframes,
             prompt_override=(prompt_overrides or {}).get("last_frame"),
         )
         if last.status == "candidate":
@@ -138,12 +124,20 @@ class VisualPreparationService:
         """按语义键选择最新批准版本，绝不回退到同role的其他资产。"""
 
         first_view = (
-            episode.plan.shots[0].dominant_view.value
-            if episode.plan.shots
+            episode.plan.script.shots[0].dominant_view.value
+            if episode.plan.script.shots
             else "front"
         )
         view = first_view if first_view in {"front", "side", "back"} else "front"
-        style_context = episode.plan.style_context
+        style_context = episode.plan.script.style_context
+        extra_semantic_keys = tuple(
+            dict.fromkeys(
+                item.semantic_key
+                for item in episode.plan.script.visible_world.entities
+                if item.semantic_key is not None
+                and item.semantic_key.split(":", 1)[0] in {"element", "scene"}
+            )
+        )
         desired = (
             f"person:{view}",
             f"cat:{view}",
@@ -153,7 +147,7 @@ class VisualPreparationService:
                 if style_context == "indoor"
                 else self._style_profile.outdoor_reference_key
             ),
-            *episode.plan.reference_semantic_keys,
+            *extra_semantic_keys,
         )
         desired = tuple(dict.fromkeys(desired))
         if not 3 <= len(desired) <= 5:
@@ -184,7 +178,6 @@ class VisualPreparationService:
         selection: ReferenceSelectionPlan,
         *,
         target: str,
-        allow_unverified_keyframes: bool,
         prompt_override: str | None = None,
         attempt: int = 1,
         retry_of_step_id: uuid.UUID | None = None,
@@ -219,10 +212,6 @@ class VisualPreparationService:
                 utf8_bytes=len(override_text.encode("utf-8")),
                 warnings=(),
             )
-        base_input_hash = _input_hash(
-            base_compiled.text,
-            *(asset.sha256 for asset in selection.assets),
-        )
         input_hash = _input_hash(
             compiled.text,
             *(asset.sha256 for asset in selection.assets),
@@ -232,31 +221,32 @@ class VisualPreparationService:
         reusable = self._repository.find_reusable_asset(
             episode_id=episode.id,
             role=target,
-            input_hash=input_hash if has_override else base_input_hash,
+            input_hash=input_hash,
             statuses=("candidate", "approved", "ready"),
         )
         if reusable is not None:
             return reusable
         operation_key = f"image:{target}"
+        prompt_sha = hashlib.sha256(compiled.text.encode("utf-8")).hexdigest()
+        snapshot = ImageInputSnapshot(
+            target=target,
+            prompt_sha256=prompt_sha,
+            reference_asset_ids=tuple(asset.id for asset in selection.assets),
+            reference_sha256=tuple(asset.sha256 for asset in selection.assets),
+            retry_of_step_id=retry_of_step_id,
+            retry_reason=retry_reason,
+        )
         step = self._repository.create_step_intent(
             run_id=episode.run_id,
             episode_id=episode.id,
             parent_step_id=None,
             kind=StepKind.IMAGE,
             attempt=attempt,
+            operation_key=operation_key,
             provider=self._provider_name,
             model=self._media_gateway.image_model,
             input_hash=input_hash,
-            request_summary={
-                "operationKey": operation_key,
-                "baseInputHash": base_input_hash,
-                "target": target,
-                "referenceSelectionPlan": selection.summary(),
-                "retryOfStepId": (
-                    None if retry_of_step_id is None else str(retry_of_step_id)
-                ),
-                "retryReason": retry_reason,
-            },
+            input_snapshot=snapshot.model_dump(mode="json"),
         )
         self._repository.save_prompt(
             step_id=step.id,
@@ -306,7 +296,7 @@ class VisualPreparationService:
             episode_id=episode.id,
             step_id=step.id,
             role=target,
-            semantic_key=f"frame:{episode.id}-{target.replace('_frame', '')}",
+            semantic_key=("frame:first" if target == "first_frame" else "frame:last"),
             scope="episode",
             status="candidate",
             media_type="image",
@@ -315,28 +305,6 @@ class VisualPreparationService:
         )
         if self._review_mode == "manual":
             return self._await_manual(step.id, asset, metadata, "manual")
-        if self._review_mode == "technical_auto":
-            if not allow_unverified_keyframes:
-                raise ValueError(
-                    "technical_auto生成视频必须显式提供"
-                    "--allow-unverified-keyframes"
-                )
-            self._repository.set_step_status(step.id, StepStatus.AWAITING_REVIEW)
-            self._repository.commit_asset_review(
-                asset_id=asset.id,
-                source="technical",
-                decision="approved",
-                reason="技术QC通过；实验模式未执行语义审核",
-                warnings=[],
-                evidence={
-                    **metadata,
-                    "reviewMode": "technical_auto",
-                    "semanticReviewStatus": "skipped",
-                    "semanticVerified": False,
-                    "autoApprovedUnverified": True,
-                },
-            )
-            return replace(asset, status="approved")
         return self._semantic_review(episode, step.id, asset, metadata, target)
 
     def _semantic_review(
@@ -435,7 +403,6 @@ class VisualPreparationService:
         original_step: StoredStep,
         *,
         reason: str,
-        allow_unverified_keyframes: bool,
     ) -> StoredAsset:
         """显式创建关键帧新attempt；拒绝资产和旧Prompt始终保留。"""
 
@@ -448,7 +415,9 @@ class VisualPreparationService:
                 episode.run_id,
                 episode.plan.slot,
             )
-        target = str(original_step.request_summary.get("target", ""))
+        target = ImageInputSnapshot.model_validate(
+            original_step.input_snapshot
+        ).target
         if target not in {"first_frame", "last_frame"}:
             raise ValueError("原步骤不是可重试的首帧或尾帧任务")
         selection = self.select_references(episode)
@@ -474,7 +443,6 @@ class VisualPreparationService:
             episode,
             selection,
             target=target,
-            allow_unverified_keyframes=allow_unverified_keyframes,
             attempt=attempt,
             retry_of_step_id=original_step.id,
             retry_reason=reason,
@@ -502,7 +470,6 @@ class VisualPreparationService:
                 "reviewMode": review_mode,
                 "semanticReviewStatus": "pending",
                 "semanticVerified": False,
-                "autoApprovedUnverified": False,
             },
         )
         return asset

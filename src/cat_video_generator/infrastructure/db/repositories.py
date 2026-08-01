@@ -7,7 +7,7 @@ import uuid
 from datetime import date, datetime, timezone
 from typing import Any
 
-from sqlalchemy import Select, func, or_, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.dialects.postgresql import insert
 
 from ...application.ports import (
@@ -18,6 +18,7 @@ from ...application.ports import (
     StoredStep,
 )
 from ...domain.contracts import DailyProductionPlan, Slot
+from ...domain.snapshots import validate_input_snapshot
 from ...domain.workflow import (
     EpisodeStatus,
     RunStatus,
@@ -77,14 +78,17 @@ class SqlAlchemyWorkflowRepository(
         parent_step_id: uuid.UUID | None,
         kind: StepKind,
         attempt: int,
+        operation_key: str,
         provider: str | None,
         model: str | None,
         input_hash: str,
-        request_summary: dict[str, Any],
+        input_snapshot: dict[str, Any],
     ) -> StoredStep:
         # 幂等键包含业务所有者、收费步骤和规范化输入。并发Worker即使同时
         # 领取同一任务，也只有一个INSERT能成功，避免重复产生Ark费用。
-        operation_key = str(request_summary.get("operationKey", ""))
+        if not operation_key.strip():
+            raise ValueError("WorkflowStep.operation_key不能为空")
+        snapshot = validate_input_snapshot(input_snapshot).model_dump(mode="json")
         raw_key = "|".join(
             (
                 str(run_id),
@@ -104,16 +108,15 @@ class SqlAlchemyWorkflowRepository(
             "kind": kind.value,
             "status": StepStatus.PENDING.value,
             "attempt": attempt,
+            "operation_key": operation_key,
             "idempotency_key": key,
             "provider": provider,
             "model": model,
             "input_hash": input_hash,
-            "request_summary_json": request_summary,
+            "input_snapshot_json": snapshot,
         }
         with self._sessions.begin() as session:
-            # 兼容本次升级前未把operationKey写入幂等摘要的历史Step。
-            # 先按完整业务字段复用旧记录，再使用新幂等键处理并发创建；否则部署
-            # 新版本后的第一次run-day可能绕过旧唯一键并重复产生收费任务。
+            # operation_key是正式关系列；同一业务操作和输入只允许存在一个收费意图。
             compatible = select(WorkflowStep.id).where(
                 WorkflowStep.production_run_id == run_id,
                 (
@@ -124,23 +127,8 @@ class SqlAlchemyWorkflowRepository(
                 WorkflowStep.kind == kind.value,
                 WorkflowStep.attempt == attempt,
                 WorkflowStep.input_hash == input_hash,
+                WorkflowStep.operation_key == operation_key,
             )
-            if operation_key:
-                compatible = compatible.where(
-                    WorkflowStep.request_summary_json["operationKey"].astext
-                    == operation_key
-                )
-            else:
-                phase = request_summary.get("phase")
-                slot = request_summary.get("slot")
-                if phase is not None:
-                    compatible = compatible.where(
-                        WorkflowStep.request_summary_json["phase"].astext == str(phase)
-                    )
-                if slot is not None:
-                    compatible = compatible.where(
-                        WorkflowStep.request_summary_json["slot"].astext == str(slot)
-                    )
             compatible_id = session.execute(
                 compatible.order_by(WorkflowStep.created_at, WorkflowStep.id).limit(1)
             ).scalar_one_or_none()
@@ -192,8 +180,6 @@ class SqlAlchemyWorkflowRepository(
                 model=model,
                 prompt_text=text,
                 sha256=digest,
-                char_count=len(text),
-                utf8_bytes=len(text.encode("utf-8")),
             )
             session.add(row)
             session.flush()
@@ -225,15 +211,14 @@ class SqlAlchemyWorkflowRepository(
         phase: str,
         slot: Slot | None,
     ) -> int:
+        operation_key = (
+            "director:day" if slot is None else f"director:episode:{slot.value}"
+        )
         statement = select(func.max(WorkflowStep.attempt)).where(
             WorkflowStep.production_run_id == run_id,
             WorkflowStep.kind == StepKind.DIRECTOR.value,
-            WorkflowStep.request_summary_json["phase"].astext == phase,
+            WorkflowStep.operation_key == operation_key,
         )
-        if slot is not None:
-            statement = statement.where(
-                WorkflowStep.request_summary_json["slot"].astext == slot.value
-            )
         with self._sessions() as session:
             return int(session.execute(statement).scalar_one_or_none() or 0) + 1
 
@@ -249,8 +234,7 @@ class SqlAlchemyWorkflowRepository(
         statement = select(func.max(WorkflowStep.attempt)).where(
             WorkflowStep.episode_id == episode_id,
             WorkflowStep.kind == kind.value,
-            WorkflowStep.request_summary_json["operationKey"].astext
-            == operation_key,
+            WorkflowStep.operation_key == operation_key,
         )
         with self._sessions() as session:
             return int(session.execute(statement).scalar_one_or_none() or 0) + 1
@@ -258,11 +242,20 @@ class SqlAlchemyWorkflowRepository(
     def get_run(self, run_id: uuid.UUID) -> StoredRun:
         with self._sessions() as session:
             row = required_record(session, ProductionRun, run_id)
-            plan = (
-                None
-                if row.plan_json is None
-                else DailyProductionPlan.model_validate(row.plan_json)
+            episode_rows = tuple(
+                session.execute(
+                    select(Episode)
+                    .where(Episode.production_run_id == run_id)
+                    .order_by(Episode.sort_order)
+                ).scalars()
             )
+            day_brief = row.planning_json.get("dayBrief")
+            plan = None
+            if day_brief is not None and len(episode_rows) == 3:
+                plan = DailyProductionPlan(
+                    day_brief=day_brief,
+                    episodes=[stored_episode(item).plan for item in episode_rows],
+                )
             return StoredRun(row.id, row.content_date, row.status, plan)
 
     def get_episode(self, run_id: uuid.UUID, slot: Slot) -> StoredEpisode:
@@ -390,11 +383,7 @@ class SqlAlchemyWorkflowRepository(
                 Asset.episode_id == episode_id,
                 Asset.role == role,
                 Asset.status.in_(statuses),
-                or_(
-                    WorkflowStep.input_hash == input_hash,
-                    WorkflowStep.request_summary_json["baseInputHash"].astext
-                    == input_hash,
-                ),
+                WorkflowStep.input_hash == input_hash,
             )
             .order_by(Asset.created_at.desc(), Asset.id.desc())
             .limit(1)
@@ -426,18 +415,18 @@ class SqlAlchemyWorkflowRepository(
         target: StepStatus,
         *,
         provider_task_id: str | None = None,
-        request_summary_patch: dict[str, Any] | None = None,
+        input_snapshot_patch: dict[str, Any] | None = None,
     ) -> None:
         with self._sessions.begin() as session:
             row = required_record(session, WorkflowStep, step_id)
             row.status = transition_step(StepStatus(row.status), target).value
             if provider_task_id is not None:
                 row.provider_task_id = provider_task_id
-            if request_summary_patch:
-                row.request_summary_json = {
-                    **row.request_summary_json,
-                    **request_summary_patch,
-                }
+            if input_snapshot_patch:
+                merged = {**row.input_snapshot_json, **input_snapshot_patch}
+                row.input_snapshot_json = validate_input_snapshot(merged).model_dump(
+                    mode="json"
+                )
             if target is StepStatus.SUBMITTING:
                 row.submitted_at = datetime.now(timezone.utc)
             if target in {

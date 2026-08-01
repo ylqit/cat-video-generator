@@ -68,20 +68,16 @@ class ProductionRun(Base):
         default=uuid.uuid4,
     )
     content_date: Mapped[date] = mapped_column(Date, nullable=False)
-    theme: Mapped[str | None] = mapped_column(String(200))
-    context_json: Mapped[dict[str, Any]] = mapped_column(
+    planning_json: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
         nullable=False,
         default=dict,
     )
-    plan_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    selected_candidate: Mapped[int | None] = mapped_column(SmallInteger)
     status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
         default=RunStatus.DRAFT.value,
     )
-    archived_source: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -132,9 +128,7 @@ class Episode(Base):
     )
     slot: Mapped[str] = mapped_column(String(16), nullable=False)
     sort_order: Mapped[int] = mapped_column(SmallInteger, nullable=False)
-    title: Mapped[str] = mapped_column(String(160), nullable=False)
     script_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
-    video_input_mode: Mapped[str] = mapped_column(String(40), nullable=False)
     prompt_overrides_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     status: Mapped[str] = mapped_column(
         String(32),
@@ -218,12 +212,13 @@ class WorkflowStep(Base):
         default=StepStatus.PENDING.value,
     )
     attempt: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=1)
+    operation_key: Mapped[str] = mapped_column(String(120), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(64), nullable=False)
     provider: Mapped[str | None] = mapped_column(String(64))
     provider_task_id: Mapped[str | None] = mapped_column(String(200))
     model: Mapped[str | None] = mapped_column(String(200))
     input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    request_summary_json: Mapped[dict[str, Any]] = mapped_column(
+    input_snapshot_json: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
         nullable=False,
         default=dict,
@@ -277,8 +272,6 @@ class PromptRecord(Base):
     model: Mapped[str] = mapped_column(String(200), nullable=False)
     prompt_text: Mapped[str] = mapped_column(Text, nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    char_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    utf8_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -294,7 +287,7 @@ class Asset(Base):
             name="ck_assets_scope",
         ),
         CheckConstraint(
-            "status IN ('candidate', 'approved', 'rejected', 'ready', 'archived')",
+            "status IN ('candidate', 'approved', 'rejected', 'ready')",
             name="ck_assets_status",
         ),
         Index("ix_assets_sha256_role", "sha256", "role"),

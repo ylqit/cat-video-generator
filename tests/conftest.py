@@ -1,3 +1,5 @@
+"""核心收敛后测试共用的最小、完整业务对象。"""
+
 from __future__ import annotations
 
 from datetime import date
@@ -5,186 +7,151 @@ from datetime import date
 import pytest
 
 from cat_video_generator.domain.continuity import (
-    ActionTransition,
     DominantView,
-    SceneAnchor,
-    ShotBoundaryState,
-    TrackedEntity,
-    VisibleWorldPlan,
+    EntityState,
+    EntityTransition,
+    VisibleEntity,
+    VisibleWorld,
+    WorldAnchor,
 )
 from cat_video_generator.domain.contracts import (
     ActionStage,
     AppearancePlan,
     CameraMove,
-    CriticalRelation,
     DailyProductionPlan,
+    DayBrief,
     EpisodePlan,
+    EpisodeScript,
     ShotPlan,
     Slot,
-    VideoInputMode,
+    SlotBrief,
 )
+from cat_video_generator.domain.rendering import VideoInputMode
 
 
-def _episode(
+def state(
+    *,
+    anchor: str | None = None,
+    support: str | None = None,
+    container: str | None = None,
+    active: bool = True,
+    appearance: str = "外观保持稳定",
+) -> EntityState:
+    return EntityState(
+        anchor_id=anchor,
+        support_id=support,
+        container_id=container,
+        active=active,
+        appearance_signature=appearance,
+    )
+
+
+def episode_for(
     slot: Slot,
     *,
-    title: str,
-    appearance: AppearancePlan,
-    input_mode: VideoInputMode,
+    mode: VideoInputMode = VideoInputMode.MULTIMODAL_REFERENCE,
 ) -> EpisodePlan:
-    return EpisodePlan(
-        slot=slot,
-        title=title,
-        event_key=f"{slot.value}-event",
-        location_key=f"{slot.value}-location",
-        main_event=f"{title}中中性儿童和灰白猫完成一个清晰生活事件",
-        scene=f"{title}对应的单一自然生活场景，空间边界清楚且可拍摄",
-        cast=["person", "cat"],
-        appearance=appearance,
+    prop_before = state(anchor="table", appearance="一只浅蓝色小纸风车")
+    prop_after = state(support="person", appearance="同一只浅蓝色小纸风车")
+    world = VisibleWorld(
+        anchors=[
+            WorldAnchor(id="ground", name="木地板", type="ground"),
+            WorldAnchor(id="table", name="矮桌桌面", type="table"),
+        ],
+        entities=[
+            VisibleEntity(
+                id="person",
+                name="中性儿童",
+                type="person",
+                semantic_key="person:front",
+                initial_state=state(anchor="ground", appearance="短发中性儿童"),
+            ),
+            VisibleEntity(
+                id="cat",
+                name="灰白猫",
+                type="cat",
+                semantic_key="cat:front",
+                initial_state=state(anchor="ground", appearance="固定灰白斑纹"),
+            ),
+            VisibleEntity(
+                id="pinwheel",
+                name="纸风车",
+                type="prop",
+                semantic_key="element:pinwheel",
+                initial_state=prop_before,
+            ),
+        ],
+    )
+    script = EpisodeScript(
+        title=f"{slot.value}纸风车",
+        event_key=f"{slot.value}-pinwheel",
+        location_key="sunroom",
+        main_event="人物发现风吹动纸风车并拿起来观察",
+        scene="明亮的室内阳台，木地板和一张稳定矮桌",
+        style_context="indoor",
+        appearance=AppearancePlan(
+            description="宽松浅色上衣与深色短裤，不携带背包",
+            continuity="continue",
+        ),
         actions=[
             ActionStage(
                 order=1,
-                actor_id="person",
-                action="中性儿童和灰白猫进入画面并注意到当前环境中的变化",
-                visible_result="观众明确理解人物、猫咪和本段活动目标",
+                actor_id="cat",
+                action="灰白猫先注意到桌面纸风车被微风吹动",
+                visible_result="猫咪抬头看向桌面",
+                transitions=[],
             ),
             ActionStage(
                 order=2,
                 actor_id="person",
-                action="中性儿童继续主要活动，灰白猫以一次自然反应回应",
-                visible_result="角色关系和事件状态产生可见变化",
-            ),
-            ActionStage(
-                order=3,
-                actor_id="cat",
-                action="两者带着刚刚形成的结果继续自然移动离开当前构图",
-                visible_result="事件获得主动收束而不是原地静止互看",
+                action="人物伸手拿起同一只纸风车并轻轻转动",
+                visible_result="纸风车持续由人物手掌支撑",
+                transitions=[
+                    EntityTransition(
+                        entity_id="pinwheel",
+                        before=prop_before,
+                        after=prop_after,
+                        reason="人物从桌面拿起纸风车",
+                    )
+                ],
             ),
         ],
         shots=[
             ShotPlan(
                 order=1,
-                action_orders=[1],
+                action_orders=[1, 2],
                 framing="中景",
-                camera_move=CameraMove.FOLLOW,
+                camera_move=CameraMove.PUSH,
                 dominant_view=DominantView.FRONT,
-                direction="平稳跟随中性儿童和灰白猫进入当前生活场景",
-            ),
-            ShotPlan(
-                order=2,
-                action_orders=[2, 3],
-                framing="中近景",
-                camera_move=CameraMove.PULL,
-                dominant_view=DominantView.SIDE,
-                direction="展示角色回应以及主动离开构图的结果",
-            ),
-        ],
-        ending="中性儿童继续迈步，灰白猫自然跟上，环境仍有轻微连续响应",
-        duration_seconds=10,
-        video_input_mode=input_mode,
-        critical_relations=[
-            CriticalRelation(
-                subject="person-and-cat",
-                relation="count",
-                initial_state="画面开始为一人一猫",
-                final_state="画面结束仍为同一人一猫",
+                direction="从猫咪视线缓慢推向人物手中的纸风车",
             )
         ],
-        visible_world=VisibleWorldPlan(
-            scene_anchors=[
-                SceneAnchor(
-                    anchor_id="path",
-                    display_name="场景地面与行走路径",
-                    anchor_type="ground",
-                )
-            ],
-            tracked_entities=[
-                TrackedEntity(
-                    entity_id="person",
-                    display_name="中性儿童",
-                    entity_type="person",
-                    appearance_signature="同一面貌、短发和儿童比例",
-                    initial_anchor_id="path",
-                ),
-                TrackedEntity(
-                    entity_id="cat",
-                    display_name="灰白猫",
-                    entity_type="cat",
-                    appearance_signature="同一脸型和主要灰白斑纹",
-                    initial_anchor_id="path",
-                ),
-            ],
-            action_transitions=[
-                ActionTransition(
-                    action_order=1,
-                    shot_order=1,
-                    actor_id="person",
-                    no_state_change=True,
-                ),
-                ActionTransition(
-                    action_order=2,
-                    shot_order=2,
-                    actor_id="person",
-                    no_state_change=True,
-                ),
-                ActionTransition(
-                    action_order=3,
-                    shot_order=2,
-                    actor_id="cat",
-                    no_state_change=True,
-                ),
-            ],
-            shot_boundary_states=[
-                ShotBoundaryState(
-                    after_shot_order=1,
-                    next_shot_order=2,
-                    visible_entity_ids=["person", "cat"],
-                    entity_anchor_ids={"person": "path", "cat": "path"},
-                    appearance_layers={
-                        "person": ["本时段完整服装"],
-                        "cat": ["固定灰白斑纹"],
-                    },
-                )
-            ],
-        ),
+        ending="人物继续转动纸风车，猫咪伸鼻靠近感受微风",
+        duration_seconds=9,
+        video_input_mode=mode,
+        visible_world=world,
     )
+    return EpisodePlan(slot=slot, script=script)
 
 
 @pytest.fixture
 def daily_plan() -> DailyProductionPlan:
-    morning = AppearancePlan(description="轻便上衣、短裤和适合户外行走的鞋，不携带背包")
-    noon = AppearancePlan(
-        description="延续轻便上衣和短裤，因日照增加草编帽，不携带背包",
-        changes_from_previous=["增加草编遮阳帽"],
-        change_reason="中午日照增强且活动位于户外",
-    )
-    evening = AppearancePlan(
-        description="延续轻便上衣和短裤，摘下草编帽并增加薄外套",
-        changes_from_previous=["摘下草编帽", "增加薄外套"],
-        change_reason="傍晚转入有风场景且日照减弱",
-    )
+    slots = [
+        SlotBrief(
+            slot=slot,
+            narrative_purpose=f"观察{slot.value}生活中的微小变化",
+            scene_direction="同一天中符合时段光线的生活空间",
+            event_direction="围绕一个清晰生活事件展开动作",
+            appearance_intent="服饰与场景自然一致",
+        )
+        for slot in Slot
+    ]
     return DailyProductionPlan(
-        content_date=date(2026, 7, 31),
-        theme="城市里三个有回应的轻生活瞬间",
-        day_context="同一天的普通城市生活，天气由晴朗逐步转为傍晚微风",
-        episodes=[
-            _episode(
-                Slot.MORNING,
-                title="晨间橱窗",
-                appearance=morning,
-                input_mode=VideoInputMode.MULTIMODAL_REFERENCE,
-            ),
-            _episode(
-                Slot.NOON,
-                title="午间树影",
-                appearance=noon,
-                input_mode=VideoInputMode.STRICT_FIRST_FRAME,
-            ),
-            _episode(
-                Slot.EVENING,
-                title="晚风灯光",
-                appearance=evening,
-                input_mode=VideoInputMode.STRICT_FIRST_LAST,
-            ),
-        ],
+        day_brief=DayBrief(
+            content_date=date(2026, 8, 2),
+            theme="风吹动的小发现",
+            day_context="中性儿童和灰白猫在普通生活空间观察风带来的变化",
+            slots=slots,
+        ),
+        episodes=[episode_for(slot) for slot in Slot],
     )

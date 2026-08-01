@@ -24,7 +24,6 @@ PAID_KINDS = frozenset(
         "run_day",
         "resume_planning",
         "replan_episode",
-        "compare_resolution",
         "retry_step",
         "prepare_keyframes",
     }

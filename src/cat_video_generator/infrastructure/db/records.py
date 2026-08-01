@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from ...application.ports import StoredAsset, StoredEpisode, StoredPrompt, StoredStep
-from ...domain.continuity import assess_visible_world
-from ...domain.contracts import EpisodePlan
+from ...domain.continuity import replay_world
+from ...domain.contracts import EpisodePlan, EpisodeScript, Slot
 from ...domain.workflow import EpisodeStatus, StepKind, StepStatus
 from .models import (
     Asset,
@@ -31,7 +31,8 @@ def stored_step(row: WorkflowStep) -> StoredStep:
         attempt=row.attempt,
         provider_task_id=row.provider_task_id,
         model=row.model,
-        request_summary=row.request_summary_json,
+        operation_key=row.operation_key,
+        input_snapshot=row.input_snapshot_json,
     )
 
 
@@ -50,7 +51,10 @@ def stored_episode(row: Episode) -> StoredEpisode:
     return StoredEpisode(
         id=row.id,
         run_id=row.production_run_id,
-        plan=EpisodePlan.model_validate(row.script_json),
+        plan=EpisodePlan(
+            slot=Slot(row.slot),
+            script=EpisodeScript.model_validate(row.script_json),
+        ),
         status=EpisodeStatus(row.status),
         selected_video_asset_id=row.selected_video_asset_id,
     )
@@ -77,10 +81,8 @@ def run_dict(row: ProductionRun) -> dict[str, Any]:
     return {
         "id": str(row.id),
         "contentDate": row.content_date.isoformat(),
-        "theme": row.theme,
+        "theme": row.planning_json.get("dayBrief", {}).get("theme"),
         "status": row.status,
-        "selectedCandidate": row.selected_candidate,
-        "archivedSource": row.archived_source,
         "createdAt": row.created_at.isoformat(),
         "updatedAt": row.updated_at.isoformat(),
         "nextAction": {
@@ -92,30 +94,26 @@ def run_dict(row: ProductionRun) -> dict[str, Any]:
             "ready": "构建本地交付包",
             "delivered": "已完成交付",
             "failed": "检查失败步骤后决定恢复或重规划",
-            "archived": "只读归档",
         }.get(row.status),
     }
 
 
 def episode_dict(row: Episode) -> dict[str, Any]:
-    plan = EpisodePlan.model_validate(row.script_json)
-    report = None if plan.visible_world is None else assess_visible_world(plan.visible_world)
+    plan = EpisodePlan(
+        slot=Slot(row.slot),
+        script=EpisodeScript.model_validate(row.script_json),
+    )
+    report = replay_world(plan.script.visible_world, plan.script.actions)
     return {
         "id": str(row.id),
         "runId": str(row.production_run_id),
         "slot": row.slot,
         "sortOrder": row.sort_order,
-        "title": row.title,
+        "title": plan.script.title,
         "status": row.status,
-        "videoInputMode": row.video_input_mode,
-        "generationStrategy": plan.generation_strategy.value,
-        "worldConsistencyStatus": (
-            "not_available" if report is None else report.world_consistency_status
-        ),
-        "contradictions": [] if report is None else list(report.contradictions),
-        "renderRiskLevel": ("unknown" if report is None else report.render_risk_level.value),
-        "renderRiskReasons": ([] if report is None else list(report.render_risk_reasons)),
-        "multiClipRecommended": (False if report is None else report.multi_clip_recommended),
+        "videoInputMode": plan.script.video_input_mode.value,
+        "worldConsistencyStatus": "valid" if report.valid else "contradiction",
+        "contradictions": [item.message for item in report.issues],
         "nextAction": {
             "planned": "准备精确参考素材或关键帧",
             "preparing_visuals": "完成关键帧语义审核",
@@ -125,18 +123,17 @@ def episode_dict(row: Episode) -> dict[str, Any]:
             "content_review": "人工观看并批准或拒绝视频",
             "ready": "等待全天其余时段或构建交付包",
             "failed": "人工检查失败原因后局部重规划",
-            "archived": "只读归档",
         }.get(row.status),
         "selectedVideoAssetId": (
             None if row.selected_video_asset_id is None else str(row.selected_video_asset_id)
         ),
         "promptOverrides": row.prompt_overrides_json or {},
-        "script": plan.model_dump(mode="json"),
+        "script": plan.script.model_dump(mode="json"),
     }
 
 
 def step_dict(row: WorkflowStep) -> dict[str, Any]:
-    operation_key = row.request_summary_json.get("operationKey")
+    operation_key = row.operation_key
     next_action = None
     if row.status == StepStatus.SUBMISSION_UNKNOWN.value:
         next_action = "先对账Ark任务列表，禁止重复POST"
@@ -162,7 +159,8 @@ def step_dict(row: WorkflowStep) -> dict[str, Any]:
         "providerTaskId": row.provider_task_id,
         "model": row.model,
         "inputHash": row.input_hash,
-        "requestSummary": row.request_summary_json,
+        "operationKey": operation_key,
+        "inputSnapshot": row.input_snapshot_json,
         "error": row.error_json,
         "nextAction": next_action,
         "createdAt": row.created_at.isoformat(),
@@ -181,8 +179,8 @@ def prompt_dict(
         "purpose": row.purpose,
         "model": row.model,
         "sha256": row.sha256,
-        "charCount": row.char_count,
-        "utf8Bytes": row.utf8_bytes,
+        "charCount": len(row.prompt_text),
+        "utf8Bytes": len(row.prompt_text.encode("utf-8")),
         "createdAt": row.created_at.isoformat(),
     }
     if full:

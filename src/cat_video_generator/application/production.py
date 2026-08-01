@@ -9,11 +9,11 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from ..domain.contracts import Slot, VideoInputMode
+from ..domain.contracts import Slot
+from ..domain.rendering import VideoInputMode
 from ..domain.rules import hard_failures, validate_input_gate
 from ..domain.workflow import EpisodeStatus, RunStatus, StepKind, StepStatus
-from .ports import StoredEpisode, WorkflowRepository
-from .resolution_comparison import ResolutionComparisonService
+from .ports import ProductionStore, StoredEpisode
 from .video_execution import VideoExecutionService
 from .visual_preparation import VisualPreparationService
 
@@ -24,15 +24,13 @@ class ProductionService:
     def __init__(
         self,
         *,
-        repository: WorkflowRepository,
+        repository: ProductionStore,
         visual_preparation: VisualPreparationService,
         video_execution: VideoExecutionService,
-        resolution_comparison: ResolutionComparisonService | None = None,
     ) -> None:
         self._repository = repository
         self._visual_preparation = visual_preparation
         self._video_execution = video_execution
-        self._resolution_comparison = resolution_comparison
 
     def prepare_keyframes_only(
         self,
@@ -41,7 +39,6 @@ class ProductionService:
         slot: Slot | None = None,
         prompt_overrides: dict[str, dict[str, str]] | None = None,
         allow_paid_generation: bool,
-        allow_unverified_keyframes: bool = False,
     ) -> dict[str, Any]:
         """主题创作台：只生成首末帧，绝不提交Seedance视频任务。
 
@@ -66,17 +63,17 @@ class ProductionService:
                 self._repository.get_prompt_overrides(episode.id)
             )
             slot_overrides.update((prompt_overrides or {}).get(episode.plan.slot.value, {}))
-            if episode.plan.video_input_mode is not VideoInputMode.STRICT_FIRST_LAST:
+            if episode.plan.script.video_input_mode is not VideoInputMode.STRICT_FIRST_LAST:
+                script = episode.plan.script.model_copy(
+                    update={"video_input_mode": VideoInputMode.STRICT_FIRST_LAST}
+                )
                 self._repository.replace_episode_plan(
                     run_id=run_id,
-                    episode=episode.plan.model_copy(
-                        update={"video_input_mode": VideoInputMode.STRICT_FIRST_LAST}
-                    ),
+                    episode=episode.plan.model_copy(update={"script": script}),
                 )
                 episode = self._repository.get_episode(run_id, episode.plan.slot)
             assets = self._visual_preparation.prepare(
                 episode,
-                allow_unverified_keyframes=allow_unverified_keyframes,
                 prompt_overrides=slot_overrides or None,
             )
             refreshed = self._repository.get_episode(run_id, episode.plan.slot)
@@ -123,8 +120,6 @@ class ProductionService:
         *,
         slot: Slot | None,
         allow_paid_generation: bool,
-        allow_unverified_keyframes: bool = False,
-        allow_multi_clip: bool = False,
     ) -> dict[str, Any]:
         """生成指定Episode或按固定顺序推进全天。"""
 
@@ -133,7 +128,7 @@ class ProductionService:
         stored_run = self._repository.get_run(run_id)
         if stored_run.plan is None:
             raise ValueError("Run尚未形成可执行方案")
-        if stored_run.status in {RunStatus.ARCHIVED.value, RunStatus.DELIVERED.value}:
+        if stored_run.status == RunStatus.DELIVERED.value:
             raise ValueError(f"Run状态{stored_run.status}不允许继续生成")
         episodes = (
             (self._repository.get_episode(run_id, slot),)
@@ -146,11 +141,7 @@ class ProductionService:
         ):
             self._repository.set_run_status(run_id, RunStatus.GENERATING)
         results = [
-            self._run_episode(
-                episode,
-                allow_unverified_keyframes=allow_unverified_keyframes,
-                allow_multi_clip=allow_multi_clip,
-            )
+            self._run_episode(episode)
             for episode in episodes
         ]
         current = self._repository.list_episodes(run_id)
@@ -181,20 +172,12 @@ class ProductionService:
                 for item in self._repository.list_episodes(step.run_id)
                 if item.id == step.episode_id
             )
-            if step.request_summary.get("generationStrategy") == "resolution_comparison":
-                if self._resolution_comparison is None:
-                    raise RuntimeError("恢复分辨率对比任务需要对比服务")
-                results.append(self._resolution_comparison.resume_step(episode, step))
-            else:
-                results.append(self._video_execution.resume_step(episode, step))
+            results.append(self._video_execution.resume_step(episode, step))
         return results
 
     def _run_episode(
         self,
         episode: StoredEpisode,
-        *,
-        allow_unverified_keyframes: bool,
-        allow_multi_clip: bool,
     ) -> dict[str, Any]:
         if episode.status in {EpisodeStatus.CONTENT_REVIEW, EpisodeStatus.READY}:
             return _episode_result(episode, "无需重复生成")
@@ -206,9 +189,7 @@ class ProductionService:
                     "存在失败步骤；run-day不会隐式创建新的收费attempt",
                 )
                 result["failedStepId"] = str(failed_step.id)
-                result["operationKey"] = failed_step.request_summary.get(
-                    "operationKey"
-                )
+                result["operationKey"] = failed_step.operation_key
                 result["nextAction"] = (
                     f"cvg retry-step {failed_step.id} --reason <原因>"
                 )
@@ -218,7 +199,6 @@ class ProductionService:
         stored_overrides = self._repository.get_prompt_overrides(episode.id)
         inputs = self._visual_preparation.prepare(
             episode,
-            allow_unverified_keyframes=allow_unverified_keyframes,
             prompt_overrides=stored_overrides or None,
         )
         if inputs is None:
@@ -229,11 +209,10 @@ class ProductionService:
                 ),
                 "关键帧等待人工语义审核",
             )
-        issues = validate_input_gate(
-            episode.plan,
-            (asset.role for asset in inputs)
-            if episode.plan.video_input_mode.value == "multimodal_reference"
-            else ("person", "cat", "style"),
+        issues = (
+            validate_input_gate(episode.plan, (asset.role for asset in inputs))
+            if episode.plan.script.video_input_mode is VideoInputMode.MULTIMODAL_REFERENCE
+            else ()
         )
         failures = hard_failures(issues)
         if failures:
@@ -259,7 +238,6 @@ class ProductionService:
         return self._video_execution.execute(
             refreshed,
             inputs,
-            allow_multi_clip=allow_multi_clip,
             prompt_override=stored_overrides.get("video"),
         )
 
