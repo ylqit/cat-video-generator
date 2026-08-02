@@ -46,6 +46,9 @@ class PlanningRepository:
     def create_draft_run(self, content_date: date) -> uuid.UUID:
         return self.run_id
 
+    def save_pipeline_settings(self, **kwargs):
+        self.pipeline_settings = kwargs["settings"]
+
     def list_recent_completed_summaries(self, *, limit: int):
         assert limit == 6
         return ()

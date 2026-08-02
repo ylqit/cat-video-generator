@@ -21,6 +21,7 @@ from ..domain.contracts import (
     Slot,
     SlotBrief,
 )
+from ..domain.pipeline import PipelineSettings
 from ..domain.prompts import (
     PromptBudgetError,
     PromptCompilationError,
@@ -63,6 +64,14 @@ class EpisodeReplanResult:
     slot: Slot
     attempt: int
     episode: EpisodePlan
+
+
+@dataclass(frozen=True, slots=True)
+class DayBriefPause:
+    """dayBrief阶段为manual时的断点结果：DayBrief已落库，Run保持draft。"""
+
+    run_id: uuid.UUID
+    day_brief: DayBrief
 
 
 class PlanningReviewRequired(RuntimeError):
@@ -118,8 +127,15 @@ class PlanningService:
         planning_context: str,
         candidate_count: int,
         allow_paid_generation: bool,
-    ) -> PlanningResult:
-        """按总导演→早→中→晚生成一份可执行全天方案。"""
+        stop_after_day_brief: bool = False,
+        pipeline_settings: PipelineSettings | None = None,
+    ) -> PlanningResult | DayBriefPause:
+        """按总导演→早→中→晚生成一份可执行全天方案。
+
+        ``stop_after_day_brief`` 用于创作台dayBrief阶段的手动开关：
+        DayBrief落库后直接断点返回（Run保持draft），人工编辑后由
+        ``resume_planning`` 续跑；流水线开关随本次提交一次性持久化。
+        """
 
         self._check_paid(allow_paid_generation)
         if candidate_count != 1:
@@ -143,6 +159,11 @@ class PlanningService:
             "eventSeeds": [item.model_dump(mode="json") for item in event_seeds],
         }
         run_id = self._repository.create_draft_run(target_date)
+        self._repository.save_pipeline_settings(
+            run_id=run_id,
+            settings=pipeline_settings
+            or PipelineSettings(allow_paid_generation=allow_paid_generation),
+        )
         try:
             day_prompt = compile_day_director_prompt(
                 target_date=target_date,
@@ -177,6 +198,8 @@ class PlanningService:
                 drafts,
                 planning_metadata,
             )
+            if stop_after_day_brief:
+                return DayBriefPause(run_id=run_id, day_brief=day_brief)
             return self._complete_plan(
                 run_id=run_id,
                 day_brief=day_brief,

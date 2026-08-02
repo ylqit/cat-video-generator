@@ -17,6 +17,7 @@ from .application.planning import PlanningService
 from .application.production import ProductionService
 from .application.queries import QueryService
 from .application.retry import RetryService
+from .application.studio_editing import StudioEditingService
 from .application.video_execution import VideoExecutionService
 from .application.visual_preparation import VisualPreparationService
 from .config import (
@@ -61,6 +62,7 @@ class RuntimeContainer(QueryContainer):
     planning: PlanningService
     production: ProductionService
     retry: RetryService
+    studio_editing: StudioEditingService
     runtime_settings: RuntimeSettings
 
 
@@ -185,6 +187,12 @@ def build_runtime_container(
             repository=repository,
             visual_preparation=visual_preparation,
             video_execution=video_execution,
+        ),
+        studio_editing=StudioEditingService(
+            repository=repository,
+            series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
+            style_profile=DEFAULT_STYLE_PROFILE,
+            video_resolution=runtime.ark_video_resolution,
         ),
         runtime_settings=runtime,
     )

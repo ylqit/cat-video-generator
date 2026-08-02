@@ -4,6 +4,7 @@ import type {
   EpisodePromptPreview,
   Job,
   JobAccepted,
+  PipelineSettings,
   PromptFull,
   PromptOverrides,
   RunGraph,
@@ -65,6 +66,7 @@ export interface PlanPayload {
   candidateCount?: number;
   allowPaidGeneration: boolean;
   autoGenerateKeyframes?: boolean;
+  pipelineSettings?: PipelineSettings;
 }
 
 export interface GeneratePayload {
@@ -197,6 +199,27 @@ export const api = {
       allowPaidGeneration,
       overrides: overrides ?? null,
     }),
+  continueRun: (runId: string) =>
+    post<JobAccepted>(`/runs/${runId}/continue`),
+  updateScript: (episodeId: string, script: Record<string, unknown>) =>
+    request<{
+      episodeId: string;
+      saved: boolean;
+      promptOverridesKept: boolean;
+    }>(`/episodes/${episodeId}/script`, {
+      method: "PUT",
+      body: JSON.stringify(script),
+    }),
+  updateDayBrief: (runId: string, brief: Record<string, unknown>) =>
+    request<{ runId: string; saved: boolean; episodeDraftsCleared: boolean }>(
+      `/runs/${runId}/day-brief`,
+      { method: "PUT", body: JSON.stringify(brief) },
+    ),
+  savePipelineSettings: (runId: string, settings: PipelineSettings) =>
+    request<{ runId: string; pipelineSettings: PipelineSettings }>(
+      `/runs/${runId}/pipeline-settings`,
+      { method: "PUT", body: JSON.stringify(settings) },
+    ),
 };
 
 export function assetContentUrl(assetId: string): string {

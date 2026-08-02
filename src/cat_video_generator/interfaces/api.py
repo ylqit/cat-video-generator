@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..application.queries import QueryService
+from .api_studio import create_studio_router
 from .api_write import create_write_router
 from .jobs import JobRegistry
 
@@ -138,6 +139,15 @@ def create_full_app(
             default_candidate_count=runtime.candidate_count,
             upload_dir=runtime.work_root / "uploads",
             delivery_root=runtime.delivery_root,
+        )
+    )
+    app.include_router(
+        create_studio_router(
+            planning=container.planning,
+            production=container.production,
+            queries=container.queries,
+            studio_editing=container.studio_editing,
+            job_registry=job_registry,
         )
     )
     token = os.environ.get("CAT_VIDEO_API_TOKEN")

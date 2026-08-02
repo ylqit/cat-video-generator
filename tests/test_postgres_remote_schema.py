@@ -56,7 +56,7 @@ def test_remote_schema_upgrade_constraints_and_cleanup(monkeypatch) -> None:
             revision = connection.execute(
                 text(f"SELECT version_num FROM {quoted}.alembic_version")
             ).scalar_one()
-            assert revision == "0006_core_simplification"
+            assert revision == "0007_pipeline_settings"
 
             run_id = uuid.uuid4()
             connection.execute(

@@ -4,17 +4,45 @@
  * EpisodeScript 对应 domain/contracts.py；slot由Episode关系字段单独返回。
  */
 
+export type StageMode = "auto" | "manual";
+
+export interface PipelineSettings {
+  allowPaidGeneration: boolean;
+  dayBrief: StageMode;
+  script: StageMode;
+  keyframes: StageMode;
+  video: StageMode;
+}
+
+export interface SlotBriefDto {
+  slot: string;
+  narrative_purpose: string;
+  scene_direction: string;
+  event_direction: string;
+  appearance_intent: string;
+}
+
+export interface DayBriefDto {
+  content_date: string;
+  theme: string;
+  day_context: string;
+  slots: SlotBriefDto[];
+}
+
 export interface RunSummary {
   id: string;
   contentDate: string;
   theme: string | null;
   status: string;
   nextAction: string | null;
+  pipelineSettings?: PipelineSettings;
   createdAt: string;
   updatedAt: string;
   /** 以下字段仅 /runs/{id}/graph 响应存在 */
   worldConsistencyStatus?: string;
   contradictions?: string[];
+  dayBrief?: DayBriefDto | null;
+  currentStage?: string;
 }
 
 export type AppearanceContinuity = "continue" | "changed";

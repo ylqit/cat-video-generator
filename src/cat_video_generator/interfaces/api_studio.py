@@ -1,0 +1,239 @@
+"""主题创作台流水线的HTTP端点与自动续跑编排。
+
+阶段串联（``chain_after_planning``）与关键帧批准后的视频续跑钩子
+（``maybe_continue_video``）必须放在接口层：Application Service不允许
+依赖任务登记器，而自动续跑本身是"登记一个新的付费任务"。
+所有自动续跑的唯一付费依据是Run级持久化的
+``PipelineSettings.allow_paid_generation``（提交主题时人工一次收齐），
+video阶段为manual或授权为假时绝不自动扣费。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+from collections.abc import Callable
+from typing import Any
+
+from fastapi import APIRouter, Body, HTTPException
+from pydantic import ValidationError
+
+from ..application.planning import DayBriefPause, PlanningResult
+from ..application.ports import GatewayError
+from ..application.queries import QueryService
+from ..domain.contracts import Slot
+from ..domain.pipeline import PipelineSettings, StageMode
+from .api_helpers import _accepted, _jsonable, _submit
+from .jobs import JobConflictError, JobRegistry
+
+
+def chain_after_planning(
+    production: Any,
+    run_id: uuid.UUID,
+    settings: PipelineSettings,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """按流水线开关在规划之后串联关键帧与视频阶段。
+
+    所有调用都在同一个后台任务、同一把付费串行门内顺序执行；
+    任一阶段为manual或等待人工审核时记录pausedAt并停住，
+    之后由POST /runs/{id}/continue或审核钩子继续。
+    """
+
+    stages = payload.setdefault("stages", {})
+    if settings.script is StageMode.MANUAL:
+        payload["pausedAt"] = "script"
+        return payload
+    if settings.keyframes is StageMode.MANUAL:
+        payload["pausedAt"] = "keyframes"
+        return payload
+    keyframes = production.prepare_keyframes_only(
+        run_id,
+        allow_paid_generation=True,
+    )
+    stages["keyframes"] = keyframes
+    if not all(item["keyframesReady"] for item in keyframes["episodes"]):
+        # 关键帧等待人工语义审核；批准后由maybe_continue_video钩子续跑。
+        payload["pausedAt"] = "keyframes"
+        return payload
+    if settings.video is StageMode.MANUAL or not settings.allow_paid_generation:
+        payload["pausedAt"] = "video"
+        return payload
+    stages["video"] = production.run_day(
+        run_id,
+        slot=None,
+        allow_paid_generation=True,
+    )
+    return payload
+
+
+def maybe_continue_video(
+    *,
+    queries: QueryService,
+    production: Any,
+    job_registry: JobRegistry,
+    asset_id: uuid.UUID,
+) -> None:
+    """人工批准关键帧后按流水线开关自动续跑该集视频。
+
+    三个条件缺一不可：video阶段为auto、Run级付费授权为真、该集首末帧
+    均已有approved/ready资产。审核人的"批准"点击即该帧的显式人工确认；
+    重复批准与同集在途任务由run_day幂等与dedup吞掉。
+    """
+
+    try:
+        asset = queries.asset(asset_id)
+    except LookupError:
+        return
+    if asset.role not in {"first_frame", "last_frame"} or asset.episode_id is None:
+        return
+    episode = queries.episode(asset.episode_id)
+    run_id = uuid.UUID(str(episode["runId"]))
+    settings = queries.pipeline_settings(run_id)
+    if settings.video is not StageMode.AUTO or not settings.allow_paid_generation:
+        return
+    ready_roles = {
+        item.role
+        for item in queries.episode_assets(asset.episode_id)
+        if item.role in {"first_frame", "last_frame"}
+        and item.status in {"approved", "ready"}
+    }
+    if ready_roles != {"first_frame", "last_frame"}:
+        return
+    slot = Slot(str(episode["slot"]))
+
+    def task() -> dict[str, Any]:
+        return production.run_day(run_id, slot=slot, allow_paid_generation=True)
+
+    try:
+        job_registry.submit(
+            kind="run_day",
+            dedup_key=f"run:{run_id}:{slot.value}",
+            fn=task,
+        )
+    except JobConflictError:
+        # 同集已有在途run_day即视为已续跑。
+        pass
+
+
+def create_studio_router(
+    *,
+    planning: Any,
+    production: Any,
+    queries: QueryService,
+    studio_editing: Any,
+    job_registry: JobRegistry,
+) -> APIRouter:
+    """创作台流水线端点：阶段续跑与人工编辑。"""
+
+    router = APIRouter(prefix="/api/v1")
+
+    @router.post("/runs/{run_id}/continue", status_code=202)
+    def continue_pipeline(run_id: uuid.UUID) -> dict[str, Any]:
+        try:
+            settings = queries.pipeline_settings(run_id)
+            status = str(queries.run_graph(run_id)["run"]["status"])
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        def task() -> dict[str, Any]:
+            if status == "draft":
+                result = planning.resume_planning(
+                    run_id,
+                    allow_paid_generation=True,
+                )
+                payload: dict[str, Any] = {
+                    "runId": str(run_id),
+                    "stages": {"planning": _jsonable(result)},
+                }
+            elif status in {"planned", "generating", "reviewing"}:
+                payload = {"runId": str(run_id), "stages": {}}
+            else:
+                raise ValueError(f"Run状态{status}不支持流水线续跑")
+            return chain_after_planning(production, run_id, settings, payload)
+
+        record = _submit(
+            job_registry,
+            kind="continue_pipeline",
+            dedup_key=f"continue:{run_id}",
+            fn=task,
+        )
+        return _accepted(record)
+
+    @router.put("/episodes/{episode_id}/script")
+    async def update_episode_script(
+        episode_id: uuid.UUID,
+        payload: dict[str, Any] = Body(...),  # noqa: B008
+    ) -> dict[str, Any]:
+        return await _run_validated(
+            lambda: studio_editing.update_episode_script(episode_id, payload)
+        )
+
+    @router.put("/runs/{run_id}/day-brief")
+    async def update_day_brief(
+        run_id: uuid.UUID,
+        payload: dict[str, Any] = Body(...),  # noqa: B008
+    ) -> dict[str, Any]:
+        return await _run_validated(
+            lambda: studio_editing.update_day_brief(run_id, payload)
+        )
+
+    @router.put("/runs/{run_id}/pipeline-settings")
+    async def update_pipeline_settings(
+        run_id: uuid.UUID,
+        payload: dict[str, Any] = Body(...),  # noqa: B008
+    ) -> dict[str, Any]:
+        return await _run_validated(
+            lambda: studio_editing.update_pipeline_settings(run_id, payload)
+        )
+
+    return router
+
+
+def build_plan_payload(
+    result: PlanningResult | DayBriefPause,
+) -> dict[str, Any]:
+    """把规划结果规整为任务payload；DayBriefPause表示dayBrief阶段停顿。"""
+
+    if isinstance(result, DayBriefPause):
+        return {
+            "runId": str(result.run_id),
+            "stages": {
+                "planning": {
+                    "status": "paused",
+                    "dayBrief": result.day_brief.model_dump(mode="json"),
+                }
+            },
+            "pausedAt": "dayBrief",
+        }
+    return {
+        "runId": str(result.run_id),
+        "selectedCandidate": result.selected_candidate,
+        "candidateCount": result.candidate_count,
+        "plan": result.plan.model_dump(mode="json"),
+        "stages": {"planning": {"status": "completed"}},
+    }
+
+
+async def _run_validated(operation: Callable[[], Any]) -> Any:
+    """契约校验失败时返回结构化errors；不能复用_run_sync（它先吞ValueError）。"""
+
+    try:
+        return await asyncio.to_thread(operation)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "编辑内容不符合契约",
+                "errors": exc.errors(include_context=False, include_url=False),
+            },
+        ) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except GatewayError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc

@@ -6,6 +6,7 @@ import uuid
 from typing import Any
 
 from ..domain.contracts import EpisodePlan
+from ..domain.pipeline import PipelineSettings
 from ..domain.prompts import compile_image_prompt, compile_video_prompt_preview
 from ..domain.visual_profiles import (
     DEFAULT_SERIES_VISUAL_PROFILE,
@@ -125,6 +126,20 @@ class QueryService:
         """返回收费意图、Ark task ID 与恢复状态。"""
 
         return self._repository.step_detail(step_id)
+
+    def pipeline_settings(self, run_id: uuid.UUID) -> PipelineSettings:
+        """返回Run的流水线开关；历史Run按legacy_default读取。"""
+
+        return self._repository.get_pipeline_settings(run_id)
+
+    def episode_assets(self, episode_id: uuid.UUID) -> tuple[StoredAsset, ...]:
+        """精确返回属于该Episode的资产（仓储查询会混入run级NULL行）。"""
+
+        return tuple(
+            asset
+            for asset in self._repository.list_assets(episode_id=episode_id)
+            if asset.episode_id == episode_id
+        )
 
     def list_canon(self) -> list[dict[str, Any]]:
         """返回人物、猫咪和画风三类已批准Canon资产。"""

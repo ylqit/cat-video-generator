@@ -41,7 +41,8 @@ def test_core_columns_do_not_duplicate_json_facts() -> None:
     assert "char_count" not in prompt_columns
     assert "utf8_bytes" not in prompt_columns
     assert "semantic_key" in asset_columns
-    assert ALEMBIC_HEAD == "0006_core_simplification"
+    assert "pipeline_settings_json" in run_columns
+    assert ALEMBIC_HEAD == "0007_pipeline_settings"
 
 
 def test_deleted_runtime_modules_and_commands_are_absent() -> None:

@@ -8,6 +8,7 @@ from typing import Any
 from ...application.ports import StoredAsset, StoredEpisode, StoredPrompt, StoredStep
 from ...domain.continuity import replay_world
 from ...domain.contracts import EpisodePlan, EpisodeScript, Slot
+from ...domain.pipeline import PipelineSettings
 from ...domain.workflow import EpisodeStatus, StepKind, StepStatus
 from .models import (
     Asset,
@@ -78,11 +79,17 @@ def stored_asset(row: Asset) -> StoredAsset:
 
 
 def run_dict(row: ProductionRun) -> dict[str, Any]:
+    settings = (
+        PipelineSettings.model_validate(row.pipeline_settings_json)
+        if row.pipeline_settings_json
+        else PipelineSettings.legacy_default()
+    )
     return {
         "id": str(row.id),
         "contentDate": row.content_date.isoformat(),
         "theme": row.planning_json.get("dayBrief", {}).get("theme"),
         "status": row.status,
+        "pipelineSettings": settings.model_dump(mode="json", by_alias=True),
         "createdAt": row.created_at.isoformat(),
         "updatedAt": row.updated_at.isoformat(),
         "nextAction": {

@@ -43,6 +43,34 @@ class RecordNotFoundError(LookupError):
     """请求的工作流记录不存在。"""
 
 
+def _current_stage(
+    run: ProductionRun,
+    episodes: tuple[Episode, ...],
+    assets: tuple[Asset, ...],
+) -> str:
+    """推导创作台步进条的当前阶段，前端无需自行拼接状态。"""
+
+    if "dayBrief" not in run.planning_json:
+        return "dayBrief"
+    if run.status == RunStatus.DRAFT.value:
+        return "dayBriefReview"
+    if run.status == RunStatus.PLANNING_REVIEW.value:
+        return "script"
+    statuses = {item.status for item in episodes}
+    if statuses and statuses <= {"ready"}:
+        return "done"
+    if statuses & {"video_pending", "video_generating", "media_qc", "content_review"}:
+        return "video"
+    frames = [
+        item
+        for item in assets
+        if item.role in {"first_frame", "last_frame"} and item.episode_id is not None
+    ]
+    if frames:
+        return "keyframes"
+    return "script"
+
+
 def required_record(
     session: Session,
     model: type[Any],
@@ -104,6 +132,8 @@ class SqlAlchemyReadRepository:
                         else "not_available"
                     ),
                     "contradictions": contradictions,
+                    "dayBrief": run.planning_json.get("dayBrief"),
+                    "currentStage": _current_stage(run, episodes, assets),
                 }
             )
             return {

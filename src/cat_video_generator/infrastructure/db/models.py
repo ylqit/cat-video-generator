@@ -73,6 +73,7 @@ class ProductionRun(Base):
         nullable=False,
         default=dict,
     )
+    pipeline_settings_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,

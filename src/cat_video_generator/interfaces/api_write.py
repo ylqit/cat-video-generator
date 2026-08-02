@@ -15,8 +15,16 @@ from typing import Any
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
+from ..application.planning import DayBriefPause
 from ..application.ports import GatewayError
 from ..domain.contracts import Slot
+from ..domain.pipeline import PipelineSettings, StageMode
+from .api_helpers import _accepted, _jsonable, _submit
+from .api_studio import (
+    build_plan_payload,
+    chain_after_planning,
+    maybe_continue_video,
+)
 from .api_schemas import (
     CANON_ROLES as _CANON_ROLES,
 )
@@ -43,7 +51,7 @@ from .api_schemas import (
     RetryStepRequest,
     ReviewRequest,
 )
-from .jobs import JobConflictError, JobRecord, JobRegistry
+from .jobs import JobRegistry
 
 
 def create_write_router(
@@ -71,6 +79,20 @@ def create_write_router(
                 status_code=422,
                 detail="规划调用付费模型，必须显式确认allowPaidGeneration",
             )
+        settings = (
+            PipelineSettings.model_validate(request.pipeline_settings)
+            if request.pipeline_settings
+            # 未显式给流水线开关时保持旧语义：链式关键帧、视频阶段手动确认。
+            else PipelineSettings(
+                allow_paid_generation=True,
+                keyframes=(
+                    StageMode.AUTO
+                    if request.auto_generate_keyframes
+                    else StageMode.MANUAL
+                ),
+                video=StageMode.MANUAL,
+            )
+        )
 
         def task() -> dict[str, Any]:
             result = planning.plan_day(
@@ -84,20 +106,14 @@ def create_write_router(
                     else default_candidate_count
                 ),
                 allow_paid_generation=True,
+                stop_after_day_brief=settings.day_brief is StageMode.MANUAL,
+                pipeline_settings=settings,
             )
-            payload: dict[str, Any] = {
-                "runId": str(result.run_id),
-                "selectedCandidate": result.selected_candidate,
-                "candidateCount": result.candidate_count,
-                "plan": result.plan.model_dump(mode="json"),
-            }
-            if request.auto_generate_keyframes:
-                # 同一付费串行门内链式生成三集首末帧；创作台默认路径。
-                payload["keyframes"] = production.prepare_keyframes_only(
-                    result.run_id,
-                    allow_paid_generation=True,
-                )
-            return payload
+            payload = build_plan_payload(result)
+            if isinstance(result, DayBriefPause):
+                return payload
+            # 同一付费串行门内按流水线开关链式推进；创作台默认路径。
+            return chain_after_planning(production, result.run_id, settings, payload)
 
         record = _submit(
             job_registry,
@@ -146,13 +162,24 @@ def create_write_router(
 
     @router.post("/assets/{asset_id}/review")
     async def review(asset_id: uuid.UUID, request: ReviewRequest) -> dict:
-        return await _run_sync(
+        result = await _run_sync(
             lambda: assets.review_asset(
                 asset_id,
                 approve=request.approve,
                 reason=request.reason,
             )
         )
+        if request.approve:
+            # 关键帧批准后按流水线开关自动续跑该集视频；manual或旧Run不触发。
+            await asyncio.to_thread(
+                lambda: maybe_continue_video(
+                    queries=queries,
+                    production=production,
+                    job_registry=job_registry,
+                    asset_id=asset_id,
+                )
+            )
+        return result
 
     @router.post("/canon", status_code=201)
     async def import_canon(
@@ -401,51 +428,6 @@ def create_write_router(
         return _accepted(record)
 
     return router
-
-
-def _submit(
-    registry: JobRegistry,
-    *,
-    kind: str,
-    dedup_key: str,
-    fn: Callable[[], Any],
-) -> JobRecord:
-    """登记后台任务并把去重冲突映射为409。"""
-
-    try:
-        return registry.submit(kind=kind, dedup_key=dedup_key, fn=fn)
-    except JobConflictError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={"message": str(exc), "jobId": exc.job_id},
-        ) from exc
-
-
-def _accepted(record: JobRecord) -> dict[str, Any]:
-    return {
-        "jobId": record.job_id,
-        "kind": record.kind,
-        "dedupKey": record.dedup_key,
-        "status": record.status,
-    }
-
-
-def _jsonable(result: Any) -> Any:
-    """把Service返回值规整为可JSON序列化结构。"""
-
-    if result is None or isinstance(result, (str, int, float, bool)):
-        return result
-    if isinstance(result, uuid.UUID):
-        return str(result)
-    if hasattr(result, "model_dump"):
-        return result.model_dump(mode="json")
-    if hasattr(result, "_asdict"):
-        return _jsonable(result._asdict())
-    if isinstance(result, dict):
-        return {str(key): _jsonable(value) for key, value in result.items()}
-    if isinstance(result, (list, tuple)):
-        return [_jsonable(item) for item in result]
-    return str(result)
 
 
 async def _run_sync(operation: Callable[[], Any]) -> Any:

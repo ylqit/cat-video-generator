@@ -10,7 +10,8 @@ from typing import Any
 
 from sqlalchemy import select
 
-from ...domain.contracts import DailyProductionPlan, DayBrief, EpisodePlan
+from ...domain.contracts import DailyProductionPlan, DayBrief, EpisodePlan, Slot
+from ...domain.pipeline import PipelineSettings
 from ...domain.workflow import (
     EpisodeStatus,
     RunStatus,
@@ -139,3 +140,58 @@ class PlanPersistenceMixin:
         with self._sessions.begin() as session:  # type: ignore[attr-defined]
             row = _required(session, Episode, episode_id)
             row.prompt_overrides_json = overrides or None
+
+    def update_day_brief(
+        self,
+        *,
+        run_id: uuid.UUID,
+        day_brief: DayBrief,
+    ) -> None:
+        """人工编辑日导演输出；旧的时段草稿与新Brief错配，必须清空。"""
+
+        with self._sessions.begin() as session:  # type: ignore[attr-defined]
+            run = _required(session, ProductionRun, run_id)
+            run.planning_json = {
+                **run.planning_json,
+                "dayBrief": day_brief.model_dump(mode="json"),
+                "episodeDrafts": {},
+            }
+
+    def update_episode_draft(
+        self,
+        *,
+        run_id: uuid.UUID,
+        slot: Slot,
+        script: dict[str, Any],
+    ) -> None:
+        """方案未定稿时把人工编辑的时段脚本写回可恢复草稿。"""
+
+        with self._sessions.begin() as session:  # type: ignore[attr-defined]
+            run = _required(session, ProductionRun, run_id)
+            drafts = dict(run.planning_json.get("episodeDrafts", {}))
+            drafts[slot.value] = script
+            run.planning_json = {**run.planning_json, "episodeDrafts": drafts}
+
+    def save_pipeline_settings(
+        self,
+        *,
+        run_id: uuid.UUID,
+        settings: PipelineSettings,
+    ) -> None:
+        """持久化流水线阶段开关与一次性付费授权。"""
+
+        with self._sessions.begin() as session:  # type: ignore[attr-defined]
+            run = _required(session, ProductionRun, run_id)
+            run.pipeline_settings_json = settings.model_dump(
+                mode="json",
+                by_alias=True,
+            )
+
+    def get_pipeline_settings(self, run_id: uuid.UUID) -> PipelineSettings:
+        """读取流水线设置；历史Run缺省列按legacy_default返回。"""
+
+        with self._sessions() as session:  # type: ignore[attr-defined]
+            raw = _required(session, ProductionRun, run_id).pipeline_settings_json
+        if not raw:
+            return PipelineSettings.legacy_default()
+        return PipelineSettings.model_validate(raw)
