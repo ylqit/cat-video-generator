@@ -29,6 +29,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from ...domain.workflow import (
     EpisodeStatus,
+    PromptPurpose,
     RunStatus,
     StepKind,
     StepStatus,
@@ -73,7 +74,12 @@ class ProductionRun(Base):
         nullable=False,
         default=dict,
     )
-    pipeline_settings_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    pipeline_settings_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
     status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
@@ -244,7 +250,7 @@ class PromptRecord(Base):
     __tablename__ = "prompt_records"
     __table_args__ = (
         CheckConstraint(
-            "purpose IN ('director', 'image', 'video', 'review')",
+            _check("purpose", tuple(item.value for item in PromptPurpose)),
             name="ck_prompt_records_purpose",
         ),
         UniqueConstraint("step_id", "sha256", name="uq_prompt_records_step_hash"),

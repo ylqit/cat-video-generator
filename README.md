@@ -7,8 +7,9 @@
 ```text
 Day Director
 → Morning / Noon / Evening Director
-→ EpisodeScript + VisibleWorld
-→ 按需 Seedream
+→ EpisodeScript + SceneContinuity
+→ 每条一次 Seedream 故事板组图
+→ 故事板整组语义审核
 → Seedance single-pass
 → 技术 QC + 语义诊断
 → 人工审核
@@ -21,7 +22,7 @@ Day Director
 
 - Python 3.12/3.13、Pydantic、SQLAlchemy 2、Alembic。
 - PostgreSQL 是工作流、Prompt 和媒体元数据的唯一事实来源。
-- Ark Responses 负责导演，Seedream 按需生成关键帧，Seedance 单次生成 8～15 秒音视频。
+- Ark Responses 负责导演，Seedream 为每条Episode生成3～4张故事板，Seedance单次生成8～15秒音视频。
 - 媒体以 SHA-256 内容寻址方式不可变地保存在本地，不写入数据库。
 - Typer 提供 Windows CLI；FastAPI + Vue 提供本机创作台。
 - 不使用 LangGraph、AgentScope、Celery、Redis 或第二套工作流状态。
@@ -46,7 +47,7 @@ uv run cvg review <assetId> --approve --reason "人工观看通过"
 uv run cvg deliver <runId>
 ```
 
-规划固定为四次独立导演调用：总导演只确定全天边界，三个时段导演分别输出一个 `EpisodeScript`。脚本由本地状态重放检查未知实体、悬空、无原因消失、容器断链和前后状态矛盾；动作多或渲染较难只形成诊断，不作为统一创意预算。
+规划固定为四次独立导演调用：总导演只确定全天边界，三个时段导演分别输出一个 `EpisodeScript`。`SceneContinuity`只保存人物、猫咪和关键道具的起点、终点与生命周期；停步、转头、蹲下、嗅闻等导演动作不进入状态账本，普通背景也不建账。
 
 失败的 Ark 步骤不会由 `run-day` 隐式重试。相同剧本需要重新渲染时必须显式执行：
 
@@ -58,25 +59,27 @@ uv run cvg retry-step <stepId> `
 
 `submission_unknown` 必须先人工对账，不得自动重复 POST。剧情或世界状态需要修改时使用 `replan-episode`，而不是重试媒体任务。
 
-## 角色、画风和关键帧
+## 角色、画风和故事板
 
 - 人物只锁定主要面貌、发型、体型和中性儿童定位；服装、鞋帽、背包服从剧情。
 - 猫咪锁定同一只灰白猫的脸型、体型和主要斑纹。
 - 画风使用已批准的二维儿童绘本、彩铅/蜡笔素材，排除明显 3D/CG/PBR 倾向。
 - 同一连续场景中的外观与道具必须连续；跨时段变化只需有合理剧情原因。
-- `KEYFRAME_REVIEW_MODE` 只支持 `semantic_auto` 或 `manual`。
-- 关键帧明确失败时不会创建 Seedance 任务；低置信结果转人工审核。
+- `STORYBOARD_REVIEW_MODE` 只支持 `semantic_auto` 或 `manual`。
+- 每条Episode只创建一个Seedream组图步骤，返回3～4张独立、无文字、9:16故事板。
+- 故事板少图、技术失败或整组语义失败时不会创建Seedance任务；低置信结果转人工审核。
+- 普通背景、轻微姿势、构图和非关键外观差异只记为故事板警告；角色数量、关键道具类别、动作顺序和结尾兑现仍是硬门。
 - 最终视频始终进入 `content_review`，不会自动批准或交付。
 
-Episode 需要动作、声音或环境参考时，可导入经批准的多模态素材：
+Episode需要更精确地固定关键道具或场景时，可选导入图片素材供Seedream使用；普通场景没有专用参考图不会阻断生成：
 
 ```powershell
 uv run cvg reference import --episode-id <episodeId> `
-  --role motion --semantic-key motion:gentle-walk `
-  --file "references\gentle-walk.mp4"
+  --role element --semantic-key element:blue-pinwheel `
+  --file "references\blue-pinwheel.png"
 ```
 
-所有 Episode 均由 Seedance 单次完整成片。通过 QC 的供应商 MP4 直接保存，不强制 FFmpeg 重编码。
+Seedance默认按顺序接收全部故事板；结尾画面必须精确时只接收首张与末张作为严格首尾帧。Canon不再与故事板重复传给Seedance。通过QC的供应商MP4直接保存，不强制FFmpeg重编码。
 
 ## 本机 Web 创作台
 
@@ -100,7 +103,7 @@ npm run dev
 - [Windows 运行手册](docs/workflows/windows-runbook.md)
 - [Docker Compose 部署](docs/workflows/docker-deployment.md)
 - [本机 HTTP 接口](docs/http-api.md)
-- [核心收敛 Checklist](docs/checklists/core-simplification.md)
+- [故事板优先内核 Checklist](docs/checklists/storyboard-first-core.md)
 
 ## 安全边界
 

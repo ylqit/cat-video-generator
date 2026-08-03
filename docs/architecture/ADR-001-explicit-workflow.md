@@ -44,7 +44,7 @@ flowchart TB
 ```text
 domain/
   contracts.py      DayBrief、EpisodeScript、EpisodePlan
-  continuity.py     VisibleWorld 状态重放与矛盾检测
+  continuity.py     SceneContinuity轻量起终态与引用检查
   rendering.py      VideoInputPlan 与素材顺序
   prompts.py        导演、图片、视频和审核 Prompt
   rules.py          规划准入硬门
@@ -53,7 +53,7 @@ domain/
 
 application/
   planning.py             四次导演调用与局部重规划
-  visual_preparation.py   精确参考选择、关键帧和语义审核
+  visual_preparation.py   精确参考选择、故事板组图和整组语义审核
   video_execution.py      Seedance、下载和技术 QC
   production.py           状态编排
   retry.py                显式 attempt 与防重复收费
@@ -73,11 +73,10 @@ EpisodePlan
    ├─ actions[]
    ├─ shots[]
    ├─ durationSeconds
-   ├─ videoInputMode
-   └─ visibleWorld
+   └─ continuity
 ```
 
-`VisibleWorld` 仅保存锚点、实体初态和动作中的完整前后状态。切镜继承由重放结果推导，不再另存一份边界状态。未知实体、无支撑、无原因消失、复制、容器断链和前后状态矛盾会阻断；渲染难度只形成诊断。
+`SceneContinuity`只保存真正参与交互的锚点，以及关键实体的起点、终点、生命周期和稳定类别。普通背景不进入账本；动作姿态不做物理状态建模，也不执行逐动作重放。未知引用、关键实体缺失、无原因消失或变类会阻断；座位、服饰和道具的实际画面连续性由故事板语义审核把关，渲染难度只形成诊断。
 
 `VideoInputPlan` 只保存输入模式、分辨率、时长和有序素材绑定。模型位于 WorkflowStep；素材别名由模态和序号确定性生成；原生音频和 Prompt 方言属于产品配置与 Step 快照。
 
@@ -100,7 +99,7 @@ delivery_items
 - `episodes.script_json` 只保存 EpisodeScript；slot、排序和状态使用关系字段。
 - `workflow_steps` 只允许 director、image、video，保存正式 operation_key、attempt、幂等键、Task ID、模型、输入哈希和类型化输入快照。
 - Prompt 正文使用 TEXT；视频二进制不进入 PostgreSQL。
-- 旧运行数据在 `0006_core_simplification` 前已导出为只读哈希归档；新 Schema 只接受新 Run。
+- 旧运行数据已按用户要求从运行库清除；新Schema只接受故事板优先的新Run。
 
 ## 不变量
 
@@ -111,6 +110,7 @@ delivery_items
 5. Ark 轮询、下载和 ffprobe 期间不保持事务。
 6. 媒体先写 `.part`，完整下载并校验 SHA-256 后原子改名。
 7. 资产审核锁定 Asset、Step 和 Episode 并在一个事务中提交。
-8. 新 Run 只选择精确 `semantic_key` 的最新已批准资产；`legacy:*` 不参与自动选择。
-9. Seedance 只走 single-pass；视频完成后进入人工 `content_review`。
+8. 新Run只选择精确`semantic_key`的最新已批准Canon；每条只有一个故事板组图Step。
+9. Seedance只接收批准故事板并走single-pass；视频完成后进入人工`content_review`。
 10. JobRegistry 只管理 HTTP 异步执行，不成为工作流事实来源。
+11. Ark返回可解析脚本但语义审核失败时进入`planning_review`；只有结构解析失败允许一次自动导演修复。

@@ -66,7 +66,6 @@ export interface PlanPayload {
   planningContext?: string;
   candidateCount?: number;
   allowPaidGeneration: boolean;
-  autoGenerateKeyframes?: boolean;
   pipelineSettings?: PipelineSettings;
 }
 
@@ -191,12 +190,12 @@ export const api = {
         body: JSON.stringify({ overrides }),
       },
     ),
-  generateKeyframes: (
+  generateStoryboard: (
     episodeId: string,
     allowPaidGeneration: boolean,
     overrides?: PromptOverrides,
   ) =>
-    post<JobAccepted>(`/episodes/${episodeId}/keyframes`, {
+    post<JobAccepted>(`/episodes/${episodeId}/storyboards`, {
       allowPaidGeneration,
       overrides: overrides ?? null,
     }),

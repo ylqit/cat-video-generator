@@ -7,7 +7,9 @@ import uuid
 from dataclasses import replace
 from datetime import date
 
-from cat_video_generator.application.planning import PlanningService
+import pytest
+
+from cat_video_generator.application.planning import PlanningReviewRequired, PlanningService
 from cat_video_generator.application.ports import DirectorResult, StoredRun, StoredStep
 from cat_video_generator.domain.contracts import DayBrief, Slot
 from cat_video_generator.domain.visual_profiles import (
@@ -53,7 +55,7 @@ class PlanningRepository:
         assert limit == 6
         return ()
 
-    def create_step_intent(self, **kwargs):
+    def create_step_with_prompt_intent(self, **kwargs):
         step = StoredStep(
             id=uuid.uuid4(),
             run_id=kwargs["run_id"],
@@ -67,7 +69,7 @@ class PlanningRepository:
             input_snapshot=kwargs["input_snapshot"],
         )
         self.steps[step.id] = step
-        return step
+        return step, uuid.uuid4()
 
     def save_prompt(self, **kwargs):
         return uuid.uuid4()
@@ -85,7 +87,13 @@ class PlanningRepository:
         )
 
     def fail_director_step(self, **kwargs):
-        raise AssertionError(kwargs)
+        step = self.steps[kwargs["step_id"]]
+        snapshot = {**step.input_snapshot, "output": kwargs["output"]}
+        self.steps[step.id] = replace(
+            step,
+            status=StepStatus.FAILED,
+            input_snapshot=snapshot,
+        )
 
     def fail_step(self, step_id, **kwargs):
         self.steps[step_id] = replace(self.steps[step_id], status=StepStatus.FAILED)
@@ -166,3 +174,66 @@ def test_planning_calls_day_and_three_episode_directors(daily_plan) -> None:
         StepKind.DIRECTOR,
         StepKind.DIRECTOR,
     ]
+
+
+def test_structural_director_failure_repairs_once(daily_plan) -> None:
+    invalid = daily_plan.episodes[0].script.model_dump(mode="json")
+    invalid.pop("title")
+    payloads = [
+        daily_plan.day_brief.model_dump(mode="json"),
+        invalid,
+        *(item.script.model_dump(mode="json") for item in daily_plan.episodes),
+    ]
+    director = Director(payloads)
+    repository = PlanningRepository()
+    service = PlanningService(
+        repository=repository,
+        director=director,
+        provider_name="volcengine-ark-standard",
+        series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
+        style_profile=DEFAULT_STYLE_PROFILE,
+        event_seed_catalog=EmptySeeds(),
+    )
+
+    result = service.plan_day(
+        target_date=daily_plan.content_date,
+        planning_context="设计普通生活中的小发现",
+        candidate_count=1,
+        allow_paid_generation=True,
+    )
+
+    assert result.plan.episodes[0].script.title == daily_plan.episodes[0].script.title
+    assert len(director.prompts) == 5
+
+
+def test_semantic_director_failure_requires_explicit_replan(daily_plan) -> None:
+    gendered = daily_plan.episodes[0].script.model_copy(
+        update={"main_event": "固定女孩在阳台发现风吹动纸风车并拿起来观察"}
+    )
+    director = Director(
+        [
+            daily_plan.day_brief.model_dump(mode="json"),
+            gendered.model_dump(mode="json"),
+            daily_plan.episodes[0].script.model_dump(mode="json"),
+        ]
+    )
+    repository = PlanningRepository()
+    service = PlanningService(
+        repository=repository,
+        director=director,
+        provider_name="volcengine-ark-standard",
+        series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
+        style_profile=DEFAULT_STYLE_PROFILE,
+        event_seed_catalog=EmptySeeds(),
+    )
+
+    with pytest.raises(PlanningReviewRequired, match="需要人工规划审核"):
+        service.plan_day(
+            target_date=daily_plan.content_date,
+            planning_context="设计普通生活中的小发现",
+            candidate_count=1,
+            allow_paid_generation=True,
+        )
+
+    assert len(director.prompts) == 2
+    assert repository.run_status == RunStatus.PLANNING_REVIEW.value

@@ -10,8 +10,6 @@ import uuid
 from typing import Any
 
 from ..domain.contracts import Slot
-from ..domain.rendering import VideoInputMode
-from ..domain.rules import hard_failures, validate_input_gate
 from ..domain.workflow import EpisodeStatus, RunStatus, StepKind, StepStatus
 from .ports import ProductionStore, StoredEpisode
 from .video_execution import VideoExecutionService
@@ -32,7 +30,7 @@ class ProductionService:
         self._visual_preparation = visual_preparation
         self._video_execution = video_execution
 
-    def prepare_keyframes_only(
+    def prepare_storyboards_only(
         self,
         run_id: uuid.UUID,
         *,
@@ -40,15 +38,10 @@ class ProductionService:
         prompt_overrides: dict[str, dict[str, str]] | None = None,
         allow_paid_generation: bool,
     ) -> dict[str, Any]:
-        """主题创作台：只生成首末帧，绝不提交Seedance视频任务。
-
-        每个Episode先把video_input_mode覆盖为STRICT_FIRST_LAST并落库
-        （retry_image从数据库重载方案，必须持久化）；Prompt覆盖按时段从
-        参数与数据库合并，编辑文本直接进入Seedream请求与审计Prompt记录。
-        """
+        """创作台只生成整组故事板，绝不提交Seedance视频任务。"""
 
         if not allow_paid_generation:
-            raise ValueError("关键帧生成需要显式提供--allow-paid-generation")
+            raise ValueError("故事板生成需要显式提供--allow-paid-generation")
         stored_run = self._repository.get_run(run_id)
         if stored_run.plan is None:
             raise ValueError("Run尚未形成可执行方案")
@@ -59,19 +52,8 @@ class ProductionService:
         )
         results: list[dict[str, Any]] = []
         for episode in episodes:
-            slot_overrides = dict(
-                self._repository.get_prompt_overrides(episode.id)
-            )
+            slot_overrides = dict(self._repository.get_prompt_overrides(episode.id))
             slot_overrides.update((prompt_overrides or {}).get(episode.plan.slot.value, {}))
-            if episode.plan.script.video_input_mode is not VideoInputMode.STRICT_FIRST_LAST:
-                script = episode.plan.script.model_copy(
-                    update={"video_input_mode": VideoInputMode.STRICT_FIRST_LAST}
-                )
-                self._repository.replace_episode_plan(
-                    run_id=run_id,
-                    episode=episode.plan.model_copy(update={"script": script}),
-                )
-                episode = self._repository.get_episode(run_id, episode.plan.slot)
             assets = self._visual_preparation.prepare(
                 episode,
                 prompt_overrides=slot_overrides or None,
@@ -82,12 +64,8 @@ class ProductionService:
                     "episodeId": str(refreshed.id),
                     "slot": refreshed.plan.slot.value,
                     "status": refreshed.status.value,
-                    "keyframesReady": assets is not None,
-                    "message": (
-                        "首末帧已就绪"
-                        if assets is not None
-                        else "关键帧等待人工语义审核"
-                    ),
+                    "storyboardReady": assets is not None,
+                    "message": ("故事板已就绪" if assets is not None else "故事板等待人工语义审核"),
                 }
             )
         return {"runId": str(run_id), "episodes": results}
@@ -100,15 +78,11 @@ class ProductionService:
     ) -> None:
         """保存页面编辑的Prompt覆盖；仅校验键名，内容完全由调用方负责。"""
 
-        allowed = {"first_frame", "last_frame", "video"}
+        allowed = {"storyboard", "video"}
         unknown = set(overrides or {}) - allowed
         if unknown:
             raise ValueError(f"不支持的Prompt覆盖键: {', '.join(sorted(unknown))}")
-        cleaned = {
-            key: value.strip()
-            for key, value in (overrides or {}).items()
-            if value.strip()
-        }
+        cleaned = {key: value.strip() for key, value in (overrides or {}).items() if value.strip()}
         self._repository.save_prompt_overrides(
             episode_id=episode_id,
             overrides=cleaned or None,
@@ -140,10 +114,7 @@ class ProductionService:
             and any(item.status is not EpisodeStatus.FAILED for item in episodes)
         ):
             self._repository.set_run_status(run_id, RunStatus.GENERATING)
-        results = [
-            self._run_episode(episode)
-            for episode in episodes
-        ]
+        results = [self._run_episode(episode) for episode in episodes]
         current = self._repository.list_episodes(run_id)
         if all(item.status is EpisodeStatus.READY for item in current):
             self._repository.set_run_status(run_id, RunStatus.READY)
@@ -190,9 +161,7 @@ class ProductionService:
                 )
                 result["failedStepId"] = str(failed_step.id)
                 result["operationKey"] = failed_step.operation_key
-                result["nextAction"] = (
-                    f"cvg retry-step {failed_step.id} --reason <原因>"
-                )
+                result["nextAction"] = f"cvg retry-step {failed_step.id} --reason <原因>"
                 return result
         # 创作台编辑过的Prompt覆盖随续跑一起传入，使哈希复用命中编辑版
         # 已生成帧，而不是回退编译出未编辑版本重新扣费。
@@ -207,16 +176,8 @@ class ProductionService:
                     episode.run_id,
                     episode.plan.slot,
                 ),
-                "关键帧等待人工语义审核",
+                "故事板等待人工语义审核",
             )
-        issues = (
-            validate_input_gate(episode.plan, (asset.role for asset in inputs))
-            if episode.plan.script.video_input_mode is VideoInputMode.MULTIMODAL_REFERENCE
-            else ()
-        )
-        failures = hard_failures(issues)
-        if failures:
-            raise ValueError("; ".join(item.message for item in failures))
 
         refreshed = self._repository.get_episode(
             episode.run_id,

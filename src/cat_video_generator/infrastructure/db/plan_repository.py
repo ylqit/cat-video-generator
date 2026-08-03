@@ -188,10 +188,10 @@ class PlanPersistenceMixin:
             )
 
     def get_pipeline_settings(self, run_id: uuid.UUID) -> PipelineSettings:
-        """读取流水线设置；历史Run缺省列按legacy_default返回。"""
+        """读取Run持久化的流水线设置。"""
 
         with self._sessions() as session:  # type: ignore[attr-defined]
             raw = _required(session, ProductionRun, run_id).pipeline_settings_json
         if not raw:
-            return PipelineSettings.legacy_default()
+            return PipelineSettings()
         return PipelineSettings.model_validate(raw)

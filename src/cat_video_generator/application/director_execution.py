@@ -13,7 +13,7 @@ from typing import Any, TypeVar
 from pydantic import ValidationError
 
 from ..domain.contracts import Slot, StrictModel
-from ..domain.workflow import StepKind, StepStatus
+from ..domain.workflow import PromptPurpose, StepKind, StepStatus
 from .ports import DirectorGateway, GatewayError, PlanningStore, StoredStep
 
 ContractT = TypeVar("ContractT", bound=StrictModel)
@@ -77,7 +77,7 @@ class DirectorInvoker:
             "output_contract": contract.__name__,
             "repair_of_step_id": repair_of_step_id,
         }
-        step = self._repository.create_step_intent(
+        step, prompt_id = self._repository.create_step_with_prompt_intent(
             run_id=run_id,
             episode_id=episode_id,
             parent_step_id=parent_step_id,
@@ -88,13 +88,10 @@ class DirectorInvoker:
             model=self._director.model,
             input_hash=input_hash,
             input_snapshot=snapshot,
-        )
-        prompt_id = self._repository.save_prompt(
-            step_id=step.id,
+            prompt_purpose=PromptPurpose.DIRECTOR,
+            prompt_model=self._director.model,
+            prompt_text=prompt,
             parent_prompt_id=parent_prompt_id,
-            purpose="director",
-            model=self._director.model,
-            text=prompt,
         )
         if step.status is StepStatus.SUCCEEDED:
             saved = step.input_snapshot.get("output")

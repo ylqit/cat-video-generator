@@ -14,26 +14,23 @@ from uuid import UUID
 from pydantic import Field, model_validator
 
 from .contract_base import StrictModel
+from .contracts import EpisodePlan
+from .visual_profiles import StyleProfile
 
 
 class VideoInputMode(StrEnum):
-    """多模态参考与严格帧锚定三种互斥模式。"""
+    """故事板参考与严格首尾帧两种互斥模式。"""
 
-    MULTIMODAL_REFERENCE = "multimodal_reference"
-    STRICT_FIRST_FRAME = "strict_first_frame"
+    STORYBOARD_REFERENCE = "storyboard_reference"
     STRICT_FIRST_LAST = "strict_first_last"
 
 
 class MediaModality(StrEnum):
     IMAGE = "image"
-    VIDEO = "video"
-    AUDIO = "audio"
 
 
 class ProviderMediaRole(StrEnum):
     REFERENCE_IMAGE = "reference_image"
-    REFERENCE_VIDEO = "reference_video"
-    REFERENCE_AUDIO = "reference_audio"
     FIRST_FRAME = "first_frame"
     LAST_FRAME = "last_frame"
 
@@ -53,12 +50,7 @@ class MediaBinding(StrictModel):
 
     @property
     def prompt_alias(self) -> str:
-        labels = {
-            MediaModality.IMAGE: "图片",
-            MediaModality.VIDEO: "视频",
-            MediaModality.AUDIO: "音频",
-        }
-        return f"@{labels[self.modality]}{self.ordinal}"
+        return f"@图片{self.ordinal}"
 
 
 class VideoInputPlan(StrictModel):
@@ -67,47 +59,29 @@ class VideoInputPlan(StrictModel):
     input_mode: VideoInputMode
     resolution: Literal["480p", "720p"]
     duration_seconds: Annotated[int, Field(ge=8, le=15)]
-    bindings: list[MediaBinding] = Field(default_factory=list, max_length=15)
+    bindings: list[MediaBinding] = Field(default_factory=list, max_length=4)
 
     @model_validator(mode="after")
     def validate_bindings(self) -> VideoInputPlan:
         if len({item.asset_id for item in self.bindings}) != len(self.bindings):
             raise ValueError("同一资产不能重复进入一个视频任务")
-        by_modality = {
-            modality: [item for item in self.bindings if item.modality is modality]
-            for modality in MediaModality
-        }
-        for modality, limit in (
-            (MediaModality.IMAGE, 9),
-            (MediaModality.VIDEO, 3),
-            (MediaModality.AUDIO, 3),
+        if [item.ordinal for item in self.bindings] != list(
+            range(1, len(self.bindings) + 1)
         ):
-            items = by_modality[modality]
-            if len(items) > limit:
-                raise ValueError(f"{modality.value}素材数量不能超过{limit}")
-            if [item.ordinal for item in items] != list(range(1, len(items) + 1)):
-                raise ValueError("同一模态素材序号必须从1连续递增")
-        if by_modality[MediaModality.AUDIO] and not (
-            by_modality[MediaModality.IMAGE] or by_modality[MediaModality.VIDEO]
-        ):
-            raise ValueError("音频参考必须同时具有视觉输入")
+            raise ValueError("故事板素材序号必须从1连续递增")
 
         roles = [item.provider_role for item in self.bindings]
-        if self.input_mode is VideoInputMode.STRICT_FIRST_FRAME:
-            if roles != [ProviderMediaRole.FIRST_FRAME]:
-                raise ValueError("strict_first_frame必须且只能发送一张first_frame")
-        elif self.input_mode is VideoInputMode.STRICT_FIRST_LAST:
+        if self.input_mode is VideoInputMode.STRICT_FIRST_LAST:
             if roles != [ProviderMediaRole.FIRST_FRAME, ProviderMediaRole.LAST_FRAME]:
                 raise ValueError("strict_first_last必须按顺序发送first_frame和last_frame")
         elif any(
-            role not in {
+            role
+            not in {
                 ProviderMediaRole.REFERENCE_IMAGE,
-                ProviderMediaRole.REFERENCE_VIDEO,
-                ProviderMediaRole.REFERENCE_AUDIO,
             }
             for role in roles
         ):
-            raise ValueError("multimodal_reference只能使用reference媒体角色")
+            raise ValueError("storyboard_reference只能使用reference媒体角色")
         return self
 
 
@@ -122,18 +96,37 @@ class MediaSource:
     metadata: dict[str, Any]
 
 
-@dataclass(frozen=True, slots=True)
-class RenderingCapabilities:
-    """当前产品启用的Seedance能力，不复制供应商完整产品目录。"""
+def storyboard_reference_keys(
+    episode: EpisodePlan,
+    style_profile: StyleProfile,
+    *,
+    explicit_episode_keys: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    """返回故事板请求使用的确定性参考顺序。
 
-    image_limit: int = 9
-    video_limit: int = 3
-    audio_limit: int = 3
-    recommended_asset_limit: int = 5
-    resolutions: tuple[str, ...] = ("480p", "720p")
+    人物、猫咪和画风由系统 Canon 提供；导演只描述剧情逻辑实体，不能把场景
+    文字伪装成数据库资产键。只有用户为当前 Episode 显式上传的素材才会追加。
+    """
 
-
-DEFAULT_CAPABILITIES = RenderingCapabilities()
+    first_view = (
+        episode.script.shots[0].dominant_view.value
+        if episode.script.shots
+        else "front"
+    )
+    view = first_view if first_view in {"front", "side", "back"} else "front"
+    contextual_style = (
+        style_profile.indoor_reference_key
+        if episode.script.style_context == "indoor"
+        else style_profile.outdoor_reference_key
+    )
+    base = (
+        f"person:{view}",
+        f"cat:{view}",
+        style_profile.line_reference_key,
+        contextual_style,
+    )
+    optional_key = explicit_episode_keys[-1] if explicit_episode_keys else None
+    return tuple(dict.fromkeys((*base, *((optional_key,) if optional_key else ()))))
 
 
 def build_video_input_plan(
@@ -142,32 +135,25 @@ def build_video_input_plan(
     resolution: str,
     duration_seconds: int,
     sources: tuple[MediaSource, ...],
-    capabilities: RenderingCapabilities = DEFAULT_CAPABILITIES,
 ) -> VideoInputPlan:
     """按语义优先级构建Prompt和Ark共用的唯一素材顺序。"""
 
-    if resolution not in capabilities.resolutions:
+    if resolution not in {"480p", "720p"}:
         raise ValueError(f"不支持的视频分辨率{resolution}")
     selected = _select_sources(input_mode, sources)
-    if (
-        input_mode is VideoInputMode.MULTIMODAL_REFERENCE
-        and len(selected) > capabilities.recommended_asset_limit
-    ):
-        raise ValueError("多模态参考默认最多选择5项必要素材")
+    if input_mode is VideoInputMode.STORYBOARD_REFERENCE and not 3 <= len(selected) <= 4:
+        raise ValueError("storyboard_reference必须按顺序提供3至4张故事板面板")
 
-    counters = dict.fromkeys(MediaModality, 0)
     bindings: list[MediaBinding] = []
-    for source in selected:
-        modality = _modality(source.media_type)
-        _validate_source(source, modality)
-        counters[modality] += 1
+    for ordinal, source in enumerate(selected, 1):
+        _validate_source(source)
         bindings.append(
             MediaBinding(
                 asset_id=source.asset_id,
                 semantic_key=source.semantic_key,
-                modality=modality,
-                provider_role=_provider_role(input_mode, source.semantic_key, modality),
-                ordinal=counters[modality],
+                modality=MediaModality.IMAGE,
+                provider_role=_provider_role(input_mode, source.semantic_key),
+                ordinal=ordinal,
                 sha256=source.sha256,
             )
         )
@@ -183,76 +169,40 @@ def _select_sources(
     mode: VideoInputMode,
     sources: tuple[MediaSource, ...],
 ) -> tuple[MediaSource, ...]:
-    if mode is VideoInputMode.STRICT_FIRST_FRAME:
-        expected = ("frame:first",)
-    elif mode is VideoInputMode.STRICT_FIRST_LAST:
-        expected = ("frame:first", "frame:last")
-    else:
-        priorities = {
-            "person": 10,
-            "cat": 20,
-            "style": 30,
-            "element": 40,
-            "scene": 50,
-            "motion": 60,
-            "audio": 70,
-        }
-        return tuple(
-            sorted(
-                sources,
-                key=lambda item: (
-                    priorities.get(item.semantic_key.split(":", 1)[0], 99),
-                    item.semantic_key,
-                ),
-            )
-        )
-    actual = tuple(item.semantic_key for item in sources)
-    if actual != expected:
-        raise ValueError(f"{mode.value}要求素材{expected}，实际为{actual}")
-    return sources
-
-
-def _modality(media_type: str) -> MediaModality:
-    try:
-        return MediaModality(media_type)
-    except ValueError as exc:
-        raise ValueError(f"不支持的参考媒体类型{media_type}") from exc
+    ordered = tuple(sorted(sources, key=lambda item: item.semantic_key))
+    if any(not item.semantic_key.startswith("storyboard:panel-") for item in ordered):
+        raise ValueError("Seedance生产输入只能使用已批准故事板面板")
+    if mode is VideoInputMode.STRICT_FIRST_LAST:
+        if len(ordered) != 2:
+            raise ValueError("strict_first_last必须只发送故事板首尾两张面板")
+        return ordered
+    return ordered
 
 
 def _provider_role(
     mode: VideoInputMode,
     semantic_key: str,
-    modality: MediaModality,
 ) -> ProviderMediaRole:
-    if mode is VideoInputMode.STRICT_FIRST_FRAME:
-        return ProviderMediaRole.FIRST_FRAME
     if mode is VideoInputMode.STRICT_FIRST_LAST:
         return (
             ProviderMediaRole.FIRST_FRAME
-            if semantic_key == "frame:first"
+            if semantic_key.endswith("01")
             else ProviderMediaRole.LAST_FRAME
         )
-    return {
-        MediaModality.IMAGE: ProviderMediaRole.REFERENCE_IMAGE,
-        MediaModality.VIDEO: ProviderMediaRole.REFERENCE_VIDEO,
-        MediaModality.AUDIO: ProviderMediaRole.REFERENCE_AUDIO,
-    }[modality]
+    return ProviderMediaRole.REFERENCE_IMAGE
 
 
-def _validate_source(source: MediaSource, modality: MediaModality) -> None:
+def _validate_source(source: MediaSource) -> None:
     """使用已落盘QC元数据验证官方输入边界，不在Domain读取文件。"""
 
-    if modality is MediaModality.IMAGE:
-        width = source.metadata.get("width")
-        height = source.metadata.get("height")
-        if width is None or height is None:
-            raise ValueError(f"{source.semantic_key}缺少图片宽高QC元数据")
-        ratio = float(width) / float(height)
-        if not (300 <= int(width) <= 6000 and 300 <= int(height) <= 6000):
-            raise ValueError(f"{source.semantic_key}图片边长必须在300至6000像素")
-        if not 0.4 <= ratio <= 2.5:
-            raise ValueError(f"{source.semantic_key}图片宽高比必须在0.4至2.5")
-        return
-    duration = source.metadata.get("durationSeconds", source.metadata.get("duration"))
-    if duration is None or not 2 <= float(duration) <= 15:
-        raise ValueError(f"{source.semantic_key}参考媒体时长必须在2至15秒")
+    if source.media_type != "image":
+        raise ValueError(f"{source.semantic_key}必须是故事板图片")
+    width = source.metadata.get("width")
+    height = source.metadata.get("height")
+    if width is None or height is None:
+        raise ValueError(f"{source.semantic_key}缺少图片宽高QC元数据")
+    ratio = float(width) / float(height)
+    if not (300 <= int(width) <= 6000 and 300 <= int(height) <= 6000):
+        raise ValueError(f"{source.semantic_key}图片边长必须在300至6000像素")
+    if not 0.4 <= ratio <= 2.5:
+        raise ValueError(f"{source.semantic_key}图片宽高比必须在0.4至2.5")

@@ -48,18 +48,15 @@ class RetryService:
             StepStatus.EXPIRED,
             StepStatus.CANCELLED,
         }:
-            raise ValueError(
-                "retry-step只接受FAILED、EXPIRED或CANCELLED步骤"
-            )
+            raise ValueError("retry-step只接受FAILED、EXPIRED或CANCELLED步骤")
         if step.episode_id is None:
             raise ValueError("当前retry-step只支持Episode媒体步骤")
         operation_key = step.operation_key
         paid = step.kind in {StepKind.IMAGE, StepKind.VIDEO}
         if paid and not allow_paid_generation:
             raise ValueError("Ark图片或视频重试需要--allow-paid-generation")
-        supported = (
-            (step.kind is StepKind.IMAGE and operation_key.startswith("image:"))
-            or (step.kind is StepKind.VIDEO and operation_key == "video:single_pass")
+        supported = (step.kind is StepKind.IMAGE and operation_key.startswith("image:")) or (
+            step.kind is StepKind.VIDEO and operation_key == "video:single_pass"
         )
         if not supported:
             raise ValueError(f"步骤operationKey={operation_key!r}不支持显式重试")
@@ -69,12 +66,10 @@ class RetryService:
             if item.id == step.episode_id
         )
         stored_run = self._repository.get_run(step.run_id)
-        if (
-            stored_run.status == RunStatus.FAILED.value
-        ):
+        if stored_run.status == RunStatus.FAILED.value:
             self._repository.set_run_status(step.run_id, RunStatus.GENERATING)
         if step.kind is StepKind.IMAGE and operation_key.startswith("image:"):
-            asset = self._visual_preparation.retry_image(
+            storyboard = self._visual_preparation.retry_storyboard(
                 episode,
                 step,
                 reason=reason,
@@ -82,8 +77,12 @@ class RetryService:
             return {
                 "stepId": str(step_id),
                 "operationKey": operation_key,
-                "assetId": str(asset.id),
-                "status": asset.status,
+                "assetIds": [str(asset.id) for asset in storyboard],
+                "status": (
+                    "approved"
+                    if all(asset.status in {"approved", "ready"} for asset in storyboard)
+                    else "pending"
+                ),
             }
         if step.kind is StepKind.VIDEO and operation_key == "video:single_pass":
             return self._video_execution.retry_video(

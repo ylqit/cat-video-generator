@@ -50,23 +50,23 @@ const STATUS_FLOW = [
 const REFERENCE_ROLE_LABEL: Record<string, string> = {
   element: "元素参考图",
   scene: "场景参考图",
-  motion: "动作参考视频",
-  atmosphere: "氛围参考音频",
 };
 const REFERENCE_ACCEPT: Record<string, string> = {
   element: "image/*",
   scene: "image/*",
-  motion: "video/*",
-  atmosphere: "audio/*",
 };
 
 const episodeAssets = computed(() =>
   props.assets.filter((asset) => asset.episodeId === props.episode.id),
 );
-const frameAssets = computed(() =>
-  episodeAssets.value.filter((asset) =>
-    ["first_frame", "last_frame"].includes(asset.role),
-  ),
+const storyboardAssets = computed(() =>
+  episodeAssets.value
+    .filter((asset) => asset.role === "storyboard_panel")
+    .sort(
+      (left, right) =>
+        Number(left.metadata.panelOrdinal ?? 0) -
+        Number(right.metadata.panelOrdinal ?? 0),
+    ),
 );
 const videoAsset = computed(() =>
   [...episodeAssets.value].reverse().find((asset) => asset.role === "video"),
@@ -83,9 +83,11 @@ const videoPrompts = computed(() =>
     (prompt) => prompt.purpose === "video" && stepIds.value.has(prompt.stepId),
   ),
 );
-const imagePrompts = computed(() =>
+const storyboardPrompts = computed(() =>
   props.prompts.filter(
-    (prompt) => prompt.purpose === "image" && stepIds.value.has(prompt.stepId),
+    (prompt) =>
+      ["storyboard", "storyboard_review"].includes(prompt.purpose) &&
+      stepIds.value.has(prompt.stepId),
   ),
 );
 const frozenStep = computed(() =>
@@ -109,15 +111,6 @@ function canonAssetFor(key: string) {
     ? canon.bySemanticKey(key)
     : canon.latestByRole(key);
 }
-
-/** 可见世界声明但本集尚未导入的元素/场景参考。 */
-const missingReferenceRoles = computed(() => {
-  const requiredKeys = script.value.visible_world.entities
-    .map((entity) => entity.semantic_key)
-    .filter((key): key is string => Boolean(key && /^(element|scene):/.test(key)));
-  const present = new Set(referenceAssets.value.map((asset) => asset.semanticKey));
-  return requiredKeys.filter((key) => !present.has(key));
-});
 
 const uploadRole = ref("element");
 const uploadKey = ref("");
@@ -151,7 +144,7 @@ function onReferenceFile(event: Event) {
   uploadFile.value = input.files?.[0] ?? null;
 }
 
-/** 导入Episode级参考资产（element/scene/motion/atmosphere）。 */
+/** 导入Episode级场景或元素参考图。 */
 async function uploadReference() {
   if (!uploadFile.value || !uploadKey.value.trim()) {
     ElMessage.warning("请选择文件并填写语义键");
@@ -247,9 +240,9 @@ async function uploadReference() {
           <span class="muted">→ {{ action.visible_result }}</span>
         </li>
       </ol>
-      <div><strong>结尾：</strong>{{ script.ending }}</div>
+      <div><strong>结尾：</strong>{{ script.ending.result }}</div>
       <PromptCollapse :prompts="videoPrompts" title="完整视频Prompt" />
-      <PromptCollapse :prompts="imagePrompts" title="完整图片Prompt" />
+      <PromptCollapse :prompts="storyboardPrompts" title="完整故事板Prompt" />
     </div>
 
     <div class="section">
@@ -266,12 +259,12 @@ async function uploadReference() {
       </template>
     </div>
 
-    <div v-if="frameAssets.length" class="section">
-      <div class="section-title">分镜图</div>
+    <div v-if="storyboardAssets.length" class="section">
+      <div class="section-title">故事板组图</div>
       <div style="display: flex; gap: 16px; flex-wrap: wrap">
-        <div v-for="asset in frameAssets" :key="asset.id">
+        <div v-for="asset in storyboardAssets" :key="asset.id">
           <div class="muted" style="font-size: 12px; margin-bottom: 4px">
-            {{ asset.role === "first_frame" ? "首帧" : "尾帧" }}
+            第 {{ asset.metadata.panelOrdinal }} / {{ asset.metadata.panelCount }} 张
           </div>
           <AssetReviewPanel
             :asset="asset"
@@ -285,16 +278,10 @@ async function uploadReference() {
 
     <div class="section">
       <div class="section-title">
-        Episode 参考资产
-        <el-tag
-          v-for="role in missingReferenceRoles"
-          :key="role"
-          type="danger"
-          size="small"
-          style="margin-left: 6px"
-        >
-          缺少{{ role }}
-        </el-tag>
+        Episode 可选参考资产
+      </div>
+      <div class="muted" style="margin-bottom: 6px">
+        普通场景和道具无需专用参考图；仅在你希望明确锁定外观时上传。
       </div>
       <template v-if="referenceAssets.length">
         <AssetThumb

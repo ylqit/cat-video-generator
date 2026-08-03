@@ -1,93 +1,80 @@
-# 三时段视频完整生产流程
+# 故事板优先的三时段完整生产流程
 
-## 1. 生产对象
-
-一次 `ProductionRun` 对应一个内容日期，固定包含三个 Episode：
-
-| slot | sortOrder | 含义 |
-| --- | ---: | --- |
-| morning | 1 | 上午生活片段 |
-| noon | 2 | 中午生活片段 |
-| evening | 3 | 傍晚生活片段 |
-
-生成时间不受内容日期限制。三条视频共享同一个持续存在的人物、灰白猫和当天背景，但不强制形成“出发—完成—归家”因果链。
-
-## 2. L1：导演规划
-
-`cvg plan-day` 先创建收费意图和 Prompt，再依次调用：
-
-1. Day Director：全天主题、天气、地点范围、共享元素、三个时段边界和换装原因。
-2. Morning Director：一个完整上午 EpisodeScript。
-3. Noon Director：读取 DayBrief 与上午重放终态，生成中午脚本。
-4. Evening Director：读取 DayBrief 与前两个时段摘要，生成傍晚脚本。
-
-每个 Episode 只包含一个主事件、2～4个同目标动作阶段、1～3个镜头和一个自然结果。Director 直接输出 `EpisodeScript`，本地只注入固定 slot，避免 Draft 与正式 Plan 重复保存同名字段。
-
-每个时段返回后立即检查：
-
-- Pydantic 结构与三个 slot 排序。
-- 中性人物、灰白猫和剧情换装原因。
-- `VisibleWorld` 状态重放。
-- Seedance 执行 Prompt 预算。
-- 与近期已批准/交付内容的结构化冷却键。
-
-明确矛盾最多自动要求导演完整重写一次；再次失败进入 `planning_review`。这一步只修复剧本，不调用 Seedream 或 Seedance。
-
-## 3. L2：可见世界与素材
-
-`VisibleWorld` 包含：
-
-- anchors：桌面、地面、座椅、架子等稳定空间锚点。
-- entities：人物、猫咪、服装层、关键道具和初始状态。
-- actions.transitions：实体完整 before/after 状态与变化原因。
-
-重放器从初始状态按动作顺序应用变化，自动得到终态与切镜继承。以下矛盾会阻断收费媒体任务：
-
-- 未声明或已经离场的实体被再次使用。
-- 非抛掷物没有人物、家具或地面支撑。
-- 容器离场后仍包含物体。
-- 无原因复制、消失、消耗或改变外观类别。
-- 坐下前不存在可坐锚点。
-- 动作 before 与当前重放状态不一致。
-
-动作次数多、手部交互复杂或跨镜头只记为渲染风险，不作为固定创意预算。
-
-素材通过 `semantic_key` 精确选择：人物、猫咪和画风由系统固定加入；Episode 中真正出现的共享元素通过实体的 `semanticKey` 关联已批准资产。不再按 role 获取“全局最新元素”。
-
-## 4. L3：按需图片与 single-pass 视频
-
-视觉准备根据 Episode 选择：
-
-- `multimodal_reference`：直接使用身份、画风和必要元素。
-- `strict_first_frame`：需要准确开场时生成并审核首帧。
-- `strict_first_last`：起点与结果都必须明确时生成并审核首尾帧。
-
-关键帧先过可读性、9:16、尺寸和黑边技术门，再按配置进行 `semantic_auto` 或人工审核。明确语义错误不会创建 Seedance Step；低置信转人工。
-
-所有 Episode 最终都由 Seedance 单次生成 8～15 秒、9:16、原生音频视频。视频 Prompt 固定为：
+## 1. 唯一生产链路
 
 ```text
-【输出、画风与素材绑定】
-【人物、猫咪、外观和空间】
-【顺序动作】
-【可见世界状态与切镜连续性】
-【原生声音和硬禁止】
+Day Director
+→ Morning / Noon / Evening Director
+→ EpisodeScript + SceneContinuity
+→ 每条一次Seedream故事板组图
+→ 故事板整组审核
+→ Seedance single-pass
+→ 技术QC与人工内容审核
+→ 01 / 02 / 03本地交付
 ```
 
-规划理由、评分、数据库状态、审核阈值和绝对秒级时间码不会进入 Seedance Prompt。素材顺序、哈希、输入模式、分辨率和时长保存在类型化 Video 输入快照中。
+一次`ProductionRun`固定包含`morning=1`、`noon=2`、`evening=3`三个Episode。生成时间与内容日期解耦；三条共享持续角色和当天背景，但不强制组成“出发—完成—归家”的因果链。
 
-## 5. L4：下载、QC、审核与交付
+## 2. 三层创作上下文
 
-Ark 成功后立即下载临时 URL：
+- `SeriesContext`：同一个中性儿童、同一只灰白猫、二维彩铅/蜡笔画风和长期性格。
+- `DayBrief`：当天主题、天气、地点范围、时段边界、共享元素和换装理由。
+- `EpisodeScript`：本时段一个主事件、2～4个动作、1～3个镜头、结尾和关键连续性。
 
-1. 同盘写入 `.part`。
-2. 校验文件完整性并计算 SHA-256。
-3. 原子移动到不可变资产目录。
-4. ffprobe 检查容器、视频/音频轨、分辨率、比例、时长和可播放性。
-5. 可选语义诊断给出人工审核证据。
-6. Episode 进入 `content_review`。
+规划固定进行四次独立调用：总导演只生成`DayBrief`，随后三个时段导演各自生成一条完整脚本。脚本不重复保存slot、渲染输入模式或供应商字段。
 
-QC 通过的供应商 MP4 直接保存，不经过默认 FFmpeg 拼接或转码。人工批准后三个 Episode 才能进入交付：
+## 3. SceneContinuity与单一语义校验
+
+`SceneContinuity`只追踪三类可见对象：
+
+- 人物和猫咪。
+- 被拿取、放置、包含、食用、变形或跨镜头延续的关键道具。
+- 实际参与坐靠、承重或交互的桌面、椅子、长椅等锚点。
+
+普通植物、屋檐、远山和装饰不进入状态账本。每个`ActionStage`只保存执行者、动作和可见结果；停步、转头、眨眼、蹲下、嗅闻和走动都是导演动作，不创建世界状态。
+
+关键实体只声明`startState`、`endState`、`lifecycle`和稳定`formKey`。起终状态允许相同；只有`transform`允许物体类别发生变化。生成前只硬阻断未知Actor/实体、关键实体缺少起终位置、无原因出现消失或变类、共享逻辑实体键冲突及供应商输入不兼容。动作较多、坐下后站起、镜头切换、近期重复和Prompt较长均只作为诊断。
+
+Pydantic只负责类型、顺序、唯一性和引用存在性；`EpisodeValidator`只检查轻量起终态语义，不执行逐动作状态重放，也不通过中文关键词猜测座椅。座位、服装和道具在真实画面中的连续性由整组故事板审核判断。
+
+## 4. 每条一个故事板组图任务
+
+每个Episode只创建一个`image:storyboard` WorkflowStep，并调用一次Seedream：
+
+```text
+sequential_image_generation = auto
+max_images = 3或4
+```
+
+- 2个动作：开场、主要变化、结尾，共3张。
+- 3个动作：开场、两个进展、结尾，共4张。
+- 4个动作：开场、动作1、动作2～3连续进展、动作4结尾，共4张。
+
+返回内容必须是按顺序的独立9:16图片，不含文字、编号、边框或九宫格。每张面板独立保存SHA-256和`panelOrdinal`，但共用一个Step、Prompt和审核决定。
+
+故事板先检查数量、序号、可读取性、9:16比例、统一尺寸和黑边。随后一次语义请求检查整组身份、二维画风、动作顺序、关键道具、实际座位、服装连续性和结尾。角色数量、关键道具复制/消失/变类、动作错序和结尾未兑现属于硬失败；普通背景、植物、轻微姿势、构图或面貌差异只保存为警告。明确失败则整组原子拒绝；低置信转人工；少图、部分下载失败或未批准均不得创建视频任务。
+
+## 5. Seedance单次成片
+
+默认`storyboard_reference`按顺序传入3～4张批准面板，Prompt使用`@图片1`、`@图片2`等引用开场、进展与结尾。若`ending.visualCritical=true`，只把第一张和最后一张映射为`first_frame`与`last_frame`，中间面板只参与规划和审核。
+
+人物、猫咪、画风和关键元素Canon只用于Seedream，不与故事板重复传入Seedance。执行Prompt只包含：
+
+```text
+【输出和画风】
+【人物、猫咪与场景】
+【按故事板顺序发生的动作】
+【关键实体连续性】
+【原生声音和少量禁止项】
+```
+
+本地不以任意字符数阻断或截断Prompt。系统只检查Prompt非空、素材别名与输入一致、顺序无冲突和模型支持；字符数与UTF-8字节数仅供Web查看。供应商若返回真实长度错误，步骤失败并保存原始Prompt。
+
+## 6. 下载、审核与交付
+
+Seedance成功后立即下载临时URL，经`.part`写入、SHA-256、原子落盘和ffprobe技术QC后进入`content_review`。最终视频必须人工批准，不会自动交付。
+
+三个时段都ready后才能构建：
 
 ```text
 output/YYYY-MM-DD/{runId}/delivery-rN/
@@ -97,22 +84,28 @@ output/YYYY-MM-DD/{runId}/delivery-rN/
   manifest.json
 ```
 
-交付先在临时目录构建，校验三个哈希后原子改名；数据库交付包与条目在一个事务中提交。
+通过QC的供应商MP4直接保存，不使用固定分段或FFmpeg拼接。
 
-## 6. 幂等与恢复
+## 7. 幂等、失败与当前边界
 
-- 每个外部调用前先提交 WorkflowStep、Prompt 和收费意图。
-- 幂等键含 Episode、StepKind、operationKey、attempt 与规范化输入哈希。
-- 已有 task ID 时只轮询和下载。
-- `submission_unknown` 不自动重复 POST。
-- `run-day` 不会为终态失败隐式创建下一次收费 attempt。
-- 相同剧本重渲染使用 `retry-step`；剧情改变使用 `replan-episode`。
-- 所有旧 Step、Prompt、task ID、错误和资产永久保留以供审计。
+- 每次Ark调用前在同一个PostgreSQL短事务中提交WorkflowStep和完整Prompt；
+  Prompt约束、正文或父子关系失败时两者一起回滚，不留下孤立Step。
+- Prompt用途固定为`director / storyboard / storyboard_review / video / review`。
+  故事板审核Prompt关联故事板生成Prompt，视频诊断Prompt关联视频生成Prompt。
+- 相同输入复用相同故事板或视频Step，不重复收费。
+- `submission_unknown`冻结，禁止自动重复POST。
+- 故事板失败只能通过`retry-step`显式新建attempt，旧组图与证据保留。
+- JSON解析或必填字段缺失最多自动结构修复一次；已经成功解析但语义不合格时进入`planning_review`，不会自动产生第二次导演收费调用。
+- 剧情或连续性需要修改时由用户显式使用`replan-episode`。
+- 历史生成记录已按用户要求清理；新系统不承担旧契约恢复。
+- 不包含multi-clip、分辨率对比、自动发布、小程序、对象存储或消息队列。
 
-## 7. 当前不包含的能力
+## 8. Web阶段与浏览页签
 
-- 分辨率自动对比实验。
-- 分段视频生成与 FFmpeg 拼接。
-- 旧版本 Run 导入或恢复执行。
-- 自动批准最终视频或自动发布。
-- 小程序、对象存储、CDN 和消息队列。
+后端`currentStage`只描述工作流真实阶段，不代表用户当前必须浏览的页面。
+创作台把手动选择保存到`/studio?run=<runId>&stage=<tab>`：首次进入且没有
+`stage`时才使用后端阶段决定默认页签；轮询、保存设置和刷新Graph均不再覆盖
+用户选择。刷新、复制链接及浏览器前进后退会恢复同一Run和页签。
+
+后台任务错误携带已知的`runId / episodeId / slot / operationKey`，页面使用持久
+Alert展示并可定位到失败节点。故事板整组未批准时，视频按钮保持禁用并说明原因。

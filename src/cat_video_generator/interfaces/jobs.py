@@ -25,12 +25,13 @@ PAID_KINDS = frozenset(
         "resume_planning",
         "replan_episode",
         "retry_step",
-        "prepare_keyframes",
+        "prepare_storyboard",
         "continue_pipeline",
     }
 )
 
 _ACTIVE_STATUSES = frozenset({"queued", "running"})
+_CONTEXT_KEYS = frozenset({"runId", "episodeId", "slot", "operationKey"})
 
 
 class JobConflictError(RuntimeError):
@@ -48,6 +49,7 @@ class JobRecord:
     job_id: str
     kind: str
     dedup_key: str
+    context: dict[str, str] = field(default_factory=dict)
     status: str = "queued"
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     started_at: datetime | None = None
@@ -62,14 +64,11 @@ class JobRecord:
             "jobId": self.job_id,
             "kind": self.kind,
             "dedupKey": self.dedup_key,
+            "context": self.context,
             "status": self.status,
             "createdAt": self.created_at.isoformat(),
-            "startedAt": (
-                None if self.started_at is None else self.started_at.isoformat()
-            ),
-            "finishedAt": (
-                None if self.finished_at is None else self.finished_at.isoformat()
-            ),
+            "startedAt": (None if self.started_at is None else self.started_at.isoformat()),
+            "finishedAt": (None if self.finished_at is None else self.finished_at.isoformat()),
             "result": self.result,
             "error": self.error,
         }
@@ -96,6 +95,7 @@ class JobRegistry:
         kind: str,
         dedup_key: str,
         fn: Callable[[], Any],
+        context: dict[str, Any] | None = None,
     ) -> JobRecord:
         """登记并启动任务；相同去重键的活跃任务存在时拒绝。"""
 
@@ -110,6 +110,11 @@ class JobRegistry:
                 job_id=uuid.uuid4().hex,
                 kind=kind,
                 dedup_key=dedup_key,
+                context={
+                    key: str(value)
+                    for key, value in (context or {}).items()
+                    if key in _CONTEXT_KEYS and value is not None
+                },
             )
             self._records[record.job_id] = record
         if self._inline:
@@ -146,7 +151,7 @@ class JobRegistry:
                 self._invoke(record, fn)
         except Exception as exc:  # 任务错误必须落进记录而不是丢失
             record.status = "failed"
-            record.error = _classify_error(exc)
+            record.error = _classify_error(exc, context=record.context)
         finally:
             record.finished_at = datetime.now(UTC)
 
@@ -158,11 +163,17 @@ class JobRegistry:
         record.status = "succeeded"
 
 
-def _classify_error(exc: Exception) -> dict[str, Any]:
+def _classify_error(
+    exc: Exception,
+    *,
+    context: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """把异常分级为前端可展示的稳定错误码。"""
 
     if isinstance(exc, GatewayError):
         code = exc.code
+    elif all(hasattr(exc, name) for name in ("run_id", "slot", "errors")):
+        code = "planning_review_required"
     elif isinstance(exc, ValueError):
         code = "invalid_request"
     elif isinstance(exc, TimeoutError):
@@ -170,6 +181,7 @@ def _classify_error(exc: Exception) -> dict[str, Any]:
     else:
         code = "internal"
     payload: dict[str, Any] = {"code": code, "message": str(exc)}
+    payload.update(context or {})
     # 规划审核异常已经在PostgreSQL留下可恢复Run。把稳定标识返回给Web，
     # 让用户直接进入失败现场，而不是回到一张看似什么都没发生的空表单。
     run_id = getattr(exc, "run_id", None)

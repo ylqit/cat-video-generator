@@ -7,6 +7,7 @@ import pytest
 from cat_video_generator.config import ConfigurationError, RuntimeSettings
 from cat_video_generator.domain.workflow import (
     EpisodeStatus,
+    PromptPurpose,
     RunStatus,
     StepKind,
     StepStatus,
@@ -24,7 +25,7 @@ def settings_env(**updates: str) -> dict[str, str]:
         "ARK_VIDEO_MODEL": "doubao-seedance-2-0-mini-260615",
         "ARK_PLANNING_MODEL": "doubao-seed-2-1-pro-260628",
         "ARK_REVIEW_MODEL": "doubao-seed-2-1-pro-260628",
-        "KEYFRAME_REVIEW_MODE": "semantic_auto",
+        "STORYBOARD_REVIEW_MODE": "semantic_auto",
         "ARK_VIDEO_RESOLUTION": "720p",
         "PATH": "",
     }
@@ -37,12 +38,22 @@ def test_standard_ark_configuration_is_valid(tmp_path) -> None:
     settings.validate_for_ark_access()
     assert settings.provider_profile == "volcengine-ark-standard"
     assert settings.ark_video_resolution == "720p"
+    assert settings.ark_image_request_timeout_seconds == 600
+    assert settings.preflight_report()["arkImageRequestTimeoutSeconds"] == 600
     assert "ark_access_mode" not in settings.__dataclass_fields__
 
 
+def test_image_request_timeout_must_be_positive(tmp_path) -> None:
+    with pytest.raises(ConfigurationError, match="请求超时必须大于0"):
+        RuntimeSettings.from_env(
+            settings_env(ARK_IMAGE_REQUEST_TIMEOUT_SECONDS="0"),
+            config_root=tmp_path,
+        )
+
+
 @pytest.mark.parametrize("mode", ["technical_auto", "auto"])
-def test_removed_keyframe_review_modes_fail(mode: str, tmp_path) -> None:
-    settings = settings_env(KEYFRAME_REVIEW_MODE=mode)
+def test_removed_storyboard_review_modes_fail(mode: str, tmp_path) -> None:
+    settings = settings_env(STORYBOARD_REVIEW_MODE=mode)
     with pytest.raises(ConfigurationError, match="semantic_auto或manual"):
         RuntimeSettings.from_env(settings, config_root=tmp_path)
 
@@ -58,6 +69,16 @@ def test_agent_plan_url_is_rejected(tmp_path) -> None:
 
 def test_only_three_step_kinds_remain() -> None:
     assert {item.value for item in StepKind} == {"director", "image", "video"}
+
+
+def test_prompt_purposes_match_storyboard_runtime() -> None:
+    assert {item.value for item in PromptPurpose} == {
+        "director",
+        "storyboard",
+        "storyboard_review",
+        "video",
+        "review",
+    }
 
 
 def test_explicit_workflow_transitions() -> None:

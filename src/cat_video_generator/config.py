@@ -29,8 +29,8 @@ class DatabaseOperation(StrEnum):
     TEST = "test"
 
 
-class KeyframeReviewMode(StrEnum):
-    """关键帧语义审核是否阻断后续收费视频任务。"""
+class StoryboardReviewMode(StrEnum):
+    """故事板整组语义审核是否阻断后续收费视频任务。"""
 
     SEMANTIC_AUTO = "semantic_auto"
     MANUAL = "manual"
@@ -114,8 +114,9 @@ class RuntimeSettings:
     ark_video_resolution: str
     ark_poll_interval_seconds: float
     ark_task_timeout_seconds: float
+    ark_image_request_timeout_seconds: float
     candidate_count: int
-    keyframe_review_mode: KeyframeReviewMode
+    storyboard_review_mode: StoryboardReviewMode
     video_semantic_review_mode: str
     configuration_warnings: tuple[str, ...]
     ffmpeg_path: Path | None
@@ -135,14 +136,17 @@ class RuntimeSettings:
         values = os.environ if environ is None else environ
         poll_interval = float(_number(values, "ARK_POLL_INTERVAL_SECONDS", "10", float))
         timeout = float(_number(values, "ARK_TASK_TIMEOUT_SECONDS", "1800", float))
+        image_request_timeout = float(
+            _number(values, "ARK_IMAGE_REQUEST_TIMEOUT_SECONDS", "600", float)
+        )
         candidate_count = int(_number(values, "DAILY_PLAN_CANDIDATE_COUNT", "1", int))
-        if poll_interval <= 0 or timeout <= 0:
-            raise ConfigurationError("Ark轮询间隔和超时必须大于0")
+        if poll_interval <= 0 or timeout <= 0 or image_request_timeout <= 0:
+            raise ConfigurationError("Ark轮询间隔和请求超时必须大于0")
         if candidate_count != 1:
             raise ConfigurationError("分层导演模式下DAILY_PLAN_CANDIDATE_COUNT必须为1")
         review_mode_value = (
             values.get(
-                "KEYFRAME_REVIEW_MODE",
+                "STORYBOARD_REVIEW_MODE",
                 "semantic_auto",
             )
             .strip()
@@ -150,10 +154,10 @@ class RuntimeSettings:
         )
         configuration_warnings: list[str] = []
         try:
-            keyframe_review_mode = KeyframeReviewMode(review_mode_value)
+            storyboard_review_mode = StoryboardReviewMode(review_mode_value)
         except ValueError as exc:
             raise ConfigurationError(
-                "KEYFRAME_REVIEW_MODE必须是semantic_auto或manual"
+                "STORYBOARD_REVIEW_MODE必须是semantic_auto或manual"
             ) from exc
         video_review_mode = values.get(
             "VIDEO_SEMANTIC_REVIEW_MODE",
@@ -214,8 +218,9 @@ class RuntimeSettings:
             .lower(),
             ark_poll_interval_seconds=poll_interval,
             ark_task_timeout_seconds=timeout,
+            ark_image_request_timeout_seconds=image_request_timeout,
             candidate_count=candidate_count,
-            keyframe_review_mode=keyframe_review_mode,
+            storyboard_review_mode=storyboard_review_mode,
             video_semantic_review_mode=video_review_mode,
             configuration_warnings=tuple(configuration_warnings),
             ffmpeg_path=_executable(
@@ -295,7 +300,8 @@ class RuntimeSettings:
             "arkPlanningModel": self.ark_planning_model,
             "arkReviewModel": self.ark_review_model,
             "arkVideoResolution": self.ark_video_resolution,
-            "keyframeReviewMode": self.keyframe_review_mode.value,
+            "arkImageRequestTimeoutSeconds": self.ark_image_request_timeout_seconds,
+            "storyboardReviewMode": self.storyboard_review_mode.value,
             "videoSemanticReviewMode": self.video_semantic_review_mode,
             "configurationWarnings": list(self.configuration_warnings),
             "eventSeedRoot": str(self.event_seed_root),

@@ -1,6 +1,6 @@
 """主题创作台的人工编辑用例：剧本、日导演输出与流水线开关。
 
-人工编辑是显式意图，因此只重跑与DayBrief的一致性、Prompt预算和整盘硬门，
+人工编辑是显式意图，因此只重跑与DayBrief的一致性、Prompt可编译性和整盘硬门，
 **不重跑冷却校验**（``validate_episode_cooldown`` 是给自动生成路径用的）。
 所有结构化校验在写库前完成——读路径对 ``script_json`` 直接
 ``EpisodeScript.model_validate``，非法JSON会崩所有读路径，绝不允许落库。
@@ -22,7 +22,6 @@ from ..domain.contracts import (
 )
 from ..domain.pipeline import PipelineSettings
 from ..domain.prompts import (
-    PromptBudgetError,
     PromptCompilationError,
     compile_video_prompt_preview,
 )
@@ -63,8 +62,7 @@ class StudioEditingService:
         status = str(detail["status"])
         if status not in {"planned", "failed"}:
             raise ValueError(
-                f"该集状态{status}已进入媒体生产，不能编辑剧本；"
-                "请先人工拒绝相关资产回到failed"
+                f"该集状态{status}已进入媒体生产，不能编辑剧本；请先人工拒绝相关资产回到failed"
             )
         script = EpisodeScript.model_validate(payload)
         run_id = uuid.UUID(str(detail["runId"]))
@@ -93,7 +91,7 @@ class StudioEditingService:
                 resolution=self._video_resolution,
                 style_profile=self._style_profile,
             )
-        except (PromptBudgetError, PromptCompilationError) as exc:
+        except PromptCompilationError as exc:
             errors.append(str(exc))
 
         stored_run = self._repository.get_run(run_id)
@@ -102,10 +100,7 @@ class StudioEditingService:
             raise ValueError("方案未定稿的剧本请编辑日导演后恢复规划重生成")
         candidate_plan = DailyProductionPlan(
             day_brief=day_brief,
-            episodes=[
-                episode if item.slot is slot else item
-                for item in stored_run.plan.episodes
-            ],
+            episodes=[episode if item.slot is slot else item for item in stored_run.plan.episodes],
         )
         errors.extend(
             item.message

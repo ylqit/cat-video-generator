@@ -18,18 +18,19 @@ from volcenginesdkarkruntime._exceptions import (
     ArkAPIError,
     ArkAPITimeoutError,
 )
+from volcenginesdkarkruntime.types.images import SequentialImageGenerationOptions
 
 from ...application.ports import (
     DirectorResult,
     GatewayError,
     ImageResult,
+    StoryboardReviewResult,
     VideoDiagnosticResult,
     VideoTaskResult,
-    VisualReviewResult,
 )
 from ...config import RuntimeSettings
-from ...domain.rendering import MediaModality, VideoInputPlan
-from .review_schemas import KEYFRAME_REVIEW_SCHEMA, VIDEO_DIAGNOSTIC_SCHEMA
+from ...domain.rendering import VideoInputPlan
+from .review_schemas import STORYBOARD_REVIEW_SCHEMA, VIDEO_DIAGNOSTIC_SCHEMA
 
 
 class ArkGatewayError(GatewayError):
@@ -156,12 +157,19 @@ class ArkGateway:
             request_hash=request_hash,
         )
 
-    def generate_image(
+    def generate_storyboard(
         self,
         *,
         prompt: str,
         reference_paths: tuple[Path, ...],
-    ) -> ImageResult:
+        max_images: int,
+    ) -> tuple[ImageResult, ...]:
+        if max_images not in {3, 4}:
+            raise ArkGatewayError(
+                "故事板组图数量只允许3或4张",
+                code="invalid_storyboard_panel_count",
+                retryable=False,
+            )
         try:
             response = self._client.images.generate(
                 model=self.image_model,
@@ -171,44 +179,77 @@ class ArkGateway:
                 size="2K",
                 watermark=False,
                 output_format="png",
-                sequential_image_generation="disabled",
-                timeout=120.0,
+                sequential_image_generation="auto",
+                # Ark SDK在序列组图请求中会直接调用该对象的model_dump()。
+                # 这里必须使用SDK声明的类型，普通dict会在HTTP请求发出前失败。
+                sequential_image_generation_options=SequentialImageGenerationOptions(
+                    max_images=max_images
+                ),
+                # 组图同步生成明显慢于单图；独立超时避免把仍在供应商侧
+                # 处理的请求过早冻结为submission_unknown。
+                timeout=self._settings.ark_image_request_timeout_seconds,
             )
         except ArkAPIError as exc:
             raise _provider_error(exc, submission=True) from exc
-        if not response.data or not response.data[0].url:
+        except (AttributeError, TypeError) as exc:
+            # SDK请求序列化失败发生在网络提交之前，因此不是submission_unknown，
+            # 也不能伪装成图片技术QC失败。
             raise ArkGatewayError(
-                "Seedream没有返回可下载图片。",
+                "Seedream故事板请求参数无法由Ark SDK序列化。",
+                code="provider_request_serialization_failed",
+                retryable=False,
+            ) from exc
+        if not response.data or any(not getattr(item, "url", None) for item in response.data):
+            raise ArkGatewayError(
+                "Seedream没有返回完整可下载故事板组图。",
                 code="empty_image_result",
                 retryable=False,
             )
-        return ImageResult(
-            url=response.data[0].url,
-            model=getattr(response, "model", self.image_model),
+        return tuple(
+            ImageResult(
+                url=item.url,
+                model=getattr(response, "model", self.image_model),
+            )
+            for item in response.data
         )
 
-    def review_keyframe(
+    def review_storyboard(
         self,
         *,
         prompt: str,
-        image_path: Path,
-    ) -> VisualReviewResult:
-        """使用独立视觉模型审核关键帧，不复用导演输出语义。"""
+        image_paths: tuple[Path, ...],
+    ) -> StoryboardReviewResult:
+        """按顺序一次审核全部故事板面板，不把单帧结论拼成组结论。"""
 
-        schema = KEYFRAME_REVIEW_SCHEMA
+        if len(image_paths) not in {3, 4}:
+            raise ArkGatewayError(
+                "故事板语义审核需要3或4张有序面板",
+                code="invalid_storyboard_review_count",
+                retryable=False,
+            )
+        schema = STORYBOARD_REVIEW_SCHEMA
         instructions, text_format = self._structured_output(
             prompt,
             schema,
-            "KeyframeSemanticReview",
+            "StoryboardSemanticReview",
         )
-        image_sha256 = hashlib.sha256(image_path.read_bytes()).hexdigest()
+        image_sha256 = [hashlib.sha256(path.read_bytes()).hexdigest() for path in image_paths]
         request_hash = _json_hash(
             {
                 "model": self.review_model,
                 "instructions": instructions,
                 "schema": schema,
-                "imageSha256": image_sha256,
+                "orderedImageSha256": image_sha256,
             }
+        )
+        content: list[dict[str, str]] = [
+            {
+                "type": "input_text",
+                "text": "以下图片按故事板顺序排列，请审核整组并只返回结构化结果。",
+            }
+        ]
+        content.extend(
+            {"type": "input_image", "image_url": _asset_data_url(path)} for path in image_paths
         )
         try:
             response = self._client.responses.create(
@@ -217,16 +258,7 @@ class ArkGateway:
                 input=[
                     {
                         "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": "审核这张关键帧并只返回结构化结果。",
-                            },
-                            {
-                                "type": "input_image",
-                                "image_url": _asset_data_url(image_path),
-                            },
-                        ],
+                        "content": content,
                     }
                 ],
                 text={"format": text_format},
@@ -240,19 +272,21 @@ class ArkGateway:
             raise _provider_error(exc, submission=True) from exc
         if response.status != "completed":
             raise ArkGatewayError(
-                f"Ark关键帧审核状态为{response.status!r}",
+                f"Ark故事板审核状态为{response.status!r}",
                 code="visual_review_not_completed",
                 retryable=False,
             )
         try:
             payload = json.loads(_response_text(response))
-            return VisualReviewResult(
+            return StoryboardReviewResult(
                 identity_ok=bool(payload["identityOk"]),
                 style_ok=bool(payload["styleOk"]),
-                world_state_ok=bool(payload["worldStateOk"]),
-                scene_topology_ok=bool(payload["sceneTopologyOk"]),
+                action_sequence_ok=bool(payload["actionSequenceOk"]),
+                continuity_ok=bool(payload["continuityOk"]),
+                ending_ok=bool(payload["endingOk"]),
                 confidence=float(payload["confidence"]),
                 violations=tuple(str(item) for item in payload["violations"]),
+                warnings=tuple(str(item) for item in payload["warnings"]),
                 evidence=tuple(str(item) for item in payload["evidence"]),
                 response_id=response.id,
                 model=response.model,
@@ -260,7 +294,7 @@ class ArkGateway:
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ArkGatewayError(
-                "Ark关键帧审核没有返回合法结构。",
+                "Ark故事板审核没有返回合法结构。",
                 code="invalid_visual_review_output",
                 retryable=False,
             ) from exc
@@ -285,9 +319,7 @@ class ArkGateway:
             schema,
             "VideoSemanticDiagnostic",
         )
-        frame_hashes = [
-            hashlib.sha256(path.read_bytes()).hexdigest() for path in frame_paths
-        ]
+        frame_hashes = [hashlib.sha256(path.read_bytes()).hexdigest() for path in frame_paths]
         request_hash = _json_hash(
             {
                 "model": self.review_model,
@@ -363,10 +395,7 @@ class ArkGateway:
                 code="invalid_visual_input_count",
                 retryable=False,
             )
-        if (
-            sum(path.stat().st_size for path in input_paths if path.is_file())
-            > 64 * 1024 * 1024
-        ):
+        if sum(path.stat().st_size for path in input_paths if path.is_file()) > 64 * 1024 * 1024:
             raise ArkGatewayError(
                 "多模态请求素材总大小超过64MB",
                 code="reference_payload_too_large",
@@ -379,11 +408,7 @@ class ArkGateway:
             strict=True,
         ):
             _validate_reference_file(path)
-            field_name = {
-                MediaModality.IMAGE: "image_url",
-                MediaModality.VIDEO: "video_url",
-                MediaModality.AUDIO: "audio_url",
-            }[binding.modality]
+            field_name = "image_url"
             content.append(
                 {
                     "type": field_name,
@@ -426,9 +451,7 @@ class ArkGateway:
         return VideoTaskResult(
             task_id=task.id,
             status=task.status,
-            video_url=(
-                None if content is None else getattr(content, "video_url", None)
-            ),
+            video_url=(None if content is None else getattr(content, "video_url", None)),
             error_code=None if error is None else getattr(error, "code", None),
             error_message=(None if error is None else getattr(error, "message", None)),
         )
@@ -539,12 +562,15 @@ def _validate_reference_file(path: Path) -> None:
 def _provider_error(exc: ArkAPIError, *, submission: bool) -> ArkGatewayError:
     body = getattr(exc, "body", None)
     nested = (
-        body.get("error")
-        if isinstance(body, dict) and isinstance(body.get("error"), dict)
-        else {}
+        body.get("error") if isinstance(body, dict) and isinstance(body.get("error"), dict) else {}
     )
     code = getattr(exc, "code", None) or nested.get("code") or type(exc).__name__
     message = nested.get("message") or getattr(exc, "message", None) or "Ark请求失败"
+    request_id = getattr(exc, "request_id", None)
+    if request_id:
+        # Request ID不是鉴权秘密，可用于Ark控制台和工单对账；签名URL、
+        # API Key及请求正文仍不得进入错误记录。
+        message = f"{message} (requestId={request_id})"
     if isinstance(exc, (ArkAPIConnectionError, ArkAPITimeoutError)):
         # 提交阶段断线时无法判断供应商是否已创建收费任务，必须冻结对账；
         # 查询阶段则可以安全重试同一个task ID。
@@ -556,16 +582,13 @@ def _provider_error(exc: ArkAPIError, *, submission: bool) -> ArkGatewayError:
         )
     status_code = getattr(exc, "status_code", None)
     quota_error = any(
-        marker in str(code).lower()
-        for marker in ("quota", "balance", "insufficient", "account")
+        marker in str(code).lower() for marker in ("quota", "balance", "insufficient", "account")
     )
     return ArkGatewayError(
         message,
         code=str(code),
         retryable=bool(
-            status_code
-            and (status_code >= 500 or status_code == 429)
-            and not quota_error
+            status_code and (status_code >= 500 or status_code == 429) and not quota_error
         ),
     )
 

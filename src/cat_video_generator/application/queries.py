@@ -7,7 +7,8 @@ from typing import Any
 
 from ..domain.contracts import EpisodePlan
 from ..domain.pipeline import PipelineSettings
-from ..domain.prompts import compile_image_prompt, compile_video_prompt_preview
+from ..domain.prompts import compile_storyboard_prompt, compile_video_prompt_preview
+from ..domain.rendering import storyboard_reference_keys
 from ..domain.visual_profiles import (
     DEFAULT_SERIES_VISUAL_PROFILE,
     DEFAULT_STYLE_PROFILE,
@@ -59,7 +60,7 @@ class QueryService:
         *,
         resolution: str = "480p",
     ) -> dict[str, Any]:
-        """实时编译首末帧与视频Prompt；纯函数预览，不创建Step或收费任务。
+        """实时编译故事板与视频Prompt；纯函数预览，不创建Step或收费任务。
 
         参考素材顺序与VisualPreparationService.select_references保持一致，
         页面编辑后的覆盖文本原样附回，便于对照。
@@ -67,43 +68,32 @@ class QueryService:
 
         detail = self._repository.episode_detail(episode_id)
         episode = EpisodePlan(slot=detail["slot"], script=detail["script"])
-        first_view = (
-            episode.script.shots[0].dominant_view.value
-            if episode.script.shots
-            else "front"
-        )
-        view = first_view if first_view in {"front", "side", "back"} else "front"
         style_profile = DEFAULT_STYLE_PROFILE
-        reference_keys = tuple(
-            dict.fromkeys(
-                (
-                    f"person:{view}",
-                    f"cat:{view}",
-                    style_profile.line_reference_key,
-                    (
-                        style_profile.indoor_reference_key
-                        if episode.style_context == "indoor"
-                        else style_profile.outdoor_reference_key
-                    ),
-                    *(
-                        entity.semantic_key
-                        for entity in episode.script.visible_world.entities
-                        if entity.semantic_key is not None
-                        and entity.semantic_key.startswith(("element:", "scene:"))
-                    ),
-                )
+        explicit_episode_assets = tuple(
+            item
+            for item in self._repository.list_assets(
+                run_id=uuid.UUID(detail["runId"]),
+                episode_id=episode_id,
+                statuses=("approved", "ready"),
             )
+            if item.episode_id == episode_id
+            and item.scope == "episode"
+            and item.role in {"element", "scene"}
+            and item.media_type == "image"
+            and item.semantic_key is not None
+            and not item.semantic_key.startswith("legacy:")
         )
-        first = compile_image_prompt(
+        reference_keys = storyboard_reference_keys(
             episode,
-            target="first_frame",
-            reference_roles=reference_keys,
-            style_profile=style_profile,
-            series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
+            style_profile,
+            explicit_episode_keys=tuple(
+                item.semantic_key
+                for item in explicit_episode_assets
+                if item.semantic_key is not None
+            ),
         )
-        last = compile_image_prompt(
+        storyboard = compile_storyboard_prompt(
             episode,
-            target="last_frame",
             reference_roles=reference_keys,
             style_profile=style_profile,
             series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
@@ -116,8 +106,7 @@ class QueryService:
         return {
             "episodeId": str(episode_id),
             "slot": detail["slot"],
-            "firstFrame": first.text,
-            "lastFrame": last.text,
+            "storyboard": storyboard.text,
             "video": video.text,
             "overrides": self._repository.get_prompt_overrides(episode_id),
         }
@@ -128,7 +117,7 @@ class QueryService:
         return self._repository.step_detail(step_id)
 
     def pipeline_settings(self, run_id: uuid.UUID) -> PipelineSettings:
-        """返回Run的流水线开关；历史Run按legacy_default读取。"""
+        """返回Run持久化的流水线开关。"""
 
         return self._repository.get_pipeline_settings(run_id)
 

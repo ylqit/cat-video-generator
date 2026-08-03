@@ -6,6 +6,7 @@ import { api, ApiError } from "../api/client";
 import DeliveryPanel from "../components/DeliveryPanel.vue";
 import EpisodeCard from "../components/EpisodeCard.vue";
 import GenerateButton from "../components/GenerateButton.vue";
+import PromptCollapse from "../components/PromptCollapse.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import StepList from "../components/StepList.vue";
 import { usePolling } from "../composables/usePolling";
@@ -75,6 +76,12 @@ const diagnostics = computed(() => {
 });
 
 const trackedJobs = computed(() => Object.values(jobs.byDedupKey));
+const workflowNodes = computed(() => graph.value?.workflowNodes ?? []);
+
+function promptsForNode(promptIds: string[]) {
+  const ids = new Set(promptIds);
+  return (graph.value?.prompts ?? []).filter((prompt) => ids.has(prompt.id));
+}
 
 /** 从被技术审核拒绝的最新导演步骤定位需要人工重规划的时段。 */
 const planningReviewSlot = computed(() => {
@@ -114,7 +121,7 @@ async function replanFailedEpisode() {
       {
         confirmButtonText: "确认付费并重规划",
         cancelButtonText: "取消",
-        inputValue: "保留主事件，减少重复描述，使执行Prompt聚焦且满足长度预算",
+        inputValue: "保留主事件，修复可见连续性矛盾，并让故事板动作顺序更清晰",
         inputValidator: (value) => Boolean(value.trim()) || "必须填写重规划原因",
       },
     );
@@ -211,6 +218,31 @@ onMounted(() => {
       :description="diagnostics.join('；')"
     />
 
+    <el-card v-if="workflowNodes.length" shadow="never" style="margin-bottom: 16px">
+      <template #header><strong>生产节点</strong></template>
+      <div class="node-grid">
+        <div v-for="node in workflowNodes" :key="node.id" class="node-card">
+          <div style="display: flex; align-items: center; gap: 8px">
+            <strong>{{ node.label }}</strong>
+            <StatusBadge :status="node.status" />
+          </div>
+          <div v-if="node.stepId" class="muted">Step {{ node.stepId }}</div>
+          <div class="node-gates">
+            <span>Provider：{{ node.providerStatus }}</span>
+            <span>契约：{{ node.contractStatus }}</span>
+            <span>语义：{{ node.semanticReviewStatus }}</span>
+          </div>
+          <div v-if="node.error?.message" class="node-error">{{ node.error.message }}</div>
+          <div v-if="node.nextAction" class="muted">下一步：{{ node.nextAction }}</div>
+          <PromptCollapse
+            v-if="node.promptIds.length"
+            :prompts="promptsForNode(node.promptIds)"
+            title="实际 Prompt"
+          />
+        </div>
+      </div>
+    </el-card>
+
     <el-alert
       v-if="needsResume"
       type="warning"
@@ -249,3 +281,12 @@ onMounted(() => {
   </div>
   <div v-else class="page" v-loading="true" style="min-height: 300px" />
 </template>
+
+<style scoped>
+.page { padding: 20px 24px; }
+.muted { color: #8a8f99; font-size: 12px; }
+.node-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; }
+.node-card { border: 1px solid #2b2d33; border-radius: 6px; padding: 10px; min-height: 82px; }
+.node-error { color: #f56c6c; font-size: 12px; margin-top: 4px; }
+.node-gates { display: flex; gap: 8px; flex-wrap: wrap; color: #8a8f99; font-size: 11px; margin-top: 4px; }
+</style>

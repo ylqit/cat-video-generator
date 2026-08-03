@@ -42,7 +42,7 @@ def test_core_columns_do_not_duplicate_json_facts() -> None:
     assert "utf8_bytes" not in prompt_columns
     assert "semantic_key" in asset_columns
     assert "pipeline_settings_json" in run_columns
-    assert ALEMBIC_HEAD == "0007_pipeline_settings"
+    assert ALEMBIC_HEAD == "0009_storyboard_prompt_purposes"
 
 
 def test_deleted_runtime_modules_and_commands_are_absent() -> None:
@@ -128,3 +128,20 @@ def test_active_documentation_describes_only_core_runtime() -> None:
                 continue
             resolved = (path.parent / target.replace("%20", " ")).resolve()
             assert resolved.exists(), f"{path}: 缺失链接 {target}"
+
+
+def test_studio_tab_is_owned_by_url_instead_of_polling() -> None:
+    """轮询只能刷新数据，不能把用户从当前浏览页签强制跳回后端阶段。"""
+
+    source = (ROOT / "web" / "src" / "views" / "StudioView.vue").read_text(
+        encoding="utf-8"
+    )
+    load_graph = source[
+        source.index("async function loadGraph") : source.index("/** 拉取实时")
+    ]
+    assert "initializedTabRunId.value !== runId.value" in load_graph
+    assert "route.query.stage" in source
+    assert "() => route.query.run" in source
+    assert "query: { ...route.query, run: runId.value, stage }" in source
+    assert "if (activeTab.value !== stage)" not in load_graph
+    assert "purpose: 'image'" not in source

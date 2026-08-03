@@ -23,7 +23,6 @@ from ..domain.contracts import (
 )
 from ..domain.pipeline import PipelineSettings
 from ..domain.prompts import (
-    PromptBudgetError,
     PromptCompilationError,
     compile_day_director_prompt,
     compile_episode_director_prompt,
@@ -75,7 +74,7 @@ class DayBriefPause:
 
 
 class PlanningReviewRequired(RuntimeError):
-    """自动修复一次后仍矛盾，需要人工给出新的时段导演理由。"""
+    """时段脚本的业务语义不合格，需要人工决定是否重新规划。"""
 
     def __init__(
         self,
@@ -85,8 +84,7 @@ class PlanningReviewRequired(RuntimeError):
         errors: tuple[str, ...],
     ) -> None:
         super().__init__(
-            f"Run {run_id} 的 {slot.value} 时段自动修复后仍不自洽："
-            + "；".join(errors)
+            f"Run {run_id} 的 {slot.value} 时段需要人工规划审核：" + "；".join(errors)
         )
         self.run_id = run_id
         self.slot = slot
@@ -113,9 +111,7 @@ class PlanningService:
             director=director,
             provider_name=provider_name,
         )
-        self._event_seed_catalog = event_seed_catalog or EventSeedCatalog(
-            Path("content/events")
-        )
+        self._event_seed_catalog = event_seed_catalog or EventSeedCatalog(Path("content/events"))
         self._series_profile = series_profile
         self._style_profile = style_profile
         self._video_resolution = video_resolution
@@ -139,9 +135,7 @@ class PlanningService:
 
         self._check_paid(allow_paid_generation)
         if candidate_count != 1:
-            raise ValueError(
-                "分层导演模式固定生成一份DayBrief；DAILY_PLAN_CANDIDATE_COUNT必须为1"
-            )
+            raise ValueError("分层导演模式固定生成一份DayBrief；DAILY_PLAN_CANDIDATE_COUNT必须为1")
 
         recent_summaries = self._repository.list_recent_completed_summaries(limit=6)
         event_seeds = self._event_seed_catalog.select(
@@ -153,9 +147,7 @@ class PlanningService:
         planning_metadata = {
             "planningRevision": 1,
             "seriesProfileHash": self._series_profile.fingerprint(),
-            "recentSummaries": [
-                item.model_dump(mode="json") for item in recent_summaries
-            ],
+            "recentSummaries": [item.model_dump(mode="json") for item in recent_summaries],
             "eventSeeds": [item.model_dump(mode="json") for item in event_seeds],
         }
         run_id = self._repository.create_draft_run(target_date)
@@ -246,9 +238,7 @@ class PlanningService:
                 day_prompt_id=uuid.UUID(context["dayDirectorPromptId"]),
                 drafts=drafts,
                 planning_metadata=metadata,
-                recent_summaries=_parse_recent_summaries(
-                    metadata.get("recentSummaries", ())
-                ),
+                recent_summaries=_parse_recent_summaries(metadata.get("recentSummaries", ())),
             )
         except PlanningReviewRequired:
             self._repository.set_run_status(run_id, RunStatus.PLANNING_REVIEW)
@@ -388,10 +378,7 @@ class PlanningService:
             self._assemble_plan(
                 run_id,
                 day_brief,
-                [
-                    episode if item.slot is slot else item
-                    for item in stored_run.plan.episodes
-                ],
+                [episode if item.slot is slot else item for item in stored_run.plan.episodes],
             )
             self._repository.replace_episode_plan(
                 run_id=run_id,
@@ -441,9 +428,7 @@ class PlanningService:
             prompt = compile_episode_director_prompt(
                 day_brief=day_brief,
                 slot_brief=slot_brief,
-                previous_state_summaries=tuple(
-                    summarize_episode_state(item) for item in previous
-                ),
+                previous_state_summaries=tuple(summarize_episode_state(item) for item in previous),
                 retry_reason=retry_reason,
                 rejected_candidate=rejected_candidate,
                 validation_errors=validation_errors,
@@ -492,7 +477,7 @@ class PlanningService:
                     resolution=self._video_resolution,
                     style_profile=self._style_profile,
                 )
-            except (PromptBudgetError, PromptCompilationError) as exc:
+            except PromptCompilationError as exc:
                 prompt_error = str(exc)
             if not failures and prompt_error is None:
                 return episode, step, attempt
@@ -518,17 +503,20 @@ class PlanningService:
                 ],
                 evidence={
                     "phase": "episode_contract",
-                    "autoRepairScheduled": repair_index == 0,
+                    # Ark 已经成功返回可解析对象。这里属于剧情语义不合格，不能把
+                    # 业务拒绝当作传输失败而自动产生第二次收费调用。
+                    "providerStatus": "succeeded",
+                    "contractStatus": "parsed",
+                    "semanticReviewStatus": "rejected",
+                    "autoRepairScheduled": False,
                 },
             )
-            if repair_index == 0:
-                continue
             raise PlanningReviewRequired(
                 run_id=run_id,
                 slot=slot_brief.slot,
                 errors=validation_errors,
             )
-        raise AssertionError("每个时段最多执行一次原始导演调用和一次自动修复")
+        raise AssertionError("每个时段最多执行一次原始导演调用和一次结构修复")
 
     def _assemble_plan(
         self,

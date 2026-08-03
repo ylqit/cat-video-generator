@@ -1,7 +1,7 @@
-"""总导演、时段导演、图片、视频与审核Prompt的唯一编译模块。
+"""全天导演、时段导演、故事板、视频与媒体审核Prompt编译。
 
-规划上下文可以完整；Seedance只接收当前Episode的执行信息。所有编译器均为纯函数，
-Prompt会先持久化再交给Ark，因而这里不能读取数据库或本地文件。
+导演上下文可以完整；Seedream负责把脚本视觉化为有序独立面板；Seedance只接收
+当前Episode、已批准故事板和少量关键连续性。字符数仅用于展示，不作为本地准入门。
 """
 
 from __future__ import annotations
@@ -10,13 +10,8 @@ import json
 from dataclasses import dataclass
 from datetime import date
 
-from .continuity import EntityState, replay_world
-from .contracts import (
-    DayBrief,
-    EpisodePlan,
-    RecentContentSummary,
-    SlotBrief,
-)
+from .continuity import EntityKind, EntityState, PlacementKind, validate_continuity
+from .contracts import DayBrief, EpisodePlan, RecentContentSummary, SlotBrief
 from .rendering import MediaBinding, VideoInputPlan
 from .visual_profiles import (
     DEFAULT_SERIES_VISUAL_PROFILE,
@@ -25,24 +20,19 @@ from .visual_profiles import (
     StyleProfile,
 )
 
-VIDEO_PROMPT_WARNING_CHARS = 1400
-VIDEO_PROMPT_BLOCKING_CHARS = 1600
-
-
-class PromptBudgetError(ValueError):
-    """执行Prompt超出收费调用允许的注意力预算。"""
-
 
 class PromptCompilationError(ValueError):
-    """合法业务对象无法安全投影为供应商Prompt。"""
+    """业务对象无法安全投影为供应商Prompt。"""
 
 
 @dataclass(frozen=True, slots=True)
 class CompiledPrompt:
+    """Prompt正文和只读统计；统计值不会阻断生成。"""
+
     text: str
     char_count: int
     utf8_bytes: int
-    warnings: tuple[str, ...]
+    warnings: tuple[str, ...] = ()
 
 
 def compile_day_director_prompt(
@@ -67,7 +57,8 @@ def compile_day_director_prompt(
             "地点范围、真正跨时段复用的元素及早中晚边界，不替时段导演写动作。",
             f"人物长期身份：{series_profile.person_identity}；{series_profile.person_hair}；"
             f"{series_profile.person_body}。",
-            "共享元素使用element:*或scene:*语义键；没有跨时段复用就保持空数组。"
+            "共享元素只使用逻辑entity_key，不要写数据库semantic_key，不要把固定人物、"
+            "固定猫咪或普通场景重复声明为共享元素；没有跨时段关键道具就保持空数组。"
             "服装、鞋帽、背包和配饰服从场景，变化时给出天气、地点或事件原因。",
             "早中晚可以独立或局部承接，不强制准备—完成—归家。slots必须严格按"
             "morning、noon、evening排序，自然语言字段全部使用中文。",
@@ -85,7 +76,7 @@ def compile_episode_director_prompt(
     validation_errors: tuple[str, ...] = (),
     series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
 ) -> str:
-    """生成只输出一个EpisodeScript的时段导演Prompt。"""
+    """生成只输出一个故事板友好EpisodeScript的时段导演Prompt。"""
 
     previous = "；".join(previous_state_summaries) or "当天第一条，无前序状态"
     repair = ""
@@ -100,67 +91,79 @@ def compile_episode_director_prompt(
         (
             f"你是{slot_brief.slot.value}时段导演。只输出符合JSON Schema的一个"
             "EpisodeScript，不输出slot、全天方案、解释或Markdown。",
-            "DayBrief："
-            + json.dumps(day_brief.model_dump(mode="json"), ensure_ascii=False),
-            "本时段边界："
-            + json.dumps(slot_brief.model_dump(mode="json"), ensure_ascii=False),
+            "DayBrief：" + json.dumps(day_brief.model_dump(mode="json"), ensure_ascii=False),
+            "本时段边界：" + json.dumps(slot_brief.model_dump(mode="json"), ensure_ascii=False),
             f"前序真实终态摘要：{previous}。{retry}{repair}",
-            "设计一条8至15秒视频：一个主事件、2至4个连续动作阶段、1至3个镜头和"
-            "一个可见收束。动作可以丰富但必须服务同一目标，结尾不得静止互看填时长。",
-            "动作主体直接使用VisibleWorld实体ID（固定人物为person、灰白猫为cat）；"
-            "每个动作只声明一次actorId。镜头只用actionOrders映射动作，每镜一种运镜。",
-            "VisibleWorld先登记锚点与所有可见关键实体。每个实体提供完整initialState。"
-            "发生状态变化时，在对应ActionStage.transitions中提供完整before、after和"
-            "reason；无状态变化时transitions保持空数组，不能创建空壳Transition。",
-            "before必须精确等于前序终态。活动实体必须位于锚点、合法支撑或容器中；"
-            "离场或消耗后active=false且不再占用空间。道具不得无原因出现、消失、"
-            "复制或变形；坐下前必须登记seat锚点。",
-            "真正跨时段元素必须在实体semanticKey中使用DayBrief声明的同一语义键。"
-            "人物、猫咪和画风参考由系统固定加入，脚本不声明参考角色或素材列表。",
+            "设计一条8至15秒生活流视频：一个主事件、2至4个连续动作阶段、1至3个"
+            "镜头和一个可见收束。每个动作必须适合转成一张清楚的独立故事板图，"
+            "结尾不得靠静止互看填时长。",
+            "动作主体使用SceneContinuity实体ID（固定人物person、灰白猫cat）；"
+            "ActionStage只保存order、actor_id、action和visible_result。停步、转头、"
+            "蹲下、嗅闻、走动等姿态只写入动作文本。",
+            "SceneContinuity只登记人物、猫咪、被操作或跨镜头延续的关键道具，以及"
+            "真正参与承重的桌面、座椅等锚点。普通植物、屋檐、远山和装饰不要建账。",
+            "每个实体声明kind、逻辑entity_key、start_state、end_state、lifecycle和稳定"
+            "form_key。form_key只表示类别或固定外观，禁止加入crouch、sniffing、walking等"
+            "姿势。人物和猫咪固定persist；其他实体按persist、enter、exit、consume或"
+            "transform声明起终态，变化时说明原因。",
+            "关键实体不得无原因出现、消失、复制或改变类别；承担发现或结尾回报的实体"
+            "必须登记，并在ending.key_entity_ids中引用。跨时段道具使用DayBrief中的同一"
+            "entity_key。导演不得生成数据库资产semantic_key。",
             f"人物保持{series_profile.person_identity}；{series_profile.person_hair}；"
             f"{series_profile.person_body}。猫保持{series_profile.cat_identity}。"
-            "服装、鞋帽和背包按剧情自然变化。",
-            "videoInputMode默认multimodal_reference；只有开场必须精确时使用"
-            "strict_first_frame，开场和结果都必须精确时使用strict_first_last。",
+            "服装、鞋帽和背包按剧情自然变化。appearance直接描述本时段外观；"
+            "若相对前一时段有变化，列入changes_from_previous并给出change_reason，"
+            "没有变化时两者保持空值。",
+            "ending必须给出result和key_entity_ids；只有结尾物体状态或构图必须精确锁定"
+            "时，才将visual_critical设为true。脚本不选择Seedance输入模式，也不声明"
+            "参考素材。",
         )
     )
 
 
-def compile_image_prompt(
+def storyboard_panel_count(episode: EpisodePlan) -> int:
+    """按动作数量确定组图数量；一次Episode永远只产生一个组图任务。"""
+
+    return 3 if len(episode.script.actions) == 2 else 4
+
+
+def compile_storyboard_prompt(
     episode: EpisodePlan,
     *,
-    target: str,
     reference_roles: tuple[str, ...] = (),
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
     series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
     retry_feedback: str | None = None,
-    **_: object,
 ) -> CompiledPrompt:
-    """为首帧、尾帧或元素图生成聚焦的9:16 Seedream Prompt。"""
+    """生成一次Seedream多图序列Prompt，返回3至4张独立无字竖图。"""
 
-    if target not in {"first_frame", "last_frame", "element"}:
-        raise ValueError(f"不支持的图片目标{target}")
-    script = episode.script
-    final = target == "last_frame"
-    references = "；".join(
-        f"图{index}负责{role}" for index, role in enumerate(reference_roles, 1)
-    ) or "没有额外参考图"
-    state = _describe_world_state(episode, final=final)
-    intended = script.ending if final else script.actions[0].action
-    lines = (
-        f"【任务】生成{target}的9:16竖屏单幅参考图。",
-        f"【素材职责】{references}。",
-        f"【画风】{style_profile.prompt_positive()}；排除{style_profile.prompt_negative()}。",
-        f"【主体】{series_profile.person_identity}；{series_profile.person_hair}；"
-        f"{series_profile.cat_identity}。",
-        f"【场景与外观】{script.scene}；{script.appearance.description}。",
-        f"【画面动作与状态】{intended}；{state}。",
-        "【硬约束】一人一猫；关键实体数量、支撑、容器和外观签名符合状态账本；"
-        "无黑边、多视图、文字、Logo、UI或明显3D商业动画质感。",
+    references = (
+        "；".join(f"图{index}只负责{role}" for index, role in enumerate(reference_roles, 1))
+        or "没有额外参考图"
     )
-    text = "\n".join(lines)
+    panels = _storyboard_panels(episode)
+    panel_lines = "\n".join(
+        f"面板{index}：{description}" for index, description in enumerate(panels, 1)
+    )
+    script = episode.script
+    text = "\n".join(
+        (
+            f"【任务】一次生成{len(panels)}张相互连贯但彼此独立的9:16竖屏故事板图；"
+            "每张都是完整画面，不要拼成网格。",
+            f"【参考职责】{references}。",
+            f"【固定主体】{series_profile.person_identity}；{series_profile.person_hair}；"
+            f"{series_profile.cat_identity}。全组始终准确一人一猫。",
+            f"【画风】{style_profile.prompt_positive()}；排除{style_profile.prompt_negative()}。",
+            f"【场景与服饰】{script.scene}；{script.appearance.description}。",
+            f"【有序面板】\n{panel_lines}",
+            "【连续性】跨面板保持同一人物、同一灰白猫、服装、关键实体稳定formKey和"
+            "数量；动作过程自然连接，并最终符合脚本声明的起终态与生命周期。",
+            "【禁止】不得包含文字、序号、对白框、边框、九宫格、UI、Logo、水印、"
+            "角色分身、明显3D/PBR质感或与面板顺序冲突的状态。",
+        )
+    )
     if retry_feedback:
-        text += f"\n【重试修正】保留旧图审计，本次必须修正：{retry_feedback}。"
+        text += f"\n【重试修正】保留旧组图审计，本次必须修正：{retry_feedback}。"
     return _compiled(text)
 
 
@@ -171,7 +174,7 @@ def compile_video_prompt(
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
     **_: object,
 ) -> CompiledPrompt:
-    """生成当前Episode唯一五段式Seedance执行Prompt。"""
+    """根据最终有序故事板输入生成五段式Seedance执行Prompt。"""
 
     if input_plan.duration_seconds != episode.script.duration_seconds:
         raise ValueError("VideoInputPlan时长与EpisodeScript不一致")
@@ -190,40 +193,49 @@ def compile_video_prompt_preview(
     resolution: str,
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
 ) -> CompiledPrompt:
-    """规划验收复用正式内核，提前阻断超预算Prompt。"""
+    """不绑定真实资产的执行Prompt预览；长度仅用于Web展示。"""
 
     if resolution not in {"480p", "720p"}:
         raise ValueError("视频分辨率只允许480p或720p")
+    count = storyboard_panel_count(episode)
+    bindings = "；".join(f"@图片{i}=故事板面板{i}" for i in range(1, count + 1)) + "。"
     return _compile_video_body(
         episode,
         resolution=resolution,
         duration_seconds=episode.script.duration_seconds,
-        bindings="人物、灰白猫、画风和本集必要元素按最终素材顺序绑定。",
+        bindings=bindings,
         style_profile=style_profile,
     )
 
 
-def compile_keyframe_review_prompt(
+def compile_storyboard_review_prompt(
     episode: EpisodePlan,
     *,
-    target: str,
+    panel_count: int,
     series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
 ) -> str:
-    """生成关键帧身份、画风和世界终态语义审核Prompt。"""
+    """一次审核整组面板，结果必须对全部面板原子生效。"""
 
-    if target not in {"first_frame", "last_frame"}:
-        raise ValueError("关键帧审核target必须是first_frame或last_frame")
+    if panel_count != storyboard_panel_count(episode):
+        raise ValueError("故事板审核数量与Episode动作数不一致")
+    actions = "；".join(
+        f"{item.order}.{_actor_name(item.actor_id)}{item.action}→{item.visible_result}"
+        for item in episode.script.actions
+    )
+    continuity = _describe_continuity(episode)
     return "\n".join(
         (
-            "你是关键帧语义审核器，只返回给定JSON Schema。",
+            f"你是故事板组图审核器。输入{panel_count}张图片按面板顺序排列，只返回给定JSON。",
             f"身份：{series_profile.person_identity}；{series_profile.person_hair}；"
             f"{series_profile.cat_identity}。",
-            f"画风：{style_profile.prompt_positive()}；不得出现"
-            f"{style_profile.prompt_negative()}。",
-            f"目标状态：{_describe_world_state(episode, final=target == 'last_frame')}。",
-            "检查实体数量、支撑、容器、座位、外观签名和空间边界。证据必须描述"
-            "图片中的实际观察；未知家具、悬空、穿透、形变或持久物缺失应明确拒绝。",
+            f"画风：{style_profile.prompt_positive()}；不得出现{style_profile.prompt_negative()}。",
+            f"动作链：{actions}。关键起终态：{continuity}。"
+            f"结尾：{episode.script.ending.result}。",
+            "硬失败只包括：人物或猫咪身份/数量错误、明显3D画风、动作错序、关键道具"
+            "复制消失或变类、实际坐下却没有前序座位、同场景服装断裂、最后一张未兑现"
+            "结尾。普通背景、次要植物、轻微姿势、构图或面貌差异写入warnings，不应让"
+            "布尔硬门失败。证据必须指出面板序号。",
         )
     )
 
@@ -231,39 +243,65 @@ def compile_keyframe_review_prompt(
 def compile_video_diagnostic_prompt(episode: EpisodePlan) -> str:
     """生成最终视频抽帧诊断Prompt；诊断不自动批准成片。"""
 
-    script = episode.script
     actions = "；".join(
-        f"{item.order}.{_actor_name(item.actor_id)}{item.action}" for item in script.actions
+        f"{item.order}.{_actor_name(item.actor_id)}{item.action}" for item in episode.script.actions
     )
-    entities = "；".join(
-        f"{item.id}={item.name}/{item.initial_state.appearance_signature}"
-        for item in script.visible_world.entities
-    )
+    entities = _describe_continuity(episode)
     return "\n".join(
         (
             "你是生活流短视频抽帧诊断器，图片按时间顺序排列，只返回给定JSON。",
-            f"实体：{entities}。动作：{actions}。结尾：{script.ending}。",
-            "检查同一人物和灰白猫、二维绘本风格、持久实体与服装连续性、支撑和"
-            "容器关系、动作先后。单帧遮挡不等于消失；证据必须包含帧序号。",
+            f"关键实体：{entities}。动作：{actions}。结尾：{episode.script.ending.result}。",
+            "检查同一人物和灰白猫、二维绘本风格、关键实体与服装连续性、动作先后和"
+            "结尾兑现。单帧遮挡不等于消失；证据必须包含帧序号。",
         )
     )
 
 
 def summarize_episode_state(episode: EpisodePlan) -> str:
-    """把真实重放终态压缩给下一个时段导演。"""
+    """把关键实体真实终态压缩给下一个时段导演。"""
 
-    result = replay_world(episode.script.visible_world, episode.script.actions)
+    result = validate_continuity(episode.script.continuity)
     if result.issues:
-        raise PromptCompilationError("不一致世界不能生成前序摘要")
+        raise PromptCompilationError("不一致场景连续性不能生成前序摘要")
     states = "、".join(
-        f"{entity_id}@{state.anchor_id or state.container_id or '离场'}:"
-        f"{'active' if state.active else 'inactive'}:{state.appearance_signature}"
-        for entity_id, state in sorted(result.states.items())
+        f"{entity_id}@{_placement_text(state)}"
+        for entity_id, state in sorted(result.final_states.items())
     )
     return (
-        f"{episode.slot.value}结尾={episode.script.ending}，"
-        f"外观={episode.script.appearance.description}，可见世界={states}"
+        f"{episode.slot.value}结尾={episode.script.ending.result}，"
+        f"外观={episode.script.appearance.description}，关键实体={states}"
     )
+
+
+def _storyboard_panels(episode: EpisodePlan) -> tuple[str, ...]:
+    script = episode.script
+    opening = (
+        f"开场建立{script.scene}，{script.appearance.description}；"
+        f"关键初态：{_describe_states(episode, final=False)}"
+    )
+    actions = script.actions
+    if len(actions) == 2:
+        middle = (
+            f"{_actor_name(actions[0].actor_id)}{actions[0].action}，{actions[0].visible_result}"
+        )
+        end = (
+            f"{_actor_name(actions[1].actor_id)}{actions[1].action}，"
+            f"{actions[1].visible_result}；结尾{script.ending.result}；"
+            f"关键终态：{_describe_states(episode, final=True)}"
+        )
+        return opening, middle, end
+    second = f"{_actor_name(actions[0].actor_id)}{actions[0].action}，{actions[0].visible_result}"
+    middle_actions = actions[1:-1]
+    third = "；随后".join(
+        f"{_actor_name(item.actor_id)}{item.action}，{item.visible_result}"
+        for item in middle_actions
+    )
+    last = actions[-1]
+    ending = (
+        f"{_actor_name(last.actor_id)}{last.action}，{last.visible_result}；"
+        f"结尾{script.ending.result}；关键终态：{_describe_states(episode, final=True)}"
+    )
+    return opening, second, third, ending
 
 
 def _compile_video_body(
@@ -275,173 +313,89 @@ def _compile_video_body(
     style_profile: StyleProfile,
 ) -> CompiledPrompt:
     script = episode.script
-    shot_lines = "\n".join(
-        _compile_shot(episode, order)
-        for order in range(1, len(script.shots) + 1)
+    actions = "\n".join(
+        f"{item.order}. {_actor_name(item.actor_id)}{item.action}，"
+        f"画面结果为{item.visible_result}。"
+        for item in script.actions
     )
-    transitions = _describe_transitions(episode)
+    continuity = _describe_continuity(episode)
     text = "\n".join(
         (
-            "【输出、画风与素材绑定】"
-            f"{bindings}输出{resolution}、9:16竖屏、{duration_seconds}秒完整成片。"
+            "【输出和画风】"
+            f"{bindings}生成{resolution}、9:16、{duration_seconds}秒single-pass完整视频。"
             f"{style_profile.prompt_positive()}；排除{style_profile.prompt_negative()}。",
-            "【人物、猫咪、外观和空间】保持参考中的同一个中性儿童和同一只灰白猫；"
-            f"本集外观：{script.appearance.description}。场景：{script.scene}。",
-            f"【顺序动作】\n{shot_lines}\n结尾可见结果：{script.ending}。",
-            f"【可见世界状态与切镜连续性】{transitions}切镜自动继承上一动作终态。",
-            "【原生声音和硬禁止】自然环境声与动作声，无对白、旁白或歌词。禁止角色"
-            "增减或分身；禁止关键实体凭空出现、消失、复制或变形；禁止物体穿透或"
-            "无支撑悬空；禁止切镜后服装或持久物无原因变化；禁止字幕、水印、Logo、UI。",
+            "【人物、猫咪与场景】保持故事板中的同一个中性儿童和同一只灰白猫；"
+            f"外观：{script.appearance.description}。场景：{script.scene}。",
+            f"【按故事板顺序发生的动作】\n{actions}\n最后兑现：{script.ending.result}。",
+            f"【关键实体连续性】{continuity}",
+            "【原生声音和禁止项】自然环境声与动作声，无对白、旁白或歌词。禁止人物或"
+            "猫咪分身；禁止关键道具无原因出现、消失、复制或改变form；禁止物体穿透、"
+            "悬空；禁止切镜后服装突变；禁止字幕、水印、Logo和UI。",
         )
     )
-    compiled = _compiled(text)
-    if compiled.char_count > VIDEO_PROMPT_BLOCKING_CHARS:
-        raise PromptBudgetError("视频Prompt超过1600字符，必须重新规划或去重")
-    return compiled
-
-
-def _compile_shot(episode: EpisodePlan, order: int) -> str:
-    script = episode.script
-    shot = next((item for item in script.shots if item.order == order), None)
-    if shot is None:
-        raise PromptCompilationError(f"不存在镜头{order}")
-    stages = [item for item in script.actions if item.order in shot.action_orders]
-    actions = "；随后".join(
-        f"{_actor_name(item.actor_id)}执行：{item.action}" for item in stages
-    )
-    return (
-        f"镜头{shot.order}：{_camera_name(shot.camera_move.value)}，{shot.framing}，"
-        f"{shot.direction}；{actions}。"
-    )
+    return _compiled(text)
 
 
 def _describe_bindings(bindings: list[MediaBinding]) -> str:
     if not bindings:
-        return "不使用额外参考素材。"
-    return "；".join(
-        f"{item.prompt_alias}={item.semantic_key}/{item.provider_role.value}"
-        for item in bindings
-    ) + "。"
-
-
-def _describe_world_state(episode: EpisodePlan, *, final: bool) -> str:
-    script = episode.script
-    if final:
-        result = replay_world(script.visible_world, script.actions)
-        if result.issues:
-            raise PromptCompilationError("不一致世界不能生成尾帧描述")
-        states = result.states
-    else:
-        states = {
-            item.id: item.initial_state for item in script.visible_world.entities
-        }
-    anchors = {item.id: item.name for item in script.visible_world.anchors}
-    entities = {item.id: item.name for item in script.visible_world.entities}
-    return "；".join(
-        _state_line(entity_id, state, anchors, entities)
-        for entity_id, state in sorted(states.items())
-    )
-
-
-def _state_line(
-    entity_id: str,
-    state: EntityState,
-    anchors: dict[str, str],
-    entities: dict[str, str],
-) -> str:
-    name = entities[entity_id]
-    if not state.active:
-        return f"{name}已离场或消耗"
-    position = anchors.get(state.anchor_id or "", state.anchor_id or "")
-    support = anchors.get(
-        state.support_id or "",
-        entities.get(state.support_id or "", state.support_id or ""),
-    )
-    container = entities.get(state.container_id or "", state.container_id or "")
-    relations = [
-        item
-        for item in (
-            position,
-            f"由{support}支撑" if support else "",
-            f"在{container}内" if container else "",
+        raise PromptCompilationError("Seedance故事板输入不能为空")
+    return (
+        "；".join(
+            f"{item.prompt_alias}={item.semantic_key}/{item.provider_role.value}"
+            for item in bindings
         )
-        if item
-    ]
-    return f"{name}位于{'，'.join(relations)}，外观{state.appearance_signature}"
-
-
-def _describe_transitions(episode: EpisodePlan) -> str:
-    lines: list[str] = []
-    entities = {item.id: item.name for item in episode.script.visible_world.entities}
-    anchors = {item.id: item.name for item in episode.script.visible_world.anchors}
-    for action in episode.script.actions:
-        for transition in action.transitions:
-            before = _state_topology(transition.before, anchors, entities)
-            after = _state_topology(transition.after, anchors, entities)
-            # 仅表情、姿态或数量等可见变化已经在动作及visibleResult中表达。
-            # 这里跳过拓扑不变项，避免连续性段再次复述同一动作。
-            if before == after:
-                continue
-            lines.append(
-                f"动作{action.order}中{entities[transition.entity_id]}因{transition.reason}从"
-                f"{before}变为{after}。"
-            )
-    return "".join(lines) or "关键实体保持初始位置、支撑、容器和外观。"
-
-
-def _state_topology(
-    state: EntityState,
-    anchors: dict[str, str],
-    entities: dict[str, str],
-) -> str:
-    """只投影物理拓扑，避免把完整外观签名重复塞入视频Prompt。
-
-    动作文字已经描述可见变化，外观由本集外观段统一锁定；连续性段只负责
-    位置、支撑和容器这些容易导致悬空或穿透的关系。
-    """
-
-    if not state.active:
-        return "非活动状态"
-    anchor = anchors.get(state.anchor_id or "", state.anchor_id or "")
-    support = anchors.get(
-        state.support_id or "",
-        entities.get(state.support_id or "", state.support_id or ""),
+        + "。"
     )
-    container = entities.get(state.container_id or "", state.container_id or "")
-    return "/".join(
-        value
-        for value in (
-            f"位置={anchor}" if anchor else None,
-            f"支撑={support}" if support else "由动作主体持续持有",
-            f"容器={container}" if container else None,
-        )
-        if value
+
+
+def _describe_states(episode: EpisodePlan, *, final: bool) -> str:
+    result = validate_continuity(episode.script.continuity)
+    if result.issues:
+        raise PromptCompilationError("不一致连续性不能生成故事板状态")
+    entities = {item.id: item for item in episode.script.continuity.entities}
+    return "；".join(
+        f"{entity.name}={_placement_text(entity.end_state if final else entity.start_state)}/"
+        f"{entity.final_form_key if final and entity.final_form_key else entity.form_key}"
+        for entity in sorted(entities.values(), key=lambda item: item.id)
     )
+
+
+def _describe_continuity(episode: EpisodePlan) -> str:
+    """把轻量起终态压缩为故事板和视频共用的一份连续性描述。"""
+
+    entities = episode.script.continuity.entities
+    props = [item for item in entities if item.kind is EntityKind.PROP]
+    selected = props or entities
+    return "；".join(
+        f"{item.name}({item.form_key})从{_placement_text(item.start_state)}到"
+        f"{_placement_text(item.end_state)}，生命周期{item.lifecycle.value}"
+        + (f"，原因{item.change_reason}" if item.change_reason else "")
+        for item in selected
+    )
+
+
+def _placement_text(state: EntityState) -> str:
+    if not state.present:
+        return "离屏"
+    labels = {
+        PlacementKind.ANCHOR: "位于",
+        PlacementKind.HELD_BY: "由其持有",
+        PlacementKind.INSIDE: "位于其内部",
+        PlacementKind.OFFSCREEN: "离屏",
+    }
+    return f"{labels[state.placement.kind]}{state.placement.target_id or ''}"
 
 
 def _actor_name(actor_id: str) -> str:
-    return {"person": "人物", "cat": "灰白猫", "environment": "环境"}.get(
-        actor_id,
-        actor_id,
-    )
-
-
-def _camera_name(value: str) -> str:
-    return {
-        "fixed": "固定镜头",
-        "follow": "平稳跟拍",
-        "push": "缓慢推进",
-        "pull": "缓慢拉远",
-        "pan": "缓慢摇摄",
-        "track": "平稳横移",
-    }[value]
+    return {"person": "人物", "cat": "灰白猫", "environment": "环境"}.get(actor_id, actor_id)
 
 
 def _compiled(text: str) -> CompiledPrompt:
-    count = len(text)
+    stripped = text.strip()
+    if not stripped:
+        raise PromptCompilationError("Prompt不能为空")
     return CompiledPrompt(
-        text=text,
-        char_count=count,
-        utf8_bytes=len(text.encode("utf-8")),
-        warnings=("prompt_length_warning",) if count > VIDEO_PROMPT_WARNING_CHARS else (),
+        text=stripped,
+        char_count=len(stripped),
+        utf8_bytes=len(stripped.encode("utf-8")),
     )

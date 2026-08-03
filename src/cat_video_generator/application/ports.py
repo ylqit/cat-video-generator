@@ -20,7 +20,13 @@ from ..domain.contracts import (
 )
 from ..domain.pipeline import PipelineSettings
 from ..domain.rendering import VideoInputPlan
-from ..domain.workflow import EpisodeStatus, RunStatus, StepKind, StepStatus
+from ..domain.workflow import (
+    EpisodeStatus,
+    PromptPurpose,
+    RunStatus,
+    StepKind,
+    StepStatus,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,7 +41,7 @@ class DirectorResult:
 
 @dataclass(frozen=True, slots=True)
 class ImageResult:
-    """同步图片生成结果。"""
+    """Seedream组图结果中的一张独立图片。"""
 
     url: str
     model: str
@@ -53,15 +59,17 @@ class VideoTaskResult:
 
 
 @dataclass(frozen=True, slots=True)
-class VisualReviewResult:
-    """Ark视觉审核的结构化判断；证据不包含原图Base64。"""
+class StoryboardReviewResult:
+    """Ark对整组故事板的原子语义判断；证据不包含Base64。"""
 
     identity_ok: bool
     style_ok: bool
-    world_state_ok: bool
-    scene_topology_ok: bool
+    action_sequence_ok: bool
+    continuity_ok: bool
+    ending_ok: bool
     confidence: float
     violations: tuple[str, ...]
+    warnings: tuple[str, ...]
     evidence: tuple[str, ...]
     response_id: str
     model: str
@@ -121,7 +129,7 @@ class StoredPrompt:
 
     id: uuid.UUID
     step_id: uuid.UUID
-    purpose: str
+    purpose: PromptPurpose
     model: str
     text: str
     sha256: str
@@ -209,12 +217,13 @@ class MediaGenerationGateway(Protocol):
     @property
     def video_model(self) -> str: ...
 
-    def generate_image(
+    def generate_storyboard(
         self,
         *,
         prompt: str,
         reference_paths: tuple[Path, ...],
-    ) -> ImageResult: ...
+        max_images: int,
+    ) -> tuple[ImageResult, ...]: ...
 
     def submit_video(
         self,
@@ -228,17 +237,17 @@ class MediaGenerationGateway(Protocol):
 
 
 class VisualReviewGateway(Protocol):
-    """关键帧语义审核的独立Ark边界。"""
+    """故事板整组审核与视频诊断的独立Ark边界。"""
 
     @property
     def review_model(self) -> str: ...
 
-    def review_keyframe(
+    def review_storyboard(
         self,
         *,
         prompt: str,
-        image_path: Path,
-    ) -> VisualReviewResult: ...
+        image_paths: tuple[Path, ...],
+    ) -> StoryboardReviewResult: ...
 
     def diagnose_video_frames(
         self,
@@ -252,7 +261,9 @@ class PlanningStore(Protocol):
     """导演规划所需的最小持久化能力。"""
 
     def create_draft_run(self, content_date: date) -> uuid.UUID: ...
-    def create_step_intent(self, **kwargs: Any) -> StoredStep: ...
+    def create_step_with_prompt_intent(
+        self, **kwargs: Any
+    ) -> tuple[StoredStep, uuid.UUID]: ...
     def save_prompt(self, **kwargs: Any) -> uuid.UUID: ...
     def finish_director_step(self, **kwargs: Any) -> None: ...
     def fail_director_step(self, **kwargs: Any) -> None: ...
@@ -263,9 +274,7 @@ class PlanningStore(Protocol):
         self, *, limit: int
     ) -> tuple[RecentContentSummary, ...]: ...
     def get_planning_context(self, run_id: uuid.UUID) -> dict[str, Any]: ...
-    def next_director_attempt(
-        self, *, run_id: uuid.UUID, phase: str, slot: Slot | None
-    ) -> int: ...
+    def next_director_attempt(self, *, run_id: uuid.UUID, phase: str, slot: Slot | None) -> int: ...
     def replace_episode_plan(self, **kwargs: Any) -> None: ...
     def get_run(self, run_id: uuid.UUID) -> StoredRun: ...
     def get_step(self, step_id: uuid.UUID) -> StoredStep: ...
@@ -279,7 +288,9 @@ class PlanningStore(Protocol):
 class ProductionStore(Protocol):
     """媒体生产、恢复、审核与交付所需的持久化能力。"""
 
-    def create_step_intent(self, **kwargs: Any) -> StoredStep: ...
+    def create_step_with_prompt_intent(
+        self, **kwargs: Any
+    ) -> tuple[StoredStep, uuid.UUID]: ...
     def save_prompt(self, **kwargs: Any) -> uuid.UUID: ...
     def fail_step(self, step_id: uuid.UUID, **kwargs: Any) -> None: ...
     def next_step_attempt(
@@ -294,22 +305,20 @@ class ProductionStore(Protocol):
     def get_step(self, step_id: uuid.UUID) -> StoredStep: ...
     def latest_retryable_step(self, episode_id: uuid.UUID) -> StoredStep | None: ...
     def get_prompt_for_step(
-        self, step_id: uuid.UUID, *, purpose: str
+        self, step_id: uuid.UUID, *, purpose: PromptPurpose
     ) -> StoredPrompt: ...
-    def list_resumable_steps(
-        self, run_id: uuid.UUID | None
-    ) -> tuple[StoredStep, ...]: ...
+    def list_resumable_steps(self, run_id: uuid.UUID | None) -> tuple[StoredStep, ...]: ...
     def list_assets(self, **kwargs: Any) -> tuple[StoredAsset, ...]: ...
     def find_reusable_asset(self, **kwargs: Any) -> StoredAsset | None: ...
-    def set_episode_status(
-        self, episode_id: uuid.UUID, target: EpisodeStatus
-    ) -> None: ...
+    def find_reusable_storyboard(self, **kwargs: Any) -> tuple[StoredAsset, ...]: ...
+    def set_episode_status(self, episode_id: uuid.UUID, target: EpisodeStatus) -> None: ...
     def set_run_status(self, run_id: uuid.UUID, target: RunStatus) -> None: ...
     def set_step_status(self, step_id: uuid.UUID, target: StepStatus, **kwargs: Any) -> None: ...
     def save_asset(self, **kwargs: Any) -> StoredAsset: ...
     def select_video_asset(self, **kwargs: Any) -> None: ...
     def record_review(self, **kwargs: Any) -> uuid.UUID: ...
     def commit_asset_review(self, **kwargs: Any) -> ReviewCommitResult: ...
+    def commit_storyboard_review(self, **kwargs: Any) -> ReviewCommitResult: ...
     def set_asset_status(self, asset_id: uuid.UUID, status: str) -> None: ...
     def asset_detail(self, asset_id: uuid.UUID) -> StoredAsset: ...
     def episode_detail(self, episode_id: uuid.UUID) -> dict[str, Any]: ...

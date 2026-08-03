@@ -37,8 +37,8 @@ from .api_schemas import (
 )
 from .api_schemas import (
     DeriveCropRequest,
-    GenerateKeyframesRequest,
     GenerateRequest,
+    GenerateStoryboardsRequest,
     PaidRequest,
     PlanRequest,
     PromptOverridesRequest,
@@ -82,14 +82,10 @@ def create_write_router(
         settings = (
             PipelineSettings.model_validate(request.pipeline_settings)
             if request.pipeline_settings
-            # 未显式给流水线开关时保持旧语义：链式关键帧、视频阶段手动确认。
+            # 未显式给流水线开关时，故事板自动推进，视频等待人工确认。
             else PipelineSettings(
                 allow_paid_generation=True,
-                keyframes=(
-                    StageMode.AUTO
-                    if request.auto_generate_keyframes
-                    else StageMode.MANUAL
-                ),
+                storyboard=StageMode.AUTO,
                 video=StageMode.MANUAL,
             )
         )
@@ -97,9 +93,7 @@ def create_write_router(
         def task() -> dict[str, Any]:
             result = planning.plan_day(
                 target_date=request.target_date,
-                planning_context=(
-                    request.planning_context or _DEFAULT_PLANNING_CONTEXT
-                ),
+                planning_context=(request.planning_context or _DEFAULT_PLANNING_CONTEXT),
                 candidate_count=(
                     request.candidate_count
                     if request.candidate_count is not None
@@ -120,6 +114,7 @@ def create_write_router(
             kind="plan_day",
             dedup_key=f"plan:{request.target_date.isoformat()}",
             fn=task,
+            context={"operationKey": "director:day"},
         )
         return _accepted(record)
 
@@ -144,6 +139,7 @@ def create_write_router(
             kind="run_day",
             dedup_key=f"run:{run_id}:{slot_label}",
             fn=task,
+            context={"runId": run_id, "slot": slot_label},
         )
         return _accepted(record)
 
@@ -157,6 +153,7 @@ def create_write_router(
             kind="resume",
             dedup_key=f"resume:{run_id}",
             fn=task,
+            context={"runId": run_id},
         )
         return _accepted(record)
 
@@ -170,7 +167,7 @@ def create_write_router(
             )
         )
         if request.approve:
-            # 关键帧批准后按流水线开关自动续跑该集视频；manual或旧Run不触发。
+            # 故事板整组批准后按流水线开关自动续跑该集视频；manual不触发。
             await asyncio.to_thread(
                 lambda: maybe_continue_video(
                     queries=queries,
@@ -258,6 +255,11 @@ def create_write_router(
                 detail="重试可能调用付费模型，必须显式确认allowPaidGeneration",
             )
 
+        try:
+            retry_target = queries.step(step_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
         def task() -> dict[str, Any]:
             result = retry.retry_step(
                 step_id,
@@ -271,6 +273,11 @@ def create_write_router(
             kind="retry_step",
             dedup_key=f"retry:{step_id}",
             fn=task,
+            context={
+                "runId": retry_target.get("runId"),
+                "episodeId": retry_target.get("episodeId"),
+                "operationKey": retry_target.get("operationKey"),
+            },
         )
         return _accepted(record)
 
@@ -297,6 +304,7 @@ def create_write_router(
             kind="resume_planning",
             dedup_key=f"resume-planning:{run_id}",
             fn=task,
+            context={"runId": run_id, "operationKey": "director:resume"},
         )
         return _accepted(record)
 
@@ -334,6 +342,11 @@ def create_write_router(
             kind="replan_episode",
             dedup_key=f"replan:{run_id}:{slot.value}",
             fn=task,
+            context={
+                "runId": run_id,
+                "slot": slot.value,
+                "operationKey": f"director:episode:{slot.value}",
+            },
         )
         return _accepted(record)
 
@@ -347,7 +360,7 @@ def create_write_router(
         if role not in _REFERENCE_ROLES:
             raise HTTPException(
                 status_code=422,
-                detail="参考资产role必须是element、scene、motion或atmosphere",
+                detail="参考资产role必须是element或scene",
             )
         suffix = Path(file.filename or "").suffix.lower()
         if suffix not in _REFERENCE_SUFFIXES[role]:
@@ -399,15 +412,15 @@ def create_write_router(
         )
         return {"episodeId": str(episode_id), "saved": True}
 
-    @router.post("/episodes/{episode_id}/keyframes", status_code=202)
-    def generate_keyframes(
+    @router.post("/episodes/{episode_id}/storyboards", status_code=202)
+    def generate_storyboards(
         episode_id: uuid.UUID,
-        request: GenerateKeyframesRequest,
+        request: GenerateStoryboardsRequest,
     ) -> dict[str, Any]:
         if not request.allow_paid_generation:
             raise HTTPException(
                 status_code=422,
-                detail="关键帧生成调用付费模型，必须显式确认allowPaidGeneration",
+                detail="故事板生成调用付费模型，必须显式确认allowPaidGeneration",
             )
         try:
             episode = queries.episode(episode_id)
@@ -418,20 +431,24 @@ def create_write_router(
         overrides = request.overrides
 
         def task() -> dict[str, Any]:
-            return production.prepare_keyframes_only(
+            return production.prepare_storyboards_only(
                 run_id,
                 slot=slot,
-                prompt_overrides=(
-                    None if overrides is None else {slot.value: overrides}
-                ),
+                prompt_overrides=(None if overrides is None else {slot.value: overrides}),
                 allow_paid_generation=True,
             )
 
         record = _submit(
             job_registry,
-            kind="prepare_keyframes",
-            dedup_key=f"keyframes:{episode_id}",
+            kind="prepare_storyboard",
+            dedup_key=f"storyboard:{episode_id}",
             fn=task,
+            context={
+                "runId": run_id,
+                "episodeId": episode_id,
+                "slot": slot.value,
+                "operationKey": "image:storyboard",
+            },
         )
         return _accepted(record)
 

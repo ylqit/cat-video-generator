@@ -67,9 +67,9 @@ def test_job_error_keeps_planning_review_run_identity() -> None:
 
     assert record.status == "failed"
     assert record.error == {
-        "code": "internal",
+        "code": "planning_review_required",
         "message": (
-            f"Run {RUN_ID} 的 noon 时段自动修复后仍不自洽：视频Prompt超过预算"
+            f"Run {RUN_ID} 的 noon 时段需要人工规划审核：视频Prompt超过预算"
         ),
         "runId": str(RUN_ID),
         "slot": "noon",
@@ -111,12 +111,12 @@ def test_plan_day_pauses_after_day_brief_then_resume(daily_plan) -> None:
     assert repository.plan is not None
 
 
-def test_pipeline_settings_legacy_default() -> None:
-    settings = PipelineSettings.legacy_default()
+def test_pipeline_settings_safe_default() -> None:
+    settings = PipelineSettings()
     assert settings.allow_paid_generation is False
     assert all(
         settings.stage(name) is StageMode.AUTO
-        for name in ("dayBrief", "script", "keyframes", "video")
+        for name in ("dayBrief", "script", "storyboard", "video")
     )
     with pytest.raises(ValueError, match="未知流水线阶段"):
         settings.stage("thumbnail")
@@ -145,7 +145,7 @@ class StudioRepository:
             "slot": episode.slot.value,
             "status": self.status,
             "script": episode.script.model_dump(mode="json"),
-            "promptOverrides": {"first_frame": "旧编辑"},
+            "promptOverrides": {"storyboard": "旧编辑"},
         }
 
     def _unfinalized_plan(self):
@@ -172,7 +172,7 @@ class StudioRepository:
         self.settings = settings
 
     def get_pipeline_settings(self, run_id):
-        return self.settings or PipelineSettings.legacy_default()
+        return self.settings or PipelineSettings()
 
 
 def _editing_service(repository) -> StudioEditingService:
@@ -240,7 +240,7 @@ def test_update_pipeline_settings_roundtrip(daily_plan) -> None:
     assert repository.settings is not None
     assert repository.settings.video is StageMode.MANUAL
     assert result["pipelineSettings"]["video"] == "manual"
-    assert result["pipelineSettings"]["keyframes"] == "auto"
+    assert result["pipelineSettings"]["storyboard"] == "auto"
 
 
 RUN_ID = uuid.uuid4()
@@ -273,7 +273,7 @@ def _queries_stub(*, role: str, settings: PipelineSettings, frames=()):
     )
 
 
-def _hook_calls(settings: PipelineSettings, *, role="last_frame", frames=()):
+def _hook_calls(settings: PipelineSettings, *, role="storyboard_panel", frames=()):
     calls: list[dict] = []
     production = SimpleNamespace(
         run_day=lambda run_id, *, slot, allow_paid_generation: calls.append(
@@ -291,9 +291,9 @@ def _hook_calls(settings: PipelineSettings, *, role="last_frame", frames=()):
     return calls, registry
 
 
-def test_review_hook_submits_run_day_when_frames_ready() -> None:
+def test_review_hook_submits_run_day_when_storyboard_ready() -> None:
     settings = PipelineSettings(allow_paid_generation=True)
-    frames = (_frame("first_frame", "approved"), _frame("last_frame", "approved"))
+    frames = tuple(_frame("storyboard_panel", "approved") for _ in range(3))
     calls, registry = _hook_calls(settings, frames=frames)
     assert calls == [{"slot": "morning", "paid": True}]
     records = registry.list()
@@ -301,21 +301,54 @@ def test_review_hook_submits_run_day_when_frames_ready() -> None:
     assert records[0].status == "succeeded"
 
 
+def test_job_failure_keeps_safe_resource_context() -> None:
+    registry = JobRegistry(inline=True)
+
+    def fail() -> None:
+        raise RuntimeError("数据库约束失败")
+
+    record = registry.submit(
+        kind="prepare_storyboard",
+        dedup_key="storyboard:test",
+        fn=fail,
+        context={
+            "runId": "run-1",
+            "episodeId": "episode-1",
+            "slot": "morning",
+            "operationKey": "image:storyboard",
+            "secret": "must-not-leak",
+        },
+    )
+    assert record.status == "failed"
+    assert record.error == {
+        "code": "internal",
+        "message": "数据库约束失败",
+        "runId": "run-1",
+        "episodeId": "episode-1",
+        "slot": "morning",
+        "operationKey": "image:storyboard",
+    }
+
+
 def test_review_hook_stays_silent_without_full_conditions() -> None:
-    frames = (_frame("first_frame", "approved"), _frame("last_frame", "approved"))
+    frames = tuple(_frame("storyboard_panel", "approved") for _ in range(3))
     # video=manual：帧就绪也必须人工确认。
     calls, _ = _hook_calls(
         PipelineSettings(allow_paid_generation=True, video=StageMode.MANUAL),
         frames=frames,
     )
     assert calls == []
-    # 未持久化付费授权：绝不自动扣费（含历史Run的legacy_default）。
-    calls, _ = _hook_calls(PipelineSettings.legacy_default(), frames=frames)
+    # 未持久化付费授权：绝不自动扣费。
+    calls, _ = _hook_calls(PipelineSettings(), frames=frames)
     assert calls == []
-    # 只有首帧就绪。
+    # 其中一张面板未批准。
     calls, _ = _hook_calls(
         PipelineSettings(allow_paid_generation=True),
-        frames=(_frame("first_frame", "approved"), _frame("last_frame", "candidate")),
+        frames=(
+            _frame("storyboard_panel", "approved"),
+            _frame("storyboard_panel", "approved"),
+            _frame("storyboard_panel", "candidate"),
+        ),
     )
     assert calls == []
     # 批准的是视频资产，与关键帧钩子无关。
@@ -330,15 +363,15 @@ def test_review_hook_stays_silent_without_full_conditions() -> None:
 class StudioProduction:
     def __init__(self, *, ready: bool = True) -> None:
         self.ready = ready
-        self.keyframe_calls = 0
+        self.storyboard_calls = 0
         self.video_calls: list[dict] = []
 
-    def prepare_keyframes_only(self, run_id, *, allow_paid_generation):
-        self.keyframe_calls += 1
+    def prepare_storyboards_only(self, run_id, *, allow_paid_generation):
+        self.storyboard_calls += 1
         return {
             "runId": str(run_id),
             "episodes": [
-                {"episodeId": str(uuid.uuid4()), "slot": slot, "keyframesReady": self.ready}
+                {"episodeId": str(uuid.uuid4()), "slot": slot, "storyboardReady": self.ready}
                 for slot in ("morning", "noon", "evening")
             ],
         }
@@ -388,7 +421,7 @@ def test_continue_accepts_failed_status_and_resumes(daily_plan) -> None:
     accepted = client.post(f"/api/v1/runs/{uuid.uuid4()}/continue")
     assert accepted.status_code == 202
     assert resume_calls == [{"paid": True}]
-    assert production.keyframe_calls == 1
+    assert production.storyboard_calls == 1
 
 
 def _write_client(*, tmp_path, settings, production, planning, status):
@@ -450,7 +483,7 @@ def test_replan_endpoint_chains_only_when_finalized(tmp_path) -> None:
     )
     assert accepted.status_code == 202
     assert unfinalized.video_calls == []
-    assert unfinalized.keyframe_calls == 0
+    assert unfinalized.storyboard_calls == 0
 
 
 def test_continue_endpoint_chains_by_settings(daily_plan) -> None:
@@ -466,7 +499,7 @@ def test_continue_endpoint_chains_by_settings(daily_plan) -> None:
     )
     accepted = client.post(f"/api/v1/runs/{uuid.uuid4()}/continue")
     assert accepted.status_code == 202
-    assert production.keyframe_calls == 1
+    assert production.storyboard_calls == 1
     assert production.video_calls == []
 
     production_auto = StudioProduction()
@@ -483,7 +516,7 @@ def test_continue_endpoint_chains_by_settings(daily_plan) -> None:
 def test_script_edit_endpoint_returns_structured_errors(daily_plan) -> None:
     repository = StudioRepository(daily_plan)
     client = _studio_client(
-        settings=PipelineSettings.legacy_default(),
+        settings=PipelineSettings(),
         production=StudioProduction(),
         studio_editing=_editing_service(repository),
     )
@@ -506,7 +539,7 @@ def test_script_edit_endpoint_returns_structured_errors(daily_plan) -> None:
 def test_pipeline_settings_endpoint(daily_plan) -> None:
     repository = StudioRepository(daily_plan)
     client = _studio_client(
-        settings=PipelineSettings.legacy_default(),
+        settings=PipelineSettings(),
         production=StudioProduction(),
         studio_editing=_editing_service(repository),
     )

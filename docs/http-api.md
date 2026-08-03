@@ -44,16 +44,21 @@ POST /api/v1/canon
 POST /api/v1/canon/{assetId}/derive-crop
 POST /api/v1/episodes/{episodeId}/references
 PUT  /api/v1/episodes/{episodeId}/prompt-overrides
-POST /api/v1/episodes/{episodeId}/keyframes
+POST /api/v1/episodes/{episodeId}/storyboards
 POST /api/v1/runs/{runId}/deliver
 ```
 
 - 规划、生成和收费重试必须显式提交 `allowPaidGeneration=true`。
 - `generate` 可指定 morning/noon/evening；不提供分段或分辨率实验参数。
 - `retry` 只接受失败、过期或取消的终态 Step；`submission_unknown` 仍冻结。
-- Canon 与 Episode 参考素材必须携带 `semantic_key`。
-- 规划和生成返回 `202 {jobId, dedupKey}`，前端轮询 Job 与 Run graph。
+- Canon与用户显式上传的Episode元素/场景图片必须携带`semantic_key`；剧情中的逻辑`entityKey`不等于数据库资产键，普通场景没有专用参考图也可生成故事板。
+- 规划和生成返回 `202 {jobId, dedupKey, context}`，其中`context`只包含已知的
+  `runId / episodeId / slot / operationKey`。前端轮询 Job 与 Run graph，失败上下文
+  会持续展示并支持定位节点。
 - 最终视频由人工审核，API 不会自动完成交付。
+
+创作台页签由URL保存：`/studio?run=<runId>&stage=storyboard`。后端工作流阶段与
+当前浏览页签相互独立，后台轮询不会把用户强制切回“三集剧本”。
 
 JobRegistry 只在本进程执行后台函数和去重活跃请求；Run、Episode、Step、Prompt、Asset 的持久状态全部来自 PostgreSQL。
 

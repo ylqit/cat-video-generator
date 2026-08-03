@@ -1,23 +1,27 @@
 """Ark Responses 视觉审核使用的严格结构化输出 Schema。"""
 
-KEYFRAME_REVIEW_SCHEMA = {
+STORYBOARD_REVIEW_SCHEMA = {
     "type": "object",
     "properties": {
         "identityOk": {"type": "boolean"},
         "styleOk": {"type": "boolean"},
-        "worldStateOk": {"type": "boolean"},
-        "sceneTopologyOk": {"type": "boolean"},
+        "actionSequenceOk": {"type": "boolean"},
+        "continuityOk": {"type": "boolean"},
+        "endingOk": {"type": "boolean"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "violations": {"type": "array", "items": {"type": "string"}},
+        "warnings": {"type": "array", "items": {"type": "string"}},
         "evidence": {"type": "array", "items": {"type": "string"}},
     },
     "required": [
         "identityOk",
         "styleOk",
-        "worldStateOk",
-        "sceneTopologyOk",
+        "actionSequenceOk",
+        "continuityOk",
+        "endingOk",
         "confidence",
         "violations",
+        "warnings",
         "evidence",
     ],
     "additionalProperties": False,

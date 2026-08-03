@@ -31,7 +31,7 @@ ARK_VIDEO_MODEL
 ARK_REVIEW_MODEL
 ARK_VIDEO_RESOLUTION=480p|720p
 
-KEYFRAME_REVIEW_MODE=semantic_auto|manual
+STORYBOARD_REVIEW_MODE=semantic_auto|manual
 MEDIA_WORK_ROOT
 MEDIA_ASSET_ROOT
 DELIVERY_OUTPUT_ROOT
@@ -41,7 +41,7 @@ DELIVERY_OUTPUT_ROOT
 
 ```powershell
 uv run cvg doctor
-uv run cvg db upgrade
+uv run alembic upgrade head
 uv run cvg doctor
 ```
 
@@ -106,7 +106,8 @@ uv run cvg resume <runId>
 
 - `retry-step` 只接受 failed、expired、cancelled。
 - `submission_unknown` 必须对账，不能重试。
-- 被拒绝关键帧不会复用；新 attempt 保留旧结论。
+- 被拒绝故事板不会复用；新attempt保留旧组图和审核结论。
+- 导演JSON解析或必填字段缺失最多自动结构修复一次；可解析脚本的语义审核失败会进入`planning_review`，必须由用户显式点击重规划。
 - `resume` 只恢复已有 task ID 的轮询、下载或 QC，不重复创建收费 POST。
 - 最终视频必须人工审核，不会自动交付。
 
@@ -119,12 +120,12 @@ uv run cvg deliver <runId>
 目录：
 
 ```text
-var/       工作文件、Prompt 导出和只读历史归档
+var/       工作文件和Prompt导出
 assets/    按 SHA-256 保存的不可变媒体
 output/    01-morning、02-noon、03-evening 与 manifest
 ```
 
-系统不自动删除历史媒体。清理前必须以数据库路径、SHA-256 和归档 Manifest 精确对账。
+系统不会在普通运行中自动清理当前Run媒体；清理必须使用精确数据库路径和SHA-256对账。
 
 ## 7. 本机 Web
 
@@ -151,11 +152,11 @@ uv run cvg api --static-dir web/dist
 
 | 现象 | 处理 |
 | --- | --- |
-| 迁移落后 | 先运行 `cvg db upgrade`，再执行 Doctor |
+| 迁移落后 | 先运行`uv run alembic upgrade head`，再执行Doctor |
 | 明文连接被拒绝 | 检查显式不安全许可；正式环境优先启用 TLS/隧道 |
 | 缺少 Canon 或语义键 | 导入并批准精确人物、猫咪和画风资产 |
 | `planning_review` | 查看矛盾后运行 `replan-episode` 或 `resume-planning` |
-| 关键帧语义失败 | 使用 `retry-step` 创建新 attempt，不覆盖旧审核 |
+| 故事板少图或语义失败 | 使用`retry-step`创建新attempt，不覆盖旧组图与审核 |
 | 视频 Step 失败 | 明确原因后显式付费重试；`run-day` 不代替重试 |
 | `submission_unknown` | 人工对账 Ark 任务，禁止重复 POST |
 | ffprobe 失败 | 检查路径、容器和文件完整性，不重新提交 Seedance |

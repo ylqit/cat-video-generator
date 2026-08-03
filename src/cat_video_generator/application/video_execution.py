@@ -14,10 +14,10 @@ from pathlib import Path
 from typing import Any
 
 from ..domain.prompts import CompiledPrompt, compile_video_diagnostic_prompt, compile_video_prompt
-from ..domain.rendering import MediaSource, build_video_input_plan
+from ..domain.rendering import MediaSource, VideoInputMode, build_video_input_plan
 from ..domain.snapshots import VideoInputSnapshot
 from ..domain.visual_profiles import StyleProfile
-from ..domain.workflow import EpisodeStatus, StepKind, StepStatus
+from ..domain.workflow import EpisodeStatus, PromptPurpose, StepKind, StepStatus
 from .errors import StepRetryRequired
 from .ports import (
     AssetStore,
@@ -54,9 +54,7 @@ class VideoExecutionService:
     ) -> None:
         if diagnostic_mode not in {"off", "diagnostic"}:
             raise ValueError("视频语义诊断模式必须是off或diagnostic")
-        if diagnostic_mode == "diagnostic" and (
-            review_gateway is None or frame_extractor is None
-        ):
+        if diagnostic_mode == "diagnostic" and (review_gateway is None or frame_extractor is None):
             raise ValueError("diagnostic模式需要审核网关和抽帧能力")
         self._repository = repository
         self._gateway = media_gateway
@@ -104,12 +102,26 @@ class VideoExecutionService:
         if original_step.operation_key != "video:single_pass":
             raise ValueError("只支持重试single-pass视频步骤")
         snapshot = VideoInputSnapshot.model_validate(original_step.input_snapshot)
-        inputs = tuple(
+        submitted_inputs = tuple(
             self._repository.asset_detail(asset_id) for asset_id in snapshot.input_asset_ids
+        )
+        storyboard_step_ids = {item.step_id for item in submitted_inputs}
+        if len(storyboard_step_ids) != 1 or None in storyboard_step_ids:
+            raise ValueError("原视频步骤没有绑定同一组故事板")
+        storyboard_step_id = next(iter(storyboard_step_ids))
+        inputs = tuple(
+            item
+            for item in self._repository.list_assets(
+                run_id=episode.run_id,
+                episode_id=episode.id,
+                roles=("storyboard_panel",),
+                statuses=("approved", "ready"),
+            )
+            if item.step_id == storyboard_step_id
         )
         prompt = self._repository.get_prompt_for_step(
             original_step.id,
-            purpose="video",
+            purpose=PromptPurpose.VIDEO,
         ).text
         attempt = self._repository.next_step_attempt(
             episode_id=episode.id,
@@ -138,11 +150,29 @@ class VideoExecutionService:
         retry_of_step_id: uuid.UUID | None = None,
         retry_reason: str | None = None,
     ) -> dict[str, Any]:
+        if not 3 <= len(inputs) <= 4:
+            raise ValueError("Seedance生成前必须具有3至4张完整故事板")
+        ordered_storyboard = tuple(sorted(inputs, key=_panel_ordinal))
+        if not all(
+            item.role == "storyboard_panel" and item.status in {"approved", "ready"}
+            for item in ordered_storyboard
+        ):
+            raise ValueError("Seedance只能使用完整且已批准的故事板面板")
+        input_mode = (
+            VideoInputMode.STRICT_FIRST_LAST
+            if episode.plan.script.ending.visual_critical
+            else VideoInputMode.STORYBOARD_REFERENCE
+        )
+        selected_inputs = (
+            (ordered_storyboard[0], ordered_storyboard[-1])
+            if input_mode is VideoInputMode.STRICT_FIRST_LAST
+            else ordered_storyboard
+        )
         input_plan = build_video_input_plan(
-            input_mode=episode.plan.script.video_input_mode,
+            input_mode=input_mode,
             resolution=self._resolution,
             duration_seconds=episode.plan.script.duration_seconds,
-            sources=tuple(_media_source(asset) for asset in inputs),
+            sources=tuple(_media_source(asset) for asset in selected_inputs),
         )
         by_id = {item.id: item for item in inputs}
         ordered_inputs = tuple(by_id[item.asset_id] for item in input_plan.bindings)
@@ -166,7 +196,7 @@ class VideoExecutionService:
             retry_of_step_id=retry_of_step_id,
             retry_reason=retry_reason,
         )
-        step = self._repository.create_step_intent(
+        step, _ = self._repository.create_step_with_prompt_intent(
             run_id=episode.run_id,
             episode_id=episode.id,
             parent_step_id=None,
@@ -177,13 +207,10 @@ class VideoExecutionService:
             model=self._gateway.video_model,
             input_hash=input_hash,
             input_snapshot=snapshot.model_dump(mode="json"),
-        )
-        self._repository.save_prompt(
-            step_id=step.id,
+            prompt_purpose=PromptPurpose.VIDEO,
+            prompt_model=self._gateway.video_model,
+            prompt_text=compiled.text,
             parent_prompt_id=None,
-            purpose="video",
-            model=self._gateway.video_model,
-            text=compiled.text,
         )
         if step.status in {StepStatus.QUEUED, StepStatus.RUNNING}:
             return self._finish(episode, step)
@@ -323,13 +350,21 @@ class VideoExecutionService:
         assert self._frame_extractor is not None
         assert asset.step_id is not None
         prompt = compile_video_diagnostic_prompt(episode.plan)
-        self._repository.save_prompt(
-            step_id=asset.step_id,
-            parent_prompt_id=None,
-            purpose="review",
-            model=self._review_gateway.review_model,
-            text=prompt,
+        video_prompt = self._repository.get_prompt_for_step(
+            asset.step_id, purpose=PromptPurpose.VIDEO
         )
+        try:
+            self._repository.save_prompt(
+                step_id=asset.step_id,
+                parent_prompt_id=video_prompt.id,
+                purpose=PromptPurpose.REVIEW,
+                model=self._review_gateway.review_model,
+                text=prompt,
+            )
+        except Exception:
+            # 视频诊断是非阻断证据；Prompt无法持久化时跳过外部审核调用，
+            # 已通过技术QC的视频仍保留在content_review等待人工判断。
+            return
         frames: tuple[Path, ...] = ()
         hashes: list[str] = []
         try:
@@ -395,14 +430,20 @@ def _media_source(asset: StoredAsset) -> MediaSource:
 
 def _override_prompt(value: str) -> CompiledPrompt:
     text = value.strip()
-    if len(text) > 1600:
-        raise ValueError("视频Prompt覆盖超过1600字符")
+    if not text:
+        raise ValueError("视频Prompt覆盖不能为空")
     return CompiledPrompt(
         text=text,
         char_count=len(text),
         utf8_bytes=len(text.encode("utf-8")),
-        warnings=("prompt_length_warning",) if len(text) > 1400 else (),
     )
+
+
+def _panel_ordinal(asset: StoredAsset) -> int:
+    ordinal = int(asset.metadata.get("panelOrdinal", 0))
+    if ordinal <= 0:
+        raise ValueError(f"故事板面板{asset.id}缺少合法panelOrdinal")
+    return ordinal
 
 
 def _input_hash(*values: str) -> str:

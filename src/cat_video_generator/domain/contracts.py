@@ -14,12 +14,9 @@ from pydantic import Field, model_validator
 
 from .continuity import (
     DominantView,
-    EntityTransition,
-    VisibleWorld,
-    replay_world,
+    SceneContinuity,
 )
 from .contract_base import StrictModel
-from .rendering import VideoInputMode
 
 
 class Slot(StrEnum):
@@ -32,11 +29,6 @@ class Slot(StrEnum):
     @property
     def sort_order(self) -> int:
         return {Slot.MORNING: 1, Slot.NOON: 2, Slot.EVENING: 3}[self]
-
-
-class AppearanceContinuity(StrEnum):
-    CONTINUE = "continue"
-    CHANGED = "changed"
 
 
 class CameraMove(StrEnum):
@@ -52,19 +44,17 @@ class AppearancePlan(StrictModel):
     """本时段实际可见服饰；身份Canon不包含衣服、鞋帽和背包。"""
 
     description: Annotated[str, Field(min_length=4, max_length=300)]
-    continuity: AppearanceContinuity
-    changes_from_previous: list[Annotated[str, Field(min_length=2, max_length=100)]] = (
-        Field(default_factory=list, max_length=8)
+    changes_from_previous: list[Annotated[str, Field(min_length=2, max_length=100)]] = Field(
+        default_factory=list, max_length=8
     )
     change_reason: Annotated[str, Field(min_length=4, max_length=200)] | None = None
 
     @model_validator(mode="after")
     def validate_change(self) -> AppearancePlan:
-        changed = self.continuity is AppearanceContinuity.CHANGED
-        if changed and (not self.changes_from_previous or not self.change_reason):
+        if self.changes_from_previous and not self.change_reason:
             raise ValueError("外观变化必须列出变化内容和剧情原因")
-        if not changed and (self.changes_from_previous or self.change_reason):
-            raise ValueError("continue外观不能声明变化内容或原因")
+        if not self.changes_from_previous and self.change_reason:
+            raise ValueError("没有外观变化时不应单独声明变化原因")
         return self
 
 
@@ -75,7 +65,6 @@ class ActionStage(StrictModel):
     actor_id: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{1,79}$")]
     action: Annotated[str, Field(min_length=6, max_length=280)]
     visible_result: Annotated[str, Field(min_length=4, max_length=180)]
-    transitions: list[EntityTransition] = Field(default_factory=list, max_length=6)
 
 
 class ShotPlan(StrictModel):
@@ -99,12 +88,9 @@ class ShotPlan(StrictModel):
 
 
 class SharedElement(StrictModel):
-    """DayBrief中确实跨时段出现的批准元素语义键。"""
+    """DayBrief中跨时段复用的逻辑实体，不等同于数据库参考资产。"""
 
-    semantic_key: Annotated[
-        str,
-        Field(pattern=r"^(element|scene):[a-z0-9][a-z0-9_-]{0,119}$"),
-    ]
+    entity_key: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{1,79}$")]
     description: Annotated[str, Field(min_length=4, max_length=240)]
     slots: list[Slot] = Field(min_length=2, max_length=3)
 
@@ -112,6 +98,8 @@ class SharedElement(StrictModel):
     def validate_slots(self) -> SharedElement:
         if len(self.slots) != len(set(self.slots)):
             raise ValueError("共享元素时段不能重复")
+        if self.entity_key in {"person", "cat"}:
+            raise ValueError("固定人物和猫咪不应重复声明为共享元素")
         return self
 
 
@@ -123,9 +111,9 @@ class SlotBrief(StrictModel):
     scene_direction: Annotated[str, Field(min_length=6, max_length=260)]
     event_direction: Annotated[str, Field(min_length=6, max_length=260)]
     appearance_intent: Annotated[str, Field(min_length=4, max_length=220)]
-    continuity_requirements: list[
-        Annotated[str, Field(min_length=3, max_length=160)]
-    ] = Field(default_factory=list, max_length=6)
+    continuity_requirements: list[Annotated[str, Field(min_length=3, max_length=160)]] = Field(
+        default_factory=list, max_length=6
+    )
 
 
 class DayBrief(StrictModel):
@@ -141,9 +129,25 @@ class DayBrief(StrictModel):
     def validate_slot_order(self) -> DayBrief:
         if [item.slot for item in self.slots] != list(Slot):
             raise ValueError("DayBrief时段必须按morning、noon、evening排序")
-        keys = [item.semantic_key for item in self.shared_elements]
+        keys = [item.entity_key for item in self.shared_elements]
         if len(keys) != len(set(keys)):
-            raise ValueError("DayBrief共享元素语义键不能重复")
+            raise ValueError("DayBrief共享元素entityKey不能重复")
+        return self
+
+
+class EpisodeEnding(StrictModel):
+    """主事件的可见结果，以及是否必须由严格首尾帧锁定。"""
+
+    result: Annotated[str, Field(min_length=6, max_length=220)]
+    visual_critical: bool = False
+    key_entity_ids: list[
+        Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{1,79}$")]
+    ] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_entity_ids(self) -> EpisodeEnding:
+        if len(self.key_entity_ids) != len(set(self.key_entity_ids)):
+            raise ValueError("结尾关键实体ID不能重复")
         return self
 
 
@@ -159,10 +163,9 @@ class EpisodeScript(StrictModel):
     appearance: AppearancePlan
     actions: list[ActionStage] = Field(min_length=2, max_length=4)
     shots: list[ShotPlan] = Field(min_length=1, max_length=3)
-    ending: Annotated[str, Field(min_length=6, max_length=220)]
+    ending: EpisodeEnding
     duration_seconds: Annotated[int, Field(ge=8, le=15)]
-    video_input_mode: VideoInputMode
-    visible_world: VisibleWorld
+    continuity: SceneContinuity
 
     @model_validator(mode="after")
     def validate_execution_graph(self) -> EpisodeScript:
@@ -177,9 +180,20 @@ class EpisodeScript(StrictModel):
             raise ValueError("镜头必须按顺序完整覆盖全部动作")
         if len(referenced) != len(set(referenced)):
             raise ValueError("每个动作只能属于一个镜头")
-        result = replay_world(self.visible_world, self.actions)
-        if result.issues:
-            raise ValueError("；".join(item.message for item in result.issues))
+        entity_ids = {item.id for item in self.continuity.entities}
+        unknown_actors = {
+            item.actor_id
+            for item in self.actions
+            if item.actor_id != "environment" and item.actor_id not in entity_ids
+        }
+        if unknown_actors:
+            raise ValueError(f"动作引用未登记主体：{', '.join(sorted(unknown_actors))}")
+        unknown_ending_entities = set(self.ending.key_entity_ids) - entity_ids
+        if unknown_ending_entities:
+            raise ValueError(
+                "结尾引用未登记关键实体："
+                + ", ".join(sorted(unknown_ending_entities))
+            )
         return self
 
 
@@ -196,10 +210,6 @@ class EpisodePlan(StrictModel):
     @property
     def duration_seconds(self) -> int:
         return self.script.duration_seconds
-
-    @property
-    def video_input_mode(self) -> VideoInputMode:
-        return self.script.video_input_mode
 
 
 class DailyProductionPlan(StrictModel):
@@ -224,15 +234,15 @@ class DailyProductionPlan(StrictModel):
     def validate_day(self) -> DailyProductionPlan:
         if [item.slot for item in self.episodes] != list(Slot):
             raise ValueError("全天Episode必须按morning、noon、evening排序")
-        declared = {item.semantic_key: set(item.slots) for item in self.day_brief.shared_elements}
+        declared = {item.entity_key: set(item.slots) for item in self.day_brief.shared_elements}
         observed: dict[str, set[Slot]] = {}
         for episode in self.episodes:
-            for entity in episode.script.visible_world.entities:
-                if entity.semantic_key in declared:
-                    observed.setdefault(entity.semantic_key, set()).add(episode.slot)
+            for entity in episode.script.continuity.entities:
+                if entity.entity_key in declared:
+                    observed.setdefault(entity.entity_key, set()).add(episode.slot)
         for key, slots in declared.items():
             if observed.get(key, set()) != slots:
-                raise ValueError(f"共享元素{key}未在声明的全部时段以同一semanticKey出现")
+                raise ValueError(f"共享元素{key}未在声明的全部时段以同一entityKey出现")
         return self
 
 
@@ -242,5 +252,5 @@ class RecentContentSummary(StrictModel):
     content_date: date
     event_keys: tuple[str, ...] = ()
     location_keys: tuple[str, ...] = ()
-    element_semantic_keys: tuple[str, ...] = ()
+    element_keys: tuple[str, ...] = ()
     summary_text: Annotated[str, Field(min_length=1, max_length=2000)]

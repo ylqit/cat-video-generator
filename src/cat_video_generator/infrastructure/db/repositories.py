@@ -21,12 +21,14 @@ from ...domain.contracts import DailyProductionPlan, Slot
 from ...domain.snapshots import validate_input_snapshot
 from ...domain.workflow import (
     EpisodeStatus,
+    PromptPurpose,
     RunStatus,
     StepKind,
     StepStatus,
     transition_episode,
     transition_run,
     transition_step,
+    validate_prompt_purpose,
 )
 from .delivery_repository import DeliveryPersistenceMixin
 from .director_repository import DirectorStepPersistenceMixin
@@ -50,6 +52,10 @@ from .records import (
 )
 from .review_repository import ReviewPersistenceMixin
 
+_GENERATION_PROMPT_PURPOSES = frozenset(
+    {PromptPurpose.DIRECTOR, PromptPurpose.STORYBOARD, PromptPurpose.VIDEO}
+)
+
 
 class SqlAlchemyWorkflowRepository(
     DirectorStepPersistenceMixin,
@@ -70,7 +76,7 @@ class SqlAlchemyWorkflowRepository(
             session.flush()
             return row.id
 
-    def create_step_intent(
+    def create_step_with_prompt_intent(
         self,
         *,
         run_id: uuid.UUID,
@@ -83,12 +89,26 @@ class SqlAlchemyWorkflowRepository(
         model: str | None,
         input_hash: str,
         input_snapshot: dict[str, Any],
-    ) -> StoredStep:
+        prompt_purpose: PromptPurpose,
+        prompt_model: str,
+        prompt_text: str,
+        parent_prompt_id: uuid.UUID | None,
+    ) -> tuple[StoredStep, uuid.UUID]:
+        """在同一事务内持久化外部调用意图与实际Prompt。
+
+        Prompt是收费输入的一部分，不能在Step之后用第二个事务补写；否则数据库
+        约束或进程中断会留下无法解释、也无法安全恢复的孤立收费意图。
+        """
+
         # 幂等键包含业务所有者、收费步骤和规范化输入。并发Worker即使同时
         # 领取同一任务，也只有一个INSERT能成功，避免重复产生Ark费用。
         if not operation_key.strip():
             raise ValueError("WorkflowStep.operation_key不能为空")
+        if not prompt_text.strip():
+            raise ValueError("Prompt正文不能为空")
+        validate_prompt_purpose(kind, prompt_purpose, generation_intent=True)
         snapshot = validate_input_snapshot(input_snapshot).model_dump(mode="json")
+        prompt_digest = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
         raw_key = "|".join(
             (
                 str(run_id),
@@ -135,7 +155,16 @@ class SqlAlchemyWorkflowRepository(
             if compatible_id is not None:
                 existing_row = session.get(WorkflowStep, compatible_id)
                 assert existing_row is not None
-                return stored_step(existing_row)
+                prompt_id = self._ensure_prompt_record(
+                    session,
+                    step=existing_row,
+                    parent_prompt_id=parent_prompt_id,
+                    purpose=prompt_purpose,
+                    model=prompt_model,
+                    text=prompt_text,
+                    digest=prompt_digest,
+                )
+                return stored_step(existing_row), prompt_id
 
             statement = (
                 insert(WorkflowStep)
@@ -152,38 +181,89 @@ class SqlAlchemyWorkflowRepository(
             )
             row = session.get(WorkflowStep, step_id)
             assert row is not None
-            return stored_step(row)
+            prompt_id = self._ensure_prompt_record(
+                session,
+                step=row,
+                parent_prompt_id=parent_prompt_id,
+                purpose=prompt_purpose,
+                model=prompt_model,
+                text=prompt_text,
+                digest=prompt_digest,
+            )
+            return stored_step(row), prompt_id
 
     def save_prompt(
         self,
         *,
         step_id: uuid.UUID,
         parent_prompt_id: uuid.UUID | None,
-        purpose: str,
+        purpose: PromptPurpose,
         model: str,
         text: str,
     ) -> uuid.UUID:
+        if not text.strip():
+            raise ValueError("Prompt正文不能为空")
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
         with self._sessions.begin() as session:
-            existing = session.execute(
-                select(PromptRecord.id).where(
-                    PromptRecord.step_id == step_id,
-                    PromptRecord.sha256 == digest,
-                )
-            ).scalar_one_or_none()
-            if existing is not None:
-                return existing
-            row = PromptRecord(
-                step_id=step_id,
+            step = required_record(session, WorkflowStep, step_id)
+            validate_prompt_purpose(StepKind(step.kind), purpose)
+            return self._ensure_prompt_record(
+                session,
+                step=step,
                 parent_prompt_id=parent_prompt_id,
                 purpose=purpose,
                 model=model,
-                prompt_text=text,
-                sha256=digest,
+                text=text,
+                digest=digest,
             )
-            session.add(row)
-            session.flush()
-            return row.id
+
+    @staticmethod
+    def _ensure_prompt_record(
+        session: Any,
+        *,
+        step: WorkflowStep,
+        parent_prompt_id: uuid.UUID | None,
+        purpose: PromptPurpose,
+        model: str,
+        text: str,
+        digest: str,
+    ) -> uuid.UUID:
+        existing = session.execute(
+            select(PromptRecord).where(
+                PromptRecord.step_id == step.id,
+                PromptRecord.sha256 == digest,
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            if (
+                existing.purpose != purpose.value
+                or existing.model != model
+                or existing.parent_prompt_id != parent_prompt_id
+            ):
+                raise ValueError("相同Step与Prompt哈希对应了不同用途、模型或父Prompt")
+            return existing.id
+        if purpose in _GENERATION_PROMPT_PURPOSES:
+            main_prompt = session.execute(
+                select(PromptRecord).where(
+                    PromptRecord.step_id == step.id,
+                    PromptRecord.purpose == purpose.value,
+                )
+            ).scalar_one_or_none()
+            if main_prompt is not None:
+                # 一个收费Step只能有一个主生成Prompt。若相同input_hash却传入不同
+                # 正文，说明调用端幂等输入构造有缺陷，必须显式失败而不是留下歧义。
+                raise ValueError("同一Step不能绑定两个不同的生成Prompt")
+        row = PromptRecord(
+            step_id=step.id,
+            parent_prompt_id=parent_prompt_id,
+            purpose=purpose.value,
+            model=model,
+            prompt_text=text,
+            sha256=digest,
+        )
+        session.add(row)
+        session.flush()
+        return row.id
 
     def fail_step(
         self,
@@ -193,16 +273,12 @@ class SqlAlchemyWorkflowRepository(
         message: str,
         submission_unknown: bool = False,
     ) -> None:
-        target = (
-            StepStatus.SUBMISSION_UNKNOWN if submission_unknown else StepStatus.FAILED
-        )
+        target = StepStatus.SUBMISSION_UNKNOWN if submission_unknown else StepStatus.FAILED
         with self._sessions.begin() as session:
             row = required_record(session, WorkflowStep, step_id)
             row.status = transition_step(StepStatus(row.status), target).value
             row.error_json = {"code": code, "message": message}
-            row.completed_at = (
-                None if submission_unknown else datetime.now(timezone.utc)
-            )
+            row.completed_at = None if submission_unknown else datetime.now(timezone.utc)
 
     def next_director_attempt(
         self,
@@ -211,9 +287,7 @@ class SqlAlchemyWorkflowRepository(
         phase: str,
         slot: Slot | None,
     ) -> int:
-        operation_key = (
-            "director:day" if slot is None else f"director:episode:{slot.value}"
-        )
+        operation_key = "director:day" if slot is None else f"director:episode:{slot.value}"
         statement = select(func.max(WorkflowStep.attempt)).where(
             WorkflowStep.production_run_id == run_id,
             WorkflowStep.kind == StepKind.DIRECTOR.value,
@@ -325,9 +399,7 @@ class SqlAlchemyWorkflowRepository(
         if run_id is not None:
             statement = statement.where(WorkflowStep.production_run_id == run_id)
         with self._sessions() as session:
-            rows = session.execute(
-                statement.order_by(WorkflowStep.created_at)
-            ).scalars()
+            rows = session.execute(statement.order_by(WorkflowStep.created_at)).scalars()
             return tuple(stored_step(row) for row in rows)
 
     def list_assets(
@@ -358,9 +430,7 @@ class SqlAlchemyWorkflowRepository(
             statement = statement.where(Asset.semantic_key.in_(semantic_keys))
         with self._sessions() as session:
             # 选择器按升序覆盖同语义键；UUID负责稳定处理相同created_at。
-            rows = session.execute(
-                statement.order_by(Asset.created_at, Asset.id)
-            ).scalars()
+            rows = session.execute(statement.order_by(Asset.created_at, Asset.id)).scalars()
             return tuple(stored_asset(row) for row in rows)
 
     def find_reusable_asset(
@@ -391,6 +461,36 @@ class SqlAlchemyWorkflowRepository(
         with self._sessions() as session:
             row = session.execute(statement).scalar_one_or_none()
             return None if row is None else stored_asset(row)
+
+    def find_reusable_storyboard(
+        self,
+        *,
+        episode_id: uuid.UUID,
+        input_hash: str,
+        statuses: tuple[str, ...],
+    ) -> tuple[StoredAsset, ...]:
+        """按同一组图Step复用完整面板集合，不拼接不同attempt的单张图片。"""
+
+        statement = (
+            select(Asset)
+            .join(WorkflowStep, Asset.producing_step_id == WorkflowStep.id)
+            .where(
+                Asset.episode_id == episode_id,
+                Asset.role == "storyboard_panel",
+                Asset.status.in_(statuses),
+                WorkflowStep.operation_key == "image:storyboard",
+                WorkflowStep.input_hash == input_hash,
+            )
+            .order_by(Asset.created_at, Asset.id)
+        )
+        with self._sessions() as session:
+            rows = tuple(session.execute(statement).scalars())
+            if not rows:
+                return ()
+            latest_step_id = rows[-1].producing_step_id
+            selected = [row for row in rows if row.producing_step_id == latest_step_id]
+            selected.sort(key=lambda row: int(row.metadata_json.get("panelOrdinal", 0)))
+            return tuple(stored_asset(row) for row in selected)
 
     def set_episode_status(
         self,
@@ -424,9 +524,7 @@ class SqlAlchemyWorkflowRepository(
                 row.provider_task_id = provider_task_id
             if input_snapshot_patch:
                 merged = {**row.input_snapshot_json, **input_snapshot_patch}
-                row.input_snapshot_json = validate_input_snapshot(merged).model_dump(
-                    mode="json"
-                )
+                row.input_snapshot_json = validate_input_snapshot(merged).model_dump(mode="json")
             if target is StepStatus.SUBMITTING:
                 row.submitted_at = datetime.now(timezone.utc)
             if target in {

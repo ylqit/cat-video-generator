@@ -29,7 +29,8 @@ class DirectorInputSnapshot(StrictModel):
 
 class ImageInputSnapshot(StrictModel):
     type: Literal["image"] = "image"
-    target: Literal["first_frame", "last_frame", "element"]
+    target: Literal["storyboard"]
+    expected_panel_count: Annotated[int, Field(ge=3, le=4)]
     prompt_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     reference_asset_ids: tuple[UUID, ...]
     reference_sha256: tuple[Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")], ...]

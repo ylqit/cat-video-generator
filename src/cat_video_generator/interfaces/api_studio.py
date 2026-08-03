@@ -45,17 +45,17 @@ def chain_after_planning(
     if settings.script is StageMode.MANUAL:
         payload["pausedAt"] = "script"
         return payload
-    if settings.keyframes is StageMode.MANUAL:
-        payload["pausedAt"] = "keyframes"
+    if settings.storyboard is StageMode.MANUAL:
+        payload["pausedAt"] = "storyboard"
         return payload
-    keyframes = production.prepare_keyframes_only(
+    storyboard = production.prepare_storyboards_only(
         run_id,
         allow_paid_generation=True,
     )
-    stages["keyframes"] = keyframes
-    if not all(item["keyframesReady"] for item in keyframes["episodes"]):
-        # 关键帧等待人工语义审核；批准后由maybe_continue_video钩子续跑。
-        payload["pausedAt"] = "keyframes"
+    stages["storyboard"] = storyboard
+    if not all(item["storyboardReady"] for item in storyboard["episodes"]):
+        # 故事板等待人工语义审核；整组批准后由maybe_continue_video钩子续跑。
+        payload["pausedAt"] = "storyboard"
         return payload
     if settings.video is StageMode.MANUAL or not settings.allow_paid_generation:
         payload["pausedAt"] = "video"
@@ -86,20 +86,21 @@ def maybe_continue_video(
         asset = queries.asset(asset_id)
     except LookupError:
         return
-    if asset.role not in {"first_frame", "last_frame"} or asset.episode_id is None:
+    if asset.role != "storyboard_panel" or asset.episode_id is None:
         return
     episode = queries.episode(asset.episode_id)
     run_id = uuid.UUID(str(episode["runId"]))
     settings = queries.pipeline_settings(run_id)
     if settings.video is not StageMode.AUTO or not settings.allow_paid_generation:
         return
-    ready_roles = {
-        item.role
+    panels = [
+        item
         for item in queries.episode_assets(asset.episode_id)
-        if item.role in {"first_frame", "last_frame"}
-        and item.status in {"approved", "ready"}
-    }
-    if ready_roles != {"first_frame", "last_frame"}:
+        if item.role == "storyboard_panel" and item.step_id == asset.step_id
+    ]
+    if len(panels) not in {3, 4} or not all(
+        item.status in {"approved", "ready"} for item in panels
+    ):
         return
     slot = Slot(str(episode["slot"]))
 
@@ -112,6 +113,12 @@ def maybe_continue_video(
             kind="run_day",
             dedup_key=f"run:{run_id}:{slot.value}",
             fn=task,
+            context={
+                "runId": run_id,
+                "episodeId": asset.episode_id,
+                "slot": slot.value,
+                "operationKey": "video:single_pass",
+            },
         )
 
 
@@ -158,6 +165,7 @@ def create_studio_router(
             kind="continue_pipeline",
             dedup_key=f"continue:{run_id}",
             fn=task,
+            context={"runId": run_id},
         )
         return _accepted(record)
 
@@ -175,9 +183,7 @@ def create_studio_router(
         run_id: uuid.UUID,
         payload: dict[str, Any] = Body(...),  # noqa: B008
     ) -> dict[str, Any]:
-        return await _run_validated(
-            lambda: studio_editing.update_day_brief(run_id, payload)
-        )
+        return await _run_validated(lambda: studio_editing.update_day_brief(run_id, payload))
 
     @router.put("/runs/{run_id}/pipeline-settings")
     async def update_pipeline_settings(

@@ -1,17 +1,19 @@
 <script setup lang="ts">
 import { ElMessage, ElMessageBox } from "element-plus";
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
 import { api, ApiError } from "../api/client";
 import type {
   EpisodeDto,
   EpisodePromptPreview,
+  Job,
   PipelineSettings,
   PromptDto,
   PromptOverrides,
   RunGraph,
   StageMode,
+  StepDto,
 } from "../api/types";
 import AssetReviewPanel from "../components/AssetReviewPanel.vue";
 import AssetThumb from "../components/AssetThumb.vue";
@@ -21,12 +23,10 @@ import ScriptEditorPanel from "../components/ScriptEditorPanel.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import { usePolling } from "../composables/usePolling";
 import { useJobsStore } from "../stores/jobs";
-import { useRunsStore } from "../stores/runs";
 
 const route = useRoute();
 const router = useRouter();
 const jobs = useJobsStore();
-const runs = useRunsStore();
 
 const SLOT_LABEL: Record<string, string> = {
   morning: "早间",
@@ -37,7 +37,7 @@ const STAGE_LABEL: Record<string, string> = {
   dayBrief: "主题",
   dayBriefReview: "日导演",
   script: "三集剧本",
-  keyframes: "首末帧",
+  storyboard: "故事板",
   video: "视频成片",
   done: "视频成片",
 };
@@ -45,14 +45,14 @@ const STAGE_INDEX: Record<string, number> = {
   dayBrief: 0,
   dayBriefReview: 1,
   script: 2,
-  keyframes: 3,
+  storyboard: 3,
   video: 4,
   done: 4,
 };
 const STAGE_TAB: Record<string, string> = {
   dayBriefReview: "brief",
   script: "scripts",
-  keyframes: "frames",
+  storyboard: "storyboard",
   video: "video",
   done: "video",
 };
@@ -64,7 +64,7 @@ const form = reactive({
   stages: {
     dayBrief: "auto",
     script: "auto",
-    keyframes: "auto",
+    storyboard: "auto",
     video: "auto",
   } as Record<string, StageMode>,
 });
@@ -73,30 +73,25 @@ const submitting = ref(false);
 const runId = ref<string | null>((route.query.run as string) || null);
 const graph = ref<RunGraph | null>(null);
 const loadingGraph = ref(false);
-const activeTab = ref("brief");
+const TAB_NAMES = new Set(["brief", "scripts", "storyboard", "video"]);
+const initialStage = typeof route.query.stage === "string" ? route.query.stage : "";
+const activeTab = ref(TAB_NAMES.has(initialStage) ? initialStage : "brief");
+const initializedTabRunId = ref<string | null>(null);
+const persistentFailure = ref<Job["error"]>(null);
 
 const previews = reactive<Record<string, EpisodePromptPreview>>({});
-const drafts = reactive<
-  Record<string, { firstFrame: string; lastFrame: string; video: string }>
->({});
+const drafts = reactive<Record<string, { storyboard: string; video: string }>>({});
 const saving = reactive<Record<string, boolean>>({});
 const generating = reactive<Record<string, boolean>>({});
 const continuing = ref(false);
-const historyVisible = ref(false);
-
-/** 打开历史Run（含未完成断点），复用当前页面继续推进。 */
-function openRun(id: string) {
-  runId.value = id;
-  historyVisible.value = false;
-  router.replace({ query: { run: id } });
-  void loadGraph();
-}
 
 /** 回到空白主题表单开始新的全天方案。 */
 function newTheme() {
   runId.value = null;
   graph.value = null;
-  historyVisible.value = false;
+  activeTab.value = "brief";
+  initializedTabRunId.value = null;
+  persistentFailure.value = null;
   router.replace({ query: {} });
 }
 
@@ -107,7 +102,7 @@ const settings = computed<PipelineSettings>(
       allowPaidGeneration: false,
       dayBrief: "auto",
       script: "auto",
-      keyframes: "auto",
+      storyboard: "auto",
       video: "auto",
     },
 );
@@ -130,22 +125,54 @@ const isActive = computed(
     run.value?.status === "generating",
 );
 
-function frameAssets(episode: EpisodeDto, role: string) {
+function storyboardAssets(episode: EpisodeDto) {
   return (graph.value?.assets ?? []).filter(
-    (asset) => asset.episodeId === episode.id && asset.role === role,
+    (asset) => asset.episodeId === episode.id && asset.role === "storyboard_panel",
+  ).sort(
+    (left, right) =>
+      Number(left.metadata.panelOrdinal ?? 0) -
+      Number(right.metadata.panelOrdinal ?? 0),
   );
 }
 
-function frameReady(episode: EpisodeDto): boolean {
+function storyboardReady(episode: EpisodeDto): boolean {
   const ok = new Set(["approved", "ready"]);
-  return ["first_frame", "last_frame"].every((role) =>
-    frameAssets(episode, role).some((asset) => ok.has(asset.status)),
+  const assets = storyboardAssets(episode);
+  return (
+    [3, 4].includes(assets.length) && assets.every((asset) => ok.has(asset.status))
+  );
+}
+
+function latestStoryboardStep(episode: EpisodeDto): StepDto | null {
+  return [...(graph.value?.steps ?? [])]
+    .filter(
+      (step) =>
+        step.episodeId === episode.id &&
+        step.operationKey === "image:storyboard",
+    )
+    .sort(
+      (left, right) =>
+        right.attempt - left.attempt ||
+        right.createdAt.localeCompare(left.createdAt),
+    )[0] ?? null;
+}
+
+function storyboardRetryRequired(episode: EpisodeDto): boolean {
+  return ["failed", "expired", "cancelled", "submission_unknown"].includes(
+    latestStoryboardStep(episode)?.status ?? "",
   );
 }
 
 function videoAssets(episode: EpisodeDto) {
   return (graph.value?.assets ?? []).filter(
     (asset) => asset.episodeId === episode.id && asset.role === "video",
+  );
+}
+
+function canSubmitVideo(episode: EpisodeDto): boolean {
+  return (
+    storyboardReady(episode) &&
+    ["video_pending", "failed"].includes(episode.status)
   );
 }
 
@@ -182,9 +209,141 @@ function referenceAssetIds(episode: EpisodeDto): string[] {
   return Array.isArray(ids) ? ids.map(String) : [];
 }
 
-const allFramesReady = computed(
-  () => episodes.value.length > 0 && episodes.value.every(frameReady),
+const allStoryboardsReady = computed(
+  () => episodes.value.length > 0 && episodes.value.every(storyboardReady),
 );
+
+const graphFailure = computed<Job["error"]>(() => {
+  const latestByOperation = new Map<string, StepDto>();
+  for (const step of graph.value?.steps ?? []) {
+    const key = `${step.episodeId ?? "run"}:${step.operationKey}`;
+    const current = latestByOperation.get(key);
+    if (
+      !current ||
+      step.attempt > current.attempt ||
+      (step.attempt === current.attempt && step.createdAt > current.createdAt)
+    ) {
+      latestByOperation.set(key, step);
+    }
+  }
+  const failed = [...latestByOperation.values()]
+    .filter((step) => step.error)
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+  if (!failed?.error) {
+    return null;
+  }
+  const episode = episodes.value.find((item) => item.id === failed.episodeId);
+  return {
+    code: failed.error.code ?? "workflow_step_failed",
+    message: failed.error.message ?? "工作流步骤失败",
+    runId: failed.runId,
+    episodeId: failed.episodeId ?? undefined,
+    slot: episode?.slot,
+    operationKey: failed.operationKey,
+  };
+});
+const backgroundFailure = computed<Job["error"]>(() => {
+  const failed = Object.values(jobs.byDedupKey)
+    .filter(
+      (job) =>
+        job.status === "failed" &&
+        job.error &&
+        (!runId.value || !job.error.runId || job.error.runId === runId.value),
+    )
+    .sort((left, right) =>
+      (right.finishedAt ?? right.createdAt).localeCompare(
+        left.finishedAt ?? left.createdAt,
+      ),
+    )[0];
+  return failed?.error ?? null;
+});
+const visibleFailure = computed(
+  // PostgreSQL工作流节点包含真实Episode与operationKey，应优先于最初提交
+  // 全天任务时记录的粗粒度后台上下文，避免把故事板失败显示成总导演失败。
+  () => graphFailure.value ?? persistentFailure.value ?? backgroundFailure.value,
+);
+
+function rememberFailure(error: Job["error"], fallback: string) {
+  persistentFailure.value = error ?? { code: "internal", message: fallback };
+  ElMessage.error(persistentFailure.value.message);
+}
+
+/** 把同步HTTP失败也提升为可持续查看的节点错误，而不是只显示瞬时Toast。 */
+function rememberRequestFailure(
+  error: unknown,
+  fallback: string,
+  context: Partial<NonNullable<Job["error"]>> = {},
+) {
+  const detail =
+    error instanceof ApiError && typeof error.detail === "object" && error.detail
+      ? (error.detail as Record<string, unknown>)
+      : {};
+  rememberFailure(
+    {
+      code: String(detail.code ?? (error instanceof ApiError ? `http_${error.status}` : "internal")),
+      message:
+        error instanceof ApiError
+          ? error.message
+          : error instanceof Error
+            ? error.message
+            : fallback,
+      runId: String(detail.runId ?? context.runId ?? runId.value ?? "") || undefined,
+      episodeId: String(detail.episodeId ?? context.episodeId ?? "") || undefined,
+      slot: String(detail.slot ?? context.slot ?? "") || undefined,
+      operationKey:
+        String(detail.operationKey ?? context.operationKey ?? "") || undefined,
+    },
+    fallback,
+  );
+}
+
+function focusFailure() {
+  const operationKey = visibleFailure.value?.operationKey ?? "";
+  if (operationKey.startsWith("image:")) {
+    activeTab.value = "storyboard";
+  } else if (operationKey.startsWith("video:")) {
+    activeTab.value = "video";
+  } else if (operationKey === "director:day") {
+    activeTab.value = "brief";
+  } else {
+    activeTab.value = "scripts";
+  }
+}
+
+watch(
+  () => route.query.run,
+  (value) => {
+    const nextRunId = typeof value === "string" && value ? value : null;
+    if (nextRunId === runId.value) {
+      return;
+    }
+    runId.value = nextRunId;
+    graph.value = null;
+    initializedTabRunId.value = null;
+    persistentFailure.value = null;
+    if (nextRunId) {
+      void loadGraph();
+    }
+  },
+);
+
+watch(
+  () => route.query.stage,
+  (stage) => {
+    if (typeof stage === "string" && TAB_NAMES.has(stage) && stage !== activeTab.value) {
+      activeTab.value = stage;
+    }
+  },
+);
+
+watch(activeTab, (stage) => {
+  if (!runId.value || route.query.stage === stage) {
+    return;
+  }
+  void router.replace({
+    query: { ...route.query, run: runId.value, stage },
+  });
+});
 
 /** 规划审核/失败定位：最新一条契约校验rejected review对应的时段与原因。 */
 const planningFailure = computed(() => {
@@ -237,15 +396,21 @@ async function submitReplan() {
     replanVisible.value = false;
     const final = await waitJob(accepted.jobId);
     if (final.status === "succeeded") {
+      persistentFailure.value = null;
       ElMessage.success("重规划完成，流水线已按开关自动推进");
       replanReason.value = "";
       replanPaid.value = false;
     } else {
-      ElMessage.error(final.error?.message ?? "重规划失败");
+      rememberFailure(final.error, "重规划失败");
     }
     await loadGraph();
   } catch (error) {
-    ElMessage.error(error instanceof ApiError ? error.message : String(error));
+    rememberRequestFailure(error, "重规划失败", {
+      slot: planningFailure.value?.slot ?? undefined,
+      operationKey: planningFailure.value?.slot
+        ? `director:episode:${planningFailure.value.slot}`
+        : undefined,
+    });
   } finally {
     replanning.value = false;
   }
@@ -258,11 +423,8 @@ function buildOverrides(episodeId: string): PromptOverrides {
     return {};
   }
   const overrides: PromptOverrides = {};
-  if (draft.firstFrame.trim() && draft.firstFrame !== preview.firstFrame) {
-    overrides.first_frame = draft.firstFrame.trim();
-  }
-  if (draft.lastFrame.trim() && draft.lastFrame !== preview.lastFrame) {
-    overrides.last_frame = draft.lastFrame.trim();
+  if (draft.storyboard.trim() && draft.storyboard !== preview.storyboard) {
+    overrides.storyboard = draft.storyboard.trim();
   }
   if (draft.video.trim() && draft.video !== preview.video) {
     overrides.video = draft.video.trim();
@@ -291,9 +453,13 @@ async function loadGraph() {
     for (const episode of graph.value.episodes) {
       await loadPreview(episode);
     }
-    const tab = STAGE_TAB[currentStage.value];
-    if (tab) {
-      activeTab.value = tab;
+    if (initializedTabRunId.value !== runId.value) {
+      const routeStage =
+        typeof route.query.stage === "string" ? route.query.stage : "";
+      activeTab.value = TAB_NAMES.has(routeStage)
+        ? routeStage
+        : (STAGE_TAB[currentStage.value] ?? "brief");
+      initializedTabRunId.value = runId.value;
     }
   } catch (error) {
     ElMessage.error(error instanceof ApiError ? error.message : String(error));
@@ -302,7 +468,7 @@ async function loadGraph() {
   }
 }
 
-/** 拉取实时编译的三段Prompt；有未保存编辑时轮询不覆盖草稿。 */
+/** 拉取实时编译的故事板与视频 Prompt；未保存编辑不被轮询覆盖。 */
 async function loadPreview(episode: EpisodeDto) {
   const preview = await api.getPromptPreview(episode.id);
   previews[episode.id] = preview;
@@ -311,8 +477,7 @@ async function loadPreview(episode: EpisodeDto) {
   }
   const stored = episode.promptOverrides ?? {};
   drafts[episode.id] = {
-    firstFrame: stored.first_frame ?? preview.firstFrame,
-    lastFrame: stored.last_frame ?? preview.lastFrame,
+    storyboard: stored.storyboard ?? preview.storyboard,
     video: stored.video ?? preview.video,
   };
 }
@@ -348,20 +513,21 @@ async function submitPlan() {
     ElMessage.info("规划任务已提交，按流水线开关自动推进…");
     const final = await waitJob(accepted.jobId);
     if (final.status === "succeeded" && final.result?.runId) {
+      persistentFailure.value = null;
       ElMessage.success("规划完成");
       runId.value = String(final.result.runId);
-      router.replace({ query: { run: runId.value } });
+      router.replace({ query: { run: runId.value, stage: activeTab.value } });
       await loadGraph();
     } else {
-      ElMessage.error(final.error?.message ?? "规划任务失败");
+      rememberFailure(final.error, "规划任务失败");
       if (final.error?.runId) {
         runId.value = final.error.runId;
-        router.replace({ query: { run: runId.value } });
+        router.replace({ query: { run: runId.value, stage: activeTab.value } });
         await loadGraph();
       }
     }
   } catch (error) {
-    ElMessage.error(error instanceof ApiError ? error.message : String(error));
+    rememberRequestFailure(error, "规划任务失败", { operationKey: "director:day" });
   } finally {
     submitting.value = false;
   }
@@ -394,13 +560,14 @@ async function continuePipeline() {
     jobs.track(accepted);
     const final = await waitJob(accepted.jobId);
     if (final.status === "succeeded") {
+      persistentFailure.value = null;
       ElMessage.success("已推进到下一阶段");
     } else {
-      ElMessage.error(final.error?.message ?? "续跑失败");
+      rememberFailure(final.error, "续跑失败");
     }
     await loadGraph();
   } catch (error) {
-    ElMessage.error(error instanceof ApiError ? error.message : String(error));
+    rememberRequestFailure(error, "续跑失败");
   } finally {
     continuing.value = false;
   }
@@ -419,12 +586,12 @@ async function saveDraft(episode: EpisodeDto) {
   }
 }
 
-/** 用当前草稿（含未保存编辑）触发首末帧真实生成。 */
+/** 用当前草稿触发一次 Seedream 故事板组图生成。 */
 async function generate(episode: EpisodeDto) {
   try {
     await ElMessageBox.confirm(
-      "将调用 Seedream 真实生成首末帧（付费）。草稿中未保存的编辑会随本次生成一并生效。",
-      "确认生成首末帧",
+      "将调用 Seedream 一次生成3～4张独立故事板图（付费）。未保存的 Prompt 编辑会随本次生成一并生效。",
+      "确认生成故事板",
       { confirmButtonText: "生成", cancelButtonText: "取消", type: "warning" },
     );
   } catch {
@@ -432,7 +599,7 @@ async function generate(episode: EpisodeDto) {
   }
   generating[episode.id] = true;
   try {
-    const accepted = await api.generateKeyframes(
+    const accepted = await api.generateStoryboard(
       episode.id,
       true,
       buildOverrides(episode.id),
@@ -440,13 +607,18 @@ async function generate(episode: EpisodeDto) {
     jobs.track(accepted);
     const final = await waitJob(accepted.jobId);
     if (final.status === "succeeded") {
-      ElMessage.success("首末帧生成完成");
+      persistentFailure.value = null;
+      ElMessage.success("故事板组图生成完成");
     } else {
-      ElMessage.error(final.error?.message ?? "首末帧生成失败");
+      rememberFailure(final.error, "故事板组图生成失败");
     }
     await loadGraph();
   } catch (error) {
-    ElMessage.error(error instanceof ApiError ? error.message : String(error));
+    rememberRequestFailure(error, "故事板组图生成失败", {
+      episodeId: episode.id,
+      slot: episode.slot,
+      operationKey: "image:storyboard",
+    });
   } finally {
     generating[episode.id] = false;
   }
@@ -475,13 +647,16 @@ async function confirmVideo(episode: EpisodeDto) {
     ElMessage.info("视频任务已提交");
     await refresh();
   } catch (error) {
-    ElMessage.error(error instanceof ApiError ? error.message : String(error));
+    rememberRequestFailure(error, "视频任务提交失败", {
+      episodeId: episode.id,
+      slot: episode.slot,
+      operationKey: "video:single_pass",
+    });
   }
 }
 
 onMounted(() => {
   void loadGraph();
-  void runs.fetchRuns();
   polling.start();
 });
 </script>
@@ -492,7 +667,6 @@ onMounted(() => {
       <h2 style="margin: 0">主题创作台</h2>
       <div style="flex: 1" />
       <el-button v-if="runId" size="small" @click="newTheme">新建主题</el-button>
-      <el-button size="small" @click="historyVisible = true">历史运行</el-button>
     </div>
 
     <el-card v-if="!runId" shadow="never" style="margin-bottom: 16px">
@@ -515,7 +689,7 @@ onMounted(() => {
         </el-form-item>
         <el-form-item label="阶段自动推进">
           <span
-            v-for="name in ['dayBrief', 'script', 'keyframes', 'video']"
+            v-for="name in ['dayBrief', 'script', 'storyboard', 'video']"
             :key="name"
             style="margin-right: 16px"
           >
@@ -552,36 +726,6 @@ onMounted(() => {
       </el-form>
     </el-card>
 
-    <el-card v-if="!runId" shadow="never">
-      <template #header><strong>历史运行（点击继续未完成断点）</strong></template>
-      <el-table
-        v-loading="runs.loading"
-        :data="runs.runs"
-        @row-click="(row: { id: string }) => openRun(row.id)"
-      >
-        <el-table-column prop="contentDate" label="内容日期" width="110" />
-        <el-table-column
-          prop="theme"
-          label="主题"
-          min-width="220"
-          show-overflow-tooltip
-        />
-        <el-table-column label="状态" width="110">
-          <template #default="{ row }">
-            <StatusBadge :status="row.status" />
-          </template>
-        </el-table-column>
-        <el-table-column label="下一步" min-width="180" show-overflow-tooltip>
-          <template #default="{ row }">
-            <span class="muted">{{ row.nextAction ?? "—" }}</span>
-          </template>
-        </el-table-column>
-        <template #empty>
-          <span class="muted">暂无历史运行</span>
-        </template>
-      </el-table>
-    </el-card>
-
     <template v-if="graph && run">
       <el-card shadow="never" style="margin-bottom: 16px">
         <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
@@ -597,7 +741,7 @@ onMounted(() => {
           </el-tag>
           <div style="flex: 1" />
           <span
-            v-for="name in ['dayBrief', 'script', 'keyframes', 'video']"
+            v-for="name in ['dayBrief', 'script', 'storyboard', 'video']"
             :key="name"
             class="muted"
           >
@@ -622,6 +766,25 @@ onMounted(() => {
         </div>
       </el-card>
 
+      <el-alert
+        v-if="visibleFailure"
+        type="error"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 16px"
+      >
+        <template #title>
+          {{ visibleFailure.code }}：{{ visibleFailure.message }}
+        </template>
+        <div style="margin-top: 8px">
+          <span v-if="visibleFailure.slot">时段：{{ SLOT_LABEL[visibleFailure.slot] ?? visibleFailure.slot }}；</span>
+          <span v-if="visibleFailure.operationKey">节点：{{ visibleFailure.operationKey }}</span>
+          <el-button link type="primary" style="margin-left: 10px" @click="focusFailure">
+            查看失败节点
+          </el-button>
+        </div>
+      </el-alert>
+
       <el-steps
         :active="stageIndex"
         align-center
@@ -631,7 +794,7 @@ onMounted(() => {
         <el-step title="主题" />
         <el-step title="日导演" />
         <el-step title="三集剧本" />
-        <el-step title="首末帧" />
+        <el-step title="故事板" />
         <el-step title="视频成片" />
       </el-steps>
 
@@ -739,7 +902,7 @@ onMounted(() => {
               :loading="continuing"
               @click="continuePipeline"
             >
-              继续：生成首末帧
+              继续：生成故事板
             </el-button>
           </template>
           <template v-else-if="Object.keys(graph.episodeDrafts ?? {}).length">
@@ -784,7 +947,7 @@ onMounted(() => {
           <el-empty v-else description="剧本尚未生成" />
         </el-tab-pane>
 
-        <el-tab-pane label="首末帧" name="frames">
+        <el-tab-pane label="故事板" name="storyboard">
           <template v-if="episodes.length">
             <el-card
               v-for="episode in episodes"
@@ -797,35 +960,27 @@ onMounted(() => {
                   <strong>{{ SLOT_LABEL[episode.slot] ?? episode.slot }}</strong>
                   <span>{{ episode.title }}</span>
                   <StatusBadge :status="episode.status" />
-                  <el-tag v-if="frameReady(episode)" type="success" size="small">
-                    首末帧就绪
+                  <el-tag v-if="storyboardReady(episode)" type="success" size="small">
+                    故事板就绪
                   </el-tag>
                 </div>
               </template>
 
               <el-row v-if="drafts[episode.id]" :gutter="16">
-                <el-col :span="8">
-                  <div class="muted" style="margin-bottom: 4px">首帧 Prompt</div>
+                <el-col :span="12">
+                  <div class="muted" style="margin-bottom: 4px">故事板组图 Prompt</div>
                   <el-input
-                    v-model="drafts[episode.id].firstFrame"
+                    v-model="drafts[episode.id].storyboard"
                     type="textarea"
-                    :rows="6"
+                    :rows="8"
                   />
                 </el-col>
-                <el-col :span="8">
-                  <div class="muted" style="margin-bottom: 4px">尾帧 Prompt</div>
-                  <el-input
-                    v-model="drafts[episode.id].lastFrame"
-                    type="textarea"
-                    :rows="6"
-                  />
-                </el-col>
-                <el-col :span="8">
+                <el-col :span="12">
                   <div class="muted" style="margin-bottom: 4px">视频 Prompt</div>
                   <el-input
                     v-model="drafts[episode.id].video"
                     type="textarea"
-                    :rows="6"
+                    :rows="8"
                   />
                 </el-col>
               </el-row>
@@ -838,24 +993,34 @@ onMounted(() => {
                     promptsFor({
                       kind: 'image',
                       episodeId: episode.id,
-                      operationKey: 'image:first_frame',
-                      purpose: 'image',
+                      operationKey: 'image:storyboard',
+                      purpose: 'storyboard',
                     })
-                  "
-                  title="首帧实际 Prompt"
-                />
-                <PromptCollapse
-                  :prompts="
-                    promptsFor({
-                      kind: 'image',
-                      episodeId: episode.id,
-                      operationKey: 'image:last_frame',
-                      purpose: 'image',
-                    })
-                  "
-                  title="尾帧实际 Prompt"
+                "
+                  title="故事板实际 Prompt"
                 />
               </div>
+              <el-alert
+                v-if="storyboardRetryRequired(episode)"
+                type="error"
+                :closable="false"
+                show-icon
+                style="margin-top: 10px"
+              >
+                <template #title>
+                  故事板步骤失败，普通“生成”不会隐式创建第二次付费任务
+                </template>
+                <div>
+                  {{ latestStoryboardStep(episode)?.error?.message }}
+                  <el-button
+                    link
+                    type="primary"
+                    @click="router.push(`/runs/${runId}`)"
+                  >
+                    前往 Run 详情显式重试
+                  </el-button>
+                </div>
+              </el-alert>
               <div v-if="referenceAssetIds(episode).length" style="margin-top: 6px">
                 <span class="muted" style="margin-right: 6px">参考图</span>
                 <AssetThumb
@@ -879,13 +1044,18 @@ onMounted(() => {
                   size="small"
                   type="primary"
                   :loading="generating[episode.id]"
-                  :disabled="jobs.isActive(`keyframes:${episode.id}`)"
+                  :disabled="
+                    jobs.isActive(`storyboard:${episode.id}`) ||
+                    storyboardRetryRequired(episode)
+                  "
                   @click="generate(episode)"
                 >
                   {{
-                    frameAssets(episode, "first_frame").length
-                      ? "重新生成首末帧"
-                      : "生成首末帧"
+                    storyboardRetryRequired(episode)
+                      ? "需要显式重试"
+                      : storyboardAssets(episode).length
+                      ? "重新生成故事板"
+                      : "生成故事板"
                   }}
                 </el-button>
                 <span
@@ -897,11 +1067,8 @@ onMounted(() => {
                 </span>
               </div>
 
-              <div v-for="role in ['first_frame', 'last_frame']" :key="role">
-                <template
-                  v-for="asset in frameAssets(episode, role)"
-                  :key="asset.id"
-                >
+              <div class="storyboard-grid">
+                <template v-for="asset in storyboardAssets(episode)" :key="asset.id">
                   <AssetReviewPanel
                     v-if="asset.status === 'candidate'"
                     :asset="asset"
@@ -912,14 +1079,14 @@ onMounted(() => {
                   <AssetThumb
                     v-else
                     :asset-id="asset.id"
-                    :label="`${role === 'first_frame' ? '首帧' : '尾帧'} · ${asset.status}`"
+                    :label="`面板 ${asset.metadata.panelOrdinal} · ${asset.status}`"
                     :size="140"
                   />
                 </template>
               </div>
             </el-card>
             <el-button
-              v-if="currentStage === 'keyframes' && settings.keyframes === 'manual'"
+              v-if="currentStage === 'storyboard' && settings.storyboard === 'manual'"
               type="primary"
               :loading="continuing"
               @click="continuePipeline"
@@ -933,11 +1100,11 @@ onMounted(() => {
         <el-tab-pane label="视频成片" name="video">
           <template v-if="episodes.length">
             <el-alert
-              v-if="allFramesReady && settings.video === 'auto'"
+              v-if="allStoryboardsReady && settings.video === 'auto'"
               type="success"
               :closable="false"
               style="margin-bottom: 12px"
-              title="首末帧已就绪，视频阶段自动推进（含人工批准帧后的自动续跑）"
+              title="故事板已就绪，视频阶段将按设置自动推进"
             />
             <el-card
               v-for="episode in episodes"
@@ -951,21 +1118,29 @@ onMounted(() => {
                   <span>{{ episode.title }}</span>
                   <StatusBadge :status="episode.status" />
                   <div style="flex: 1" />
-                  <el-button
+                  <el-tooltip
                     v-if="
                       settings.video === 'manual' &&
-                      frameReady(episode) &&
-                      !videoAssets(episode).length &&
-                      ['planned', 'preparing_visuals', 'failed'].includes(
-                        episode.status,
-                      )
+                      !videoAssets(episode).length
                     "
-                    size="small"
-                    type="primary"
-                    @click="confirmVideo(episode)"
+                    :content="
+                      storyboardReady(episode)
+                        ? '提交Seedance视频任务'
+                        : '必须先完成并批准3～4张故事板'
+                    "
+                    placement="top"
                   >
-                    确认生成视频
-                  </el-button>
+                    <span>
+                      <el-button
+                        size="small"
+                        type="primary"
+                        :disabled="!canSubmitVideo(episode)"
+                        @click="confirmVideo(episode)"
+                      >
+                        确认生成视频
+                      </el-button>
+                    </span>
+                  </el-tooltip>
                 </div>
               </template>
               <PromptCollapse
@@ -1003,7 +1178,7 @@ onMounted(() => {
 
     <el-empty
       v-else-if="!loadingGraph"
-      description="输入主题并提交后，这里将按阶段展示日导演、剧本、首末帧与成片"
+      description="输入主题并提交后，这里将按阶段展示日导演、三时段剧本、故事板与成片"
     />
 
     <el-dialog
@@ -1047,38 +1222,6 @@ onMounted(() => {
       </template>
     </el-dialog>
 
-    <el-drawer v-model="historyVisible" title="历史运行" size="640px">
-      <el-table
-        v-loading="runs.loading"
-        :data="runs.runs"
-        :row-class-name="
-          ({ row }: { row: { id: string } }) =>
-            row.id === runId ? 'current-run' : ''
-        "
-        @row-click="(row: { id: string }) => openRun(row.id)"
-      >
-        <el-table-column prop="contentDate" label="内容日期" width="100" />
-        <el-table-column
-          prop="theme"
-          label="主题"
-          min-width="180"
-          show-overflow-tooltip
-        />
-        <el-table-column label="状态" width="100">
-          <template #default="{ row }">
-            <StatusBadge :status="row.status" />
-          </template>
-        </el-table-column>
-        <el-table-column label="下一步" min-width="150" show-overflow-tooltip>
-          <template #default="{ row }">
-            <span class="muted">{{ row.nextAction ?? "—" }}</span>
-          </template>
-        </el-table-column>
-        <template #empty>
-          <span class="muted">暂无历史运行</span>
-        </template>
-      </el-table>
-    </el-drawer>
   </div>
 </template>
 

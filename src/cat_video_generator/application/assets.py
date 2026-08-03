@@ -139,28 +139,15 @@ class AssetService:
         path: Path,
         semantic_key: str,
     ) -> dict[str, Any]:
-        """导入仅供一个Episode使用的场景、元素、动作或声音参考。"""
+        """导入仅供一个Episode使用的场景或元素参考图。"""
 
-        media_types = {
-            "element": "image",
-            "scene": "image",
-            "motion": "video",
-            "atmosphere": "audio",
-        }
-        if role not in media_types:
-            raise ValueError("Episode参考role必须是element、scene、motion或atmosphere")
+        if role not in {"element", "scene"}:
+            raise ValueError("Episode参考role必须是element或scene")
         _validate_semantic_key(role, semantic_key, scope="episode")
         episode = self._repository.episode_detail(episode_id)
         landed = self._asset_store.import_local(path)
-        media_type = media_types[role]
-        metadata = (
-            self._probe.inspect_image(landed.path)
-            if media_type == "image"
-            else self._probe.inspect_reference(
-                landed.path,
-                media_type=media_type,
-            )
-        )
+        media_type = "image"
+        metadata = self._probe.inspect_image(landed.path)
         asset = self._repository.save_asset(
             run_id=uuid.UUID(episode["runId"]),
             episode_id=episode_id,
@@ -194,15 +181,37 @@ class AssetService:
         """记录人工决定；拒绝后只保留审计，不自动再次付费。"""
 
         decision = "approved" if approve else "rejected"
-        result = self._repository.commit_asset_review(
-            asset_id=asset_id,
-            source="human",
-            decision=decision,
-            reason=reason,
-            warnings=[],
-            evidence={},
-        )
         asset = self._repository.asset_detail(asset_id)
+        if asset.role == "storyboard_panel":
+            if asset.step_id is None or asset.episode_id is None:
+                raise ValueError("故事板面板缺少生产步骤或Episode")
+            panels = tuple(
+                item
+                for item in self._repository.list_assets(
+                    run_id=asset.run_id,
+                    episode_id=asset.episode_id,
+                    roles=("storyboard_panel",),
+                )
+                if item.step_id == asset.step_id
+            )
+            result = self._repository.commit_storyboard_review(
+                step_id=asset.step_id,
+                asset_ids=tuple(item.id for item in panels),
+                source="human",
+                decision=decision,
+                reason=reason,
+                warnings=[],
+                evidence={"reviewedFromPanelId": str(asset_id)},
+            )
+        else:
+            result = self._repository.commit_asset_review(
+                asset_id=asset_id,
+                source="human",
+                decision=decision,
+                reason=reason,
+                warnings=[],
+                evidence={},
+            )
         if (
             approve
             and asset.role == "video"
@@ -236,8 +245,6 @@ def _validate_semantic_key(role: str, semantic_key: str, *, scope: str) -> None:
         "style": {"style"},
         "element": {"element"},
         "scene": {"scene"},
-        "motion": {"motion"},
-        "atmosphere": {"atmosphere"},
     }[role]
     if prefix not in allowed:
         raise ValueError(f"{role}资产不能使用{semantic_key}")

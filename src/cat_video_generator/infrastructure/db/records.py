@@ -6,10 +6,10 @@ from pathlib import Path
 from typing import Any
 
 from ...application.ports import StoredAsset, StoredEpisode, StoredPrompt, StoredStep
-from ...domain.continuity import replay_world
+from ...domain.continuity import validate_continuity
 from ...domain.contracts import EpisodePlan, EpisodeScript, Slot
 from ...domain.pipeline import PipelineSettings
-from ...domain.workflow import EpisodeStatus, StepKind, StepStatus
+from ...domain.workflow import EpisodeStatus, PromptPurpose, StepKind, StepStatus
 from .models import (
     Asset,
     DeliveryItem,
@@ -41,7 +41,7 @@ def stored_prompt(row: PromptRecord) -> StoredPrompt:
     return StoredPrompt(
         id=row.id,
         step_id=row.step_id,
-        purpose=row.purpose,
+        purpose=PromptPurpose(row.purpose),
         model=row.model,
         text=row.prompt_text,
         sha256=row.sha256,
@@ -49,12 +49,13 @@ def stored_prompt(row: PromptRecord) -> StoredPrompt:
 
 
 def stored_episode(row: Episode) -> StoredEpisode:
+    script = EpisodeScript.model_validate(row.script_json)
     return StoredEpisode(
         id=row.id,
         run_id=row.production_run_id,
         plan=EpisodePlan(
             slot=Slot(row.slot),
-            script=EpisodeScript.model_validate(row.script_json),
+            script=script,
         ),
         status=EpisodeStatus(row.status),
         selected_video_asset_id=row.selected_video_asset_id,
@@ -79,11 +80,7 @@ def stored_asset(row: Asset) -> StoredAsset:
 
 
 def run_dict(row: ProductionRun) -> dict[str, Any]:
-    settings = (
-        PipelineSettings.model_validate(row.pipeline_settings_json)
-        if row.pipeline_settings_json
-        else PipelineSettings.legacy_default()
-    )
+    settings = PipelineSettings.model_validate(row.pipeline_settings_json)
     return {
         "id": str(row.id),
         "contentDate": row.content_date.isoformat(),
@@ -110,7 +107,7 @@ def episode_dict(row: Episode) -> dict[str, Any]:
         slot=Slot(row.slot),
         script=EpisodeScript.model_validate(row.script_json),
     )
-    report = replay_world(plan.script.visible_world, plan.script.actions)
+    report = validate_continuity(plan.script.continuity)
     return {
         "id": str(row.id),
         "runId": str(row.production_run_id),
@@ -118,12 +115,14 @@ def episode_dict(row: Episode) -> dict[str, Any]:
         "sortOrder": row.sort_order,
         "title": plan.script.title,
         "status": row.status,
-        "videoInputMode": plan.script.video_input_mode.value,
+        "videoInputMode": (
+            "strict_first_last" if plan.script.ending.visual_critical else "storyboard_reference"
+        ),
         "worldConsistencyStatus": "valid" if report.valid else "contradiction",
         "contradictions": [item.message for item in report.issues],
         "nextAction": {
-            "planned": "准备精确参考素材或关键帧",
-            "preparing_visuals": "完成关键帧语义审核",
+            "planned": "生成整组故事板",
+            "preparing_visuals": "完成故事板语义审核",
             "video_pending": "提交Seedance视频任务",
             "video_generating": "轮询并下载已有Ark任务",
             "media_qc": "完成媒体技术检查",

@@ -20,11 +20,17 @@ def _submit(
     kind: str,
     dedup_key: str,
     fn: Callable[[], Any],
+    context: dict[str, Any] | None = None,
 ) -> JobRecord:
     """登记后台任务并把去重冲突映射为409。"""
 
     try:
-        return registry.submit(kind=kind, dedup_key=dedup_key, fn=fn)
+        return registry.submit(
+            kind=kind,
+            dedup_key=dedup_key,
+            fn=fn,
+            context=context,
+        )
     except JobConflictError as exc:
         raise HTTPException(
             status_code=409,
@@ -38,6 +44,7 @@ def _accepted(record: JobRecord) -> dict[str, Any]:
         "kind": record.kind,
         "dedupKey": record.dedup_key,
         "status": record.status,
+        "context": record.context,
     }
 
 

@@ -142,7 +142,7 @@ def build_runtime_container(
         asset_store=store,
         media_probe=probe,
         provider_name=runtime.provider_profile,
-        keyframe_review_mode=runtime.keyframe_review_mode,
+        storyboard_review_mode=runtime.storyboard_review_mode,
         series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
         style_profile=DEFAULT_STYLE_PROFILE,
     )

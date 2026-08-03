@@ -10,7 +10,7 @@ export interface PipelineSettings {
   allowPaidGeneration: boolean;
   dayBrief: StageMode;
   script: StageMode;
-  keyframes: StageMode;
+  storyboard: StageMode;
   video: StageMode;
 }
 
@@ -45,23 +45,17 @@ export interface RunSummary {
   currentStage?: string;
 }
 
-export type AppearanceContinuity = "continue" | "changed";
-
 export interface AppearancePlanDto {
   description: string;
-  continuity: AppearanceContinuity | null;
   changes_from_previous: string[];
   change_reason: string | null;
 }
 
-export type ActorId = "person" | "cat" | "guest" | "environment";
-
 export interface ActionStageDto {
   order: number;
-  actor_id: ActorId;
+  actor_id: string;
   action: string;
   visible_result: string;
-  transitions: EntityTransitionDto[];
 }
 
 export type CameraMove = "fixed" | "follow" | "push" | "pull" | "pan" | "track";
@@ -76,37 +70,45 @@ export interface ShotPlanDto {
   direction: string;
 }
 
+export type PlacementKind = "anchor" | "held_by" | "inside" | "offscreen";
+
+export interface PlacementDto {
+  kind: PlacementKind;
+  target_id: string | null;
+}
+
 export interface EntityStateDto {
-  anchor_id: string | null;
-  support_id: string | null;
-  container_id: string | null;
-  active: boolean;
-  appearance_signature: string;
+  present: boolean;
+  placement: PlacementDto;
 }
 
-export interface EntityTransitionDto {
-  entity_id: string;
-  before: EntityStateDto;
-  after: EntityStateDto;
-  reason: string;
-}
+export type EntityKind = "person" | "cat" | "prop";
+export type EntityLifecycle = "persist" | "enter" | "exit" | "consume" | "transform";
 
-export interface VisibleWorldDto {
+export interface SceneContinuityDto {
   anchors: Array<{ id: string; name: string; type: string }>;
   entities: Array<{
     id: string;
     name: string;
-    type: string;
-    semantic_key: string | null;
-    initial_state: EntityStateDto;
+    kind: EntityKind;
+    entity_key: string;
+    start_state: EntityStateDto;
+    end_state: EntityStateDto;
+    lifecycle: EntityLifecycle;
+    form_key: string;
+    final_form_key: string | null;
+    change_reason: string | null;
   }>;
 }
 
-export type VideoInputMode =
-  | "multimodal_reference"
-  | "strict_first_frame"
-  | "strict_first_last";
+export type VideoInputMode = "storyboard_reference" | "strict_first_last";
 export type StyleContext = "indoor" | "outdoor";
+
+export interface EpisodeEndingDto {
+  result: string;
+  visual_critical: boolean;
+  key_entity_ids: string[];
+}
 
 export interface EpisodeScript {
   title: string;
@@ -118,10 +120,9 @@ export interface EpisodeScript {
   appearance: AppearancePlanDto;
   actions: ActionStageDto[];
   shots: ShotPlanDto[];
-  ending: string;
+  ending: EpisodeEndingDto;
   duration_seconds: number;
-  video_input_mode: VideoInputMode;
-  visible_world: VisibleWorldDto;
+  continuity: SceneContinuityDto;
 }
 
 export interface EpisodeDto {
@@ -168,7 +169,7 @@ export interface PromptDto {
   id: string;
   stepId: string;
   parentPromptId: string | null;
-  purpose: string;
+  purpose: "director" | "storyboard" | "storyboard_review" | "video" | "review";
   model: string;
   sha256: string;
   charCount: number;
@@ -215,6 +216,24 @@ export interface RunGraph {
   reviews: ReviewDto[];
   /** 未定稿Run的时段剧本草稿（planning_json.episodeDrafts），键为slot */
   episodeDrafts?: Record<string, EpisodeScript>;
+  workflowNodes?: WorkflowNodeDto[];
+}
+
+export interface WorkflowNodeDto {
+  id: string;
+  type: "director" | "storyboard" | "storyboard_review" | "video" | "content_review";
+  slot: string | null;
+  label: string;
+  status: string;
+  providerStatus: string;
+  contractStatus: string;
+  semanticReviewStatus: string;
+  stepId: string | null;
+  promptIds: string[];
+  assetIds: string[];
+  reviewIds: string[];
+  error: StepError | null;
+  nextAction: string | null;
 }
 
 export interface CanonAsset {
@@ -233,12 +252,14 @@ export interface JobAccepted {
   kind: string;
   dedupKey: string;
   status: string;
+  context: Record<string, string>;
 }
 
 export interface Job {
   jobId: string;
   kind: string;
   dedupKey: string;
+  context: Record<string, string>;
   status: string;
   createdAt: string;
   startedAt: string | null;
@@ -248,7 +269,9 @@ export interface Job {
     code: string;
     message: string;
     runId?: string;
+    episodeId?: string;
     slot?: string;
+    operationKey?: string;
     details?: string[];
   } | null;
 }
@@ -284,16 +307,14 @@ export interface HealthStatus {
 
 /** 主题创作台：单集 Prompt 预览与编辑覆盖。 */
 export interface PromptOverrides {
-  first_frame?: string;
-  last_frame?: string;
+  storyboard?: string;
   video?: string;
 }
 
 export interface EpisodePromptPreview {
   episodeId: string;
   slot: string;
-  firstFrame: string;
-  lastFrame: string;
+  storyboard: string;
   video: string;
   overrides: PromptOverrides;
 }

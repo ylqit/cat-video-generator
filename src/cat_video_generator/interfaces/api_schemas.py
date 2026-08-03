@@ -15,12 +15,10 @@ from ..domain.contracts import Slot
 CANON_ROLES = frozenset({"person", "cat", "style"})
 CANON_VIEWS = frozenset({"front", "side", "back"})
 IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp"})
-REFERENCE_ROLES = frozenset({"element", "scene", "motion", "atmosphere"})
+REFERENCE_ROLES = frozenset({"element", "scene"})
 REFERENCE_SUFFIXES = {
     "element": IMAGE_SUFFIXES,
     "scene": IMAGE_SUFFIXES,
-    "motion": frozenset({".mp4", ".mov", ".webm"}),
-    "atmosphere": frozenset({".mp3", ".wav", ".m4a"}),
 }
 DEFAULT_PLANNING_CONTEXT = "根据日期、天气和角色习惯设计自然的一天。"
 
@@ -34,7 +32,6 @@ class PlanRequest(BaseModel):
     planning_context: str | None = Field(None, alias="planningContext")
     candidate_count: int | None = Field(None, alias="candidateCount", ge=1, le=5)
     allow_paid_generation: bool = Field(False, alias="allowPaidGeneration")
-    auto_generate_keyframes: bool = Field(True, alias="autoGenerateKeyframes")
     pipeline_settings: dict | None = Field(None, alias="pipelineSettings")
 
 
@@ -93,15 +90,15 @@ class DeriveCropRequest(BaseModel):
 
 
 class PromptOverridesRequest(BaseModel):
-    """主题创作台的Prompt编辑保存；键只允许首帧/尾帧/视频。"""
+    """主题创作台的Prompt编辑保存；键只允许故事板和视频。"""
 
     model_config = ConfigDict(populate_by_name=True)
 
     overrides: dict[str, str] = Field(default_factory=dict)
 
 
-class GenerateKeyframesRequest(BaseModel):
-    """为单个Episode生成或按编辑版重新生成首末帧。"""
+class GenerateStoryboardsRequest(BaseModel):
+    """为单个Episode生成或按编辑版重新生成整组故事板。"""
 
     model_config = ConfigDict(populate_by_name=True)
 

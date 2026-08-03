@@ -8,11 +8,13 @@ import pytest
 
 from cat_video_generator.domain.continuity import (
     DominantView,
+    EntityKind,
+    EntityLifecycle,
     EntityState,
-    EntityTransition,
-    VisibleEntity,
-    VisibleWorld,
-    WorldAnchor,
+    Placement,
+    SceneAnchor,
+    SceneContinuity,
+    TrackedEntity,
 )
 from cat_video_generator.domain.contracts import (
     ActionStage,
@@ -20,65 +22,64 @@ from cat_video_generator.domain.contracts import (
     CameraMove,
     DailyProductionPlan,
     DayBrief,
+    EpisodeEnding,
     EpisodePlan,
     EpisodeScript,
     ShotPlan,
     Slot,
     SlotBrief,
 )
-from cat_video_generator.domain.rendering import VideoInputMode
 
 
 def state(
     *,
-    anchor: str | None = None,
-    support: str | None = None,
-    container: str | None = None,
-    active: bool = True,
-    appearance: str = "外观保持稳定",
+    kind: str = "anchor",
+    target: str | None = "ground",
+    present: bool = True,
 ) -> EntityState:
     return EntityState(
-        anchor_id=anchor,
-        support_id=support,
-        container_id=container,
-        active=active,
-        appearance_signature=appearance,
+        present=present,
+        placement=Placement(kind=kind, target_id=target),
     )
 
 
-def episode_for(
-    slot: Slot,
-    *,
-    mode: VideoInputMode = VideoInputMode.MULTIMODAL_REFERENCE,
-) -> EpisodePlan:
-    prop_before = state(anchor="table", appearance="一只浅蓝色小纸风车")
-    prop_after = state(support="person", appearance="同一只浅蓝色小纸风车")
-    world = VisibleWorld(
+def episode_for(slot: Slot) -> EpisodePlan:
+    continuity = SceneContinuity(
         anchors=[
-            WorldAnchor(id="ground", name="木地板", type="ground"),
-            WorldAnchor(id="table", name="矮桌桌面", type="table"),
+            SceneAnchor(id="ground", name="木地板", type="ground"),
+            SceneAnchor(id="table", name="矮木桌面", type="table"),
         ],
         entities=[
-            VisibleEntity(
+            TrackedEntity(
                 id="person",
                 name="中性儿童",
-                type="person",
-                semantic_key="person:front",
-                initial_state=state(anchor="ground", appearance="短发中性儿童"),
+                kind=EntityKind.PERSON,
+                entity_key="person",
+                start_state=state(),
+                end_state=state(),
+                lifecycle=EntityLifecycle.PERSIST,
+                form_key="neutral-child",
             ),
-            VisibleEntity(
+            TrackedEntity(
                 id="cat",
                 name="灰白猫",
-                type="cat",
-                semantic_key="cat:front",
-                initial_state=state(anchor="ground", appearance="固定灰白斑纹"),
+                kind=EntityKind.CAT,
+                entity_key="cat",
+                start_state=state(),
+                end_state=state(),
+                lifecycle=EntityLifecycle.PERSIST,
+                form_key="gray-white-cat",
             ),
-            VisibleEntity(
+            TrackedEntity(
                 id="pinwheel",
                 name="纸风车",
-                type="prop",
-                semantic_key="element:pinwheel",
-                initial_state=prop_before,
+                kind=EntityKind.PROP,
+                entity_key="pinwheel",
+                start_state=state(kind="anchor", target="table"),
+                end_state=state(kind="held_by", target="person"),
+                lifecycle=EntityLifecycle.PERSIST,
+                form_key="blue-pinwheel",
+                change_reason="人物从桌面拿起同一只纸风车",
             ),
         ],
     )
@@ -91,7 +92,6 @@ def episode_for(
         style_context="indoor",
         appearance=AppearancePlan(
             description="宽松浅色上衣与深色短裤，不携带背包",
-            continuity="continue",
         ),
         actions=[
             ActionStage(
@@ -99,21 +99,12 @@ def episode_for(
                 actor_id="cat",
                 action="灰白猫先注意到桌面纸风车被微风吹动",
                 visible_result="猫咪抬头看向桌面",
-                transitions=[],
             ),
             ActionStage(
                 order=2,
                 actor_id="person",
                 action="人物伸手拿起同一只纸风车并轻轻转动",
                 visible_result="纸风车持续由人物手掌支撑",
-                transitions=[
-                    EntityTransition(
-                        entity_id="pinwheel",
-                        before=prop_before,
-                        after=prop_after,
-                        reason="人物从桌面拿起纸风车",
-                    )
-                ],
             ),
         ],
         shots=[
@@ -126,10 +117,13 @@ def episode_for(
                 direction="从猫咪视线缓慢推向人物手中的纸风车",
             )
         ],
-        ending="人物继续转动纸风车，猫咪伸鼻靠近感受微风",
+        ending=EpisodeEnding(
+            result="人物继续转动纸风车，猫咪伸鼻靠近感受微风",
+            visual_critical=False,
+            key_entity_ids=["pinwheel", "cat"],
+        ),
         duration_seconds=9,
-        video_input_mode=mode,
-        visible_world=world,
+        continuity=continuity,
     )
     return EpisodePlan(slot=slot, script=script)
 

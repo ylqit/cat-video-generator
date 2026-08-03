@@ -42,6 +42,16 @@ class StepKind(StrEnum):
     VIDEO = "video"
 
 
+class PromptPurpose(StrEnum):
+    """供应商调用及其审核使用的稳定Prompt用途。"""
+
+    DIRECTOR = "director"
+    STORYBOARD = "storyboard"
+    STORYBOARD_REVIEW = "storyboard_review"
+    VIDEO = "video"
+    REVIEW = "review"
+
+
 class StepStatus(StrEnum):
     PENDING = "pending"
     SUBMITTING = "submitting"
@@ -53,6 +63,42 @@ class StepStatus(StrEnum):
     FAILED = "failed"
     EXPIRED = "expired"
     CANCELLED = "cancelled"
+
+
+_PROMPT_PURPOSES_BY_STEP_KIND = {
+    StepKind.DIRECTOR: frozenset({PromptPurpose.DIRECTOR}),
+    StepKind.IMAGE: frozenset(
+        {PromptPurpose.STORYBOARD, PromptPurpose.STORYBOARD_REVIEW}
+    ),
+    StepKind.VIDEO: frozenset({PromptPurpose.VIDEO, PromptPurpose.REVIEW}),
+}
+
+_GENERATION_PROMPT_BY_STEP_KIND = {
+    StepKind.DIRECTOR: PromptPurpose.DIRECTOR,
+    StepKind.IMAGE: PromptPurpose.STORYBOARD,
+    StepKind.VIDEO: PromptPurpose.VIDEO,
+}
+
+
+def validate_prompt_purpose(
+    kind: StepKind,
+    purpose: PromptPurpose,
+    *,
+    generation_intent: bool = False,
+) -> PromptPurpose:
+    """校验Step和Prompt用途的对应关系。
+
+    生成意图只能绑定该Step的主Prompt；审核Prompt在供应商媒体落盘后追加，
+    防止把审核文本误当成一次新的收费生成输入。
+    """
+
+    allowed = _PROMPT_PURPOSES_BY_STEP_KIND[kind]
+    if purpose not in allowed:
+        raise ValueError(f"{kind.value}步骤不允许purpose={purpose.value}")
+    if generation_intent and _GENERATION_PROMPT_BY_STEP_KIND[kind] is not purpose:
+        expected = _GENERATION_PROMPT_BY_STEP_KIND[kind].value
+        raise ValueError(f"{kind.value}步骤的生成Prompt必须是{expected}")
+    return purpose
 
 
 _RUN_TRANSITIONS = {
