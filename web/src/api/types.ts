@@ -213,6 +213,8 @@ export interface RunGraph {
   prompts: PromptDto[];
   assets: AssetDto[];
   reviews: ReviewDto[];
+  /** 未定稿Run的时段剧本草稿（planning_json.episodeDrafts），键为slot */
+  episodeDrafts?: Record<string, EpisodeScript>;
 }
 
 export interface CanonAsset {
@@ -242,7 +244,13 @@ export interface Job {
   startedAt: string | null;
   finishedAt: string | null;
   result: Record<string, unknown> | null;
-  error: { code: string; message: string } | null;
+  error: {
+    code: string;
+    message: string;
+    runId?: string;
+    slot?: string;
+    details?: string[];
+  } | null;
 }
 
 export interface DeliveryItemDto {
@@ -267,14 +275,11 @@ export interface DeliveryPackageDto {
 }
 
 export interface HealthStatus {
-  connected: boolean;
   database: string;
   user: string;
-  serverVersionNum: number;
-  ssl: boolean;
-  alembicRevision: string;
-  alembicHead: string;
-  migrationCurrent: boolean;
+  alembicRevision: string | null;
+  expectedAlembicRevision: string;
+  ready: boolean;
 }
 
 /** 主题创作台：单集 Prompt 预览与编辑覆盖。 */

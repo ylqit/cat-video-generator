@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..application.queries import QueryService
 from .api_studio import create_studio_router
@@ -18,6 +19,26 @@ from .jobs import JobRegistry
 
 if TYPE_CHECKING:
     from ..bootstrap import RuntimeContainer
+
+
+class _SPAStaticFiles(StaticFiles):
+    """托管Vue产物，并只为真正的前端History路由回退到index.html。"""
+
+    async def get_response(self, path: str, scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            normalized_path = path.replace("\\", "/").lstrip("/")
+            # 缺失API和带扩展名的静态文件必须保留404；只有浏览器页面路由
+            # 才交给Vue Router，避免把资源部署错误隐藏成200 HTML。
+            if (
+                exc.status_code != 404
+                or scope["method"] not in {"GET", "HEAD"}
+                or normalized_path.startswith("api/")
+                or Path(normalized_path).suffix
+            ):
+                raise
+            return await super().get_response("index.html", scope)
 
 
 def create_app(
@@ -156,7 +177,7 @@ def create_full_app(
     if static_dir is not None and (static_dir / "index.html").is_file():
         app.mount(
             "/",
-            StaticFiles(directory=static_dir, html=True),
+            _SPAStaticFiles(directory=static_dir, html=True),
             name="web",
         )
     return app

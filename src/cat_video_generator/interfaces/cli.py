@@ -393,16 +393,22 @@ def deliver(run_id: uuid.UUID = typer.Argument(...)) -> None:
 
 @app.command("api")
 def serve_api(
+    host: str = typer.Option("127.0.0.1", "--host"),
     port: int = typer.Option(8765, "--port", min=1, max=65535),
     read_only: bool = typer.Option(False, "--read-only"),
     static_dir: Path | None = typer.Option(None, "--static-dir"),
 ) -> None:
-    """启动仅监听本机的HTTP接口；默认含写端点与后台任务。"""
+    """启动HTTP接口；本机默认监听回环地址，容器可显式监听所有网卡。"""
 
     from concurrent.futures import ThreadPoolExecutor
 
     import uvicorn
 
+    if static_dir is not None and not (static_dir / "index.html").is_file():
+        raise typer.BadParameter(
+            "静态目录必须包含index.html",
+            param_hint="--static-dir",
+        )
     load_local_env()
     runtime = RuntimeSettings.from_env()
     media_roots = (runtime.asset_root, runtime.delivery_root)
@@ -423,7 +429,7 @@ def serve_api(
             static_dir=static_dir,
         )
     try:
-        uvicorn.run(api, host="127.0.0.1", port=port)
+        uvicorn.run(api, host=host, port=port)
     finally:
         container.close()
 

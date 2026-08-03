@@ -119,6 +119,8 @@ def test_video_prompt_is_compact_and_has_five_sections(daily_plan) -> None:
         assert title in prompt.text
     assert "00:00" not in prompt.text
     assert "assetId" not in prompt.text
+    # 外观签名由外观与动作段表达；物理连续性段只投影拓扑，避免重复挤占注意力。
+    assert "外观保持稳定" not in prompt.text
 
 
 def test_directors_are_four_separate_contract_prompts(daily_plan) -> None:

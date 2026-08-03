@@ -133,6 +133,7 @@ class SqlAlchemyReadRepository:
                     ),
                     "contradictions": contradictions,
                     "dayBrief": run.planning_json.get("dayBrief"),
+                    "episodeDrafts": run.planning_json.get("episodeDrafts", {}),
                     "currentStage": _current_stage(run, episodes, assets),
                 }
             )

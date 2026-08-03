@@ -90,7 +90,7 @@ npm install
 npm run dev
 ```
 
-生产模式可执行 `npm run build` 后运行 `uv run cvg api --static-dir web/dist`。后台 JobRegistry 只负责 HTTP 进程内异步执行，真正状态仍以 PostgreSQL 为准。
+生产模式可执行 `npm run build` 后运行 `uv run cvg api --static-dir web/dist`。后台 JobRegistry 只负责 HTTP 进程内异步执行，真正状态仍以 PostgreSQL 为准。Linux 服务器可通过单容器 [Docker Compose 部署](docs/workflows/docker-deployment.md)，直接访问 `http://服务器IP:8765`。
 
 ## 文档
 
@@ -98,6 +98,7 @@ npm run dev
 - [架构决策](docs/architecture/ADR-001-explicit-workflow.md)
 - [完整生产流程](docs/workflows/complete-production.md)
 - [Windows 运行手册](docs/workflows/windows-runbook.md)
+- [Docker Compose 部署](docs/workflows/docker-deployment.md)
 - [本机 HTTP 接口](docs/http-api.md)
 - [核心收敛 Checklist](docs/checklists/core-simplification.md)
 

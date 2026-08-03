@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import Callable
+from contextlib import suppress
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException
@@ -105,15 +106,13 @@ def maybe_continue_video(
     def task() -> dict[str, Any]:
         return production.run_day(run_id, slot=slot, allow_paid_generation=True)
 
-    try:
+    # 同集已有在途run_day即视为续跑成功，数据库幂等仍负责最终防重。
+    with suppress(JobConflictError):
         job_registry.submit(
             kind="run_day",
             dedup_key=f"run:{run_id}:{slot.value}",
             fn=task,
         )
-    except JobConflictError:
-        # 同集已有在途run_day即视为已续跑。
-        pass
 
 
 def create_studio_router(
@@ -137,7 +136,9 @@ def create_studio_router(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
         def task() -> dict[str, Any]:
-            if status == "draft":
+            if status in {"draft", "failed"}:
+                # resume_planning本就接受draft/failed：瞬时失败可一键恢复，
+                # 确定性校验失败会再次失败并给出同样错误，无副作用。
                 result = planning.resume_planning(
                     run_id,
                     allow_paid_generation=True,

@@ -2,6 +2,7 @@ import type {
   CanonAsset,
   DeliveryPackageDto,
   EpisodePromptPreview,
+  HealthStatus,
   Job,
   JobAccepted,
   PipelineSettings,
@@ -125,7 +126,7 @@ export const api = {
     request<Record<string, unknown>>(`/deliveries/${packageId}/manifest`),
   job: (jobId: string) => request<Job>(`/jobs/${jobId}`),
   listJobs: () => request<Job[]>("/jobs"),
-  health: () => request<Record<string, unknown>>("/health"),
+  health: () => request<HealthStatus>("/health"),
   retryStep: (
     stepId: string,
     reason: string,

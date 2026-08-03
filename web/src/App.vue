@@ -3,12 +3,13 @@ import { useRoute } from "vue-router";
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
 import { api } from "./api/client";
+import type { HealthStatus } from "./api/types";
 
 const route = useRoute();
 const active = computed(() => route.path);
 
 /** 后端健康状态：绿=数据库连通且迁移最新，黄=迁移落后，红=不可达。 */
-const health = ref<Record<string, unknown> | null>(null);
+const health = ref<HealthStatus | null>(null);
 const unreachable = ref(false);
 let timer: number | undefined;
 
@@ -19,7 +20,7 @@ const healthColor = computed(() => {
   if (!health.value) {
     return "#8a8f99";
   }
-  return health.value.migrationCurrent ? "#67c23a" : "#e6a23c";
+  return health.value.ready ? "#67c23a" : "#e6a23c";
 });
 
 const healthText = computed(() => {
@@ -30,7 +31,7 @@ const healthText = computed(() => {
     return "检查中…";
   }
   const db = String(health.value.database ?? "");
-  return health.value.migrationCurrent ? `已连接 ${db}` : `${db} 迁移落后`;
+  return health.value.ready ? `已连接 ${db}` : `${db} 迁移落后`;
 });
 
 async function checkHealth() {

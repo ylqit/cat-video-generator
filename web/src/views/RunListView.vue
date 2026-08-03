@@ -48,6 +48,18 @@ onMounted(() => {
           {{ new Date(row.createdAt).toLocaleString() }}
         </template>
       </el-table-column>
+      <el-table-column label="" width="130">
+        <template #default="{ row }">
+          <el-button
+            size="small"
+            text
+            type="primary"
+            @click.stop="router.push(`/studio?run=${row.id}`)"
+          >
+            在创作台打开
+          </el-button>
+        </template>
+      </el-table-column>
       <template #empty>
         <span class="muted">暂无运行，点击右上角"新建计划"开始一天的生产</span>
       </template>

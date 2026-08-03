@@ -5,6 +5,7 @@
 - [显式状态机与模块化单体 ADR](architecture/ADR-001-explicit-workflow.md)
 - [从导演到三条视频的完整流程](workflows/complete-production.md)
 - [Windows 运行手册](workflows/windows-runbook.md)
+- [Docker Compose 最简部署](workflows/docker-deployment.md)
 - [火山方舟多模态能力与 Prompt 基线](providers/volcengine-multimodal.md)
 - [FastAPI 本机接口](http-api.md)
 - [核心收敛 Checklist](checklists/core-simplification.md)

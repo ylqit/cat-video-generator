@@ -53,7 +53,7 @@ class JobRecord:
     started_at: datetime | None = None
     finished_at: datetime | None = None
     result: Any = None
-    error: dict[str, str] | None = None
+    error: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """转换为HTTP响应使用的camelCase字典。"""
@@ -158,7 +158,7 @@ class JobRegistry:
         record.status = "succeeded"
 
 
-def _classify_error(exc: Exception) -> dict[str, str]:
+def _classify_error(exc: Exception) -> dict[str, Any]:
     """把异常分级为前端可展示的稳定错误码。"""
 
     if isinstance(exc, GatewayError):
@@ -169,4 +169,16 @@ def _classify_error(exc: Exception) -> dict[str, str]:
         code = "provider_timeout"
     else:
         code = "internal"
-    return {"code": code, "message": str(exc)}
+    payload: dict[str, Any] = {"code": code, "message": str(exc)}
+    # 规划审核异常已经在PostgreSQL留下可恢复Run。把稳定标识返回给Web，
+    # 让用户直接进入失败现场，而不是回到一张看似什么都没发生的空表单。
+    run_id = getattr(exc, "run_id", None)
+    if run_id is not None:
+        payload["runId"] = str(run_id)
+    slot = getattr(exc, "slot", None)
+    if slot is not None:
+        payload["slot"] = getattr(slot, "value", str(slot))
+    errors = getattr(exc, "errors", None)
+    if errors is not None:
+        payload["details"] = list(errors)
+    return payload

@@ -11,15 +11,21 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from test_planning_application import (
+    Director,
+    EmptySeeds,
+    PlanningRepository,
+)
 
 from cat_video_generator.application.planning import (
     DayBriefPause,
     PlanningResult,
+    PlanningReviewRequired,
     PlanningService,
 )
 from cat_video_generator.application.ports import StoredAsset, StoredRun
 from cat_video_generator.application.studio_editing import StudioEditingService
-from cat_video_generator.domain.contracts import DailyProductionPlan, DayBrief
+from cat_video_generator.domain.contracts import DailyProductionPlan, DayBrief, Slot
 from cat_video_generator.domain.pipeline import PipelineSettings, StageMode
 from cat_video_generator.domain.visual_profiles import (
     DEFAULT_SERIES_VISUAL_PROFILE,
@@ -30,12 +36,8 @@ from cat_video_generator.interfaces.api_studio import (
     create_studio_router,
     maybe_continue_video,
 )
+from cat_video_generator.interfaces.api_write import create_write_router
 from cat_video_generator.interfaces.jobs import JobRegistry
-from test_planning_application import (
-    Director,
-    EmptySeeds,
-    PlanningRepository,
-)
 
 
 def _planning_service(repository, director) -> PlanningService:
@@ -47,6 +49,32 @@ def _planning_service(repository, director) -> PlanningService:
         style_profile=DEFAULT_STYLE_PROFILE,
         event_seed_catalog=EmptySeeds(),
     )
+
+
+def test_job_error_keeps_planning_review_run_identity() -> None:
+    registry = JobRegistry(inline=True)
+    record = registry.submit(
+        kind="plan_day",
+        dedup_key="plan:review",
+        fn=lambda: (_ for _ in ()).throw(
+            PlanningReviewRequired(
+                run_id=RUN_ID,
+                slot=Slot.NOON,
+                errors=("视频Prompt超过预算",),
+            )
+        ),
+    )
+
+    assert record.status == "failed"
+    assert record.error == {
+        "code": "internal",
+        "message": (
+            f"Run {RUN_ID} 的 noon 时段自动修复后仍不自洽：视频Prompt超过预算"
+        ),
+        "runId": str(RUN_ID),
+        "slot": "noon",
+        "details": ["视频Prompt超过预算"],
+    }
 
 
 def test_plan_day_pauses_after_day_brief_then_resume(daily_plan) -> None:
@@ -320,15 +348,15 @@ class StudioProduction:
         return {"runId": str(run_id), "episodes": []}
 
 
-def _studio_client(*, settings, production, studio_editing):
+def _studio_client(*, settings, production, studio_editing, status="planned", planning=None):
     queries = SimpleNamespace(
         pipeline_settings=lambda run_id: settings,
-        run_graph=lambda run_id: {"run": {"status": "planned"}},
+        run_graph=lambda run_id: {"run": {"status": status}},
     )
     app = FastAPI()
     app.include_router(
         create_studio_router(
-            planning=SimpleNamespace(),
+            planning=planning or SimpleNamespace(),
             production=production,
             queries=queries,
             studio_editing=studio_editing,
@@ -336,6 +364,93 @@ def _studio_client(*, settings, production, studio_editing):
         )
     )
     return TestClient(app)
+
+
+def test_continue_accepts_failed_status_and_resumes(daily_plan) -> None:
+    repository = StudioRepository(daily_plan)
+    production = StudioProduction()
+    resume_calls: list[dict] = []
+    planning = SimpleNamespace(
+        resume_planning=lambda run_id, *, allow_paid_generation: (
+            resume_calls.append({"paid": allow_paid_generation}) or {"ok": True}
+        )
+    )
+    client = _studio_client(
+        settings=PipelineSettings(
+            allow_paid_generation=True,
+            video=StageMode.MANUAL,
+        ),
+        production=production,
+        studio_editing=_editing_service(repository),
+        status="failed",
+        planning=planning,
+    )
+    accepted = client.post(f"/api/v1/runs/{uuid.uuid4()}/continue")
+    assert accepted.status_code == 202
+    assert resume_calls == [{"paid": True}]
+    assert production.keyframe_calls == 1
+
+
+def _write_client(*, tmp_path, settings, production, planning, status):
+    queries = SimpleNamespace(
+        pipeline_settings=lambda run_id: settings,
+        run_graph=lambda run_id: {"run": {"status": status}},
+        episode=lambda episode_id: {"runId": str(RUN_ID), "slot": "morning"},
+    )
+    app = FastAPI()
+    app.include_router(
+        create_write_router(
+            planning=planning,
+            production=production,
+            assets=SimpleNamespace(),
+            delivery=SimpleNamespace(),
+            queries=queries,
+            retry=SimpleNamespace(),
+            job_registry=JobRegistry(inline=True),
+            default_candidate_count=1,
+            upload_dir=tmp_path,
+            delivery_root=tmp_path,
+        )
+    )
+    return TestClient(app)
+
+
+def test_replan_endpoint_chains_only_when_finalized(tmp_path) -> None:
+    planning = SimpleNamespace(
+        replan_episode=lambda run_id, *, slot, reason, allow_paid_generation: {
+            "slot": slot.value
+        }
+    )
+    finalized = StudioProduction()
+    client = _write_client(
+        tmp_path=tmp_path,
+        settings=PipelineSettings(allow_paid_generation=True),
+        production=finalized,
+        planning=planning,
+        status="planned",
+    )
+    accepted = client.post(
+        f"/api/v1/runs/{uuid.uuid4()}/episodes/morning/replan",
+        json={"reason": "共享元素声明与其他时段保持一致", "allowPaidGeneration": True},
+    )
+    assert accepted.status_code == 202
+    assert finalized.video_calls == [{"slot": None}]
+
+    unfinalized = StudioProduction()
+    client_draft = _write_client(
+        tmp_path=tmp_path,
+        settings=PipelineSettings(allow_paid_generation=True),
+        production=unfinalized,
+        planning=planning,
+        status="draft",
+    )
+    accepted = client_draft.post(
+        f"/api/v1/runs/{uuid.uuid4()}/episodes/morning/replan",
+        json={"reason": "共享元素声明与其他时段保持一致", "allowPaidGeneration": True},
+    )
+    assert accepted.status_code == 202
+    assert unfinalized.video_calls == []
+    assert unfinalized.keyframe_calls == 0
 
 
 def test_continue_endpoint_chains_by_settings(daily_plan) -> None:

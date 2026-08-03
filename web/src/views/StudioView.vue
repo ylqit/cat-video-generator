@@ -8,6 +8,7 @@ import type {
   EpisodeDto,
   EpisodePromptPreview,
   PipelineSettings,
+  PromptDto,
   PromptOverrides,
   RunGraph,
   StageMode,
@@ -15,14 +16,17 @@ import type {
 import AssetReviewPanel from "../components/AssetReviewPanel.vue";
 import AssetThumb from "../components/AssetThumb.vue";
 import DayBriefPanel from "../components/DayBriefPanel.vue";
+import PromptCollapse from "../components/PromptCollapse.vue";
 import ScriptEditorPanel from "../components/ScriptEditorPanel.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import { usePolling } from "../composables/usePolling";
 import { useJobsStore } from "../stores/jobs";
+import { useRunsStore } from "../stores/runs";
 
 const route = useRoute();
 const router = useRouter();
 const jobs = useJobsStore();
+const runs = useRunsStore();
 
 const SLOT_LABEL: Record<string, string> = {
   morning: "早间",
@@ -78,6 +82,23 @@ const drafts = reactive<
 const saving = reactive<Record<string, boolean>>({});
 const generating = reactive<Record<string, boolean>>({});
 const continuing = ref(false);
+const historyVisible = ref(false);
+
+/** 打开历史Run（含未完成断点），复用当前页面继续推进。 */
+function openRun(id: string) {
+  runId.value = id;
+  historyVisible.value = false;
+  router.replace({ query: { run: id } });
+  void loadGraph();
+}
+
+/** 回到空白主题表单开始新的全天方案。 */
+function newTheme() {
+  runId.value = null;
+  graph.value = null;
+  historyVisible.value = false;
+  router.replace({ query: {} });
+}
 
 const run = computed(() => graph.value?.run ?? null);
 const settings = computed<PipelineSettings>(
@@ -128,9 +149,107 @@ function videoAssets(episode: EpisodeDto) {
   );
 }
 
+/** 按步骤定位某节点实际发送的Prompt记录（审计留档版，区别于可编辑预览）。 */
+function promptsFor(match: {
+  operationKey?: string;
+  kind?: string;
+  episodeId?: string;
+  purpose: string;
+}): PromptDto[] {
+  const stepIds = new Set(
+    (graph.value?.steps ?? [])
+      .filter(
+        (step) =>
+          (match.operationKey === undefined ||
+            step.operationKey === match.operationKey) &&
+          (match.kind === undefined || step.kind === match.kind) &&
+          (match.episodeId === undefined ||
+            step.episodeId === match.episodeId),
+      )
+      .map((step) => step.id),
+  );
+  return (graph.value?.prompts ?? []).filter(
+    (prompt) => stepIds.has(prompt.stepId) && prompt.purpose === match.purpose,
+  );
+}
+
+/** 该集最新图片步骤实际使用的参考图资产ID。 */
+function referenceAssetIds(episode: EpisodeDto): string[] {
+  const step = [...(graph.value?.steps ?? [])]
+    .filter((item) => item.kind === "image" && item.episodeId === episode.id)
+    .pop();
+  const ids = step?.inputSnapshot?.reference_asset_ids;
+  return Array.isArray(ids) ? ids.map(String) : [];
+}
+
 const allFramesReady = computed(
   () => episodes.value.length > 0 && episodes.value.every(frameReady),
 );
+
+/** 规划审核/失败定位：最新一条契约校验rejected review对应的时段与原因。 */
+const planningFailure = computed(() => {
+  const g = graph.value;
+  if (!g || !["planning_review", "failed"].includes(g.run.status)) {
+    return null;
+  }
+  const rejectedStepIds = new Set(
+    g.reviews
+      .filter(
+        (review) =>
+          review.decision === "rejected" &&
+          review.evidence.phase === "episode_contract",
+      )
+      .map((review) => review.stepId),
+  );
+  const step = [...g.steps]
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .find(
+      (item) =>
+        rejectedStepIds.has(item.id) &&
+        item.operationKey.startsWith("director:episode:"),
+    );
+  const slot = step?.operationKey.split(":").at(-1) ?? null;
+  const reasons = g.reviews
+    .filter((review) => review.stepId === step?.id && review.reason)
+    .map((review) => String(review.reason));
+  return { slot, reasons };
+});
+
+const replanVisible = ref(false);
+const replanReason = ref("");
+const replanPaid = ref(false);
+const replanning = ref(false);
+
+/** 人工给出修正理由重规划失败时段；成功后后端按开关自动链式推进。 */
+async function submitReplan() {
+  if (!runId.value || !planningFailure.value?.slot) {
+    return;
+  }
+  replanning.value = true;
+  try {
+    const accepted = await api.replanEpisode(
+      runId.value,
+      planningFailure.value.slot,
+      replanReason.value.trim(),
+      true,
+    );
+    jobs.track(accepted);
+    replanVisible.value = false;
+    const final = await waitJob(accepted.jobId);
+    if (final.status === "succeeded") {
+      ElMessage.success("重规划完成，流水线已按开关自动推进");
+      replanReason.value = "";
+      replanPaid.value = false;
+    } else {
+      ElMessage.error(final.error?.message ?? "重规划失败");
+    }
+    await loadGraph();
+  } catch (error) {
+    ElMessage.error(error instanceof ApiError ? error.message : String(error));
+  } finally {
+    replanning.value = false;
+  }
+}
 
 function buildOverrides(episodeId: string): PromptOverrides {
   const preview = previews[episodeId];
@@ -235,6 +354,11 @@ async function submitPlan() {
       await loadGraph();
     } else {
       ElMessage.error(final.error?.message ?? "规划任务失败");
+      if (final.error?.runId) {
+        runId.value = final.error.runId;
+        router.replace({ query: { run: runId.value } });
+        await loadGraph();
+      }
     }
   } catch (error) {
     ElMessage.error(error instanceof ApiError ? error.message : String(error));
@@ -357,13 +481,19 @@ async function confirmVideo(episode: EpisodeDto) {
 
 onMounted(() => {
   void loadGraph();
+  void runs.fetchRuns();
   polling.start();
 });
 </script>
 
 <template>
   <div style="padding: 20px 24px">
-    <h2 style="margin-top: 0">主题创作台</h2>
+    <div style="display: flex; align-items: center; margin-bottom: 12px">
+      <h2 style="margin: 0">主题创作台</h2>
+      <div style="flex: 1" />
+      <el-button v-if="runId" size="small" @click="newTheme">新建主题</el-button>
+      <el-button size="small" @click="historyVisible = true">历史运行</el-button>
+    </div>
 
     <el-card v-if="!runId" shadow="never" style="margin-bottom: 16px">
       <el-form label-width="130px">
@@ -420,6 +550,36 @@ onMounted(() => {
           </el-button>
         </el-form-item>
       </el-form>
+    </el-card>
+
+    <el-card v-if="!runId" shadow="never">
+      <template #header><strong>历史运行（点击继续未完成断点）</strong></template>
+      <el-table
+        v-loading="runs.loading"
+        :data="runs.runs"
+        @row-click="(row: { id: string }) => openRun(row.id)"
+      >
+        <el-table-column prop="contentDate" label="内容日期" width="110" />
+        <el-table-column
+          prop="theme"
+          label="主题"
+          min-width="220"
+          show-overflow-tooltip
+        />
+        <el-table-column label="状态" width="110">
+          <template #default="{ row }">
+            <StatusBadge :status="row.status" />
+          </template>
+        </el-table-column>
+        <el-table-column label="下一步" min-width="180" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span class="muted">{{ row.nextAction ?? "—" }}</span>
+          </template>
+        </el-table-column>
+        <template #empty>
+          <span class="muted">暂无历史运行</span>
+        </template>
+      </el-table>
     </el-card>
 
     <template v-if="graph && run">
@@ -485,6 +645,10 @@ onMounted(() => {
               style="margin-bottom: 12px"
               title="日导演阶段为手动：检查或编辑后点击继续"
             />
+            <PromptCollapse
+              :prompts="promptsFor({ operationKey: 'director:day', purpose: 'director' })"
+              title="总导演 Prompt"
+            />
             <DayBriefPanel
               :run-id="runId!"
               :day-brief="run.dayBrief"
@@ -504,6 +668,36 @@ onMounted(() => {
         </el-tab-pane>
 
         <el-tab-pane label="三集剧本" name="scripts">
+          <el-alert
+            v-if="planningFailure"
+            type="error"
+            :closable="false"
+            style="margin-bottom: 12px"
+          >
+            <template #title>
+              规划审核：{{
+                planningFailure.slot
+                  ? `${SLOT_LABEL[planningFailure.slot] ?? planningFailure.slot}时段`
+                  : "部分时段"
+              }}导演输出未通过契约校验，流水线已停在此处
+            </template>
+            <div
+              v-for="(reason, index) in planningFailure.reasons"
+              :key="index"
+              style="font-size: 12px"
+            >
+              {{ reason }}
+            </div>
+            <el-button
+              v-if="planningFailure.slot"
+              size="small"
+              type="danger"
+              style="margin-top: 8px"
+              @click="replanVisible = true"
+            >
+              重规划{{ SLOT_LABEL[planningFailure.slot] ?? planningFailure.slot }}时段
+            </el-button>
+          </el-alert>
           <template v-if="episodes.length">
             <el-alert
               v-if="currentStage === 'script'"
@@ -524,6 +718,15 @@ onMounted(() => {
                   <StatusBadge :status="episode.status" />
                 </div>
               </template>
+              <PromptCollapse
+                :prompts="
+                  promptsFor({
+                    operationKey: `director:episode:${episode.slot}`,
+                    purpose: 'director',
+                  })
+                "
+                title="时段导演 Prompt"
+              />
               <ScriptEditorPanel
                 :episode="episode"
                 :editable="['planned', 'failed'].includes(episode.status)"
@@ -538,6 +741,45 @@ onMounted(() => {
             >
               继续：生成首末帧
             </el-button>
+          </template>
+          <template v-else-if="Object.keys(graph.episodeDrafts ?? {}).length">
+            <el-card
+              v-for="slot in ['morning', 'noon', 'evening']"
+              :key="slot"
+              shadow="never"
+              style="margin-bottom: 12px"
+            >
+              <template #header>
+                <div style="display: flex; align-items: center; gap: 10px">
+                  <strong>{{ SLOT_LABEL[slot] }}</strong>
+                  <el-tag
+                    v-if="planningFailure?.slot === slot"
+                    type="danger"
+                    size="small"
+                  >
+                    校验未通过
+                  </el-tag>
+                  <el-tag
+                    v-else-if="graph.episodeDrafts?.[slot]"
+                    type="success"
+                    size="small"
+                  >
+                    草稿已生成
+                  </el-tag>
+                  <el-tag v-else type="info" size="small">未生成</el-tag>
+                </div>
+              </template>
+              <template v-if="graph.episodeDrafts?.[slot]">
+                <div><strong>{{ graph.episodeDrafts[slot].title }}</strong></div>
+                <div class="muted">
+                  主事件：{{ graph.episodeDrafts[slot].main_event }}
+                </div>
+                <div class="muted">
+                  场景：{{ graph.episodeDrafts[slot].scene }}
+                </div>
+              </template>
+              <span v-else class="muted">该时段剧本尚未成功生成</span>
+            </el-card>
           </template>
           <el-empty v-else description="剧本尚未生成" />
         </el-tab-pane>
@@ -587,6 +829,42 @@ onMounted(() => {
                   />
                 </el-col>
               </el-row>
+
+              <div
+                style="display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start"
+              >
+                <PromptCollapse
+                  :prompts="
+                    promptsFor({
+                      kind: 'image',
+                      episodeId: episode.id,
+                      operationKey: 'image:first_frame',
+                      purpose: 'image',
+                    })
+                  "
+                  title="首帧实际 Prompt"
+                />
+                <PromptCollapse
+                  :prompts="
+                    promptsFor({
+                      kind: 'image',
+                      episodeId: episode.id,
+                      operationKey: 'image:last_frame',
+                      purpose: 'image',
+                    })
+                  "
+                  title="尾帧实际 Prompt"
+                />
+              </div>
+              <div v-if="referenceAssetIds(episode).length" style="margin-top: 6px">
+                <span class="muted" style="margin-right: 6px">参考图</span>
+                <AssetThumb
+                  v-for="assetId in referenceAssetIds(episode)"
+                  :key="assetId"
+                  :asset-id="assetId"
+                  :size="72"
+                />
+              </div>
 
               <div style="margin: 10px 0">
                 <el-button
@@ -690,6 +968,16 @@ onMounted(() => {
                   </el-button>
                 </div>
               </template>
+              <PromptCollapse
+                :prompts="
+                  promptsFor({
+                    kind: 'video',
+                    episodeId: episode.id,
+                    purpose: 'video',
+                  })
+                "
+                title="视频实际 Prompt"
+              />
               <template v-if="videoAssets(episode).length">
                 <AssetReviewPanel
                   v-for="asset in videoAssets(episode)"
@@ -717,6 +1005,80 @@ onMounted(() => {
       v-else-if="!loadingGraph"
       description="输入主题并提交后，这里将按阶段展示日导演、剧本、首末帧与成片"
     />
+
+    <el-dialog
+      v-model="replanVisible"
+      :title="`重规划${SLOT_LABEL[planningFailure?.slot ?? ''] ?? ''}时段`"
+      width="480px"
+    >
+      <el-alert
+        type="warning"
+        :closable="false"
+        style="margin-bottom: 12px"
+        title="重规划只重调该时段导演；成功后流水线按阶段开关自动推进后续节点"
+      />
+      <el-form label-width="90px">
+        <el-form-item label="修正理由" required>
+          <el-input
+            v-model="replanReason"
+            type="textarea"
+            :rows="3"
+            placeholder="至少4个字；会注入导演修复Prompt，例如：保留主事件，共享元素声明与其他时段保持一致"
+          />
+        </el-form-item>
+        <el-form-item>
+          <el-checkbox v-model="replanPaid">
+            <span style="color: #f56c6c">
+              我已知晓重规划将产生 Ark 付费模型调用
+            </span>
+          </el-checkbox>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="replanVisible = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="replanning"
+          :disabled="replanReason.trim().length < 4 || !replanPaid"
+          @click="submitReplan"
+        >
+          确认付费并重规划
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-drawer v-model="historyVisible" title="历史运行" size="640px">
+      <el-table
+        v-loading="runs.loading"
+        :data="runs.runs"
+        :row-class-name="
+          ({ row }: { row: { id: string } }) =>
+            row.id === runId ? 'current-run' : ''
+        "
+        @row-click="(row: { id: string }) => openRun(row.id)"
+      >
+        <el-table-column prop="contentDate" label="内容日期" width="100" />
+        <el-table-column
+          prop="theme"
+          label="主题"
+          min-width="180"
+          show-overflow-tooltip
+        />
+        <el-table-column label="状态" width="100">
+          <template #default="{ row }">
+            <StatusBadge :status="row.status" />
+          </template>
+        </el-table-column>
+        <el-table-column label="下一步" min-width="150" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span class="muted">{{ row.nextAction ?? "—" }}</span>
+          </template>
+        </el-table-column>
+        <template #empty>
+          <span class="muted">暂无历史运行</span>
+        </template>
+      </el-table>
+    </el-drawer>
   </div>
 </template>
 
@@ -724,5 +1086,8 @@ onMounted(() => {
 .muted {
   color: #8a8f99;
   font-size: 12px;
+}
+:deep(.current-run) {
+  background: #1d2733;
 }
 </style>

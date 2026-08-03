@@ -373,25 +373,47 @@ def _state_line(
 def _describe_transitions(episode: EpisodePlan) -> str:
     lines: list[str] = []
     entities = {item.id: item.name for item in episode.script.visible_world.entities}
+    anchors = {item.id: item.name for item in episode.script.visible_world.anchors}
     for action in episode.script.actions:
         for transition in action.transitions:
+            before = _state_topology(transition.before, anchors, entities)
+            after = _state_topology(transition.after, anchors, entities)
+            # 仅表情、姿态或数量等可见变化已经在动作及visibleResult中表达。
+            # 这里跳过拓扑不变项，避免连续性段再次复述同一动作。
+            if before == after:
+                continue
             lines.append(
                 f"动作{action.order}中{entities[transition.entity_id]}因{transition.reason}从"
-                f"{_state_compact(transition.before)}变为{_state_compact(transition.after)}。"
+                f"{before}变为{after}。"
             )
     return "".join(lines) or "关键实体保持初始位置、支撑、容器和外观。"
 
 
-def _state_compact(state: EntityState) -> str:
+def _state_topology(
+    state: EntityState,
+    anchors: dict[str, str],
+    entities: dict[str, str],
+) -> str:
+    """只投影物理拓扑，避免把完整外观签名重复塞入视频Prompt。
+
+    动作文字已经描述可见变化，外观由本集外观段统一锁定；连续性段只负责
+    位置、支撑和容器这些容易导致悬空或穿透的关系。
+    """
+
     if not state.active:
         return "非活动状态"
+    anchor = anchors.get(state.anchor_id or "", state.anchor_id or "")
+    support = anchors.get(
+        state.support_id or "",
+        entities.get(state.support_id or "", state.support_id or ""),
+    )
+    container = entities.get(state.container_id or "", state.container_id or "")
     return "/".join(
         value
         for value in (
-            state.anchor_id,
-            f"支撑={state.support_id}" if state.support_id else None,
-            f"容器={state.container_id}" if state.container_id else None,
-            state.appearance_signature,
+            f"位置={anchor}" if anchor else None,
+            f"支撑={support}" if support else "由动作主体持续持有",
+            f"容器={container}" if container else None,
         )
         if value
     )

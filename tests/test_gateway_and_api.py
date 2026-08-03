@@ -6,10 +6,16 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from typer.testing import CliRunner
+
 from cat_video_generator.config import RuntimeSettings
 from cat_video_generator.domain.rendering import MediaSource, VideoInputMode, build_video_input_plan
 from cat_video_generator.infrastructure.ark.gateway import ArkGateway
+from cat_video_generator.interfaces.api import _SPAStaticFiles
 from cat_video_generator.interfaces.api_schemas import GenerateRequest, RetryStepRequest
+from cat_video_generator.interfaces.cli import app as cli_app
 
 
 class Tasks:
@@ -85,3 +91,34 @@ def test_removed_http_flags_are_not_accepted() -> None:
         "reason",
         "allow_paid_generation",
     }
+
+
+def test_api_command_exposes_host_option() -> None:
+    result = CliRunner().invoke(cli_app, ["api", "--help"])
+
+    assert result.exit_code == 0
+    assert "--host" in result.stdout
+    assert "127.0.0.1" in result.stdout
+
+
+def test_api_command_rejects_missing_static_bundle(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        cli_app,
+        ["api", "--static-dir", str(tmp_path / "missing")],
+    )
+
+    assert result.exit_code != 0
+    assert "index.html" in result.output
+
+
+def test_spa_static_files_falls_back_only_for_browser_routes(tmp_path: Path) -> None:
+    static_dir = tmp_path / "web-dist"
+    static_dir.mkdir()
+    (static_dir / "index.html").write_text('<div id="app"></div>', encoding="utf-8")
+    app = FastAPI()
+    app.mount("/", _SPAStaticFiles(directory=static_dir, html=True), name="web")
+    client = TestClient(app)
+
+    assert client.get("/runs/example").status_code == 200
+    assert client.get("/missing.js").status_code == 404
+    assert client.get("/api/v1/missing").status_code == 404

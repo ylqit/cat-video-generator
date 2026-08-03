@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ElMessage } from "element-plus";
+import { ElMessage, ElMessageBox } from "element-plus";
 import { computed, onMounted, ref } from "vue";
 
 import { api, ApiError } from "../api/client";
@@ -76,14 +76,61 @@ const diagnostics = computed(() => {
 
 const trackedJobs = computed(() => Object.values(jobs.byDedupKey));
 
-/** 规划审核/失败时可恢复规划（付费闸）。 */
-async function resumePlanning() {
+/** 从被技术审核拒绝的最新导演步骤定位需要人工重规划的时段。 */
+const planningReviewSlot = computed(() => {
+  if (graph.value?.run.status !== "planning_review") {
+    return null;
+  }
+  const rejectedStepIds = new Set(
+    graph.value.reviews
+      .filter(
+        (review) =>
+          review.decision === "rejected" &&
+          review.evidence.phase === "episode_contract",
+      )
+      .map((review) => review.stepId),
+  );
+  const step = [...graph.value.steps]
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .find(
+      (item) =>
+        rejectedStepIds.has(item.id) &&
+        item.operationKey.startsWith("director:episode:"),
+    );
+  const slot = step?.operationKey.split(":").at(-1);
+  return slot && ["morning", "noon", "evening"].includes(slot) ? slot : null;
+});
+
+/** 规划审核必须明确给出人工原因并再次确认付费，不能误走初始规划恢复。 */
+async function replanFailedEpisode() {
+  if (!planningReviewSlot.value) {
+    ElMessage.error("无法定位失败时段，请在工作流步骤中查看审核记录");
+    return;
+  }
   try {
-    const accepted = await api.resumePlanning(props.id, true);
+    const { value: reason } = await ElMessageBox.prompt(
+      `重新调用${planningReviewSlot.value}时段导演会产生一次Ark付费请求，请说明修正目标。`,
+      "重规划失败时段",
+      {
+        confirmButtonText: "确认付费并重规划",
+        cancelButtonText: "取消",
+        inputValue: "保留主事件，减少重复描述，使执行Prompt聚焦且满足长度预算",
+        inputValidator: (value) => Boolean(value.trim()) || "必须填写重规划原因",
+      },
+    );
+    const accepted = await api.replanEpisode(
+      props.id,
+      planningReviewSlot.value,
+      reason.trim(),
+      true,
+    );
     jobs.track(accepted);
-    ElMessage.success("恢复规划任务已提交");
+    ElMessage.success(`${planningReviewSlot.value}时段重规划任务已提交`);
     await refresh();
   } catch (error) {
+    if (error === "cancel" || error === "close") {
+      return;
+    }
     ElMessage.error(error instanceof ApiError ? error.message : String(error));
   }
 }
@@ -119,12 +166,12 @@ onMounted(() => {
       <span class="muted">{{ graph.run.theme }}</span>
       <div style="flex: 1" />
       <el-button
-        v-if="graph.run.status === 'planning_review'"
+        v-if="planningReviewSlot"
         size="small"
         type="warning"
-        @click="resumePlanning"
+        @click="replanFailedEpisode"
       >
-        恢复规划
+        重规划{{ planningReviewSlot }}时段
       </el-button>
       <el-button size="small" @click="resume">恢复在途任务</el-button>
       <GenerateButton

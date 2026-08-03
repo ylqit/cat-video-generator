@@ -20,11 +20,6 @@ from ..application.ports import GatewayError
 from ..domain.contracts import Slot
 from ..domain.pipeline import PipelineSettings, StageMode
 from .api_helpers import _accepted, _jsonable, _submit
-from .api_studio import (
-    build_plan_payload,
-    chain_after_planning,
-    maybe_continue_video,
-)
 from .api_schemas import (
     CANON_ROLES as _CANON_ROLES,
 )
@@ -50,6 +45,11 @@ from .api_schemas import (
     ReplanRequest,
     RetryStepRequest,
     ReviewRequest,
+)
+from .api_studio import (
+    build_plan_payload,
+    chain_after_planning,
+    maybe_continue_video,
 )
 from .jobs import JobRegistry
 
@@ -319,7 +319,15 @@ def create_write_router(
                 reason=request.reason,
                 allow_paid_generation=True,
             )
-            return _jsonable(result)
+            payload: dict[str, Any] = {"replan": _jsonable(result)}
+            status = str(queries.run_graph(run_id)["run"]["status"])
+            # 方案已定稿时按流水线开关自动推进后续节点，与plan job行为一致；
+            # 未定稿（回draft等剩余时段）只返回重规划结果。
+            if status in {"planned", "generating", "reviewing"}:
+                settings = queries.pipeline_settings(run_id)
+                payload["runId"] = str(run_id)
+                return chain_after_planning(production, run_id, settings, payload)
+            return payload
 
         record = _submit(
             job_registry,

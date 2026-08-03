@@ -6,7 +6,7 @@
 uv run cvg api
 ```
 
-默认监听 `http://127.0.0.1:8765`。`--read-only` 只启用查询路由；`--static-dir web/dist` 可托管前端构建产物。
+默认监听 `http://127.0.0.1:8765`。`--host` 可显式修改监听地址；Docker 使用 `--host 0.0.0.0`。`--read-only` 只启用查询路由；`--static-dir web/dist` 可托管前端构建产物，并要求目录中存在 `index.html`。
 
 ## 查询路由
 
