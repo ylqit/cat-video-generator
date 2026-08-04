@@ -112,9 +112,14 @@ class RuntimeSettings:
     ark_review_model: str
     ark_structured_output_mode: str
     ark_video_resolution: str
+    ark_director_request_timeout_seconds: float
+    ark_review_request_timeout_seconds: float
+    ark_video_api_timeout_seconds: float
     ark_poll_interval_seconds: float
     ark_task_timeout_seconds: float
     ark_image_request_timeout_seconds: float
+    ark_image_timeout_auto_retries: int
+    ark_image_retry_delay_seconds: float
     candidate_count: int
     storyboard_review_mode: StoryboardReviewMode
     video_semantic_review_mode: str
@@ -134,14 +139,42 @@ class RuntimeSettings:
         config_root: Path | None = None,
     ) -> RuntimeSettings:
         values = os.environ if environ is None else environ
+        director_request_timeout = float(
+            _number(values, "ARK_DIRECTOR_REQUEST_TIMEOUT_SECONDS", "240", float)
+        )
+        review_request_timeout = float(
+            _number(values, "ARK_REVIEW_REQUEST_TIMEOUT_SECONDS", "240", float)
+        )
+        video_api_timeout = float(
+            _number(values, "ARK_VIDEO_API_TIMEOUT_SECONDS", "120", float)
+        )
         poll_interval = float(_number(values, "ARK_POLL_INTERVAL_SECONDS", "10", float))
         timeout = float(_number(values, "ARK_TASK_TIMEOUT_SECONDS", "1800", float))
         image_request_timeout = float(
             _number(values, "ARK_IMAGE_REQUEST_TIMEOUT_SECONDS", "600", float)
         )
+        image_timeout_auto_retries = int(
+            _number(values, "ARK_IMAGE_TIMEOUT_AUTO_RETRIES", "1", int)
+        )
+        image_retry_delay = float(
+            _number(values, "ARK_IMAGE_RETRY_DELAY_SECONDS", "15", float)
+        )
         candidate_count = int(_number(values, "DAILY_PLAN_CANDIDATE_COUNT", "1", int))
-        if poll_interval <= 0 or timeout <= 0 or image_request_timeout <= 0:
+        if any(
+            value <= 0
+            for value in (
+                director_request_timeout,
+                review_request_timeout,
+                video_api_timeout,
+                poll_interval,
+                timeout,
+                image_request_timeout,
+                image_retry_delay,
+            )
+        ):
             raise ConfigurationError("Ark轮询间隔和请求超时必须大于0")
+        if image_timeout_auto_retries not in {0, 1}:
+            raise ConfigurationError("ARK_IMAGE_TIMEOUT_AUTO_RETRIES只允许0或1")
         if candidate_count != 1:
             raise ConfigurationError("分层导演模式下DAILY_PLAN_CANDIDATE_COUNT必须为1")
         review_mode_value = (
@@ -216,9 +249,14 @@ class RuntimeSettings:
             )
             .strip()
             .lower(),
+            ark_director_request_timeout_seconds=director_request_timeout,
+            ark_review_request_timeout_seconds=review_request_timeout,
+            ark_video_api_timeout_seconds=video_api_timeout,
             ark_poll_interval_seconds=poll_interval,
             ark_task_timeout_seconds=timeout,
             ark_image_request_timeout_seconds=image_request_timeout,
+            ark_image_timeout_auto_retries=image_timeout_auto_retries,
+            ark_image_retry_delay_seconds=image_retry_delay,
             candidate_count=candidate_count,
             storyboard_review_mode=storyboard_review_mode,
             video_semantic_review_mode=video_review_mode,
@@ -300,7 +338,14 @@ class RuntimeSettings:
             "arkPlanningModel": self.ark_planning_model,
             "arkReviewModel": self.ark_review_model,
             "arkVideoResolution": self.ark_video_resolution,
+            "arkDirectorRequestTimeoutSeconds": self.ark_director_request_timeout_seconds,
+            "arkReviewRequestTimeoutSeconds": self.ark_review_request_timeout_seconds,
+            "arkVideoApiTimeoutSeconds": self.ark_video_api_timeout_seconds,
+            "arkPollIntervalSeconds": self.ark_poll_interval_seconds,
+            "arkTaskTimeoutSeconds": self.ark_task_timeout_seconds,
             "arkImageRequestTimeoutSeconds": self.ark_image_request_timeout_seconds,
+            "arkImageTimeoutAutoRetries": self.ark_image_timeout_auto_retries,
+            "arkImageRetryDelaySeconds": self.ark_image_retry_delay_seconds,
             "storyboardReviewMode": self.storyboard_review_mode.value,
             "videoSemanticReviewMode": self.video_semantic_review_mode,
             "configurationWarnings": list(self.configuration_warnings),

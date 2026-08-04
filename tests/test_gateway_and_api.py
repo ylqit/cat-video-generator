@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from conftest import episode_for
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -18,13 +19,15 @@ from cat_video_generator.domain.contracts import Slot
 from cat_video_generator.domain.rendering import MediaSource, VideoInputMode, build_video_input_plan
 from cat_video_generator.infrastructure.ark.gateway import ArkGateway
 from cat_video_generator.infrastructure.db.models import (
+    Asset,
     Episode,
     ProductionRun,
     Review,
     WorkflowStep,
 )
 from cat_video_generator.infrastructure.db.query_repository import _current_stage, _workflow_nodes
-from cat_video_generator.interfaces.api import _SPAStaticFiles
+from cat_video_generator.infrastructure.db.records import run_dict, step_dict
+from cat_video_generator.interfaces.api import _SPAStaticFiles, create_app
 from cat_video_generator.interfaces.api_schemas import GenerateRequest, RetryStepRequest
 from cat_video_generator.interfaces.cli import app as cli_app
 
@@ -124,11 +127,52 @@ def test_gateway_requests_seedream_group_images(tmp_path) -> None:
     assert images.serialized_options == {"max_images": 3}
 
 
+def test_gateway_lists_video_tasks_with_configured_timeout(tmp_path) -> None:
+    class ListTasks:
+        def __init__(self) -> None:
+            self.kwargs = None
+
+        def list(self, **kwargs):
+            self.kwargs = kwargs
+            return SimpleNamespace(
+                items=[
+                    SimpleNamespace(
+                        id="task-list-1",
+                        status="running",
+                        model="doubao-seedance-2-0-mini-260615",
+                        created_at=1_786_000_000,
+                        duration=9,
+                        ratio="9:16",
+                        resolution="720p",
+                        generate_audio=True,
+                        content=None,
+                        error=None,
+                    )
+                ]
+            )
+
+    tasks = ListTasks()
+    client = SimpleNamespace(content_generation=SimpleNamespace(tasks=tasks))
+    results = ArkGateway(runtime(tmp_path), client=client).list_video_tasks(
+        model="doubao-seedance-2-0-mini-260615"
+    )
+
+    assert [item.task_id for item in results] == ["task-list-1"]
+    assert results[0].duration_seconds == 9
+    assert tasks.kwargs == {
+        "page_num": 1,
+        "page_size": 100,
+        "model": "doubao-seedance-2-0-mini-260615",
+        "timeout": 120.0,
+    }
+
+
 def test_removed_http_flags_are_not_accepted() -> None:
     assert set(GenerateRequest.model_fields) == {"slot", "allow_paid_generation"}
     assert set(RetryStepRequest.model_fields) == {
         "reason",
         "allow_paid_generation",
+        "acknowledge_duplicate_billing",
     }
 
 
@@ -161,6 +205,32 @@ def test_spa_static_files_falls_back_only_for_browser_routes(tmp_path: Path) -> 
     assert client.get("/runs/example").status_code == 200
     assert client.get("/missing.js").status_code == 404
     assert client.get("/api/v1/missing").status_code == 404
+
+
+def test_health_exposes_timeouts_without_secrets(tmp_path: Path) -> None:
+    query = SimpleNamespace(
+        health=lambda: {
+            "database": "test",
+            "user": "postgres",
+            "alembicRevision": "0009",
+            "expectedAlembicRevision": "0009",
+            "ready": True,
+        }
+    )
+    app = create_app(
+        query,
+        allowed_media_roots=(tmp_path,),
+        runtime_report={
+            "arkImageRequestTimeoutSeconds": 600,
+            "arkTaskTimeoutSeconds": 1800,
+        },
+    )
+    payload = TestClient(app).get("/api/v1/health").json()
+
+    assert payload["arkImageRequestTimeoutSeconds"] == 600
+    assert payload["arkTaskTimeoutSeconds"] == 1800
+    assert "arkApiKey" not in payload
+    assert "databasePassword" not in payload
 
 
 def test_workflow_node_separates_provider_contract_and_semantic_status() -> None:
@@ -263,3 +333,189 @@ def test_failed_storyboard_blocks_review_and_keeps_storyboard_stage() -> None:
     assert review_node["semanticReviewStatus"] == "not_started"
     assert review_node["error"]["code"] == "provider_request_serialization_failed"
     assert _current_stage(run, (episode,), (step,), ()) == "storyboard"
+
+
+def test_replanned_storyboard_uses_newest_step_instead_of_largest_attempt() -> None:
+    now = datetime.now(UTC)
+    run_id = uuid.uuid4()
+    episode_id = uuid.uuid4()
+
+    def storyboard_step(*, attempt: int, created_at: datetime) -> WorkflowStep:
+        return WorkflowStep(
+            id=uuid.uuid4(),
+            production_run_id=run_id,
+            episode_id=episode_id,
+            parent_step_id=None,
+            kind="image",
+            status="failed",
+            attempt=attempt,
+            operation_key="image:storyboard",
+            idempotency_key=uuid.uuid4().hex.ljust(64, "0"),
+            provider="volcengine-ark-standard",
+            provider_task_id=None,
+            model="seedream",
+            input_hash=uuid.uuid4().hex.ljust(64, "0"),
+            input_snapshot_json={},
+            error_json={"code": "review_rejected", "message": "rejected"},
+            created_at=created_at,
+            updated_at=created_at,
+        )
+
+    old_script_retry = storyboard_step(attempt=2, created_at=now)
+    new_script_first_attempt = storyboard_step(
+        attempt=1,
+        created_at=now + timedelta(seconds=1),
+    )
+    episode = Episode(
+        id=episode_id,
+        production_run_id=run_id,
+        slot="morning",
+        sort_order=1,
+        script_json=episode_for(Slot.MORNING).script.model_dump(mode="json"),
+        prompt_overrides_json=None,
+        status="failed",
+        selected_video_asset_id=None,
+        created_at=now,
+        updated_at=now,
+    )
+    old_asset = Asset(
+        id=uuid.uuid4(),
+        production_run_id=run_id,
+        episode_id=episode_id,
+        producing_step_id=old_script_retry.id,
+        role="storyboard_panel",
+        semantic_key="storyboard:panel-01",
+        scope="episode",
+        status="rejected",
+        media_type="image",
+        local_path="old.png",
+        sha256="a" * 64,
+        byte_size=1,
+        metadata_json={"panelOrdinal": 1},
+        created_at=now,
+    )
+    new_asset = Asset(
+        id=uuid.uuid4(),
+        production_run_id=run_id,
+        episode_id=episode_id,
+        producing_step_id=new_script_first_attempt.id,
+        role="storyboard_panel",
+        semantic_key="storyboard:panel-01",
+        scope="episode",
+        status="rejected",
+        media_type="image",
+        local_path="new.png",
+        sha256="b" * 64,
+        byte_size=1,
+        metadata_json={"panelOrdinal": 1},
+        created_at=now + timedelta(seconds=1),
+    )
+
+    nodes = _workflow_nodes(
+        (episode,),
+        (old_script_retry, new_script_first_attempt),
+        (),
+        (old_asset, new_asset),
+        (),
+    )
+    node = next(item for item in nodes if item["id"] == "storyboard:morning")
+
+    assert node["stepId"] == str(new_script_first_attempt.id)
+    assert node["assetIds"] == [str(new_asset.id)]
+    assert [item["id"] for item in node["attempts"]] == [
+        str(old_script_retry.id),
+        str(new_script_first_attempt.id),
+    ]
+
+
+@pytest.mark.parametrize("status", ["failed", "expired", "cancelled"])
+def test_terminal_media_steps_advertise_explicit_retry(status: str) -> None:
+    now = datetime.now(UTC)
+    step = WorkflowStep(
+        id=uuid.uuid4(),
+        production_run_id=uuid.uuid4(),
+        episode_id=uuid.uuid4(),
+        parent_step_id=None,
+        kind="video",
+        status=status,
+        attempt=1,
+        operation_key="video:single_pass",
+        idempotency_key=uuid.uuid4().hex.ljust(64, "0"),
+        provider="volcengine-ark-standard",
+        provider_task_id="task-old",
+        model="seedance",
+        input_hash="e" * 64,
+        input_snapshot_json={},
+        error_json={"code": status, "message": status},
+        created_at=now,
+        updated_at=now,
+    )
+
+    assert step_dict(step)["availableActions"] == [
+        {"type": "retry", "label": "重试该节点", "paid": True}
+    ]
+
+
+def test_provider_running_and_unknown_steps_advertise_safe_recovery() -> None:
+    now = datetime.now(UTC)
+
+    def step(*, kind: str, status: str, task_id: str | None):
+        return WorkflowStep(
+            id=uuid.uuid4(),
+            production_run_id=uuid.uuid4(),
+            episode_id=uuid.uuid4(),
+            parent_step_id=None,
+            kind=kind,
+            status=status,
+            attempt=1,
+            operation_key=("video:single_pass" if kind == "video" else "image:storyboard"),
+            idempotency_key=uuid.uuid4().hex.ljust(64, "0"),
+            provider="volcengine-ark-standard",
+            provider_task_id=task_id,
+            model="provider-model",
+            input_hash="f" * 64,
+            input_snapshot_json={},
+            error_json=None,
+            created_at=now,
+            updated_at=now,
+        )
+
+    running = step_dict(step(kind="video", status="running", task_id="task-1"))
+    video_unknown = step_dict(
+        step(kind="video", status="submission_unknown", task_id=None)
+    )
+    image_unknown = step_dict(
+        step(kind="image", status="submission_unknown", task_id=None)
+    )
+
+    assert running["availableActions"][0]["type"] == "continue_query"
+    assert video_unknown["availableActions"][0]["type"] == "reconcile"
+    assert image_unknown["availableActions"][0] == {
+        "type": "retry_unknown_image",
+        "label": "接受风险并重新生成",
+        "paid": True,
+        "requiresDuplicateBillingAck": True,
+    }
+
+
+def test_run_dict_exposes_delivery_as_backend_owned_action() -> None:
+    now = datetime.now(UTC)
+    row = SimpleNamespace(
+        id=uuid.uuid4(),
+        content_date=date(2026, 8, 4),
+        planning_json={"dayBrief": {"theme": "雨后花园"}},
+        status="ready",
+        pipeline_settings_json={
+            "allowPaidGeneration": True,
+            "dayBrief": "auto",
+            "script": "auto",
+            "storyboard": "auto",
+            "video": "auto",
+        },
+        created_at=now,
+        updated_at=now,
+    )
+
+    assert run_dict(row)["availableActions"] == [
+        {"type": "deliver", "label": "构建交付包", "paid": False}
+    ]

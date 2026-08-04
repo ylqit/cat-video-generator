@@ -6,6 +6,7 @@ import hashlib
 import uuid
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -22,7 +23,9 @@ from cat_video_generator.application.ports import (
     StoredStep,
     StoryboardReviewResult,
 )
+from cat_video_generator.application.retry import RetryService
 from cat_video_generator.application.visual_preparation import VisualPreparationService
+from cat_video_generator.domain.continuity import EntityKind
 from cat_video_generator.domain.contracts import Slot
 from cat_video_generator.domain.visual_profiles import (
     DEFAULT_SERIES_VISUAL_PROFILE,
@@ -67,6 +70,28 @@ class StoryboardRepository:
             if item.role == "storyboard_panel"
             and item.step_id in matching_steps
             and item.status in kwargs["statuses"]
+        ]
+        return tuple(sorted(candidates, key=lambda item: item.metadata["panelOrdinal"]))
+
+    def latest_approved_storyboard(
+        self, episode_id: uuid.UUID
+    ) -> tuple[StoredAsset, ...]:
+        successful_steps = [
+            step
+            for step in self.steps
+            if step.episode_id == episode_id
+            and step.operation_key == "image:storyboard"
+            and step.status is StepStatus.SUCCEEDED
+        ]
+        if not successful_steps:
+            return ()
+        latest_step_id = successful_steps[-1].id
+        candidates = [
+            item
+            for item in self.assets
+            if item.step_id == latest_step_id
+            and item.role == "storyboard_panel"
+            and item.status in {"approved", "ready"}
         ]
         return tuple(sorted(candidates, key=lambda item: item.metadata["panelOrdinal"]))
 
@@ -121,6 +146,14 @@ class StoryboardRepository:
     def get_step(self, step_id: uuid.UUID) -> StoredStep:
         return next(item for item in self.steps if item.id == step_id)
 
+    def get_episode(self, run_id: uuid.UUID, slot: Slot) -> StoredEpisode:
+        assert run_id == self.episode.run_id
+        assert slot is self.episode.plan.slot
+        return self.episode
+
+    def next_step_attempt(self, **_: Any) -> int:
+        return max((item.attempt for item in self.steps), default=0) + 1
+
     def set_step_status(self, step_id: uuid.UUID, target: StepStatus, **_: Any) -> None:
         self.steps = [
             replace(item, status=target) if item.id == step_id else item for item in self.steps
@@ -128,7 +161,24 @@ class StoryboardRepository:
 
     def fail_step(self, step_id: uuid.UUID, **kwargs: Any) -> None:
         self.step_errors[step_id] = kwargs
-        self.set_step_status(step_id, StepStatus.FAILED)
+        target = (
+            StepStatus.SUBMISSION_UNKNOWN
+            if kwargs.get("submission_unknown")
+            else StepStatus.FAILED
+        )
+        self.steps = [
+            replace(
+                item,
+                status=target,
+                input_snapshot={
+                    **item.input_snapshot,
+                    **(kwargs.get("input_snapshot_patch") or {}),
+                },
+            )
+            if item.id == step_id
+            else item
+            for item in self.steps
+        ]
 
     def save_asset(self, **kwargs: Any) -> StoredAsset:
         landed = kwargs["landed"]
@@ -245,7 +295,13 @@ def _canon_assets(tmp_path: Path, run_id: uuid.UUID) -> tuple[StoredAsset, ...]:
     )
 
 
-def _service(tmp_path: Path, *, returned: int = 3, approved: bool = True):
+def _service(
+    tmp_path: Path,
+    *,
+    returned: int = 3,
+    approved: bool = True,
+    retry_delay_seconds: float = 15,
+):
     run_id = uuid.uuid4()
     episode = StoredEpisode(
         id=uuid.uuid4(),
@@ -264,10 +320,22 @@ def _service(tmp_path: Path, *, returned: int = 3, approved: bool = True):
         media_probe=StoryboardProbe(),
         provider_name="test",
         storyboard_review_mode="semantic_auto",
+        image_retry_delay_seconds=retry_delay_seconds,
         series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
         style_profile=DEFAULT_STYLE_PROFILE,
     )
     return service, repository, gateway, episode
+
+
+def _timeout_error() -> GatewayError:
+    return GatewayError(
+        "Seedream同步请求超时",
+        code="provider_timeout",
+        retryable=False,
+        submission_unknown=True,
+        request_id="req-timeout",
+        timed_out=True,
+    )
 
 
 def test_episode_creates_one_storyboard_step_and_reuses_approved_group(tmp_path: Path) -> None:
@@ -291,11 +359,28 @@ def test_episode_creates_one_storyboard_step_and_reuses_approved_group(tmp_path:
     assert repository.reviews[0]["warnings"] == [
         {"code": "storyboard_warning", "message": "minor background drift"}
     ]
+    assert repository.episode.status is EpisodeStatus.VIDEO_PENDING
 
     repeated = service.prepare(repository.episode)
     assert repeated is not None
     assert gateway.generate_calls == 1
     assert len(repository.steps) == 1
+
+
+def test_video_phase_uses_latest_approved_retry_group_without_regenerating(
+    tmp_path: Path,
+) -> None:
+    service, repository, gateway, episode = _service(tmp_path)
+    panels = service.prepare(episode)
+    assert panels is not None
+
+    # 模拟显式图片重试使用了不同Prompt：视频阶段仍应消费已经批准的冻结组图，
+    # 而不是重新按最初Prompt哈希生图或回退到旧失败attempt。
+    repository.episode = replace(repository.episode, status=EpisodeStatus.VIDEO_PENDING)
+    frozen = service.approved_storyboard(repository.episode)
+
+    assert [item.id for item in frozen] == [item.id for item in panels]
+    assert gateway.generate_calls == 1
 
 
 def test_incomplete_storyboard_fails_before_video_can_exist(tmp_path: Path) -> None:
@@ -338,3 +423,133 @@ def test_semantic_storyboard_rejection_is_atomic(tmp_path: Path) -> None:
     assert len(panels) == 3
     assert all(item.status == "rejected" for item in panels)
     assert repository.steps[0].status is StepStatus.FAILED
+
+
+def test_pose_only_storyboard_keeps_micro_actions_as_diagnostics(tmp_path: Path) -> None:
+    service, repository, gateway, episode = _service(tmp_path)
+    pose_only = episode.plan.model_copy(
+        update={
+            "script": episode.plan.script.model_copy(
+                update={
+                    "continuity": episode.plan.script.continuity.model_copy(
+                        update={
+                            "entities": [
+                                item
+                                for item in episode.plan.script.continuity.entities
+                                if item.kind in {EntityKind.PERSON, EntityKind.CAT}
+                            ]
+                        }
+                    )
+                }
+            )
+        }
+    )
+    repository.episode = replace(episode, plan=pose_only)
+
+    def pose_drift_only(**_: Any) -> StoryboardReviewResult:
+        return StoryboardReviewResult(
+            identity_ok=True,
+            style_ok=True,
+            action_sequence_ok=False,
+            continuity_ok=False,
+            ending_ok=False,
+            confidence=0.9,
+            violations=("pose drift",),
+            warnings=(),
+            evidence=("same subjects and style",),
+            response_id="review-pose-only",
+            model=gateway.review_model,
+            request_hash="review-pose-only-hash",
+        )
+
+    gateway.review_storyboard = pose_drift_only  # type: ignore[method-assign]
+
+    panels = service.prepare(repository.episode)
+
+    assert panels is not None
+    assert all(item.status == "approved" for item in panels)
+    assert repository.reviews[0]["evidence"]["poseOnlyStoryboardPolicy"] is True
+    assert gateway.generate_calls == 1
+
+
+def test_storyboard_retry_returns_new_step_and_advances_episode(tmp_path: Path) -> None:
+    service, repository, gateway, episode = _service(tmp_path, approved=False)
+    with pytest.raises(RuntimeError, match="语义审核失败"):
+        service.prepare(episode)
+    original_step = replace(
+        repository.steps[0],
+        input_snapshot={
+            key: value
+            for key, value in repository.steps[0].input_snapshot.items()
+            if key != "input_hash"
+        },
+    )
+    gateway.approved = True
+    repository.list_episodes = lambda _: (repository.episode,)  # type: ignore[attr-defined]
+    repository.get_run = lambda _: SimpleNamespace(status="generating")  # type: ignore[attr-defined]
+    repository.get_step = lambda _: original_step  # type: ignore[method-assign]
+    retry = RetryService(
+        repository=repository,  # type: ignore[arg-type]
+        visual_preparation=service,
+        video_execution=object(),  # type: ignore[arg-type]
+    )
+
+    result = retry.retry_step(
+        original_step.id,
+        reason="按审核反馈重试故事板",
+        allow_paid_generation=True,
+    )
+
+    assert result["stepId"] == str(repository.steps[-1].id)
+    assert result["stepId"] != str(original_step.id)
+    assert result["status"] == "approved"
+    assert repository.episode.status is EpisodeStatus.VIDEO_PENDING
+
+
+def test_seedream_timeout_auto_retries_once_and_preserves_unknown_attempt(
+    tmp_path: Path,
+) -> None:
+    service, repository, gateway, episode = _service(
+        tmp_path,
+        retry_delay_seconds=0,
+    )
+    original = gateway.generate_storyboard
+
+    def timeout_once(**kwargs: Any):
+        if gateway.generate_calls == 0:
+            gateway.generate_calls += 1
+            raise _timeout_error()
+        return original(**kwargs)
+
+    gateway.generate_storyboard = timeout_once  # type: ignore[method-assign]
+    panels = service.prepare(episode)
+
+    assert panels is not None
+    assert [item.attempt for item in repository.steps] == [1, 2]
+    assert repository.steps[0].status is StepStatus.SUBMISSION_UNKNOWN
+    assert repository.steps[1].status is StepStatus.SUCCEEDED
+    assert repository.steps[1].input_snapshot["retry_of_step_id"] == str(
+        repository.steps[0].id
+    )
+    assert repository.steps[1].input_snapshot["auto_timeout_retry_index"] == 1
+    assert repository.steps[1].input_snapshot["duplicate_billing_risk_accepted"] is True
+
+
+def test_seedream_second_timeout_stops_without_third_attempt(tmp_path: Path) -> None:
+    service, repository, gateway, episode = _service(
+        tmp_path,
+        retry_delay_seconds=0,
+    )
+
+    def always_timeout(**_: Any):
+        gateway.generate_calls += 1
+        raise _timeout_error()
+
+    gateway.generate_storyboard = always_timeout  # type: ignore[method-assign]
+    with pytest.raises(GatewayError, match="同步请求超时"):
+        service.prepare(episode)
+
+    assert gateway.generate_calls == 2
+    assert [item.attempt for item in repository.steps] == [1, 2]
+    assert all(item.status is StepStatus.SUBMISSION_UNKNOWN for item in repository.steps)
+    assert repository.episode.status is EpisodeStatus.FAILED

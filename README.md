@@ -57,7 +57,7 @@ uv run cvg retry-step <stepId> `
   --allow-paid-generation
 ```
 
-`submission_unknown` 必须先人工对账，不得自动重复 POST。剧情或世界状态需要修改时使用 `replan-episode`，而不是重试媒体任务。
+Seedance 的 `submission_unknown` 必须先通过Ark任务列表人工对账，不得自动重复POST；已有Task ID的任务只继续查询。Seedream是同步接口，超时后无法按Task ID找回，系统默认等待600秒后最多自动创建一次新attempt，并在记录和页面明确标记潜在重复计费。剧情或连续性需要修改时使用 `replan-episode`，而不是重试媒体任务。
 
 ## 角色、画风和故事板
 
@@ -81,7 +81,7 @@ uv run cvg reference import --episode-id <episodeId> `
 
 Seedance默认按顺序接收全部故事板；结尾画面必须精确时只接收首张与末张作为严格首尾帧。Canon不再与故事板重复传给Seedance。通过QC的供应商MP4直接保存，不强制FFmpeg重编码。
 
-## 本机 Web 创作台
+## 本机 Web 生产工作台
 
 ```powershell
 # 终端一
@@ -93,7 +93,7 @@ npm install
 npm run dev
 ```
 
-生产模式可执行 `npm run build` 后运行 `uv run cvg api --static-dir web/dist`。后台 JobRegistry 只负责 HTTP 进程内异步执行，真正状态仍以 PostgreSQL 为准。Linux 服务器可通过单容器 [Docker Compose 部署](docs/workflows/docker-deployment.md)，直接访问 `http://服务器IP:8765`。
+生产模式可执行 `npm run build` 后运行 `uv run cvg api --static-dir web/dist`。工作台统一展示“总导演→三集导演→故事板→视频成片→审核交付”，节点抽屉可查看实际Prompt、输入素材、Provider任务、审核证据和attempt历史。`/runs/:id`会进入同一个工作台；后台 JobRegistry 只负责 HTTP 进程内异步执行，真正状态仍以 PostgreSQL 为准。Linux 服务器可通过单容器 [Docker Compose 部署](docs/workflows/docker-deployment.md)，直接访问 `http://服务器IP:8765`。
 
 ## 文档
 

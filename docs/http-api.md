@@ -39,6 +39,9 @@ POST /api/v1/runs/{runId}/resume
 POST /api/v1/runs/{runId}/resume-planning
 POST /api/v1/runs/{runId}/episodes/{slot}/replan
 POST /api/v1/steps/{stepId}/retry
+POST /api/v1/steps/{stepId}/resume
+GET  /api/v1/steps/{stepId}/reconciliation-candidates
+POST /api/v1/steps/{stepId}/reconcile
 POST /api/v1/assets/{assetId}/review
 POST /api/v1/canon
 POST /api/v1/canon/{assetId}/derive-crop
@@ -50,15 +53,18 @@ POST /api/v1/runs/{runId}/deliver
 
 - 规划、生成和收费重试必须显式提交 `allowPaidGeneration=true`。
 - `generate` 可指定 morning/noon/evening；不提供分段或分辨率实验参数。
-- `retry` 只接受失败、过期或取消的终态 Step；`submission_unknown` 仍冻结。
+- `retry`接受失败、过期或取消的媒体Step并创建`attempt+1`。Seedream同步超时形成的`submission_unknown`只有在请求体额外提交`acknowledgeDuplicateBilling=true`时允许人工再生成。
+- `resume`只查询已有Seedance Task ID，不创建新的生成POST。
+- 视频`submission_unknown`使用`reconciliation-candidates`查询候选，再由用户通过`reconcile`确认绑定；Task ID全局唯一，不可绑定到两个Step。
 - Canon与用户显式上传的Episode元素/场景图片必须携带`semantic_key`；剧情中的逻辑`entityKey`不等于数据库资产键，普通场景没有专用参考图也可生成故事板。
 - 规划和生成返回 `202 {jobId, dedupKey, context}`，其中`context`只包含已知的
   `runId / episodeId / slot / operationKey`。前端轮询 Job 与 Run graph，失败上下文
   会持续展示并支持定位节点。
 - 最终视频由人工审核，API 不会自动完成交付。
 
-创作台页签由URL保存：`/studio?run=<runId>&stage=storyboard`。后端工作流阶段与
-当前浏览页签相互独立，后台轮询不会把用户强制切回“三集剧本”。
+工作台定位由URL保存：`/studio?run=<runId>&stage=storyboard&slot=morning&node=storyboard:morning`。后端工作流阶段与当前浏览页签相互独立，后台轮询不会覆盖用户选择。`/runs/{runId}`只负责跳转到该统一工作台。
+
+`GET /health`除数据库迁移状态外，还只读返回当前生效的导演、图片、审核、视频API和视频监看超时；不返回Key、密码或连接串。
 
 JobRegistry 只在本进程执行后台函数和去重活跃请求；Run、Episode、Step、Prompt、Asset 的持久状态全部来自 PostgreSQL。
 

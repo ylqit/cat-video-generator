@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -37,6 +38,9 @@ class ImageInputSnapshot(StrictModel):
     retry_of_step_id: UUID | None = None
     retry_reason: str | None = None
     provider_task_status: str | None = None
+    request_timeout_seconds: float | None = None
+    auto_timeout_retry_index: Annotated[int, Field(ge=0, le=1)] = 0
+    duplicate_billing_risk_accepted: bool = False
 
 
 class VideoInputSnapshot(StrictModel):
@@ -46,7 +50,15 @@ class VideoInputSnapshot(StrictModel):
     input_asset_ids: tuple[UUID, ...]
     retry_of_step_id: UUID | None = None
     retry_reason: str | None = None
+    api_request_timeout_seconds: float | None = None
+    task_timeout_seconds: float | None = None
+    poll_interval_seconds: float | None = None
     provider_task_status: str | None = None
+    polling_window_ended_at: datetime | None = None
+    reconciliation_candidates: tuple[dict[str, object | None], ...] = ()
+    reconciliation_queried_at: datetime | None = None
+    reconciled_provider_task_id: str | None = None
+    reconciled_at: datetime | None = None
 
 
 StepInputSnapshot = Annotated[

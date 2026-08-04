@@ -162,4 +162,6 @@ def test_directors_are_four_separate_contract_prompts(daily_plan) -> None:
     assert "EpisodeScript" not in day_prompt
     assert "EpisodeScript" in episode_prompt
     assert "SceneContinuity" in episode_prompt
+    assert "首个动作" in episode_prompt
+    assert "start_state" in episode_prompt
     assert "全天三个" not in episode_prompt

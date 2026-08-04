@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -56,6 +56,12 @@ class VideoTaskResult:
     video_url: str | None = None
     error_code: str | None = None
     error_message: str | None = None
+    model: str | None = None
+    created_at: datetime | None = None
+    duration_seconds: int | None = None
+    ratio: str | None = None
+    resolution: str | None = None
+    generate_audio: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +127,8 @@ class StoredStep:
     model: str | None
     operation_key: str
     input_snapshot: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime | None = None
+    submitted_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,11 +194,15 @@ class GatewayError(RuntimeError):
         code: str,
         retryable: bool,
         submission_unknown: bool = False,
+        request_id: str | None = None,
+        timed_out: bool = False,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.retryable = retryable
         self.submission_unknown = submission_unknown
+        self.request_id = request_id
+        self.timed_out = timed_out
 
 
 class DirectorGateway(Protocol):
@@ -234,6 +246,13 @@ class MediaGenerationGateway(Protocol):
     ) -> VideoTaskResult: ...
 
     def get_video_task(self, task_id: str) -> VideoTaskResult: ...
+
+    def list_video_tasks(
+        self,
+        *,
+        model: str,
+        page_size: int = 100,
+    ) -> tuple[VideoTaskResult, ...]: ...
 
 
 class VisualReviewGateway(Protocol):
@@ -311,9 +330,16 @@ class ProductionStore(Protocol):
     def list_assets(self, **kwargs: Any) -> tuple[StoredAsset, ...]: ...
     def find_reusable_asset(self, **kwargs: Any) -> StoredAsset | None: ...
     def find_reusable_storyboard(self, **kwargs: Any) -> tuple[StoredAsset, ...]: ...
+    def latest_approved_storyboard(
+        self, episode_id: uuid.UUID
+    ) -> tuple[StoredAsset, ...]: ...
     def set_episode_status(self, episode_id: uuid.UUID, target: EpisodeStatus) -> None: ...
     def set_run_status(self, run_id: uuid.UUID, target: RunStatus) -> None: ...
     def set_step_status(self, step_id: uuid.UUID, target: StepStatus, **kwargs: Any) -> None: ...
+    def patch_step_snapshot(self, step_id: uuid.UUID, patch: dict[str, Any]) -> None: ...
+    def find_step_by_provider_task_id(
+        self, provider_task_id: str
+    ) -> StoredStep | None: ...
     def save_asset(self, **kwargs: Any) -> StoredAsset: ...
     def select_video_asset(self, **kwargs: Any) -> None: ...
     def record_review(self, **kwargs: Any) -> uuid.UUID: ...

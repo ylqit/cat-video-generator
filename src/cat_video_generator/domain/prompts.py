@@ -106,6 +106,9 @@ def compile_episode_director_prompt(
             "form_key。form_key只表示类别或固定外观，禁止加入crouch、sniffing、walking等"
             "姿势。人物和猫咪固定persist；其他实体按persist、enter、exit、consume或"
             "transform声明起终态，变化时说明原因。",
+            "首个动作里提到的人物、猫咪和关键道具起点必须逐项等于对应实体的start_state；"
+            "不得同时写成位于窗台和来自地面等互相冲突的位置。后续动作与end_state也必须"
+            "保持同一空间语义。",
             "关键实体不得无原因出现、消失、复制或改变类别；承担发现或结尾回报的实体"
             "必须登记，并在ending.key_entity_ids中引用。跨时段道具使用DayBrief中的同一"
             "entity_key。导演不得生成数据库资产semantic_key。",
@@ -114,7 +117,8 @@ def compile_episode_director_prompt(
             "服装、鞋帽和背包按剧情自然变化。appearance直接描述本时段外观；"
             "若相对前一时段有变化，列入changes_from_previous并给出change_reason，"
             "没有变化时两者保持空值。",
-            "ending必须给出result和key_entity_ids；只有结尾物体状态或构图必须精确锁定"
+            "ending必须给出result和key_entity_ids；key_entity_ids可引用continuity中已登记的"
+            "实体或场景锚点；只有结尾物体状态或构图必须精确锁定"
             "时，才将visual_critical设为true。脚本不选择Seedance输入模式，也不声明"
             "参考素材。",
         )

@@ -10,9 +10,11 @@ import hashlib
 import json
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from ..domain.continuity import EntityKind
 from ..domain.prompts import CompiledPrompt, compile_video_diagnostic_prompt, compile_video_prompt
 from ..domain.rendering import MediaSource, VideoInputMode, build_video_input_plan
 from ..domain.snapshots import VideoInputSnapshot
@@ -29,6 +31,7 @@ from .ports import (
     StoredAsset,
     StoredEpisode,
     StoredStep,
+    VideoTaskResult,
     VisualReviewGateway,
 )
 
@@ -49,6 +52,7 @@ class VideoExecutionService:
         review_gateway: VisualReviewGateway | None = None,
         frame_extractor: ReviewFrameExtractor | None = None,
         diagnostic_mode: str = "off",
+        api_timeout_seconds: float = 120,
         poll_interval_seconds: float = 10,
         task_timeout_seconds: float = 1800,
     ) -> None:
@@ -66,6 +70,7 @@ class VideoExecutionService:
         self._review_gateway = review_gateway
         self._frame_extractor = frame_extractor
         self._diagnostic_mode = diagnostic_mode
+        self._api_timeout = api_timeout_seconds
         self._poll_interval = poll_interval_seconds
         self._task_timeout = task_timeout_seconds
 
@@ -88,7 +93,90 @@ class VideoExecutionService:
     def resume_step(self, episode: StoredEpisode, step: StoredStep) -> dict[str, Any]:
         """只轮询已有task ID；submission_unknown不进入本方法。"""
 
+        if step.kind is not StepKind.VIDEO or step.status not in {
+            StepStatus.QUEUED,
+            StepStatus.RUNNING,
+        }:
+            raise ValueError("continue-query只接受已有task ID的queued/running视频步骤")
         return self._finish(episode, step)
+
+    def reconciliation_candidates(
+        self,
+        step: StoredStep,
+    ) -> tuple[dict[str, Any], ...]:
+        """为创建响应丢失的视频Step筛选近期Ark任务，不自动绑定歧义候选。"""
+
+        if step.kind is not StepKind.VIDEO or step.status is not StepStatus.SUBMISSION_UNKNOWN:
+            raise ValueError("只有submission_unknown视频步骤可以查询对账候选")
+        if step.provider_task_id:
+            raise ValueError("该步骤已经具有provider task ID，应直接继续查询")
+        snapshot = VideoInputSnapshot.model_validate(step.input_snapshot)
+        reference_time = step.submitted_at or step.created_at
+        lower_bound = (
+            None
+            if reference_time is None
+            else reference_time.astimezone(timezone.utc) - timedelta(minutes=5)
+        )
+        upper_bound = (
+            None
+            if reference_time is None
+            else reference_time.astimezone(timezone.utc) + timedelta(minutes=30)
+        )
+        candidates: list[dict[str, Any]] = []
+        for task in self._gateway.list_video_tasks(model=step.model or self._gateway.video_model):
+            if not _matches_reconciliation_task(
+                task,
+                snapshot,
+                model=step.model or self._gateway.video_model,
+                lower_bound=lower_bound,
+                upper_bound=upper_bound,
+            ):
+                continue
+            owner = self._repository.find_step_by_provider_task_id(task.task_id)
+            if owner is not None and owner.id != step.id:
+                continue
+            candidates.append(_task_candidate(task))
+        result = tuple(candidates)
+        self._repository.patch_step_snapshot(
+            step.id,
+            {
+                "reconciliation_candidates": result,
+                "reconciliation_queried_at": datetime.now(timezone.utc),
+            },
+        )
+        return result
+
+    def reconcile_step(
+        self,
+        episode: StoredEpisode,
+        step: StoredStep,
+        *,
+        provider_task_id: str,
+    ) -> dict[str, Any]:
+        """人工确认候选后绑定原Ark任务，并沿同一task ID继续下载与QC。"""
+
+        candidates = self.reconciliation_candidates(step)
+        if provider_task_id not in {item["taskId"] for item in candidates}:
+            raise ValueError("所选Task ID不属于当前步骤的可对账候选")
+        owner = self._repository.find_step_by_provider_task_id(provider_task_id)
+        if owner is not None and owner.id != step.id:
+            raise ValueError("该Ark Task ID已绑定其他WorkflowStep")
+        now = datetime.now(timezone.utc)
+        self._repository.set_step_status(
+            step.id,
+            StepStatus.QUEUED,
+            provider_task_id=provider_task_id,
+            input_snapshot_patch={
+                "provider_task_status": "reconciled",
+                "reconciled_provider_task_id": provider_task_id,
+                "reconciled_at": now,
+            },
+        )
+        if episode.status is EpisodeStatus.FAILED:
+            self._repository.set_episode_status(episode.id, EpisodeStatus.VIDEO_PENDING)
+            self._repository.set_episode_status(episode.id, EpisodeStatus.VIDEO_GENERATING)
+            episode = self._repository.get_episode(episode.run_id, episode.plan.slot)
+        return self._finish(episode, self._repository.get_step(step.id))
 
     def retry_video(
         self,
@@ -158,9 +246,13 @@ class VideoExecutionService:
             for item in ordered_storyboard
         ):
             raise ValueError("Seedance只能使用完整且已批准的故事板面板")
+        has_critical_prop = any(
+            item.kind is EntityKind.PROP
+            for item in episode.plan.script.continuity.entities
+        )
         input_mode = (
             VideoInputMode.STRICT_FIRST_LAST
-            if episode.plan.script.ending.visual_critical
+            if episode.plan.script.ending.visual_critical and has_critical_prop
             else VideoInputMode.STORYBOARD_REFERENCE
         )
         selected_inputs = (
@@ -195,6 +287,9 @@ class VideoExecutionService:
             input_asset_ids=tuple(item.id for item in ordered_inputs),
             retry_of_step_id=retry_of_step_id,
             retry_reason=retry_reason,
+            api_request_timeout_seconds=self._api_timeout,
+            task_timeout_seconds=self._task_timeout,
+            poll_interval_seconds=self._poll_interval,
         )
         step, _ = self._repository.create_step_with_prompt_intent(
             run_id=episode.run_id,
@@ -240,8 +335,15 @@ class VideoExecutionService:
                 code=exc.code,
                 message=str(exc),
                 submission_unknown=exc.submission_unknown,
+                request_id=exc.request_id,
+                input_snapshot_patch={
+                    "provider_task_status": (
+                        "submission_unknown" if exc.submission_unknown else "failed"
+                    )
+                },
             )
-            self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
+            if not exc.submission_unknown:
+                self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
             raise
         self._repository.set_step_status(
             step.id,
@@ -285,7 +387,21 @@ class VideoExecutionService:
                 self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
                 raise RuntimeError(task.error_message or "Seedance任务失败")
             return self._land_video(episode, step, task.video_url)
-        raise TimeoutError("等待Seedance任务超时，可稍后使用resume恢复")
+        ended_at = datetime.now(timezone.utc)
+        self._repository.patch_step_snapshot(
+            step.id,
+            {
+                "provider_task_status": "polling_window_elapsed",
+                "polling_window_ended_at": ended_at,
+            },
+        )
+        return {
+            "episodeId": str(episode.id),
+            "slot": episode.plan.slot.value,
+            "stepId": str(step.id),
+            "status": "provider_running",
+            "message": "本地监看窗口结束，Ark任务仍可按原Task ID继续查询",
+        }
 
     def _land_video(
         self,
@@ -457,4 +573,47 @@ def _episode_result(episode: StoredEpisode, message: str) -> dict[str, Any]:
         "slot": episode.plan.slot.value,
         "status": episode.status.value,
         "message": message,
+    }
+
+
+def _matches_reconciliation_task(
+    task: VideoTaskResult,
+    snapshot: VideoInputSnapshot,
+    *,
+    model: str,
+    lower_bound: datetime | None,
+    upper_bound: datetime | None,
+) -> bool:
+    """只按Ark任务列表实际可返回的稳定规格筛选，不推测Prompt等不可见字段。"""
+
+    if task.model is not None and task.model != model:
+        return False
+    if task.duration_seconds is not None and (
+        task.duration_seconds != snapshot.input_plan.duration_seconds
+    ):
+        return False
+    if task.resolution is not None and task.resolution != snapshot.input_plan.resolution:
+        return False
+    if task.ratio is not None and task.ratio != "9:16":
+        return False
+    if task.generate_audio is not None and task.generate_audio is not True:
+        return False
+    if task.created_at is not None:
+        if lower_bound is not None and task.created_at < lower_bound:
+            return False
+        if upper_bound is not None and task.created_at > upper_bound:
+            return False
+    return True
+
+
+def _task_candidate(task: VideoTaskResult) -> dict[str, Any]:
+    return {
+        "taskId": task.task_id,
+        "status": task.status,
+        "model": task.model,
+        "createdAt": None if task.created_at is None else task.created_at.isoformat(),
+        "durationSeconds": task.duration_seconds,
+        "ratio": task.ratio,
+        "resolution": task.resolution,
+        "generateAudio": task.generate_audio,
     }

@@ -30,6 +30,14 @@ ARK_IMAGE_MODEL
 ARK_VIDEO_MODEL
 ARK_REVIEW_MODEL
 ARK_VIDEO_RESOLUTION=480p|720p
+ARK_DIRECTOR_REQUEST_TIMEOUT_SECONDS=240
+ARK_IMAGE_REQUEST_TIMEOUT_SECONDS=600
+ARK_IMAGE_TIMEOUT_AUTO_RETRIES=1
+ARK_IMAGE_RETRY_DELAY_SECONDS=15
+ARK_REVIEW_REQUEST_TIMEOUT_SECONDS=240
+ARK_VIDEO_API_TIMEOUT_SECONDS=120
+ARK_TASK_TIMEOUT_SECONDS=1800
+ARK_POLL_INTERVAL_SECONDS=10
 
 STORYBOARD_REVIEW_MODE=semantic_auto|manual
 MEDIA_WORK_ROOT
@@ -45,7 +53,7 @@ uv run alembic upgrade head
 uv run cvg doctor
 ```
 
-正式 Schema 当前必须位于 `0006_core_simplification`。Doctor 还会检查标准 Ark 配置、ffmpeg/ffprobe、Canon 数量和事件种子目录。
+正式 Schema 当前必须位于 `0009_storyboard_prompt_purposes`。Doctor 还会检查标准 Ark 配置、ffmpeg/ffprobe、Canon 数量、事件种子目录和全部Ark超时参数。
 
 当前明文数据库只有在以下配置同时成立时才允许正式运行：
 
@@ -104,8 +112,9 @@ uv run cvg retry-step <stepId> `
 uv run cvg resume <runId>
 ```
 
-- `retry-step` 只接受 failed、expired、cancelled。
-- `submission_unknown` 必须对账，不能重试。
+- `retry-step`通常只接受failed、expired、cancelled，并创建新的attempt。
+- Seedance `submission_unknown`必须通过Web节点对账，不能普通重试；已有Task ID时使用“继续查询”。
+- Seedream同步超时不能查询原任务；系统默认最多自动重试一次。再次人工生成必须在Web明确接受原请求可能已计费。
 - 被拒绝故事板不会复用；新attempt保留旧组图和审核结论。
 - 导演JSON解析或必填字段缺失最多自动结构修复一次；可解析脚本的语义审核失败会进入`planning_review`，必须由用户显式点击重规划。
 - `resume` 只恢复已有 task ID 的轮询、下载或 QC，不重复创建收费 POST。
@@ -158,7 +167,9 @@ uv run cvg api --static-dir web/dist
 | `planning_review` | 查看矛盾后运行 `replan-episode` 或 `resume-planning` |
 | 故事板少图或语义失败 | 使用`retry-step`创建新attempt，不覆盖旧组图与审核 |
 | 视频 Step 失败 | 明确原因后显式付费重试；`run-day` 不代替重试 |
-| `submission_unknown` | 人工对账 Ark 任务，禁止重复 POST |
+| Seedance `submission_unknown` | 在工作台节点查询候选并确认Task ID，禁止重复POST |
+| Seedream同步超时 | 查看两个attempt与重复计费警告；自动重试用尽后再决定是否人工生成 |
+| 本地视频监看窗口结束 | 点击“继续查询”恢复同一Task ID，不创建第二次收费任务 |
 | ffprobe 失败 | 检查路径、容器和文件完整性，不重新提交 Seedance |
 | 交付被拒绝 | 确认三个 slot 都有已批准且 ready 的视频资产 |
 

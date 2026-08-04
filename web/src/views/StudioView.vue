@@ -3,10 +3,11 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
-import { api, ApiError } from "../api/client";
+import { api, assetContentUrl, ApiError } from "../api/client";
 import type {
   EpisodeDto,
   EpisodePromptPreview,
+  HealthStatus,
   Job,
   PipelineSettings,
   PromptDto,
@@ -14,13 +15,16 @@ import type {
   RunGraph,
   StageMode,
   StepDto,
+  WorkflowNodeDto,
 } from "../api/types";
 import AssetReviewPanel from "../components/AssetReviewPanel.vue";
 import AssetThumb from "../components/AssetThumb.vue";
 import DayBriefPanel from "../components/DayBriefPanel.vue";
+import DeliveryPanel from "../components/DeliveryPanel.vue";
 import PromptCollapse from "../components/PromptCollapse.vue";
 import ScriptEditorPanel from "../components/ScriptEditorPanel.vue";
 import StatusBadge from "../components/StatusBadge.vue";
+import WorkflowNodeDrawer from "../components/WorkflowNodeDrawer.vue";
 import { usePolling } from "../composables/usePolling";
 import { useJobsStore } from "../stores/jobs";
 
@@ -34,19 +38,19 @@ const SLOT_LABEL: Record<string, string> = {
   evening: "晚间",
 };
 const STAGE_LABEL: Record<string, string> = {
-  dayBrief: "主题",
-  dayBriefReview: "日导演",
-  script: "三集剧本",
+  dayBrief: "总导演",
+  dayBriefReview: "总导演",
+  script: "三集导演",
   storyboard: "故事板",
   video: "视频成片",
-  done: "视频成片",
+  done: "审核交付",
 };
 const STAGE_INDEX: Record<string, number> = {
   dayBrief: 0,
-  dayBriefReview: 1,
-  script: 2,
-  storyboard: 3,
-  video: 4,
+  dayBriefReview: 0,
+  script: 1,
+  storyboard: 2,
+  video: 3,
   done: 4,
 };
 const STAGE_TAB: Record<string, string> = {
@@ -54,7 +58,7 @@ const STAGE_TAB: Record<string, string> = {
   script: "scripts",
   storyboard: "storyboard",
   video: "video",
-  done: "video",
+  done: "review",
 };
 
 const form = reactive({
@@ -73,11 +77,16 @@ const submitting = ref(false);
 const runId = ref<string | null>((route.query.run as string) || null);
 const graph = ref<RunGraph | null>(null);
 const loadingGraph = ref(false);
-const TAB_NAMES = new Set(["brief", "scripts", "storyboard", "video"]);
+const TAB_NAMES = new Set(["brief", "scripts", "storyboard", "video", "review"]);
 const initialStage = typeof route.query.stage === "string" ? route.query.stage : "";
 const activeTab = ref(TAB_NAMES.has(initialStage) ? initialStage : "brief");
 const initializedTabRunId = ref<string | null>(null);
 const persistentFailure = ref<Job["error"]>(null);
+const health = ref<HealthStatus | null>(null);
+const selectedNodeId = ref(
+  typeof route.query.node === "string" ? route.query.node : "",
+);
+const nodeDrawerVisible = ref(Boolean(selectedNodeId.value));
 
 const previews = reactive<Record<string, EpisodePromptPreview>>({});
 const drafts = reactive<Record<string, { storyboard: string; video: string }>>({});
@@ -111,6 +120,103 @@ const stageIndex = computed(() => STAGE_INDEX[currentStage.value] ?? 0);
 const episodes = computed(() =>
   [...(graph.value?.episodes ?? [])].sort((a, b) => a.sortOrder - b.sortOrder),
 );
+const workflowNodes = computed(() => graph.value?.workflowNodes ?? []);
+const selectedNode = computed(
+  () => workflowNodes.value.find((item) => item.id === selectedNodeId.value) ?? null,
+);
+const workflowGroups = computed(() => [
+  {
+    key: "brief",
+    label: "总导演",
+    nodes: workflowNodes.value.filter((item) => item.id === "director:day"),
+  },
+  {
+    key: "scripts",
+    label: "三集导演",
+    nodes: workflowNodes.value.filter(
+      (item) => item.type === "director" && item.slot !== null,
+    ),
+  },
+  {
+    key: "storyboard",
+    label: "故事板",
+    nodes: workflowNodes.value.filter(
+      (item) => item.type === "storyboard" || item.type === "storyboard_review",
+    ),
+  },
+  {
+    key: "video",
+    label: "视频成片",
+    nodes: workflowNodes.value.filter((item) => item.type === "video"),
+  },
+  {
+    key: "review",
+    label: "审核与交付",
+    nodes: workflowNodes.value.filter((item) => item.type === "content_review"),
+  },
+]);
+
+function openNode(node: WorkflowNodeDto) {
+  selectedNodeId.value = node.id;
+  nodeDrawerVisible.value = true;
+  activeTab.value =
+    node.type === "director"
+      ? node.slot === null
+        ? "brief"
+        : "scripts"
+      : node.type === "storyboard" || node.type === "storyboard_review"
+        ? "storyboard"
+        : node.type === "video"
+          ? "video"
+          : "review";
+  void router.replace({
+    query: {
+      ...route.query,
+      run: runId.value ?? undefined,
+      stage: activeTab.value,
+      slot: node.slot ?? undefined,
+      node: node.id,
+    },
+  });
+}
+
+function openEpisodeNode(prefix: string, episode: EpisodeDto) {
+  const node = workflowNodes.value.find(
+    (item) => item.id === `${prefix}:${episode.slot}`,
+  );
+  if (node) {
+    openNode(node);
+  }
+}
+
+function closeNodeDrawer() {
+  nodeDrawerVisible.value = false;
+  selectedNodeId.value = "";
+  const query = { ...route.query };
+  delete query.node;
+  void router.replace({ query });
+}
+
+function setNodeDrawerVisible(value: boolean) {
+  if (value) {
+    nodeDrawerVisible.value = true;
+  } else {
+    closeNodeDrawer();
+  }
+}
+
+function focusReview(step: StepDto) {
+  const episode = episodes.value.find((item) => item.id === step.episodeId);
+  activeTab.value = "review";
+  void router.replace({
+    query: {
+      ...route.query,
+      stage: "review",
+      slot: episode?.slot,
+      node: episode ? `content-review:${episode.slot}` : undefined,
+    },
+  });
+}
 
 const ACTIVE_EPISODE = new Set([
   "preparing_visuals",
@@ -126,8 +232,12 @@ const isActive = computed(
 );
 
 function storyboardAssets(episode: EpisodeDto) {
+  const latestStep = latestStoryboardStep(episode);
   return (graph.value?.assets ?? []).filter(
-    (asset) => asset.episodeId === episode.id && asset.role === "storyboard_panel",
+    (asset) =>
+      asset.episodeId === episode.id &&
+      asset.role === "storyboard_panel" &&
+      asset.stepId === latestStep?.id,
   ).sort(
     (left, right) =>
       Number(left.metadata.panelOrdinal ?? 0) -
@@ -152,7 +262,6 @@ function latestStoryboardStep(episode: EpisodeDto): StepDto | null {
     )
     .sort(
       (left, right) =>
-        right.attempt - left.attempt ||
         right.createdAt.localeCompare(left.createdAt),
     )[0] ?? null;
 }
@@ -299,6 +408,25 @@ function rememberRequestFailure(
 
 function focusFailure() {
   const operationKey = visibleFailure.value?.operationKey ?? "";
+  const slot = visibleFailure.value?.slot;
+  const nodeId = operationKey.startsWith("image:")
+    ? slot
+      ? `storyboard:${slot}`
+      : ""
+    : operationKey.startsWith("video:")
+      ? slot
+        ? `video:${slot}`
+        : ""
+      : operationKey === "director:day"
+        ? "director:day"
+        : slot
+          ? `director:${slot}`
+          : "";
+  const node = workflowNodes.value.find((item) => item.id === nodeId);
+  if (node) {
+    openNode(node);
+    return;
+  }
   if (operationKey.startsWith("image:")) {
     activeTab.value = "storyboard";
   } else if (operationKey.startsWith("video:")) {
@@ -336,6 +464,14 @@ watch(
   },
 );
 
+watch(
+  () => route.query.node,
+  (node) => {
+    selectedNodeId.value = typeof node === "string" ? node : "";
+    nodeDrawerVisible.value = Boolean(selectedNodeId.value);
+  },
+);
+
 watch(activeTab, (stage) => {
   if (!runId.value || route.query.stage === stage) {
     return;
@@ -364,31 +500,39 @@ const planningFailure = computed(() => {
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
     .find(
       (item) =>
-        rejectedStepIds.has(item.id) &&
-        item.operationKey.startsWith("director:episode:"),
+        item.operationKey.startsWith("director:episode:") &&
+        (rejectedStepIds.has(item.id) || item.error !== null),
     );
+  if (!step) {
+    return null;
+  }
   const slot = step?.operationKey.split(":").at(-1) ?? null;
   const reasons = g.reviews
     .filter((review) => review.stepId === step?.id && review.reason)
     .map((review) => String(review.reason));
+  if (!reasons.length && step.error?.message) {
+    reasons.push(step.error.message);
+  }
   return { slot, reasons };
 });
 
 const replanVisible = ref(false);
+const replanSlot = ref<string | null>(null);
 const replanReason = ref("");
 const replanPaid = ref(false);
 const replanning = ref(false);
 
 /** 人工给出修正理由重规划失败时段；成功后后端按开关自动链式推进。 */
 async function submitReplan() {
-  if (!runId.value || !planningFailure.value?.slot) {
+  const slot = replanSlot.value ?? planningFailure.value?.slot ?? null;
+  if (!runId.value || !slot) {
     return;
   }
   replanning.value = true;
   try {
     const accepted = await api.replanEpisode(
       runId.value,
-      planningFailure.value.slot,
+      slot,
       replanReason.value.trim(),
       true,
     );
@@ -406,14 +550,19 @@ async function submitReplan() {
     await loadGraph();
   } catch (error) {
     rememberRequestFailure(error, "重规划失败", {
-      slot: planningFailure.value?.slot ?? undefined,
-      operationKey: planningFailure.value?.slot
-        ? `director:episode:${planningFailure.value.slot}`
-        : undefined,
+      slot,
+      operationKey: `director:episode:${slot}`,
     });
   } finally {
     replanning.value = false;
   }
+}
+
+function openReplan(slot: string) {
+  replanSlot.value = slot;
+  replanReason.value = "";
+  replanPaid.value = false;
+  replanVisible.value = true;
 }
 
 function buildOverrides(episodeId: string): PromptOverrides {
@@ -657,6 +806,9 @@ async function confirmVideo(episode: EpisodeDto) {
 
 onMounted(() => {
   void loadGraph();
+  void api.health().then((value) => {
+    health.value = value;
+  }).catch(() => undefined);
   polling.start();
 });
 </script>
@@ -664,7 +816,7 @@ onMounted(() => {
 <template>
   <div style="padding: 20px 24px">
     <div style="display: flex; align-items: center; margin-bottom: 12px">
-      <h2 style="margin: 0">主题创作台</h2>
+      <h2 style="margin: 0">三时段视频生产工作台</h2>
       <div style="flex: 1" />
       <el-button v-if="runId" size="small" @click="newTheme">新建主题</el-button>
     </div>
@@ -757,12 +909,36 @@ onMounted(() => {
               @change="(value: string | number | boolean) => toggleStage(name, value as StageMode)"
             />
           </span>
-          <el-button
-            size="small"
-            @click="router.push(`/runs/${runId}`)"
-          >
-            Run 详情
-          </el-button>
+          <el-popover placement="bottom-end" :width="360" trigger="click">
+            <template #reference>
+              <el-button size="small">运行配置</el-button>
+            </template>
+            <el-descriptions :column="1" size="small" border>
+              <el-descriptions-item label="导演请求">
+                {{ health?.arkDirectorRequestTimeoutSeconds ?? "—" }} 秒
+              </el-descriptions-item>
+              <el-descriptions-item label="故事板请求">
+                {{ health?.arkImageRequestTimeoutSeconds ?? "—" }} 秒
+              </el-descriptions-item>
+              <el-descriptions-item label="图片超时自动重试">
+                {{ health?.arkImageTimeoutAutoRetries ?? "—" }} 次，延迟
+                {{ health?.arkImageRetryDelaySeconds ?? "—" }} 秒
+              </el-descriptions-item>
+              <el-descriptions-item label="审核请求">
+                {{ health?.arkReviewRequestTimeoutSeconds ?? "—" }} 秒
+              </el-descriptions-item>
+              <el-descriptions-item label="视频API请求">
+                {{ health?.arkVideoApiTimeoutSeconds ?? "—" }} 秒
+              </el-descriptions-item>
+              <el-descriptions-item label="视频监看窗口">
+                {{ health?.arkTaskTimeoutSeconds ?? "—" }} 秒，间隔
+                {{ health?.arkPollIntervalSeconds ?? "—" }} 秒
+              </el-descriptions-item>
+            </el-descriptions>
+            <div class="muted" style="margin-top: 8px">
+              只读配置，修改服务器.env并重启服务后生效。
+            </div>
+          </el-popover>
         </div>
       </el-card>
 
@@ -791,12 +967,46 @@ onMounted(() => {
         finish-status="success"
         style="margin-bottom: 16px"
       >
-        <el-step title="主题" />
-        <el-step title="日导演" />
-        <el-step title="三集剧本" />
+        <el-step title="总导演" />
+        <el-step title="三集导演" />
         <el-step title="故事板" />
         <el-step title="视频成片" />
+        <el-step title="审核交付" />
       </el-steps>
+
+      <el-card shadow="never" class="workflow-map">
+        <template #header>
+          <div style="display: flex; align-items: center; gap: 10px">
+            <strong>全天生产链</strong>
+            <span class="muted">点击任一节点查看Prompt、素材、Provider和attempt历史</span>
+          </div>
+        </template>
+        <div class="workflow-groups">
+          <template v-for="(group, index) in workflowGroups" :key="group.key">
+            <section class="workflow-group">
+              <button
+                type="button"
+                class="group-title"
+                @click="activeTab = group.key"
+              >
+                {{ group.label }}
+              </button>
+              <button
+                v-for="node in group.nodes"
+                :key="node.id"
+                type="button"
+                class="workflow-node"
+                :class="{ selected: selectedNodeId === node.id, failed: !!node.error }"
+                @click="openNode(node)"
+              >
+                <span>{{ node.label }}</span>
+                <StatusBadge :status="node.status" />
+              </button>
+            </section>
+            <span v-if="index < workflowGroups.length - 1" class="flow-arrow">→</span>
+          </template>
+        </div>
+      </el-card>
 
       <el-tabs v-model="activeTab">
         <el-tab-pane label="日导演" name="brief">
@@ -856,7 +1066,7 @@ onMounted(() => {
               size="small"
               type="danger"
               style="margin-top: 8px"
-              @click="replanVisible = true"
+              @click="openReplan(planningFailure.slot)"
             >
               重规划{{ SLOT_LABEL[planningFailure.slot] ?? planningFailure.slot }}时段
             </el-button>
@@ -879,6 +1089,14 @@ onMounted(() => {
                 <div style="display: flex; align-items: center; gap: 10px">
                   <strong>{{ SLOT_LABEL[episode.slot] ?? episode.slot }}</strong>
                   <StatusBadge :status="episode.status" />
+                  <el-button
+                    v-if="['planned', 'failed'].includes(episode.status)"
+                    size="small"
+                    style="margin-left: auto"
+                    @click="openReplan(episode.slot)"
+                  >
+                    重规划该时段
+                  </el-button>
                 </div>
               </template>
               <PromptCollapse
@@ -1015,9 +1233,16 @@ onMounted(() => {
                   <el-button
                     link
                     type="primary"
-                    @click="router.push(`/runs/${runId}`)"
+                    @click="openEpisodeNode('storyboard', episode)"
                   >
-                    前往 Run 详情显式重试
+                    打开失败节点并处理
+                  </el-button>
+                  <el-button
+                    link
+                    type="warning"
+                    @click="openReplan(episode.slot)"
+                  >
+                    按审核证据重规划该时段
                   </el-button>
                 </div>
               </el-alert>
@@ -1154,22 +1379,79 @@ onMounted(() => {
                 title="视频实际 Prompt"
               />
               <template v-if="videoAssets(episode).length">
-                <AssetReviewPanel
+                <div
                   v-for="asset in videoAssets(episode)"
                   :key="asset.id"
-                  :asset="asset"
-                  :reviews="graph.reviews"
-                  @reviewed="refresh"
-                />
+                  class="video-preview"
+                >
+                  <video
+                    :src="assetContentUrl(asset.id)"
+                    controls
+                    preload="metadata"
+                  />
+                  <div class="muted">
+                    {{ asset.status }} · SHA-256 {{ asset.sha256.slice(0, 16) }}…
+                  </div>
+                </div>
               </template>
               <span v-else class="muted">尚未生成视频</span>
+              <div style="margin-top: 10px">
+                <el-button size="small" @click="openEpisodeNode('video', episode)">
+                  查看视频节点详情
+                </el-button>
+              </div>
             </el-card>
-            <el-button
-              v-if="currentStage === 'video' || currentStage === 'done'"
-              @click="router.push(`/runs/${runId}`)"
-            >
-              前往 Run 详情页处理审核与交付
+            <el-button type="primary" @click="activeTab = 'review'">
+              进入审核与交付
             </el-button>
+          </template>
+          <el-empty v-else description="剧本尚未生成" />
+        </el-tab-pane>
+
+        <el-tab-pane label="审核与交付" name="review">
+          <template v-if="episodes.length">
+            <el-alert
+              type="info"
+              :closable="false"
+              style="margin-bottom: 12px"
+              title="最终视频必须由人工观看后决定；三条全部通过才可构建1/2/3交付包"
+            />
+            <el-card
+              v-for="episode in episodes"
+              :key="episode.id"
+              shadow="never"
+              style="margin-bottom: 16px"
+            >
+              <template #header>
+                <div style="display: flex; align-items: center; gap: 10px">
+                  <strong>{{ SLOT_LABEL[episode.slot] ?? episode.slot }}</strong>
+                  <span>{{ episode.title }}</span>
+                  <StatusBadge :status="episode.status" />
+                  <div style="flex: 1" />
+                  <el-button
+                    size="small"
+                    @click="openEpisodeNode('content-review', episode)"
+                  >
+                    查看审核节点
+                  </el-button>
+                </div>
+              </template>
+              <AssetReviewPanel
+                v-for="asset in videoAssets(episode)"
+                :key="asset.id"
+                :asset="asset"
+                :reviews="graph.reviews"
+                @reviewed="refresh"
+              />
+              <el-empty
+                v-if="!videoAssets(episode).length"
+                description="该时段尚未产生可审核视频"
+              />
+            </el-card>
+            <DeliveryPanel
+              :run-id="runId!"
+              :can-deliver="run.availableActions.some((action) => action.type === 'deliver')"
+            />
           </template>
           <el-empty v-else description="剧本尚未生成" />
         </el-tab-pane>
@@ -1181,9 +1463,19 @@ onMounted(() => {
       description="输入主题并提交后，这里将按阶段展示日导演、三时段剧本、故事板与成片"
     />
 
+    <WorkflowNodeDrawer
+      v-if="graph"
+      :model-value="nodeDrawerVisible"
+      :node="selectedNode"
+      :graph="graph"
+      @update:model-value="setNodeDrawerVisible"
+      @changed="refresh"
+      @review="focusReview"
+    />
+
     <el-dialog
       v-model="replanVisible"
-      :title="`重规划${SLOT_LABEL[planningFailure?.slot ?? ''] ?? ''}时段`"
+      :title="`重规划${SLOT_LABEL[replanSlot ?? planningFailure?.slot ?? ''] ?? ''}时段`"
       width="480px"
     >
       <el-alert
@@ -1232,5 +1524,65 @@ onMounted(() => {
 }
 :deep(.current-run) {
   background: #1d2733;
+}
+.workflow-map {
+  margin-bottom: 16px;
+  background: #14161b;
+}
+.workflow-groups {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+.workflow-group {
+  min-width: 170px;
+  flex: 1 0 170px;
+  border: 1px solid #2b2d33;
+  border-radius: 8px;
+  padding: 10px;
+}
+.group-title,
+.workflow-node {
+  width: 100%;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.group-title {
+  background: transparent;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+.workflow-node {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  background: #1b1d23;
+  border: 1px solid #2b2d33;
+  border-radius: 6px;
+  padding: 7px 8px;
+  margin-top: 6px;
+}
+.workflow-node:hover,
+.workflow-node.selected {
+  border-color: #409eff;
+  background: #182536;
+}
+.workflow-node.failed {
+  border-color: #f56c6c;
+}
+.flow-arrow {
+  align-self: center;
+  color: #60656f;
+  font-size: 20px;
+}
+.video-preview video {
+  width: min(100%, 360px);
+  border-radius: 8px;
+  background: #000;
 }
 </style>

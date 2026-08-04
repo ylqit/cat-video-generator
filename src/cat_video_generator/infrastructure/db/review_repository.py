@@ -92,6 +92,7 @@ class ReviewPersistenceMixin:
                     select(Review)
                     .where(
                         Review.asset_id == asset.id,
+                        Review.source == source,
                         Review.decision.in_(("approved", "rejected")),
                     )
                     .order_by(Review.created_at.desc(), Review.id.desc())
@@ -194,6 +195,7 @@ class ReviewPersistenceMixin:
                     .where(
                         Review.step_id == step.id,
                         Review.asset_id.is_(None),
+                        Review.source == source,
                         Review.decision.in_(("approved", "rejected")),
                     )
                     .order_by(Review.created_at.desc(), Review.id.desc())

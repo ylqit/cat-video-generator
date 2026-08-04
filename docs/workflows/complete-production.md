@@ -93,19 +93,20 @@ output/YYYY-MM-DD/{runId}/delivery-rN/
 - Prompt用途固定为`director / storyboard / storyboard_review / video / review`。
   故事板审核Prompt关联故事板生成Prompt，视频诊断Prompt关联视频生成Prompt。
 - 相同输入复用相同故事板或视频Step，不重复收费。
-- `submission_unknown`冻结，禁止自动重复POST。
+- Seedance `submission_unknown`冻结并通过任务列表人工对账，已有Task ID只恢复查询。
+- Seedream同步接口超时无法找回原任务；默认600秒等待后最多自动创建一次新attempt，旧未知attempt和潜在重复计费标记永久保留。
 - 故事板失败只能通过`retry-step`显式新建attempt，旧组图与证据保留。
 - JSON解析或必填字段缺失最多自动结构修复一次；已经成功解析但语义不合格时进入`planning_review`，不会自动产生第二次导演收费调用。
 - 剧情或连续性需要修改时由用户显式使用`replan-episode`。
 - 历史生成记录已按用户要求清理；新系统不承担旧契约恢复。
 - 不包含multi-clip、分辨率对比、自动发布、小程序、对象存储或消息队列。
 
-## 8. Web阶段与浏览页签
+## 8. 统一Web生产工作台
 
 后端`currentStage`只描述工作流真实阶段，不代表用户当前必须浏览的页面。
-创作台把手动选择保存到`/studio?run=<runId>&stage=<tab>`：首次进入且没有
-`stage`时才使用后端阶段决定默认页签；轮询、保存设置和刷新Graph均不再覆盖
-用户选择。刷新、复制链接及浏览器前进后退会恢复同一Run和页签。
+工作台把浏览定位保存到`/studio?run=<runId>&stage=<tab>&slot=<slot>&node=<nodeId>`：首次进入且没有`stage`时才使用后端阶段决定默认页签；轮询、保存设置和刷新Graph均不再覆盖用户选择。刷新、复制链接及浏览器前进后退会恢复同一Run、页签和节点抽屉。旧`/runs/:id`不再维护重复操作页面，只跳转到工作台。
+
+固定五级视图为“总导演→三集导演→故事板→视频成片→审核交付”。每个节点可查看内容结果、实际调用Prompt、输入素材、Provider任务、审核证据和全部attempt。失败、过期、取消、继续查询、对账和审核动作由后端`availableActions`返回，前端不再复制状态机判断。
 
 后台任务错误携带已知的`runId / episodeId / slot / operationKey`，页面使用持久
 Alert展示并可定位到失败节点。故事板整组未批准时，视频按钮保持禁用并说明原因。

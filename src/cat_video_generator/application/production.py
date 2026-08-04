@@ -166,10 +166,19 @@ class ProductionService:
         # 创作台编辑过的Prompt覆盖随续跑一起传入，使哈希复用命中编辑版
         # 已生成帧，而不是回退编译出未编辑版本重新扣费。
         stored_overrides = self._repository.get_prompt_overrides(episode.id)
-        inputs = self._visual_preparation.prepare(
-            episode,
-            prompt_overrides=stored_overrides or None,
-        )
+        if episode.status in {
+            EpisodeStatus.VIDEO_PENDING,
+            EpisodeStatus.VIDEO_GENERATING,
+            EpisodeStatus.MEDIA_QC,
+        }:
+            # 视频阶段只消费已经批准并冻结的故事板。图片重试Prompt可以与最初编译文本
+            # 不同，但这不应让视频入口回退到旧的rejected组图或隐式产生新图片费用。
+            inputs = self._visual_preparation.approved_storyboard(episode)
+        else:
+            inputs = self._visual_preparation.prepare(
+                episode,
+                prompt_overrides=stored_overrides or None,
+            )
         if inputs is None:
             return _episode_result(
                 self._repository.get_episode(

@@ -369,6 +369,17 @@ def test_remote_schema_upgrade_constraints_and_cleanup(monkeypatch) -> None:
                 },
             )
 
+        # Ark视频诊断可以给出approved，但它不是人工最终决定。
+        # 最终审核的幂等范围必须包含source，否则Web人工通过会被诊断记录吞掉。
+        repository.record_review(
+            step_id=review_step_id,
+            asset_id=asset_id,
+            source="ark_visual",
+            decision="approved",
+            reason="diagnostic only",
+            warnings=[],
+            evidence={"confidence": 0.95},
+        )
         committed = repository.commit_asset_review(
             asset_id=asset_id,
             source="human",
@@ -410,7 +421,7 @@ def test_remote_schema_upgrade_constraints_and_cleanup(monkeypatch) -> None:
                 ),
                 {"asset": asset_id},
             ).one()
-            assert row == ("ready", "succeeded", "ready", 1)
+            assert row == ("ready", "succeeded", "ready", 2)
     finally:
         with engine.begin() as connection:
             quoted = connection.dialect.identifier_preparer.quote_schema(schema)

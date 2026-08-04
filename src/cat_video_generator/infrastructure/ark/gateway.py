@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -43,12 +44,16 @@ class ArkGatewayError(GatewayError):
         code: str,
         retryable: bool,
         submission_unknown: bool = False,
+        request_id: str | None = None,
+        timed_out: bool = False,
     ) -> None:
         super().__init__(
             message,
             code=code,
             retryable=retryable,
             submission_unknown=submission_unknown,
+            request_id=request_id,
+            timed_out=timed_out,
         )
 
 
@@ -116,7 +121,7 @@ class ArkGateway:
                 # 消耗输出预算后只返回incomplete，创意约束仍由分层Prompt承担。
                 thinking={"type": "disabled"},
                 store=False,
-                timeout=180.0,
+                timeout=self._settings.ark_director_request_timeout_seconds,
             )
         except ArkAPIError as exc:
             raise _provider_error(exc, submission=True) from exc
@@ -266,7 +271,7 @@ class ArkGateway:
                 max_output_tokens=1800,
                 thinking={"type": "disabled"},
                 store=False,
-                timeout=180.0,
+                timeout=self._settings.ark_review_request_timeout_seconds,
             )
         except ArkAPIError as exc:
             raise _provider_error(exc, submission=True) from exc
@@ -351,7 +356,7 @@ class ArkGateway:
                 max_output_tokens=2400,
                 thinking={"type": "disabled"},
                 store=False,
-                timeout=240.0,
+                timeout=self._settings.ark_review_request_timeout_seconds,
             )
         except ArkAPIError as exc:
             raise _provider_error(exc, submission=True) from exc
@@ -426,7 +431,7 @@ class ArkGateway:
                 resolution=input_plan.resolution,
                 ratio="9:16",
                 duration=input_plan.duration_seconds,
-                timeout=120.0,
+                timeout=self._settings.ark_video_api_timeout_seconds,
             )
         except ArkAPIError as exc:
             raise _provider_error(exc, submission=True) from exc
@@ -442,19 +447,32 @@ class ArkGateway:
         try:
             task = self._client.content_generation.tasks.get(
                 task_id=task_id,
-                timeout=120.0,
+                timeout=self._settings.ark_video_api_timeout_seconds,
             )
         except ArkAPIError as exc:
             raise _provider_error(exc, submission=False) from exc
-        content = getattr(task, "content", None)
-        error = getattr(task, "error", None)
-        return VideoTaskResult(
-            task_id=task.id,
-            status=task.status,
-            video_url=(None if content is None else getattr(content, "video_url", None)),
-            error_code=None if error is None else getattr(error, "code", None),
-            error_message=(None if error is None else getattr(error, "message", None)),
-        )
+        return _video_task_result(task)
+
+    def list_video_tasks(
+        self,
+        *,
+        model: str,
+        page_size: int = 100,
+    ) -> tuple[VideoTaskResult, ...]:
+        """列出可用于submission_unknown人工对账的近期视频任务。"""
+
+        if not 1 <= page_size <= 100:
+            raise ValueError("Ark视频任务列表page_size必须在1至100之间")
+        try:
+            response = self._client.content_generation.tasks.list(
+                page_num=1,
+                page_size=page_size,
+                model=model,
+                timeout=self._settings.ark_video_api_timeout_seconds,
+            )
+        except ArkAPIError as exc:
+            raise _provider_error(exc, submission=False) from exc
+        return tuple(_video_task_result(item) for item in response.items)
 
     def _structured_output(
         self,
@@ -579,6 +597,8 @@ def _provider_error(exc: ArkAPIError, *, submission: bool) -> ArkGatewayError:
             code=code,
             retryable=not submission,
             submission_unknown=submission,
+            request_id=request_id,
+            timed_out=isinstance(exc, ArkAPITimeoutError),
         )
     status_code = getattr(exc, "status_code", None)
     quota_error = any(
@@ -590,6 +610,32 @@ def _provider_error(exc: ArkAPIError, *, submission: bool) -> ArkGatewayError:
         retryable=bool(
             status_code and (status_code >= 500 or status_code == 429) and not quota_error
         ),
+        request_id=request_id,
+    )
+
+
+def _video_task_result(task: Any) -> VideoTaskResult:
+    """把Get/List的SDK对象归一为同一严格结果，避免Application依赖SDK类型。"""
+
+    content = getattr(task, "content", None)
+    error = getattr(task, "error", None)
+    created_at = getattr(task, "created_at", None)
+    return VideoTaskResult(
+        task_id=str(task.id),
+        status=str(task.status),
+        video_url=(None if content is None else getattr(content, "video_url", None)),
+        error_code=None if error is None else getattr(error, "code", None),
+        error_message=None if error is None else getattr(error, "message", None),
+        model=getattr(task, "model", None),
+        created_at=(
+            datetime.fromtimestamp(created_at, tz=timezone.utc)
+            if isinstance(created_at, int | float)
+            else None
+        ),
+        duration_seconds=getattr(task, "duration", None),
+        ratio=getattr(task, "ratio", None),
+        resolution=getattr(task, "resolution", None),
+        generate_audio=getattr(task, "generate_audio", None),
     )
 
 

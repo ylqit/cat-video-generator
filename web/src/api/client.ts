@@ -8,6 +8,7 @@ import type {
   PipelineSettings,
   PromptFull,
   PromptOverrides,
+  ReconciliationCandidateDto,
   RunGraph,
   RunSummary,
 } from "./types";
@@ -130,11 +131,21 @@ export const api = {
     stepId: string,
     reason: string,
     allowPaidGeneration: boolean,
+    acknowledgeDuplicateBilling = false,
   ) =>
     post<JobAccepted>(`/steps/${stepId}/retry`, {
       reason,
       allowPaidGeneration,
+      acknowledgeDuplicateBilling,
     }),
+  resumeStep: (stepId: string) =>
+    post<JobAccepted>(`/steps/${stepId}/resume`),
+  reconciliationCandidates: (stepId: string) =>
+    request<ReconciliationCandidateDto[]>(
+      `/steps/${stepId}/reconciliation-candidates`,
+    ),
+  reconcileStep: (stepId: string, providerTaskId: string) =>
+    post<JobAccepted>(`/steps/${stepId}/reconcile`, { providerTaskId }),
   resumePlanning: (runId: string, allowPaidGeneration: boolean) =>
     post<JobAccepted>(`/runs/${runId}/resume-planning`, {
       allowPaidGeneration,

@@ -188,10 +188,11 @@ class EpisodeScript(StrictModel):
         }
         if unknown_actors:
             raise ValueError(f"动作引用未登记主体：{', '.join(sorted(unknown_actors))}")
-        unknown_ending_entities = set(self.ending.key_entity_ids) - entity_ids
+        anchor_ids = {item.id for item in self.continuity.anchors}
+        unknown_ending_entities = set(self.ending.key_entity_ids) - entity_ids - anchor_ids
         if unknown_ending_entities:
             raise ValueError(
-                "结尾引用未登记关键实体："
+                "结尾引用未登记关键实体或场景锚点："
                 + ", ".join(sorted(unknown_ending_entities))
             )
         return self

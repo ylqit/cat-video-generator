@@ -66,6 +66,18 @@ class RetryStepRequest(BaseModel):
 
     reason: str = Field(min_length=4, max_length=500)
     allow_paid_generation: bool = Field(False, alias="allowPaidGeneration")
+    acknowledge_duplicate_billing: bool = Field(
+        False,
+        alias="acknowledgeDuplicateBilling",
+    )
+
+
+class ReconcileStepRequest(BaseModel):
+    """把人工确认的Ark Task ID绑定到submission_unknown视频步骤。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    provider_task_id: str = Field(alias="providerTaskId", min_length=1, max_length=200)
 
 
 class ReplanRequest(BaseModel):

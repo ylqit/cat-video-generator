@@ -42,6 +42,7 @@ from .api_schemas import (
     PaidRequest,
     PlanRequest,
     PromptOverridesRequest,
+    ReconcileStepRequest,
     ReplanRequest,
     RetryStepRequest,
     ReviewRequest,
@@ -265,6 +266,7 @@ def create_write_router(
                 step_id,
                 reason=request.reason,
                 allow_paid_generation=True,
+                acknowledge_duplicate_billing=request.acknowledge_duplicate_billing,
             )
             return _jsonable(result)
 
@@ -277,6 +279,76 @@ def create_write_router(
                 "runId": retry_target.get("runId"),
                 "episodeId": retry_target.get("episodeId"),
                 "operationKey": retry_target.get("operationKey"),
+            },
+        )
+        return _accepted(record)
+
+    @router.post("/steps/{step_id}/resume", status_code=202)
+    def resume_step(step_id: uuid.UUID) -> dict[str, Any]:
+        """继续查询已有Ark Task ID；不创建新的供应商生成请求。"""
+
+        try:
+            target = queries.step(step_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        def task() -> dict[str, Any]:
+            return _jsonable(retry.resume_step(step_id))
+
+        record = _submit(
+            job_registry,
+            kind="resume_step",
+            dedup_key=f"resume-step:{step_id}",
+            fn=task,
+            context={
+                "runId": target.get("runId"),
+                "episodeId": target.get("episodeId"),
+                "operationKey": target.get("operationKey"),
+            },
+        )
+        return _accepted(record)
+
+    @router.get("/steps/{step_id}/reconciliation-candidates")
+    def reconciliation_candidates(step_id: uuid.UUID) -> list[dict[str, Any]]:
+        try:
+            return list(retry.reconciliation_candidates(step_id))
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except GatewayError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
+
+    @router.post("/steps/{step_id}/reconcile", status_code=202)
+    def reconcile_step(
+        step_id: uuid.UUID,
+        request: ReconcileStepRequest,
+    ) -> dict[str, Any]:
+        try:
+            target = queries.step(step_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        def task() -> dict[str, Any]:
+            return _jsonable(
+                retry.reconcile_step(
+                    step_id,
+                    provider_task_id=request.provider_task_id,
+                )
+            )
+
+        record = _submit(
+            job_registry,
+            kind="reconcile_step",
+            dedup_key=f"reconcile:{step_id}:{request.provider_task_id}",
+            fn=task,
+            context={
+                "runId": target.get("runId"),
+                "episodeId": target.get("episodeId"),
+                "operationKey": target.get("operationKey"),
             },
         )
         return _accepted(record)
@@ -329,6 +401,16 @@ def create_write_router(
             )
             payload: dict[str, Any] = {"replan": _jsonable(result)}
             status = str(queries.run_graph(run_id)["run"]["status"])
+            if status == "draft":
+                # 局部重规划修复了当前时段后，继续补齐尚未生成的其余时段。
+                # 复用PlanningService的恢复入口，避免接口层复制导演循环。
+                payload["planning"] = _jsonable(
+                    planning.resume_planning(
+                        run_id,
+                        allow_paid_generation=True,
+                    )
+                )
+                status = "planned"
             # 方案已定稿时按流水线开关自动推进后续节点，与plan job行为一致；
             # 未定稿（回draft等剩余时段）只返回重规划结果。
             if status in {"planned", "generating", "reviewing"}:

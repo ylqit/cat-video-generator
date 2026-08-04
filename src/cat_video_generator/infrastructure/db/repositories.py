@@ -272,12 +272,21 @@ class SqlAlchemyWorkflowRepository(
         code: str,
         message: str,
         submission_unknown: bool = False,
+        request_id: str | None = None,
+        input_snapshot_patch: dict[str, Any] | None = None,
     ) -> None:
         target = StepStatus.SUBMISSION_UNKNOWN if submission_unknown else StepStatus.FAILED
         with self._sessions.begin() as session:
             row = required_record(session, WorkflowStep, step_id)
             row.status = transition_step(StepStatus(row.status), target).value
-            row.error_json = {"code": code, "message": message}
+            row.error_json = {
+                "code": code,
+                "message": message,
+                **({"requestId": request_id} if request_id else {}),
+            }
+            if input_snapshot_patch:
+                merged = {**row.input_snapshot_json, **input_snapshot_patch}
+                row.input_snapshot_json = validate_input_snapshot(merged).model_dump(mode="json")
             row.completed_at = None if submission_unknown else datetime.now(timezone.utc)
 
     def next_director_attempt(
@@ -356,6 +365,20 @@ class SqlAlchemyWorkflowRepository(
     def get_step(self, step_id: uuid.UUID) -> StoredStep:
         with self._sessions() as session:
             return stored_step(required_record(session, WorkflowStep, step_id))
+
+    def find_step_by_provider_task_id(
+        self,
+        provider_task_id: str,
+    ) -> StoredStep | None:
+        """查询供应商任务的唯一所有者，防止对账时跨Step重复绑定。"""
+
+        with self._sessions() as session:
+            row = session.execute(
+                select(WorkflowStep).where(
+                    WorkflowStep.provider_task_id == provider_task_id
+                )
+            ).scalar_one_or_none()
+            return None if row is None else stored_step(row)
 
     def latest_retryable_step(
         self,
@@ -492,6 +515,37 @@ class SqlAlchemyWorkflowRepository(
             selected.sort(key=lambda row: int(row.metadata_json.get("panelOrdinal", 0)))
             return tuple(stored_asset(row) for row in selected)
 
+    def latest_approved_storyboard(
+        self,
+        episode_id: uuid.UUID,
+    ) -> tuple[StoredAsset, ...]:
+        """返回Episode最近一次完整批准的故事板，不回退到旧失败attempt。
+
+        故事板一旦把Episode推进到视频阶段，就是该次视频提交的冻结视觉输入。
+        后续Canon更新或旧失败Prompt都不能让视频入口隐式重新生图。
+        """
+
+        statement = (
+            select(Asset)
+            .join(WorkflowStep, Asset.producing_step_id == WorkflowStep.id)
+            .where(
+                Asset.episode_id == episode_id,
+                Asset.role == "storyboard_panel",
+                Asset.status.in_(("approved", "ready")),
+                WorkflowStep.operation_key == "image:storyboard",
+                WorkflowStep.status == StepStatus.SUCCEEDED.value,
+            )
+            .order_by(WorkflowStep.created_at.desc(), Asset.created_at, Asset.id)
+        )
+        with self._sessions() as session:
+            rows = tuple(session.execute(statement).scalars())
+            if not rows:
+                return ()
+            latest_step_id = rows[0].producing_step_id
+            selected = [row for row in rows if row.producing_step_id == latest_step_id]
+            selected.sort(key=lambda row: int(row.metadata_json.get("panelOrdinal", 0)))
+            return tuple(stored_asset(row) for row in selected)
+
     def set_episode_status(
         self,
         episode_id: uuid.UUID,
@@ -534,6 +588,20 @@ class SqlAlchemyWorkflowRepository(
                 StepStatus.CANCELLED,
             }:
                 row.completed_at = datetime.now(timezone.utc)
+
+    def patch_step_snapshot(
+        self,
+        step_id: uuid.UUID,
+        patch: dict[str, Any],
+    ) -> None:
+        """不改变生命周期状态地记录轮询、自动重试或对账事实。"""
+
+        if not patch:
+            return
+        with self._sessions.begin() as session:
+            row = required_record(session, WorkflowStep, step_id)
+            merged = {**row.input_snapshot_json, **patch}
+            row.input_snapshot_json = validate_input_snapshot(merged).model_dump(mode="json")
 
     def save_asset(
         self,

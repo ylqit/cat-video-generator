@@ -34,6 +34,8 @@ def stored_step(row: WorkflowStep) -> StoredStep:
         model=row.model,
         operation_key=row.operation_key,
         input_snapshot=row.input_snapshot_json,
+        created_at=row.created_at,
+        submitted_at=row.submitted_at,
     )
 
 
@@ -81,6 +83,11 @@ def stored_asset(row: Asset) -> StoredAsset:
 
 def run_dict(row: ProductionRun) -> dict[str, Any]:
     settings = PipelineSettings.model_validate(row.pipeline_settings_json)
+    available_actions = (
+        [{"type": "deliver", "label": "构建交付包", "paid": False}]
+        if row.status == "ready"
+        else []
+    )
     return {
         "id": str(row.id),
         "contentDate": row.content_date.isoformat(),
@@ -89,6 +96,8 @@ def run_dict(row: ProductionRun) -> dict[str, Any]:
         "pipelineSettings": settings.model_dump(mode="json", by_alias=True),
         "createdAt": row.created_at.isoformat(),
         "updatedAt": row.updated_at.isoformat(),
+        # 交付资格由后端状态机决定，避免Web自行复制Run状态判断。
+        "availableActions": available_actions,
         "nextAction": {
             "draft": "继续完成总导演和三个时段导演",
             "planning_review": "查看导演候选矛盾并执行replan-episode",
@@ -140,19 +149,38 @@ def episode_dict(row: Episode) -> dict[str, Any]:
 
 def step_dict(row: WorkflowStep) -> dict[str, Any]:
     operation_key = row.operation_key
-    next_action = None
-    if row.status == StepStatus.SUBMISSION_UNKNOWN.value:
-        next_action = "先对账Ark任务列表，禁止重复POST"
+    actions: list[dict[str, Any]] = []
+    if (
+        row.status in {StepStatus.QUEUED.value, StepStatus.RUNNING.value}
+        and row.kind == StepKind.VIDEO.value
+        and row.provider_task_id
+    ):
+        actions.append(
+            {"type": "continue_query", "label": "继续查询", "paid": False}
+        )
+    elif row.status == StepStatus.SUBMISSION_UNKNOWN.value:
+        if row.kind == StepKind.VIDEO.value:
+            actions.append(
+                {"type": "reconcile", "label": "查询并对账", "paid": False}
+            )
+        elif row.kind == StepKind.IMAGE.value:
+            actions.append(
+                {
+                    "type": "retry_unknown_image",
+                    "label": "接受风险并重新生成",
+                    "paid": True,
+                    "requiresDuplicateBillingAck": True,
+                }
+            )
     elif row.status in {
         StepStatus.FAILED.value,
         StepStatus.EXPIRED.value,
         StepStatus.CANCELLED.value,
-    }:
-        next_action = (
-            f"cvg retry-step {row.id} --reason <原因>"
-            if operation_key
-            else "查看失败详情；旧步骤不支持自动重试"
-        )
+    } and row.kind in {StepKind.IMAGE.value, StepKind.VIDEO.value} and operation_key:
+        actions.append({"type": "retry", "label": "重试该节点", "paid": True})
+    elif row.status == StepStatus.AWAITING_REVIEW.value:
+        actions.append({"type": "review", "label": "进入审核", "paid": False})
+    next_action = actions[0]["label"] if actions else None
     return {
         "id": str(row.id),
         "runId": str(row.production_run_id),
@@ -169,7 +197,9 @@ def step_dict(row: WorkflowStep) -> dict[str, Any]:
         "inputSnapshot": row.input_snapshot_json,
         "error": row.error_json,
         "nextAction": next_action,
+        "availableActions": actions,
         "createdAt": row.created_at.isoformat(),
+        "submittedAt": None if row.submitted_at is None else row.submitted_at.isoformat(),
     }
 
 

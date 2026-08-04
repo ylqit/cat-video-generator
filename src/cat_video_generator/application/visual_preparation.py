@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 import uuid
 from dataclasses import dataclass, replace
 from typing import Any
 
+from ..domain.continuity import EntityKind, EntityLifecycle
 from ..domain.prompts import (
     CompiledPrompt,
     compile_storyboard_prompt,
@@ -57,6 +59,9 @@ class VisualPreparationService:
         media_probe: MediaProbe,
         provider_name: str,
         storyboard_review_mode: str,
+        image_request_timeout_seconds: float = 600,
+        image_timeout_auto_retries: int = 1,
+        image_retry_delay_seconds: float = 15,
         series_profile: SeriesVisualProfile,
         style_profile: StyleProfile,
     ) -> None:
@@ -66,6 +71,9 @@ class VisualPreparationService:
         self._asset_store = asset_store
         self._probe = media_probe
         self._provider_name = provider_name
+        self._image_request_timeout = image_request_timeout_seconds
+        self._image_timeout_auto_retries = image_timeout_auto_retries
+        self._image_retry_delay = image_retry_delay_seconds
         self._review_mode = str(storyboard_review_mode)
         if self._review_mode not in {"semantic_auto", "manual"}:
             raise ValueError("故事板审核只允许semantic_auto或manual")
@@ -89,6 +97,29 @@ class VisualPreparationService:
             raise RuntimeError("故事板语义审核失败，已阻断Seedance任务")
         if not all(item.status in {"approved", "ready"} for item in assets):
             return None
+        current = self._repository.get_episode(episode.run_id, episode.plan.slot)
+        if current.status is EpisodeStatus.PREPARING_VISUALS:
+            # 故事板生成、审核可能由Web手动入口或自动流水线触发；统一在成功出口
+            # 推进Episode，避免调用入口遗漏状态而重复生成已经批准的组图。
+            self._repository.set_episode_status(episode.id, EpisodeStatus.VIDEO_PENDING)
+        return assets
+
+    def approved_storyboard(
+        self,
+        episode: StoredEpisode,
+    ) -> tuple[StoredAsset, ...]:
+        """取得视频阶段已经冻结的完整故事板组。
+
+        这里不重新编译图片Prompt，也不按旧失败attempt回退；缺少完整批准组时直接
+        停止视频提交，避免一次“生成视频”操作意外产生新的Seedream费用。
+        """
+
+        assets = self._repository.latest_approved_storyboard(episode.id)
+        expected_count = storyboard_panel_count(episode.plan)
+        if len(assets) != expected_count:
+            raise RuntimeError(
+                f"Episode已进入视频阶段，但批准故事板应为{expected_count}张，实际为{len(assets)}张"
+            )
         return assets
 
     def select_references(self, episode: StoredEpisode) -> ReferenceSelectionPlan:
@@ -145,6 +176,9 @@ class VisualPreparationService:
         attempt: int = 1,
         retry_of_step_id: uuid.UUID | None = None,
         retry_reason: str | None = None,
+        prompt_retry_feedback: str | None = None,
+        auto_timeout_retry_index: int = 0,
+        duplicate_billing_risk_accepted: bool = False,
     ) -> tuple[StoredAsset, ...]:
         expected_count = storyboard_panel_count(episode.plan)
         compiled = compile_storyboard_prompt(
@@ -152,7 +186,7 @@ class VisualPreparationService:
             reference_roles=selection.semantic_keys,
             style_profile=self._style_profile,
             series_profile=self._series_profile,
-            retry_feedback=retry_reason,
+            retry_feedback=prompt_retry_feedback,
         )
         if prompt_override is not None and prompt_override.strip():
             compiled = _override_prompt(prompt_override)
@@ -179,6 +213,9 @@ class VisualPreparationService:
             reference_sha256=tuple(asset.sha256 for asset in selection.assets),
             retry_of_step_id=retry_of_step_id,
             retry_reason=retry_reason,
+            request_timeout_seconds=self._image_request_timeout,
+            auto_timeout_retry_index=auto_timeout_retry_index,
+            duplicate_billing_risk_accepted=duplicate_billing_risk_accepted,
         )
         step, _ = self._repository.create_step_with_prompt_intent(
             run_id=episode.run_id,
@@ -214,7 +251,22 @@ class VisualPreparationService:
         if step.status in {StepStatus.FAILED, StepStatus.EXPIRED, StepStatus.CANCELLED}:
             raise StepRetryRequired(step.id, operation_key)
         if step.status is StepStatus.SUBMISSION_UNKNOWN:
-            raise RuntimeError("故事板提交结果未知，必须先对账，禁止重复请求")
+            stored_snapshot = ImageInputSnapshot.model_validate(step.input_snapshot)
+            if (
+                stored_snapshot.provider_task_status == "submission_unknown_timeout"
+                and stored_snapshot.auto_timeout_retry_index
+                < self._image_timeout_auto_retries
+            ):
+                return self._retry_after_timeout(
+                    episode,
+                    selection,
+                    step,
+                    prompt_override=prompt_override,
+                    auto_timeout_retry_index=stored_snapshot.auto_timeout_retry_index + 1,
+                )
+            raise RuntimeError(
+                "故事板提交结果未知；自动重试已用尽，需确认潜在重复计费后再生成"
+            )
 
         self._repository.set_step_status(step.id, StepStatus.SUBMITTING)
         try:
@@ -229,7 +281,29 @@ class VisualPreparationService:
                 code=exc.code,
                 message=str(exc),
                 submission_unknown=exc.submission_unknown,
+                request_id=exc.request_id,
+                input_snapshot_patch={
+                    "provider_task_status": (
+                        "submission_unknown_timeout"
+                        if exc.submission_unknown and exc.timed_out
+                        else "submission_unknown"
+                        if exc.submission_unknown
+                        else "failed"
+                    )
+                },
             )
+            if (
+                exc.submission_unknown
+                and exc.timed_out
+                and auto_timeout_retry_index < self._image_timeout_auto_retries
+            ):
+                return self._retry_after_timeout(
+                    episode,
+                    selection,
+                    step,
+                    prompt_override=prompt_override,
+                    auto_timeout_retry_index=auto_timeout_retry_index + 1,
+                )
             self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
             raise
         except Exception as exc:
@@ -338,15 +412,26 @@ class VisualPreparationService:
                 panels,
                 f"故事板语义审核异常，转人工：{exc.code}",
             )
-        passed = all(
-            (
-                result.identity_ok,
-                result.style_ok,
-                result.action_sequence_ok,
-                result.continuity_ok,
-                result.ending_ok,
-            )
+        # 纯人物与猫咪互动的故事板只承担身份、画风和大致构图锚定。
+        # 抚摸、转头、闭眼等连续姿态由Seedance完成；若把每个微动作都设为静态组图硬门，
+        # 会在没有关键道具风险时反复产生图片费用。涉及道具或生命周期变化时仍执行完整硬门。
+        continuity_entities = episode.plan.script.continuity.entities
+        pose_only_storyboard = all(
+            item.kind in {EntityKind.PERSON, EntityKind.CAT}
+            and item.lifecycle is EntityLifecycle.PERSIST
+            and item.start_state == item.end_state
+            for item in continuity_entities
         )
+        required_checks = [result.identity_ok, result.style_ok]
+        if not pose_only_storyboard:
+            required_checks.extend(
+                (
+                    result.action_sequence_ok,
+                    result.continuity_ok,
+                    result.ending_ok,
+                )
+            )
+        passed = all(required_checks)
         evidence = {
             "reviewMode": "semantic_auto",
             "semanticVerified": passed and result.confidence >= 0.8,
@@ -362,21 +447,27 @@ class VisualPreparationService:
             "responseId": result.response_id,
             "providerRequestHash": result.request_hash,
             "orderedPanelSha256": [item.sha256 for item in panels],
+            "poseOnlyStoryboardPolicy": pose_only_storyboard,
         }
         if result.confidence < 0.8:
             return self._await_manual(step_id, panels, "故事板审核置信度低于0.80，转人工", evidence)
         self._repository.set_step_status(step_id, StepStatus.AWAITING_REVIEW)
         decision = "approved" if passed else "rejected"
+        if passed and pose_only_storyboard:
+            review_reason = (
+                "整组故事板通过身份与二维画风硬门；动作顺序、连续性和结尾细节"
+                "作为视频阶段诊断证据保留"
+            )
+        elif passed:
+            review_reason = "整组故事板通过身份、二维画风、动作顺序、连续性和结尾审核"
+        else:
+            review_reason = "故事板存在明确身份、画风、动作顺序、连续性或结尾错误"
         self._repository.commit_storyboard_review(
             step_id=step_id,
             asset_ids=tuple(item.id for item in panels),
             source="ark_visual",
             decision=decision,
-            reason=(
-                "整组故事板通过身份、二维画风、动作顺序、连续性和结尾审核"
-                if passed
-                else "故事板存在明确身份、画风、动作顺序、连续性或结尾错误"
-            ),
+            reason=review_reason,
             warnings=[{"code": "storyboard_warning", "message": item} for item in result.warnings],
             evidence=evidence,
         )
@@ -388,6 +479,7 @@ class VisualPreparationService:
         original_step: StoredStep,
         *,
         reason: str,
+        duplicate_billing_risk_accepted: bool = False,
     ) -> tuple[StoredAsset, ...]:
         """显式创建故事板新attempt；旧组图、审核和Prompt全部保留。"""
 
@@ -408,6 +500,47 @@ class VisualPreparationService:
             attempt=attempt,
             retry_of_step_id=original_step.id,
             retry_reason=reason,
+            # 同步超时并不表示故事板内容有问题。只在明确的媒体失败重试时
+            # 把人工反馈加入Prompt，避免未知提交的重做无故改变幂等输入语义。
+            prompt_retry_feedback=(
+                None
+                if original_step.status is StepStatus.SUBMISSION_UNKNOWN
+                else reason
+            ),
+            auto_timeout_retry_index=(
+                self._image_timeout_auto_retries
+                if original_step.status is StepStatus.SUBMISSION_UNKNOWN
+                else 0
+            ),
+            duplicate_billing_risk_accepted=duplicate_billing_risk_accepted,
+        )
+
+    def _retry_after_timeout(
+        self,
+        episode: StoredEpisode,
+        selection: ReferenceSelectionPlan,
+        original_step: StoredStep,
+        *,
+        prompt_override: str | None,
+        auto_timeout_retry_index: int,
+    ) -> tuple[StoredAsset, ...]:
+        """Seedream同步超时后仅自动再提交一次，并完整保留未知旧attempt。"""
+
+        time.sleep(self._image_retry_delay)
+        attempt = self._repository.next_step_attempt(
+            episode_id=episode.id,
+            kind=StepKind.IMAGE,
+            operation_key="image:storyboard",
+        )
+        return self._ensure_storyboard(
+            episode,
+            selection,
+            prompt_override=prompt_override,
+            attempt=attempt,
+            retry_of_step_id=original_step.id,
+            retry_reason="Seedream同步请求超时，按运行策略自动重试一次",
+            auto_timeout_retry_index=auto_timeout_retry_index,
+            duplicate_billing_risk_accepted=True,
         )
 
     def _await_manual(

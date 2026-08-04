@@ -18,7 +18,13 @@ const reason = ref("");
 const submitting = ref(false);
 
 const url = computed(() => assetContentUrl(props.asset.id));
-const isVideo = computed(() => props.asset.mediaType.startsWith("video/"));
+// 后端用业务媒体类型（video/image），部分历史数据则保存具体 MIME。
+// 两种形式都应走浏览器原生视频播放器，避免把 MP4 误交给图片组件。
+const isVideo = computed(
+  () =>
+    props.asset.mediaType === "video" ||
+    props.asset.mediaType.startsWith("video/"),
+);
 
 /** 该资产最近一条人工审核决定。 */
 const humanDecision = computed(() =>
@@ -38,6 +44,13 @@ const technical = computed(() =>
     )
     .pop(),
 );
+
+const technicalPassed = computed(() => {
+  const evidence = technical.value?.evidence;
+  return Boolean(
+    evidence && typeof evidence === "object" && evidence.passed === true,
+  );
+});
 
 /** Ark 视觉语义审核证据（身份/画风/世界连续性/叙事）。 */
 const visualReview = computed(() =>
@@ -136,7 +149,7 @@ async function decide(approve: boolean) {
       </a>
     </div>
     <div v-if="technical" class="muted" style="margin-top: 6px">
-      技术QC：{{ technical.decision === "approved" ? "通过" : "未通过" }}
+      技术QC：{{ technicalPassed ? "通过" : "未通过" }}
       <span v-if="technical.warnings?.length">
         · {{ technical.warnings.length }} 条警告
       </span>

@@ -45,6 +45,7 @@ def create_app(
     query_service: QueryService,
     *,
     allowed_media_roots: tuple[Path, ...],
+    runtime_report: dict[str, object] | None = None,
 ) -> FastAPI:
     """创建只读API；业务状态由共享QueryService提供。"""
 
@@ -58,7 +59,9 @@ def create_app(
 
     @app.get("/api/v1/health")
     def health() -> dict:
-        return query_service.health()
+        # 运行超时属于只读运维事实。与数据库健康状态合并返回，前端无需读取
+        # .env，也不会接触API Key、密码或连接串。
+        return {**query_service.health(), **(runtime_report or {})}
 
     @app.get("/api/v1/runs")
     def list_runs(
@@ -146,6 +149,7 @@ def create_full_app(
     app = create_app(
         container.queries,
         allowed_media_roots=allowed_media_roots,
+        runtime_report=container.runtime_settings.preflight_report(),
     )
     runtime = container.runtime_settings
     app.include_router(

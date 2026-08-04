@@ -14,6 +14,8 @@ output/
 docs/设计脚本教程/
 docs/公众号文章解析
 docs/LibTV
+/.playwright-mcp
+/docs
 
 # Web frontend
 web/node_modules/

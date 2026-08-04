@@ -36,6 +36,12 @@ const draft = reactive({
   shots: [] as ShotDraft[],
 });
 
+const loadedDraftSnapshot = ref("");
+
+function currentDraftSnapshot(): string {
+  return JSON.stringify(draft);
+}
+
 function reset() {
   const script = props.episode.script;
   draft.title = script.title;
@@ -55,8 +61,22 @@ function reset() {
     framing: item.framing,
     direction: item.direction,
   }));
+  loadedDraftSnapshot.value = currentDraftSnapshot();
 }
-watch(() => props.episode.id, reset, { immediate: true });
+watch(
+  () => props.episode.script,
+  () => {
+    // 轮询或重规划会在同一Episode ID下替换脚本。只有用户尚未编辑时才同步
+    // 后端新版本，避免旧草稿遮住真实数据，也不覆盖尚未保存的输入。
+    if (
+      !loadedDraftSnapshot.value ||
+      currentDraftSnapshot() === loadedDraftSnapshot.value
+    ) {
+      reset();
+    }
+  },
+  { deep: true, immediate: true },
+);
 
 const saving = ref(false);
 const errors = ref<string[]>([]);

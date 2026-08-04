@@ -448,11 +448,14 @@ def _write_client(*, tmp_path, settings, production, planning, status):
     return TestClient(app)
 
 
-def test_replan_endpoint_chains_only_when_finalized(tmp_path) -> None:
+def test_replan_endpoint_continues_pipeline_from_draft_or_finalized(tmp_path) -> None:
+    resumed: list[uuid.UUID] = []
     planning = SimpleNamespace(
         replan_episode=lambda run_id, *, slot, reason, allow_paid_generation: {
             "slot": slot.value
-        }
+        },
+        resume_planning=lambda run_id, *, allow_paid_generation: resumed.append(run_id)
+        or {"runId": str(run_id)},
     )
     finalized = StudioProduction()
     client = _write_client(
@@ -469,11 +472,11 @@ def test_replan_endpoint_chains_only_when_finalized(tmp_path) -> None:
     assert accepted.status_code == 202
     assert finalized.video_calls == [{"slot": None}]
 
-    unfinalized = StudioProduction()
+    draft = StudioProduction()
     client_draft = _write_client(
         tmp_path=tmp_path,
         settings=PipelineSettings(allow_paid_generation=True),
-        production=unfinalized,
+        production=draft,
         planning=planning,
         status="draft",
     )
@@ -482,8 +485,8 @@ def test_replan_endpoint_chains_only_when_finalized(tmp_path) -> None:
         json={"reason": "共享元素声明与其他时段保持一致", "allowPaidGeneration": True},
     )
     assert accepted.status_code == 202
-    assert unfinalized.video_calls == []
-    assert unfinalized.storyboard_calls == 0
+    assert draft.video_calls == [{"slot": None}]
+    assert len(resumed) == 1
 
 
 def test_continue_endpoint_chains_by_settings(daily_plan) -> None:
@@ -551,3 +554,115 @@ def test_pipeline_settings_endpoint(daily_plan) -> None:
     assert response.json()["pipelineSettings"]["dayBrief"] == "manual"
     assert repository.settings is not None
     assert repository.settings.day_brief is StageMode.MANUAL
+
+
+def test_step_recovery_endpoints_target_exact_node(tmp_path) -> None:
+    step_id = uuid.uuid4()
+    calls: list[tuple[str, object]] = []
+    retry = SimpleNamespace(
+        resume_step=lambda value: calls.append(("resume", value))
+        or {"status": "provider_running"},
+        reconciliation_candidates=lambda value: (
+            {
+                "taskId": "ark-task-1",
+                "status": "running",
+                "model": "seedance",
+                "createdAt": None,
+                "durationSeconds": 9,
+                "ratio": "9:16",
+                "resolution": "480p",
+                "generateAudio": True,
+            },
+        ),
+        reconcile_step=lambda value, *, provider_task_id: calls.append(
+            ("reconcile", (value, provider_task_id))
+        )
+        or {"status": "provider_running"},
+    )
+    queries = SimpleNamespace(
+        step=lambda value: {
+            "id": str(value),
+            "runId": str(RUN_ID),
+            "episodeId": str(EPISODE_ID),
+            "operationKey": "video:single_pass",
+        }
+    )
+    app = FastAPI()
+    app.include_router(
+        create_write_router(
+            planning=SimpleNamespace(),
+            production=SimpleNamespace(),
+            assets=SimpleNamespace(),
+            delivery=SimpleNamespace(),
+            queries=queries,
+            retry=retry,
+            job_registry=JobRegistry(inline=True),
+            default_candidate_count=1,
+            upload_dir=tmp_path,
+            delivery_root=tmp_path,
+        )
+    )
+    client = TestClient(app)
+
+    resumed = client.post(f"/api/v1/steps/{step_id}/resume")
+    candidates = client.get(
+        f"/api/v1/steps/{step_id}/reconciliation-candidates"
+    )
+    reconciled = client.post(
+        f"/api/v1/steps/{step_id}/reconcile",
+        json={"providerTaskId": "ark-task-1"},
+    )
+
+    assert resumed.status_code == 202
+    assert candidates.status_code == 200
+    assert candidates.json()[0]["taskId"] == "ark-task-1"
+    assert reconciled.status_code == 202
+    assert calls == [
+        ("resume", step_id),
+        ("reconcile", (step_id, "ark-task-1")),
+    ]
+
+
+def test_unknown_image_retry_requires_duplicate_billing_ack(tmp_path) -> None:
+    step_id = uuid.uuid4()
+    calls: list[bool] = []
+    retry = SimpleNamespace(
+        retry_step=lambda value, **kwargs: calls.append(
+            kwargs["acknowledge_duplicate_billing"]
+        )
+        or {"stepId": str(value)}
+    )
+    queries = SimpleNamespace(
+        step=lambda value: {
+            "id": str(value),
+            "runId": str(RUN_ID),
+            "episodeId": str(EPISODE_ID),
+            "operationKey": "image:storyboard",
+        }
+    )
+    app = FastAPI()
+    app.include_router(
+        create_write_router(
+            planning=SimpleNamespace(),
+            production=SimpleNamespace(),
+            assets=SimpleNamespace(),
+            delivery=SimpleNamespace(),
+            queries=queries,
+            retry=retry,
+            job_registry=JobRegistry(inline=True),
+            default_candidate_count=1,
+            upload_dir=tmp_path,
+            delivery_root=tmp_path,
+        )
+    )
+    response = TestClient(app).post(
+        f"/api/v1/steps/{step_id}/retry",
+        json={
+            "reason": "接受图片未知提交风险",
+            "allowPaidGeneration": True,
+            "acknowledgeDuplicateBilling": True,
+        },
+    )
+
+    assert response.status_code == 202
+    assert calls == [True]

@@ -92,7 +92,9 @@ def _workflow_nodes(
 
     def latest_step(operation_key: str) -> WorkflowStep | None:
         matches = [item for item in steps if item.operation_key == operation_key]
-        return max(matches, key=lambda item: (item.attempt, item.created_at), default=None)
+        # 局部重规划会开始一组新的媒体attempt，数字可能重新从1开始。
+        # 节点当前态因此必须按真实创建时间选择，不能让旧剧本的attempt=2遮住新剧本的attempt=1。
+        return max(matches, key=lambda item: item.created_at, default=None)
 
     def step_node(
         *,
@@ -107,6 +109,22 @@ def _workflow_nodes(
         semantic_review_status: str = "not_applicable",
     ) -> dict[str, Any]:
         step_payload = None if step is None else step_dict(step)
+        attempts = (
+            []
+            if step is None
+            else [
+                step_dict(item)
+                for item in sorted(
+                    (
+                        item
+                        for item in steps
+                        if item.operation_key == step.operation_key
+                        and item.episode_id == step.episode_id
+                    ),
+                    key=lambda item: item.created_at,
+                )
+            ]
+        )
         return {
             "id": node_id,
             "type": node_type,
@@ -128,6 +146,10 @@ def _workflow_nodes(
             "reviewIds": [] if step is None else review_ids_by_step.get(step.id, []),
             "error": None if step_payload is None else step_payload["error"],
             "nextAction": None if step_payload is None else step_payload["nextAction"],
+            "availableActions": (
+                [] if step_payload is None else step_payload["availableActions"]
+            ),
+            "attempts": attempts,
         }
 
     def latest_review(
@@ -201,11 +223,15 @@ def _workflow_nodes(
         ]
         storyboard_step = max(
             storyboard_steps,
-            key=lambda item: (item.attempt, item.created_at),
+            key=lambda item: item.created_at,
             default=None,
         )
         storyboards = tuple(
-            item for item in episode_assets if item.role == "storyboard_panel"
+            item
+            for item in episode_assets
+            if item.role == "storyboard_panel"
+            and storyboard_step is not None
+            and item.producing_step_id == storyboard_step.id
         )
         video_steps = [
             item
@@ -216,10 +242,16 @@ def _workflow_nodes(
         ]
         video_step = max(
             video_steps,
-            key=lambda item: (item.attempt, item.created_at),
+            key=lambda item: item.created_at,
             default=None,
         )
-        videos = tuple(item for item in episode_assets if item.role == "video")
+        videos = tuple(
+            item
+            for item in episode_assets
+            if item.role == "video"
+            and video_step is not None
+            and item.producing_step_id == video_step.id
+        )
         director_node = step_node(
             node_id=f"director:{slot}",
             node_type="director",

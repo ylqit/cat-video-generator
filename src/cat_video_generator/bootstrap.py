@@ -143,6 +143,9 @@ def build_runtime_container(
         media_probe=probe,
         provider_name=runtime.provider_profile,
         storyboard_review_mode=runtime.storyboard_review_mode,
+        image_request_timeout_seconds=runtime.ark_image_request_timeout_seconds,
+        image_timeout_auto_retries=runtime.ark_image_timeout_auto_retries,
+        image_retry_delay_seconds=runtime.ark_image_retry_delay_seconds,
         series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
         style_profile=DEFAULT_STYLE_PROFILE,
     )
@@ -156,6 +159,7 @@ def build_runtime_container(
         review_gateway=gateway,
         frame_extractor=frame_extractor,
         diagnostic_mode=runtime.video_semantic_review_mode,
+        api_timeout_seconds=runtime.ark_video_api_timeout_seconds,
         poll_interval_seconds=runtime.ark_poll_interval_seconds,
         task_timeout_seconds=runtime.ark_task_timeout_seconds,
         style_profile=DEFAULT_STYLE_PROFILE,

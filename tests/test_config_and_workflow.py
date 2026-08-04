@@ -39,6 +39,11 @@ def test_standard_ark_configuration_is_valid(tmp_path) -> None:
     assert settings.provider_profile == "volcengine-ark-standard"
     assert settings.ark_video_resolution == "720p"
     assert settings.ark_image_request_timeout_seconds == 600
+    assert settings.ark_director_request_timeout_seconds == 240
+    assert settings.ark_review_request_timeout_seconds == 240
+    assert settings.ark_video_api_timeout_seconds == 120
+    assert settings.ark_image_timeout_auto_retries == 1
+    assert settings.ark_image_retry_delay_seconds == 15
     assert settings.preflight_report()["arkImageRequestTimeoutSeconds"] == 600
     assert "ark_access_mode" not in settings.__dataclass_fields__
 
@@ -47,6 +52,34 @@ def test_image_request_timeout_must_be_positive(tmp_path) -> None:
     with pytest.raises(ConfigurationError, match="请求超时必须大于0"):
         RuntimeSettings.from_env(
             settings_env(ARK_IMAGE_REQUEST_TIMEOUT_SECONDS="0"),
+            config_root=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "ARK_DIRECTOR_REQUEST_TIMEOUT_SECONDS",
+        "ARK_REVIEW_REQUEST_TIMEOUT_SECONDS",
+        "ARK_VIDEO_API_TIMEOUT_SECONDS",
+        "ARK_TASK_TIMEOUT_SECONDS",
+        "ARK_POLL_INTERVAL_SECONDS",
+        "ARK_IMAGE_RETRY_DELAY_SECONDS",
+    ],
+)
+def test_all_runtime_timeouts_must_be_positive(name: str, tmp_path) -> None:
+    with pytest.raises(ConfigurationError, match="必须大于0"):
+        RuntimeSettings.from_env(
+            settings_env(**{name: "0"}),
+            config_root=tmp_path,
+        )
+
+
+@pytest.mark.parametrize("value", ["-1", "2"])
+def test_seedream_timeout_retry_count_is_bounded(value: str, tmp_path) -> None:
+    with pytest.raises(ConfigurationError, match="只允许0或1"):
+        RuntimeSettings.from_env(
+            settings_env(ARK_IMAGE_TIMEOUT_AUTO_RETRIES=value),
             config_root=tmp_path,
         )
 

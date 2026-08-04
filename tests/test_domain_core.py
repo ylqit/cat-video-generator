@@ -152,8 +152,19 @@ def test_sitting_text_is_not_parsed_as_physics(daily_plan) -> None:
 def test_missing_ending_entity_is_rejected(daily_plan) -> None:
     payload = daily_plan.episodes[0].script.model_dump(mode="python")
     payload["ending"]["key_entity_ids"] = ["snail"]
-    with pytest.raises(ValidationError, match="结尾引用未登记关键实体"):
+    with pytest.raises(ValidationError, match="结尾引用未登记关键实体或场景锚点"):
         EpisodeScript.model_validate(payload)
+
+
+def test_registered_anchor_can_be_part_of_visible_ending(daily_plan) -> None:
+    original = daily_plan.episodes[0]
+    payload = original.script.model_dump(mode="python")
+    anchor_id = payload["continuity"]["anchors"][0]["id"]
+    payload["ending"]["key_entity_ids"] = ["person", "cat", anchor_id]
+
+    script = EpisodeScript.model_validate(payload)
+
+    assert anchor_id in script.ending.key_entity_ids
 
 
 def test_more_than_four_ending_entities_is_warning_only(daily_plan) -> None:

@@ -35,6 +35,7 @@ export interface RunSummary {
   theme: string | null;
   status: string;
   nextAction: string | null;
+  availableActions: StepActionDto[];
   pipelineSettings?: PipelineSettings;
   createdAt: string;
   updatedAt: string;
@@ -144,6 +145,23 @@ export interface EpisodeDto {
 export interface StepError {
   code?: string;
   message?: string;
+  requestId?: string;
+}
+
+export type StepActionType =
+  | "retry"
+  | "retry_unknown_image"
+  | "continue_query"
+  | "reconcile"
+  | "review"
+  | "deliver"
+  | "none";
+
+export interface StepActionDto {
+  type: StepActionType;
+  label: string;
+  paid: boolean;
+  requiresDuplicateBillingAck?: boolean;
 }
 
 export interface StepDto {
@@ -162,7 +180,9 @@ export interface StepDto {
   inputSnapshot: Record<string, unknown>;
   error: StepError | null;
   nextAction: string | null;
+  availableActions: StepActionDto[];
   createdAt: string;
+  submittedAt: string | null;
 }
 
 export interface PromptDto {
@@ -234,6 +254,19 @@ export interface WorkflowNodeDto {
   reviewIds: string[];
   error: StepError | null;
   nextAction: string | null;
+  availableActions: StepActionDto[];
+  attempts: StepDto[];
+}
+
+export interface ReconciliationCandidateDto {
+  taskId: string;
+  status: string;
+  model: string | null;
+  createdAt: string | null;
+  durationSeconds: number | null;
+  ratio: string | null;
+  resolution: string | null;
+  generateAudio: boolean | null;
 }
 
 export interface CanonAsset {
@@ -303,9 +336,17 @@ export interface HealthStatus {
   alembicRevision: string | null;
   expectedAlembicRevision: string;
   ready: boolean;
+  arkDirectorRequestTimeoutSeconds?: number;
+  arkImageRequestTimeoutSeconds?: number;
+  arkImageTimeoutAutoRetries?: number;
+  arkImageRetryDelaySeconds?: number;
+  arkReviewRequestTimeoutSeconds?: number;
+  arkVideoApiTimeoutSeconds?: number;
+  arkTaskTimeoutSeconds?: number;
+  arkPollIntervalSeconds?: number;
 }
 
-/** 主题创作台：单集 Prompt 预览与编辑覆盖。 */
+/** 生产工作台：单集 Prompt 预览与编辑覆盖。 */
 export interface PromptOverrides {
   storyboard?: string;
   video?: string;

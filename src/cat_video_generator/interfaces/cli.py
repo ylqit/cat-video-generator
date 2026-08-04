@@ -414,7 +414,11 @@ def serve_api(
     media_roots = (runtime.asset_root, runtime.delivery_root)
     if read_only:
         container = build_query_container()
-        api = create_app(container.queries, allowed_media_roots=media_roots)
+        api = create_app(
+            container.queries,
+            allowed_media_roots=media_roots,
+            runtime_report=runtime.preflight_report(),
+        )
     else:
         container = build_runtime_container(
             allow_paid_generation=False,
