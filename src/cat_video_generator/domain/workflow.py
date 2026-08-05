@@ -46,6 +46,8 @@ class PromptPurpose(StrEnum):
     """供应商调用及其审核使用的稳定Prompt用途。"""
 
     DIRECTOR = "director"
+    LOOK = "look"
+    LOOK_REVIEW = "look_review"
     STORYBOARD = "storyboard"
     STORYBOARD_REVIEW = "storyboard_review"
     VIDEO = "video"
@@ -68,15 +70,20 @@ class StepStatus(StrEnum):
 _PROMPT_PURPOSES_BY_STEP_KIND = {
     StepKind.DIRECTOR: frozenset({PromptPurpose.DIRECTOR}),
     StepKind.IMAGE: frozenset(
-        {PromptPurpose.STORYBOARD, PromptPurpose.STORYBOARD_REVIEW}
+        {
+            PromptPurpose.LOOK,
+            PromptPurpose.LOOK_REVIEW,
+            PromptPurpose.STORYBOARD,
+            PromptPurpose.STORYBOARD_REVIEW,
+        }
     ),
     StepKind.VIDEO: frozenset({PromptPurpose.VIDEO, PromptPurpose.REVIEW}),
 }
 
-_GENERATION_PROMPT_BY_STEP_KIND = {
-    StepKind.DIRECTOR: PromptPurpose.DIRECTOR,
-    StepKind.IMAGE: PromptPurpose.STORYBOARD,
-    StepKind.VIDEO: PromptPurpose.VIDEO,
+_GENERATION_PROMPTS_BY_STEP_KIND = {
+    StepKind.DIRECTOR: frozenset({PromptPurpose.DIRECTOR}),
+    StepKind.IMAGE: frozenset({PromptPurpose.LOOK, PromptPurpose.STORYBOARD}),
+    StepKind.VIDEO: frozenset({PromptPurpose.VIDEO}),
 }
 
 
@@ -95,8 +102,9 @@ def validate_prompt_purpose(
     allowed = _PROMPT_PURPOSES_BY_STEP_KIND[kind]
     if purpose not in allowed:
         raise ValueError(f"{kind.value}步骤不允许purpose={purpose.value}")
-    if generation_intent and _GENERATION_PROMPT_BY_STEP_KIND[kind] is not purpose:
-        expected = _GENERATION_PROMPT_BY_STEP_KIND[kind].value
+    generation_purposes = _GENERATION_PROMPTS_BY_STEP_KIND[kind]
+    if generation_intent and purpose not in generation_purposes:
+        expected = ", ".join(sorted(item.value for item in generation_purposes))
         raise ValueError(f"{kind.value}步骤的生成Prompt必须是{expected}")
     return purpose
 

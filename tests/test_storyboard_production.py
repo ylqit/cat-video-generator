@@ -42,10 +42,19 @@ class StoryboardRepository:
         self.prompts: list[dict[str, Any]] = []
         self.reviews: list[dict[str, Any]] = []
         self.step_errors: dict[uuid.UUID, dict[str, Any]] = {}
+        self.step_input_hashes: dict[uuid.UUID, str] = {}
 
     def set_episode_status(self, episode_id: uuid.UUID, target: EpisodeStatus) -> None:
         assert episode_id == self.episode.id
         self.episode = replace(self.episode, status=target)
+
+    def get_planning_context(self, run_id: uuid.UUID) -> dict[str, Any]:
+        assert run_id == self.episode.run_id
+        return {
+            "planningMetadata": {
+                "seriesProfile": DEFAULT_SERIES_VISUAL_PROFILE.model_dump(mode="json")
+            }
+        }
 
     def list_assets(self, **kwargs: Any) -> tuple[StoredAsset, ...]:
         semantic_keys = set(kwargs.get("semantic_keys") or ())
@@ -62,7 +71,7 @@ class StoryboardRepository:
         matching_steps = {
             step.id
             for step in self.steps
-            if step.input_snapshot.get("input_hash") == input_hash
+            if self.step_input_hashes.get(step.id) == input_hash
         }
         candidates = [
             item
@@ -108,9 +117,10 @@ class StoryboardRepository:
             provider_task_id=None,
             model=kwargs["model"],
             operation_key=kwargs["operation_key"],
-            input_snapshot={**kwargs["input_snapshot"], "input_hash": kwargs["input_hash"]},
+            input_snapshot=kwargs["input_snapshot"],
         )
         self.steps.append(step)
+        self.step_input_hashes[step.id] = kwargs["input_hash"]
         prompt_id = self.save_prompt(
             step_id=step.id,
             parent_prompt_id=kwargs["parent_prompt_id"],
@@ -145,6 +155,9 @@ class StoryboardRepository:
 
     def get_step(self, step_id: uuid.UUID) -> StoredStep:
         return next(item for item in self.steps if item.id == step_id)
+
+    def asset_detail(self, asset_id: uuid.UUID) -> StoredAsset:
+        return next(item for item in self.assets if item.id == asset_id)
 
     def get_episode(self, run_id: uuid.UUID, slot: Slot) -> StoredEpisode:
         assert run_id == self.episode.run_id
@@ -268,15 +281,19 @@ class StoryboardProbe:
         return {"width": 720, "height": 1280, "blackBorderDetected": False}
 
 
-def _canon_assets(tmp_path: Path, run_id: uuid.UUID) -> tuple[StoredAsset, ...]:
+def _canon_assets(
+    tmp_path: Path,
+    run_id: uuid.UUID,
+    episode: StoredEpisode,
+) -> tuple[StoredAsset, ...]:
     keys = (
-        "person:front",
+        "person:headshot",
         "cat:front",
         "style:line_texture",
         "style:indoor",
         "element:pinwheel",
     )
-    return tuple(
+    canon = tuple(
         StoredAsset(
             id=uuid.uuid4(),
             run_id=None,
@@ -293,6 +310,25 @@ def _canon_assets(tmp_path: Path, run_id: uuid.UUID) -> tuple[StoredAsset, ...]:
         )
         for index, key in enumerate(keys, 1)
     )
+    description = " ".join(episode.plan.script.appearance.description.split())
+    signature = hashlib.sha256(
+        ('{"description": "' + description + '"}').encode("utf-8")
+    ).hexdigest()
+    look = StoredAsset(
+        id=uuid.uuid4(),
+        run_id=run_id,
+        episode_id=episode.id,
+        step_id=None,
+        role="look_reference",
+        media_type="image",
+        scope="episode",
+        status="approved",
+        path=tmp_path / "look.png",
+        sha256=hashlib.sha256(b"look").hexdigest(),
+        metadata={"appearanceSignature": signature},
+        semantic_key=f"look:{episode.plan.slot.value}-{signature[:12]}",
+    )
+    return (*canon, look)
 
 
 def _service(
@@ -310,7 +346,7 @@ def _service(
         status=EpisodeStatus.PLANNED,
         selected_video_asset_id=None,
     )
-    repository = StoryboardRepository(episode, _canon_assets(tmp_path, run_id))
+    repository = StoryboardRepository(episode, _canon_assets(tmp_path, run_id, episode))
     gateway = StoryboardGateway(returned, approved=approved)
     service = VisualPreparationService(
         repository=repository,
@@ -355,7 +391,7 @@ def test_episode_creates_one_storyboard_step_and_reuses_approved_group(tmp_path:
         if item["purpose"] is PromptPurpose.STORYBOARD_REVIEW
     )
     assert review["parent_prompt_id"] == generation["id"]
-    assert len(repository.steps[0].input_snapshot["reference_asset_ids"]) == 4
+    assert len(repository.steps[0].input_snapshot["reference_asset_ids"]) == 5
     assert repository.reviews[0]["warnings"] == [
         {"code": "storyboard_warning", "message": "minor background drift"}
     ]
@@ -425,7 +461,7 @@ def test_semantic_storyboard_rejection_is_atomic(tmp_path: Path) -> None:
     assert repository.steps[0].status is StepStatus.FAILED
 
 
-def test_semantic_review_exception_reuses_existing_panels_without_new_seedream(
+def test_semantic_review_exception_waits_for_human_without_recalling_providers(
     tmp_path: Path,
 ) -> None:
     service, repository, gateway, episode = _service(tmp_path)
@@ -447,11 +483,17 @@ def test_semantic_review_exception_reuses_existing_panels_without_new_seedream(
     gateway.review_storyboard = original_review  # type: ignore[method-assign]
     panels = service.prepare(repository.episode)
 
-    assert panels is not None
-    assert [item.id for item in panels] == candidate_ids
-    assert all(item.status == "approved" for item in panels)
+    assert panels is None
+    assert [
+        item.id for item in repository.assets if item.role == "storyboard_panel"
+    ] == candidate_ids
+    assert all(
+        item.status == "candidate"
+        for item in repository.assets
+        if item.role == "storyboard_panel"
+    )
     assert gateway.generate_calls == 1
-    assert repository.episode.status is EpisodeStatus.VIDEO_PENDING
+    assert repository.steps[0].status is StepStatus.AWAITING_REVIEW
 
 
 def test_pose_only_storyboard_keeps_micro_actions_as_diagnostics(tmp_path: Path) -> None:

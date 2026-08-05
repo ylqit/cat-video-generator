@@ -35,7 +35,9 @@ from ..domain.rules import (
     validate_episode_cooldown,
     validate_plan_gate,
 )
+from ..domain.story_patterns import StoryPattern
 from ..domain.visual_profiles import (
+    CreativeProfileOverride,
     SeriesVisualProfile,
     StyleProfile,
 )
@@ -123,6 +125,7 @@ class PlanningService:
         planning_context: str,
         candidate_count: int,
         allow_paid_generation: bool,
+        creative_profile: CreativeProfileOverride | None = None,
         stop_after_day_brief: bool = False,
         pipeline_settings: PipelineSettings | None = None,
     ) -> PlanningResult | DayBriefPause:
@@ -137,18 +140,37 @@ class PlanningService:
         if candidate_count != 1:
             raise ValueError("分层导演模式固定生成一份DayBrief；DAILY_PLAN_CANDIDATE_COUNT必须为1")
 
+        series_profile = (creative_profile or CreativeProfileOverride()).apply_to(
+            self._series_profile
+        )
         recent_summaries = self._repository.list_recent_completed_summaries(limit=6)
         event_seeds = self._event_seed_catalog.select(
-            series_profile_hash=self._series_profile.fingerprint(),
+            series_profile_hash=series_profile.fingerprint(),
             content_date=target_date,
             planning_revision=1,
             planning_context=planning_context,
         )
+        recent_pattern_ids = tuple(
+            pattern_id
+            for summary in recent_summaries
+            for pattern_id in summary.pattern_ids
+        )
+        story_patterns = self._event_seed_catalog.select_patterns(
+            series_profile_hash=series_profile.fingerprint(),
+            content_date=target_date,
+            planning_revision=1,
+            recent_pattern_ids=recent_pattern_ids,
+        )
         planning_metadata = {
             "planningRevision": 1,
-            "seriesProfileHash": self._series_profile.fingerprint(),
+            "seriesProfileHash": series_profile.fingerprint(),
+            "seriesProfile": series_profile.model_dump(mode="json"),
             "recentSummaries": [item.model_dump(mode="json") for item in recent_summaries],
             "eventSeeds": [item.model_dump(mode="json") for item in event_seeds],
+            "storyPatterns": {
+                slot.value: pattern.model_dump(mode="json")
+                for slot, pattern in story_patterns.items()
+            },
         }
         run_id = self._repository.create_draft_run(target_date)
         self._repository.save_pipeline_settings(
@@ -166,7 +188,8 @@ class PlanningService:
                     f"{item.direction}"
                     for item in event_seeds
                 ),
-                series_profile=self._series_profile,
+                story_patterns=story_patterns,
+                series_profile=series_profile,
             )
             day_brief, day_step, day_prompt_id = self._director_invoker.invoke(
                 run_id=run_id,
@@ -261,6 +284,11 @@ class PlanningService:
     ) -> PlanningResult:
         """顺序补齐三个Episode并原子形成可生成的全天方案。"""
 
+        series_profile = _series_profile_from_metadata(
+            planning_metadata,
+            self._series_profile,
+        )
+        story_patterns = _story_patterns_from_metadata(planning_metadata)
         episodes: list[EpisodePlan] = []
         for slot_brief in day_brief.slots:
             saved = drafts.get(slot_brief.slot.value)
@@ -279,6 +307,8 @@ class PlanningService:
                     parent_prompt_id=day_prompt_id,
                     retry_reason=None,
                     recent_summaries=recent_summaries,
+                    story_pattern=story_patterns.get(slot_brief.slot),
+                    series_profile=series_profile,
                 )
                 drafts[episode.slot.value] = episode.script.model_dump(mode="json")
                 self._save_context(
@@ -295,6 +325,7 @@ class PlanningService:
             run_id,
             day_brief,
             episodes,
+            series_profile=series_profile,
         )
         self._repository.finalize_plan(
             run_id=run_id,
@@ -341,6 +372,9 @@ class PlanningService:
         )
         day_step_id = uuid.UUID(context["dayDirectorStepId"])
         day_prompt_id = uuid.UUID(context["dayDirectorPromptId"])
+        metadata = context.get("planningMetadata", {})
+        series_profile = _series_profile_from_metadata(metadata, self._series_profile)
+        story_patterns = _story_patterns_from_metadata(metadata)
         try:
             episode, _, attempt = self._generate_episode(
                 run_id=run_id,
@@ -351,11 +385,13 @@ class PlanningService:
                 parent_prompt_id=day_prompt_id,
                 retry_reason=reason,
                 recent_summaries=_parse_recent_summaries(
-                    context.get("planningMetadata", {}).get(
+                    metadata.get(
                         "recentSummaries",
                         (),
                     )
                 ),
+                story_pattern=story_patterns.get(slot),
+                series_profile=series_profile,
             )
         except PlanningReviewRequired:
             if stored_run.status != RunStatus.PLANNING_REVIEW.value:
@@ -380,6 +416,7 @@ class PlanningService:
                 run_id,
                 day_brief,
                 [episode if item.slot is slot else item for item in stored_run.plan.episodes],
+                series_profile=series_profile,
             )
             self._repository.replace_episode_plan(
                 run_id=run_id,
@@ -392,6 +429,7 @@ class PlanningService:
                 run_id,
                 day_brief,
                 [drafts[item.value] for item in Slot],
+                series_profile=series_profile,
             )
             self._repository.finalize_plan(
                 run_id=run_id,
@@ -415,6 +453,8 @@ class PlanningService:
         parent_prompt_id: uuid.UUID,
         retry_reason: str | None,
         recent_summaries: tuple[RecentContentSummary, ...],
+        story_pattern: StoryPattern | None,
+        series_profile: SeriesVisualProfile,
     ) -> tuple[EpisodePlan, StoredStep, int]:
         first_attempt = self._repository.next_director_attempt(
             run_id=run_id,
@@ -433,7 +473,8 @@ class PlanningService:
                 retry_reason=retry_reason,
                 rejected_candidate=rejected_candidate,
                 validation_errors=validation_errors,
-                series_profile=self._series_profile,
+                story_pattern=story_pattern,
+                series_profile=series_profile,
             )
             try:
                 draft, step, _ = self._director_invoker.invoke(
@@ -466,7 +507,7 @@ class PlanningService:
                     episode,
                     day_brief=day_brief,
                     slot_brief=slot_brief,
-                    series_profile=self._series_profile,
+                    series_profile=series_profile,
                 ),
                 *validate_episode_cooldown(episode, recent_summaries),
             )
@@ -524,6 +565,8 @@ class PlanningService:
         run_id: uuid.UUID,
         day_brief: DayBrief,
         episodes: list[EpisodePlan],
+        *,
+        series_profile: SeriesVisualProfile,
     ) -> DailyProductionPlan:
         plan = DailyProductionPlan(
             day_brief=day_brief,
@@ -534,7 +577,7 @@ class PlanningService:
                 *validate_plan_gate(
                     plan,
                     expected_date=day_brief.content_date,
-                    series_profile=self._series_profile,
+                    series_profile=series_profile,
                 ),
             )
         )
@@ -581,3 +624,26 @@ def _parse_recent_summaries(
     for value in values:
         result.append(RecentContentSummary.model_validate(value))
     return tuple(result)
+
+
+def _series_profile_from_metadata(
+    metadata: dict[str, Any],
+    fallback: SeriesVisualProfile,
+) -> SeriesVisualProfile:
+    """恢复本Run冻结的人格档案，保证续跑不会受后来默认值变化影响。"""
+
+    value = metadata.get("seriesProfile")
+    return SeriesVisualProfile.model_validate(value) if isinstance(value, dict) else fallback
+
+
+def _story_patterns_from_metadata(
+    metadata: dict[str, Any],
+) -> dict[Slot, StoryPattern]:
+    values = metadata.get("storyPatterns")
+    if not isinstance(values, dict):
+        return {}
+    result: dict[Slot, StoryPattern] = {}
+    for raw_slot, value in values.items():
+        if isinstance(value, dict):
+            result[Slot(raw_slot)] = StoryPattern.model_validate(value)
+    return result

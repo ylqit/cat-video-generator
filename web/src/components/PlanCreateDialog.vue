@@ -15,6 +15,9 @@ const submitting = ref(false);
 const form = reactive({
   targetDate: "",
   planningContext: "",
+  personPersonality: "",
+  catPersonality: "",
+  humorStyle: "",
   allowPaidGeneration: false,
 });
 
@@ -33,6 +36,11 @@ async function submit() {
     const accepted = await api.createPlan({
       targetDate: form.targetDate,
       planningContext: form.planningContext || undefined,
+      creativeProfile: {
+        personPersonality: form.personPersonality || undefined,
+        catPersonality: form.catPersonality || undefined,
+        humorStyle: form.humorStyle || undefined,
+      },
       allowPaidGeneration: true,
     });
     jobs.track(accepted);
@@ -85,6 +93,15 @@ defineExpose({ open });
           :rows="3"
           placeholder="留空则使用默认：根据日期、天气和角色习惯设计自然的一天。"
         />
+      </el-form-item>
+      <el-form-item>
+        <el-collapse style="width: 100%">
+          <el-collapse-item title="性格与幽默（可选）" name="creative-profile">
+            <el-input v-model="form.personPersonality" placeholder="人物性格；留空使用系列默认" />
+            <el-input v-model="form.catPersonality" placeholder="猫咪性格；留空使用系列默认" style="margin-top: 8px" />
+            <el-input v-model="form.humorStyle" placeholder="幽默方式；留空使用系列默认" style="margin-top: 8px" />
+          </el-collapse-item>
+        </el-collapse>
       </el-form-item>
       <el-form-item>
         <el-checkbox v-model="form.allowPaidGeneration">

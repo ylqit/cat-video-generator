@@ -93,9 +93,8 @@ docker compose down
 重新上传以下语义资产：
 
 ```text
-person:front
-person:side
-person:back
+person:headshot
+person:fullbody
 cat:front
 cat:side
 cat:back
@@ -105,7 +104,7 @@ style:outdoor
 ```
 
 新上传文件会写入 `/data/assets`，并成为相同 `semantic_key` 下最新的已批准版本。确认
-九项资产均可预览后，再创建新的全天 Run。
+八项资产均可预览后，再创建新的全天 Run。
 
 ## 本地开发
 

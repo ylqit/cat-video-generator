@@ -65,6 +65,11 @@ function post<T>(path: string, body?: unknown): Promise<T> {
 export interface PlanPayload {
   targetDate: string;
   planningContext?: string;
+  creativeProfile?: {
+    personPersonality?: string;
+    catPersonality?: string;
+    humorStyle?: string;
+  };
   candidateCount?: number;
   allowPaidGeneration: boolean;
   pipelineSettings?: PipelineSettings;

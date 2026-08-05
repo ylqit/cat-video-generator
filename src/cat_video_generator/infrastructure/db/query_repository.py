@@ -64,7 +64,9 @@ def _current_stage(
         return "video"
     # 失败的故事板可能还没有产生任何Asset。仅依赖图片资产会让页面退回
     # “三集剧本”，因此以已经持久化的工作流意图作为阶段事实。
-    if any(item.operation_key == "image:storyboard" for item in steps):
+    if any(
+        item.operation_key in {"image:look", "image:storyboard"} for item in steps
+    ):
         return "storyboard"
     storyboards = [
         item for item in assets if item.role == "storyboard_panel" and item.episode_id is not None
@@ -238,6 +240,33 @@ def _workflow_nodes(
             key=lambda item: item.created_at,
             default=None,
         )
+        look_steps = [
+            item
+            for item in steps
+            if item.operation_key == "image:look"
+            and episode is not None
+            and item.episode_id == episode.id
+        ]
+        look_step = max(look_steps, key=lambda item: item.created_at, default=None)
+        looks = tuple(
+            item
+            for item in episode_assets
+            if item.role == "look_reference"
+            and look_step is not None
+            and item.producing_step_id == look_step.id
+        )
+        if not looks and storyboard_step is not None:
+            reference_ids = {
+                str(item)
+                for item in storyboard_step.input_snapshot_json.get(
+                    "reference_asset_ids", ()
+                )
+            }
+            looks = tuple(
+                item
+                for item in assets
+                if item.role == "look_reference" and str(item.id) in reference_ids
+            )
         if video_step is not None:
             # 工作台展示当前视频真正消费的故事板，而不是后来一次未进入视频链路的
             # 失败图片attempt。所有attempt仍保留在节点历史中，生产血缘则保持准确。
@@ -340,6 +369,32 @@ def _workflow_nodes(
         nodes.extend(
             (
                 director_node,
+                {
+                    **step_node(
+                        node_id=f"look:{slot}",
+                        node_type="look",
+                        slot=slot,
+                        label=f"{slot}定妆图",
+                        step=look_step,
+                        node_assets=looks,
+                        semantic_review_status=(
+                            "approved"
+                            if any(item.status in {"approved", "ready"} for item in looks)
+                            else "rejected"
+                            if any(item.status == "rejected" for item in looks)
+                            else "pending"
+                        ),
+                    ),
+                    # 中午、傍晚可以复用上午定妆图，此时没有属于当前Episode的
+                    # Image Step；资产已经批准仍应显示成功，而不是误导为待处理。
+                    "status": (
+                        "approved"
+                        if any(item.status in {"approved", "ready"} for item in looks)
+                        else "rejected"
+                        if any(item.status == "rejected" for item in looks)
+                        else "pending"
+                    ),
+                },
                 step_node(
                     node_id=f"storyboard:{slot}",
                     node_type="storyboard",
@@ -446,6 +501,7 @@ class SqlAlchemyReadRepository:
                     "contradictions": contradictions,
                     "dayBrief": run.planning_json.get("dayBrief"),
                     "episodeDrafts": run.planning_json.get("episodeDrafts", {}),
+                    "planningMetadata": run.planning_json.get("planningMetadata", {}),
                     "currentStage": _current_stage(run, episodes, steps, assets),
                 }
             )
@@ -464,6 +520,13 @@ class SqlAlchemyReadRepository:
                     reviews,
                 ),
             }
+
+    def get_planning_context(self, run_id: uuid.UUID) -> dict[str, Any]:
+        """返回导演与创意档案的持久化上下文，不在查询层重建默认值。"""
+
+        with self._sessions() as session:
+            run = required_record(session, ProductionRun, run_id)
+            return dict(run.planning_json or {})
 
     @staticmethod
     def _rows_for_steps(
@@ -536,12 +599,23 @@ class SqlAlchemyReadRepository:
                         if entity.kind.value == "prop"
                     )
                 )
+                raw_patterns = (
+                    run.planning_json.get("planningMetadata", {}).get("storyPatterns", {})
+                )
+                pattern_ids = tuple(
+                    value.get("pattern_id", value.get("patternId", ""))
+                    if isinstance(value, dict)
+                    else str(value)
+                    for value in raw_patterns.values()
+                    if value
+                )
                 result.append(
                     RecentContentSummary(
                         content_date=run.content_date,
                         event_keys=tuple(item.event_key for item in scripts),
                         location_keys=tuple(item.location_key for item in scripts),
                         element_keys=keys,
+                        pattern_ids=tuple(item for item in pattern_ids if item),
                         summary_text=(
                             f"{run.content_date.isoformat()}主题="
                             f"{run.planning_json.get('dayBrief', {}).get('theme', '')}；"

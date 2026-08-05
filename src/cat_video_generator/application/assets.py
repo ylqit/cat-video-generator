@@ -39,8 +39,9 @@ class AssetService:
             raise ValueError("Canon role必须是person、cat或style")
         _validate_semantic_key(role, semantic_key, scope="canon")
         if role in {"person", "cat"}:
-            if view not in {"front", "side", "back"}:
-                raise ValueError("人物和猫咪Canon必须提供front、side或back视角")
+            allowed = _canon_views(role)
+            if view not in allowed:
+                raise ValueError(f"{role} Canon视角必须是{', '.join(sorted(allowed))}")
             if semantic_key != f"{role}:{view}":
                 raise ValueError("人物和猫咪semantic_key必须与role和view一致")
         elif view is not None:
@@ -90,16 +91,17 @@ class AssetService:
             raise ValueError("派生角色必须与来源Canon角色一致")
         _validate_semantic_key(role, semantic_key, scope="canon")
         if role in {"person", "cat"}:
-            if view not in {"front", "side", "back"}:
-                raise ValueError("人物和猫咪裁片必须声明front、side或back")
+            allowed = _canon_views(role)
+            if view not in allowed:
+                raise ValueError(f"{role}裁片视角必须是{', '.join(sorted(allowed))}")
             if semantic_key != f"{role}:{view}":
                 raise ValueError("裁片semantic_key必须与role和view一致")
         elif view is not None:
             raise ValueError("style裁片不能声明人物视角")
         source_meta = self._probe.inspect_image(source.path)
         if box is None:
-            if role == "style":
-                raise ValueError("style必须显式提供无主体区域的裁剪框")
+            if role in {"style", "person"}:
+                raise ValueError("人物新参考和style必须显式提供裁剪框")
             box = (0, 0, int(source_meta["width"]) // 3, int(source_meta["height"]))
         landed = self._asset_store.crop_local(source.path, box=box)
         metadata = {
@@ -231,6 +233,14 @@ class AssetService:
 
 
 _SEMANTIC_KEY = re.compile(r"^[a-z][a-z0-9_]*:[a-z0-9][a-z0-9_-]{0,119}$")
+
+
+def _canon_views(role: str) -> frozenset[str]:
+    if role == "person":
+        return frozenset({"headshot", "fullbody"})
+    if role == "cat":
+        return frozenset({"front", "side", "back"})
+    return frozenset()
 
 
 def _validate_semantic_key(role: str, semantic_key: str, *, scope: str) -> None:

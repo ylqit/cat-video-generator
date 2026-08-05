@@ -11,9 +11,13 @@ from datetime import date
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..domain.contracts import Slot
+from ..domain.visual_profiles import CreativeProfileOverride
 
 CANON_ROLES = frozenset({"person", "cat", "style"})
-CANON_VIEWS = frozenset({"front", "side", "back"})
+CANON_VIEWS = {
+    "person": frozenset({"headshot", "fullbody"}),
+    "cat": frozenset({"front", "side", "back"}),
+}
 IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp"})
 REFERENCE_ROLES = frozenset({"element", "scene"})
 REFERENCE_SUFFIXES = {
@@ -23,6 +27,36 @@ REFERENCE_SUFFIXES = {
 DEFAULT_PLANNING_CONTEXT = "根据日期、天气和角色习惯设计自然的一天。"
 
 
+class CreativeProfileRequest(BaseModel):
+    """Web 创建 Run 时可选的性格偏好；HTTP 使用 camelCase，领域仍保持 snake_case。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    person_personality: str | None = Field(
+        None,
+        alias="personPersonality",
+        min_length=4,
+        max_length=200,
+    )
+    cat_personality: str | None = Field(
+        None,
+        alias="catPersonality",
+        min_length=4,
+        max_length=200,
+    )
+    humor_style: str | None = Field(
+        None,
+        alias="humorStyle",
+        min_length=4,
+        max_length=200,
+    )
+
+    def to_domain(self) -> CreativeProfileOverride:
+        """在HTTP边界完成命名转换，避免把前端字段约定泄漏到领域模型。"""
+
+        return CreativeProfileOverride.model_validate(self.model_dump())
+
+
 class PlanRequest(BaseModel):
     """触发全天规划的请求体；付费许可缺省为拒绝。"""
 
@@ -30,6 +64,10 @@ class PlanRequest(BaseModel):
 
     target_date: date = Field(alias="targetDate")
     planning_context: str | None = Field(None, alias="planningContext")
+    creative_profile: CreativeProfileRequest | None = Field(
+        None,
+        alias="creativeProfile",
+    )
     candidate_count: int | None = Field(None, alias="candidateCount", ge=1, le=5)
     allow_paid_generation: bool = Field(False, alias="allowPaidGeneration")
     pipeline_settings: dict | None = Field(None, alias="pipelineSettings")

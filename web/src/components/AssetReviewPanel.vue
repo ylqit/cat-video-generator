@@ -102,6 +102,24 @@ const visualConfidence = computed(() => {
   return typeof value === "number" ? value : null;
 });
 
+const visualDecisionLabel = computed(() => {
+  if (visualReview.value?.decision === "approved") {
+    return "通过";
+  }
+  if (visualReview.value?.decision === "rejected") {
+    return "打回";
+  }
+  if (typeof visualEvidence.value?.diagnosticError === "string") {
+    return "诊断未完成";
+  }
+  return "待处理";
+});
+
+const visualDiagnosticError = computed(() => {
+  const value = visualEvidence.value?.diagnosticError;
+  return typeof value === "string" ? value : null;
+});
+
 async function decide(approve: boolean) {
   if (!reason.value.trim()) {
     ElMessage.warning("请填写审核理由");
@@ -156,10 +174,13 @@ async function decide(approve: boolean) {
     </div>
     <div v-if="visualReview" style="margin-top: 6px">
       <div class="muted">
-        语义审核：{{ visualReview.decision === "approved" ? "通过" : "打回" }}
+        语义审核：{{ visualDecisionLabel }}
         <span v-if="visualConfidence !== null">
           · 置信度 {{ (visualConfidence * 100).toFixed(0) }}%
         </span>
+      </div>
+      <div v-if="visualDiagnosticError" class="muted" style="margin-top: 4px">
+        诊断错误：{{ visualDiagnosticError }}；最终结论仍由人工审核决定
       </div>
       <el-tag
         v-for="flag in visualFlags"

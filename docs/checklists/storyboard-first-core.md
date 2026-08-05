@@ -11,13 +11,16 @@
 - [x] Prompt字符数只展示，不参与收费准入。
 - [x] 语义失败进入planning_review，不自动产生第二次导演调用。
 
-## 故事板生产
+## 定妆图与故事板生产
 
+- [ ] 人物Canon已收敛为大头照+全身照，旧记录不被自动改写。
+- [ ] 外观相同的后续时段复用同一张已批准日内定妆图；变化时创建新attempt。
+- [ ] `look`与`look_review` Prompt已进入0010约束和Web节点。
 - [x] 每条Episode只有一个`image:storyboard`步骤。
 - [x] 两动作生成3张面板，三至四动作生成4张面板。
 - [x] Seedream使用一次sequential image generation请求。
 - [x] 每张面板独立下载、哈希和保存序号。
-- [x] 少图、序号错误、非9:16、尺寸不一致或黑边阻断视频。
+- [ ] 1%～2%比例偏差按全组同一居中裁切归一化，超过2%、尺寸不一致或黑边阻断视频。
 - [x] 一次语义审核原子批准或拒绝全部面板。
 - [x] 关键项失败阻断；普通背景、轻微姿势和构图偏差只保存warnings。
 - [x] rejected故事板不会被复用；重试必须创建新attempt。
@@ -41,9 +44,9 @@
 - [x] `uv run cvg doctor`
 - [x] 非付费草稿Run经真实FastAPI health/list/graph烟测后精确清理，无残留。
 
-## Prompt与Web稳定化（0009）
+## Prompt与Web稳定化（0010）
 
-- [x] Prompt Purpose统一为director、storyboard、storyboard_review、video和review。
+- [ ] Prompt Purpose统一为director、look、look_review、storyboard、storyboard_review、video和review。
 - [x] 0008的image Prompt升级时迁移为storyboard，未知Purpose拒绝迁移。
 - [x] WorkflowStep与生成Prompt在一个事务中创建；Prompt失败不残留Step。
 - [x] 故事板与视频审核Prompt分别关联对应生成Prompt。
@@ -52,4 +55,4 @@
 - [x] 创作台页签写入URL，轮询不覆盖用户选择。
 - [x] 后台错误持久展示Run、Episode、Slot与Operation Key。
 - [x] 三个旧测试Run清理前诊断已保存到忽略目录，11个Canon保留。
-- [x] 正式Schema已升级到0009_storyboard_prompt_purposes。
+- [ ] 正式Schema已升级到0010_look_prompt_purposes。

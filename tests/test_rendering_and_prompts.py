@@ -148,7 +148,9 @@ def test_two_shots_use_distinct_entry_and_payoff_panels(daily_plan) -> None:
     assert "不复制面板2的动作构图" in prompt.text
 
 
-def test_video_prompt_uses_storyboard_and_has_five_sections(daily_plan) -> None:
+def test_single_shot_video_prompt_uses_storyboard_without_redundant_sections(
+    daily_plan,
+) -> None:
     episode = daily_plan.episodes[0]
     plan = build_video_input_plan(
         input_mode=VideoInputMode.STORYBOARD_REFERENCE,
@@ -157,14 +159,7 @@ def test_video_prompt_uses_storyboard_and_has_five_sections(daily_plan) -> None:
         sources=storyboard_sources(),
     )
     prompt = compile_video_prompt(episode, input_plan=plan)
-    for title in (
-        "【输出和画风】",
-        "【人物、猫咪与场景】",
-        "【按故事板顺序发生的动作】",
-        "【关键实体连续性】",
-        "【原生声音和禁止项】",
-    ):
-        assert title in prompt.text
+    assert "【输出和画风】" not in prompt.text
     assert "@图片1" in prompt.text
     assert "00:00" not in prompt.text
     assert "assetId" not in prompt.text

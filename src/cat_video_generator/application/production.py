@@ -65,7 +65,11 @@ class ProductionService:
                     "slot": refreshed.plan.slot.value,
                     "status": refreshed.status.value,
                     "storyboardReady": assets is not None,
-                    "message": ("故事板已就绪" if assets is not None else "故事板等待人工语义审核"),
+                    "message": (
+                        "故事板已就绪"
+                        if assets is not None
+                        else "定妆图或故事板等待人工语义审核"
+                    ),
                 }
             )
         return {"runId": str(run_id), "episodes": results}

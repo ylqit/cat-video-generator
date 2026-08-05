@@ -15,7 +15,7 @@ from pydantic import Field, model_validator
 
 from .contract_base import StrictModel
 from .contracts import EpisodePlan
-from .visual_profiles import StyleProfile
+from .visual_profiles import SeriesVisualProfile, StyleProfile
 
 
 class VideoInputMode(StrEnum):
@@ -99,7 +99,9 @@ class MediaSource:
 def storyboard_reference_keys(
     episode: EpisodePlan,
     style_profile: StyleProfile,
+    series_profile: SeriesVisualProfile,
     *,
+    look_key: str | None = None,
     explicit_episode_keys: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     """返回故事板请求使用的确定性参考顺序。
@@ -119,13 +121,20 @@ def storyboard_reference_keys(
         if episode.script.style_context == "indoor"
         else style_profile.outdoor_reference_key
     )
-    base = (
-        f"person:{view}",
-        f"cat:{view}",
-        style_profile.line_reference_key,
-        contextual_style,
+    person_references = (
+        (series_profile.person_reference_keys[0], look_key)
+        if look_key is not None
+        else series_profile.person_reference_keys
     )
     optional_key = explicit_episode_keys[-1] if explicit_episode_keys else None
+    # 日内定妆已经融合场景画风。显式关键元素存在时，用它替换弱相关的第二张
+    # 场景风格图，把Seedream输入稳定控制在五张以内，避免参考职责互相竞争。
+    base = (
+        *person_references,
+        f"cat:{view}",
+        style_profile.line_reference_key,
+        *(() if optional_key else (contextual_style,)),
+    )
     return tuple(dict.fromkeys((*base, *((optional_key,) if optional_key else ()))))
 
 

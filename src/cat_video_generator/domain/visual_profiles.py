@@ -40,6 +40,10 @@ class SeriesVisualProfile(VisualProfileModel):
         min_length=8,
         max_length=200,
     )
+    person_reference_keys: tuple[str, str] = (
+        "person:headshot",
+        "person:fullbody",
+    )
     mutable_appearance: tuple[str, ...] = (
         "衣服",
         "鞋",
@@ -57,43 +61,26 @@ class SeriesVisualProfile(VisualProfileModel):
         "发髻",
         "妆容",
     )
-    person_personality: str = Field(
-        default="好奇心旺盛、做事认真，容易被小意外逗笑",
-        min_length=4,
-        max_length=200,
-    )
-    cat_personality: str = Field(
-        default="表面高冷、其实贪玩，常常先假装不在意再忍不住凑近的反差萌",
-        min_length=4,
-        max_length=200,
-    )
-    humor_style: str = Field(
-        default="每集至少一个意外、反差或幽默节拍，靠可见动作与表情而非对白",
-        min_length=4,
-        max_length=200,
-    )
-    person_personality: str = Field(
-        default="好奇心旺盛、做事认真，容易被小意外逗笑",
-        min_length=4,
-        max_length=160,
-    )
-    cat_personality: str = Field(
-        default="表面高冷、其实贪玩，常常先假装不在意再忍不住凑近的反差萌",
-        min_length=4,
-        max_length=160,
-    )
-    humor_style: str = Field(
-        default="每集至少一个意外、反差或幽默节拍，靠可见动作与表情而非对白",
-        min_length=4,
-        max_length=200,
-    )
-
     def fingerprint(self) -> str:
         """生成事件种子筛选和规划幂等使用的稳定摘要。"""
 
         return hashlib.sha256(
             self.model_dump_json(exclude_none=True).encode("utf-8")
         ).hexdigest()
+
+
+class CreativeProfileOverride(VisualProfileModel):
+    """单个Run可覆盖的行为偏好；不允许改写人物或猫咪身份。"""
+
+    person_personality: str | None = Field(default=None, min_length=4, max_length=200)
+    cat_personality: str | None = Field(default=None, min_length=4, max_length=200)
+    humor_style: str | None = Field(default=None, min_length=4, max_length=200)
+
+    def apply_to(self, profile: SeriesVisualProfile) -> SeriesVisualProfile:
+        """在不改变Canon边界的前提下生成本Run有效档案。"""
+
+        updates = self.model_dump(exclude_none=True)
+        return profile.model_copy(update=updates) if updates else profile
 
 
 class StyleProfile(VisualProfileModel):

@@ -99,25 +99,19 @@ def maybe_continue_video(
     settings = queries.pipeline_settings(run_id)
     if settings.video is not StageMode.AUTO or not settings.allow_paid_generation:
         return
-    panels = [
-        item
-        for item in queries.episode_assets(asset.episode_id)
-        if item.role == "storyboard_panel" and item.step_id == asset.step_id
-    ]
-    if len(panels) not in {3, 4} or not all(
-        item.status in {"approved", "ready"} for item in panels
-    ):
-        return
     slot = Slot(str(episode["slot"]))
 
     def task() -> dict[str, Any]:
-        return production.run_day(run_id, slot=slot, allow_paid_generation=True)
+        # 故事板采用整组原子审核：本钩子被调用时，同组面板已经一次性提交为批准状态。
+        # 这里继续整个全天流水线，让其他已自动批准的时段也能顺序进入视频生成；
+        # ProductionService 会幂等跳过已完成Episode，因此不会重复创建收费任务。
+        return production.run_day(run_id, slot=None, allow_paid_generation=True)
 
-    # 同集已有在途run_day即视为续跑成功，数据库幂等仍负责最终防重。
+    # 同一Run只允许一个全天续跑任务；数据库幂等仍负责最终防止重复收费。
     with suppress(JobConflictError):
         job_registry.submit(
             kind="run_day",
-            dedup_key=f"run:{run_id}:{slot.value}",
+            dedup_key=f"run:{run_id}:all",
             fn=task,
             context={
                 "runId": run_id,

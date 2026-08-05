@@ -15,7 +15,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..domain.contracts import Slot
 from ..domain.story_patterns import StoryPattern
-from ..domain.story_patterns import StoryPattern
 
 
 class EventSeed(BaseModel):
@@ -86,12 +85,12 @@ class EventSeedCatalog:
         series_profile_hash: str,
         content_date: date,
         planning_revision: int,
+        recent_pattern_ids: tuple[str, ...] = (),
     ) -> dict[Slot, StoryPattern]:
-        """为一天三个时段各确定性抽签一个不同剧情模式。
+        """为三个时段优先选择不同且未在冷却期的剧情模式。
 
-        同一天内模式绝不重复（结构差异是多样性底线）；跨天变化由日期哈希
-        自然轮转，模式池足够大时不会长期重复。模式不足时缺口的时段回退
-        导演自由发挥，本模块同样不做单点故障。
+        模式是创意先验而非业务硬门。冷却后没有候选时，会回退到近期模式；
+        模式池不足时缺口交给导演原创，绝不因为素材库规模阻断全天计划。
         """
 
         pool = self._load_patterns()
@@ -107,8 +106,11 @@ class EventSeedCatalog:
             ]
             if not eligible:
                 continue
+            cooled = [
+                pattern for pattern in eligible if pattern.pattern_id not in recent_pattern_ids
+            ]
             ranked = sorted(
-                eligible,
+                cooled or eligible,
                 key=lambda item: hashlib.sha256(
                     f"{key}|{slot.value}|{item.pattern_id}".encode("utf-8")
                 ).hexdigest(),

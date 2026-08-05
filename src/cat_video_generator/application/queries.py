@@ -12,6 +12,7 @@ from ..domain.rendering import storyboard_reference_keys
 from ..domain.visual_profiles import (
     DEFAULT_SERIES_VISUAL_PROFILE,
     DEFAULT_STYLE_PROFILE,
+    SeriesVisualProfile,
 )
 from .ports import QueryStore, StoredAsset
 
@@ -69,6 +70,20 @@ class QueryService:
         detail = self._repository.episode_detail(episode_id)
         episode = EpisodePlan(slot=detail["slot"], script=detail["script"])
         style_profile = DEFAULT_STYLE_PROFILE
+        planning_context = self._repository.get_planning_context(
+            uuid.UUID(detail["runId"])
+        )
+        planning_metadata = planning_context.get("planningMetadata", {})
+        raw_series_profile = (
+            planning_metadata.get("seriesProfile")
+            if isinstance(planning_metadata, dict)
+            else None
+        )
+        series_profile = (
+            SeriesVisualProfile.model_validate(raw_series_profile)
+            if isinstance(raw_series_profile, dict)
+            else DEFAULT_SERIES_VISUAL_PROFILE
+        )
         explicit_episode_assets = tuple(
             item
             for item in self._repository.list_assets(
@@ -86,6 +101,10 @@ class QueryService:
         reference_keys = storyboard_reference_keys(
             episode,
             style_profile,
+            series_profile,
+            # 故事板生产固定先完成日内定妆。预览使用稳定占位键，确保用户编辑
+            # 的“图2=本时段装扮”职责与实际输入顺序一致，不依赖尚未生成的哈希。
+            look_key="look:current-appearance",
             explicit_episode_keys=tuple(
                 item.semantic_key
                 for item in explicit_episode_assets
@@ -96,7 +115,7 @@ class QueryService:
             episode,
             reference_roles=reference_keys,
             style_profile=style_profile,
-            series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
+            series_profile=series_profile,
         )
         video = compile_video_prompt_preview(
             episode,

@@ -41,7 +41,7 @@ class DirectorResult:
 
 @dataclass(frozen=True, slots=True)
 class ImageResult:
-    """Seedream组图结果中的一张独立图片。"""
+    """Seedream返回的一张独立图片，可属于定妆或故事板组图。"""
 
     url: str
     model: str
@@ -73,6 +73,22 @@ class StoryboardReviewResult:
     action_sequence_ok: bool
     continuity_ok: bool
     ending_ok: bool
+    confidence: float
+    violations: tuple[str, ...]
+    warnings: tuple[str, ...]
+    evidence: tuple[str, ...]
+    response_id: str
+    model: str
+    request_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class LookReviewResult:
+    """日内定妆图的轻量语义审核结果。"""
+
+    identity_ok: bool
+    style_ok: bool
+    appearance_ok: bool
     confidence: float
     violations: tuple[str, ...]
     warnings: tuple[str, ...]
@@ -237,6 +253,13 @@ class MediaGenerationGateway(Protocol):
         max_images: int,
     ) -> tuple[ImageResult, ...]: ...
 
+    def generate_look(
+        self,
+        *,
+        prompt: str,
+        reference_paths: tuple[Path, ...],
+    ) -> ImageResult: ...
+
     def submit_video(
         self,
         *,
@@ -266,7 +289,16 @@ class VisualReviewGateway(Protocol):
         *,
         prompt: str,
         image_paths: tuple[Path, ...],
+        reference_paths: tuple[Path, ...],
     ) -> StoryboardReviewResult: ...
+
+    def review_look(
+        self,
+        *,
+        prompt: str,
+        image_path: Path,
+        reference_paths: tuple[Path, ...],
+    ) -> LookReviewResult: ...
 
     def diagnose_video_frames(
         self,
@@ -319,6 +351,7 @@ class ProductionStore(Protocol):
     def get_prompt_overrides(self, episode_id: uuid.UUID) -> dict[str, str]: ...
     def save_prompt_overrides(self, **kwargs: Any) -> None: ...
     def get_run(self, run_id: uuid.UUID) -> StoredRun: ...
+    def get_planning_context(self, run_id: uuid.UUID) -> dict[str, Any]: ...
     def get_episode(self, run_id: uuid.UUID, slot: Slot) -> StoredEpisode: ...
     def list_episodes(self, run_id: uuid.UUID) -> tuple[StoredEpisode, ...]: ...
     def get_step(self, step_id: uuid.UUID) -> StoredStep: ...
@@ -362,6 +395,7 @@ class QueryStore(Protocol):
     def episode_detail(self, episode_id: uuid.UUID) -> dict[str, Any]: ...
     def step_detail(self, step_id: uuid.UUID) -> dict[str, Any]: ...
     def list_assets(self, **kwargs: Any) -> tuple[StoredAsset, ...]: ...
+    def get_planning_context(self, run_id: uuid.UUID) -> dict[str, Any]: ...
     def get_prompt_overrides(self, episode_id: uuid.UUID) -> dict[str, str]: ...
     def get_pipeline_settings(self, run_id: uuid.UUID) -> PipelineSettings: ...
     def list_delivery_packages(self, run_id: uuid.UUID) -> list[dict[str, Any]]: ...

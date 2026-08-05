@@ -6,6 +6,7 @@
 Day Director
 → Morning / Noon / Evening Director
 → EpisodeScript + SceneContinuity
+→ 日内定妆图（外观相同则复用）
 → 每条一次Seedream故事板组图
 → 故事板整组审核
 → Seedance single-pass
@@ -17,11 +18,11 @@ Day Director
 
 ## 2. 三层创作上下文
 
-- `SeriesContext`：同一个中性儿童、同一只灰白猫、二维彩铅/蜡笔画风和长期性格。
+- `SeriesContext`：同一个中性儿童、同一只灰白猫、二维彩铅/蜡笔画风、长期性格和幽默表达。
 - `DayBrief`：当天主题、天气、地点范围、时段边界、共享元素和换装理由。
 - `EpisodeScript`：本时段一个主事件、2～4个动作、默认2～3个镜头、结尾和关键连续性。镜头优先采用“人物活动建立→猫咪独立反应/探索→人猫关系回报”，动作只服务于镜头叙事。
 
-规划固定进行四次独立调用：总导演只生成`DayBrief`，随后三个时段导演各自生成一条完整脚本。脚本不重复保存slot、渲染输入模式或供应商字段。
+规划固定进行四次独立调用：总导演只生成`DayBrief`，随后三个时段导演各自生成一条完整脚本。剧情模式池按日期和系列档案稳定选择三个不同软先验；近期已交付模式优先冷却，池不足时允许回退或原创，绝不作为业务硬门。脚本不重复保存slot、渲染输入模式或供应商字段。
 
 ## 3. SceneContinuity与单一语义校验
 
@@ -37,7 +38,9 @@ Day Director
 
 Pydantic只负责类型、顺序、唯一性和引用存在性；`EpisodeValidator`只检查轻量起终态语义，不执行逐动作状态重放，也不通过中文关键词猜测座椅。座位、服装和道具在真实画面中的连续性由整组故事板审核判断。
 
-## 4. 每条一个故事板组图任务
+## 4. 日内定妆与故事板组图
+
+人物Canon固定使用`person:headshot`和`person:fullbody`，猫咪保留三视图。每个Episode在故事板前确定本时段外观签名：Run内已有相同可见外观时复用已批准定妆图，否则创建一次`image:look`单图任务。定妆图审核只检查同一人物、二维画风和本时段服饰是否完整；它不会写回长期Canon。故事板参考按“大头照 + 已批准定妆图 + 猫咪视角 + 两张画风”确定性排序。
 
 每个Episode只创建一个`image:storyboard` WorkflowStep，并调用一次Seedream：
 
@@ -90,7 +93,7 @@ output/YYYY-MM-DD/{runId}/delivery-rN/
 
 - 每次Ark调用前在同一个PostgreSQL短事务中提交WorkflowStep和完整Prompt；
   Prompt约束、正文或父子关系失败时两者一起回滚，不留下孤立Step。
-- Prompt用途固定为`director / storyboard / storyboard_review / video / review`。
+- Prompt用途固定为`director / look / look_review / storyboard / storyboard_review / video / review`。
   故事板审核Prompt关联故事板生成Prompt，视频诊断Prompt关联视频生成Prompt。
 - 相同输入复用相同故事板或视频Step，不重复收费。
 - Seedance `submission_unknown`冻结并通过任务列表人工对账，已有Task ID只恢复查询。

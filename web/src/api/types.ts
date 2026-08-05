@@ -43,6 +43,17 @@ export interface RunSummary {
   worldConsistencyStatus?: string;
   contradictions?: string[];
   dayBrief?: DayBriefDto | null;
+  planningMetadata?: {
+    seriesProfile?: {
+      person_personality?: string;
+      cat_personality?: string;
+      humor_style?: string;
+    };
+    storyPatterns?: Record<
+      string,
+      { pattern_id?: string; name?: string; mood?: string }
+    >;
+  };
   currentStage?: string;
 }
 
@@ -189,7 +200,14 @@ export interface PromptDto {
   id: string;
   stepId: string;
   parentPromptId: string | null;
-  purpose: "director" | "storyboard" | "storyboard_review" | "video" | "review";
+  purpose:
+    | "director"
+    | "look"
+    | "look_review"
+    | "storyboard"
+    | "storyboard_review"
+    | "video"
+    | "review";
   model: string;
   sha256: string;
   charCount: number;
@@ -241,7 +259,13 @@ export interface RunGraph {
 
 export interface WorkflowNodeDto {
   id: string;
-  type: "director" | "storyboard" | "storyboard_review" | "video" | "content_review";
+  type:
+    | "director"
+    | "look"
+    | "storyboard"
+    | "storyboard_review"
+    | "video"
+    | "content_review";
   slot: string | null;
   label: string;
   status: string;

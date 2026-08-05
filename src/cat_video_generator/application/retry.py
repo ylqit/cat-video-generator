@@ -76,7 +76,20 @@ class RetryService:
         stored_run = self._repository.get_run(step.run_id)
         if stored_run.status == RunStatus.FAILED.value:
             self._repository.set_run_status(step.run_id, RunStatus.GENERATING)
-        if step.kind is StepKind.IMAGE and operation_key.startswith("image:"):
+        if step.kind is StepKind.IMAGE and operation_key == "image:look":
+            look = self._visual_preparation.retry_look(
+                episode,
+                step,
+                reason=reason,
+                duplicate_billing_risk_accepted=acknowledge_duplicate_billing,
+            )
+            return {
+                "stepId": str(look.step_id),
+                "operationKey": operation_key,
+                "assetIds": [str(look.id)],
+                "status": look.status,
+            }
+        if step.kind is StepKind.IMAGE and operation_key == "image:storyboard":
             storyboard = self._visual_preparation.retry_storyboard(
                 episode,
                 step,

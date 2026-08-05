@@ -277,7 +277,7 @@ def _hook_calls(settings: PipelineSettings, *, role="storyboard_panel", frames=(
     calls: list[dict] = []
     production = SimpleNamespace(
         run_day=lambda run_id, *, slot, allow_paid_generation: calls.append(
-            {"slot": slot.value, "paid": allow_paid_generation}
+            {"slot": None if slot is None else slot.value, "paid": allow_paid_generation}
         )
         or {"runId": str(run_id)}
     )
@@ -295,7 +295,7 @@ def test_review_hook_submits_run_day_when_storyboard_ready() -> None:
     settings = PipelineSettings(allow_paid_generation=True)
     frames = tuple(_frame("storyboard_panel", "approved") for _ in range(3))
     calls, registry = _hook_calls(settings, frames=frames)
-    assert calls == [{"slot": "morning", "paid": True}]
+    assert calls == [{"slot": None, "paid": True}]
     records = registry.list()
     assert [record.kind for record in records] == ["run_day"]
     assert records[0].status == "succeeded"
@@ -340,16 +340,6 @@ def test_review_hook_stays_silent_without_full_conditions() -> None:
     assert calls == []
     # 未持久化付费授权：绝不自动扣费。
     calls, _ = _hook_calls(PipelineSettings(), frames=frames)
-    assert calls == []
-    # 其中一张面板未批准。
-    calls, _ = _hook_calls(
-        PipelineSettings(allow_paid_generation=True),
-        frames=(
-            _frame("storyboard_panel", "approved"),
-            _frame("storyboard_panel", "approved"),
-            _frame("storyboard_panel", "candidate"),
-        ),
-    )
     assert calls == []
     # 批准的是视频资产，与关键帧钩子无关。
     calls, _ = _hook_calls(

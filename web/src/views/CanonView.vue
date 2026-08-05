@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ElMessage } from "element-plus";
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 
 import { ApiError } from "../api/client";
 import AssetThumb from "../components/AssetThumb.vue";
@@ -14,8 +14,10 @@ const ROLE_LABEL: Record<string, string> = {
   style: "画风示例",
 };
 
-/** person/cat 按视角组合 semantic_key（如 person:front）。 */
+/** person 使用大头照/全身照，cat 保留前侧后三视图。 */
 const VIEW_LABEL: Record<string, string> = {
+  headshot: "大头照",
+  fullbody: "全身照",
   front: "正面",
   side: "侧面",
   back: "背面",
@@ -28,12 +30,22 @@ const STYLE_KEY_HINTS = [
 ];
 
 const role = ref("person");
-const view = ref("front");
+const view = ref("headshot");
 const styleKey = ref("style:line_texture");
 const file = ref<File | null>(null);
 const uploading = ref(false);
 
 const needsView = computed(() => role.value === "person" || role.value === "cat");
+const viewOptions = computed<Record<string, string>>(() =>
+  role.value === "person"
+    ? { headshot: VIEW_LABEL.headshot, fullbody: VIEW_LABEL.fullbody }
+    : { front: VIEW_LABEL.front, side: VIEW_LABEL.side, back: VIEW_LABEL.back },
+);
+
+watch(role, (value) => {
+  if (value === "person") view.value = "headshot";
+  if (value === "cat") view.value = "front";
+});
 
 /** 最终提交的 semantic_key：person/cat 由视角组合，style 手填。 */
 const semanticKey = computed(() =>
@@ -101,7 +113,7 @@ onMounted(() => canon.fetch(true));
         </el-select>
         <el-select v-if="needsView" v-model="view" style="width: 110px">
           <el-option
-            v-for="(label, key) in VIEW_LABEL"
+            v-for="(label, key) in viewOptions"
             :key="key"
             :label="label"
             :value="key"

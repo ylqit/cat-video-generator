@@ -53,7 +53,7 @@ domain/
 
 application/
   planning.py             四次导演调用与局部重规划
-  visual_preparation.py   精确参考选择、故事板组图和整组语义审核
+  visual_preparation.py   日内定妆、精确参考选择、故事板组图和整组语义审核
   video_execution.py      Seedance、下载和技术 QC
   production.py           状态编排
   retry.py                显式 attempt 与防重复收费
@@ -110,7 +110,7 @@ delivery_items
 5. Ark 轮询、下载和 ffprobe 期间不保持事务。
 6. 媒体先写 `.part`，完整下载并校验 SHA-256 后原子改名。
 7. 资产审核锁定 Asset、Step 和 Episode 并在一个事务中提交。
-8. 新Run只选择精确`semantic_key`的最新已批准Canon；每条只有一个故事板组图Step。
+8. 新Run只选择精确`semantic_key`的最新已批准Canon；人物使用大头照与全身照，日内外观先资产化，相同外观复用定妆图；每条只有一个故事板组图Step。
 9. Seedance只接收批准故事板并走single-pass；视频完成后进入人工`content_review`。
 10. JobRegistry 只管理 HTTP 异步执行，不成为工作流事实来源。
 11. Ark返回可解析脚本但语义审核失败时进入`planning_review`；只有结构解析失败允许一次自动导演修复。

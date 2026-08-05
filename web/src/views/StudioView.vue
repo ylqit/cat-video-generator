@@ -64,6 +64,9 @@ const STAGE_TAB: Record<string, string> = {
 const form = reactive({
   theme: "",
   targetDate: "",
+  personPersonality: "",
+  catPersonality: "",
+  humorStyle: "",
   allowPaidGeneration: false,
   stages: {
     dayBrief: "auto",
@@ -121,6 +124,9 @@ const episodes = computed(() =>
   [...(graph.value?.episodes ?? [])].sort((a, b) => a.sortOrder - b.sortOrder),
 );
 const workflowNodes = computed(() => graph.value?.workflowNodes ?? []);
+const storyPatterns = computed(
+  () => run.value?.planningMetadata?.storyPatterns ?? {},
+);
 const selectedNode = computed(
   () => workflowNodes.value.find((item) => item.id === selectedNodeId.value) ?? null,
 );
@@ -141,7 +147,10 @@ const workflowGroups = computed(() => [
     key: "storyboard",
     label: "故事板",
     nodes: workflowNodes.value.filter(
-      (item) => item.type === "storyboard" || item.type === "storyboard_review",
+      (item) =>
+        item.type === "look" ||
+        item.type === "storyboard" ||
+        item.type === "storyboard_review",
     ),
   },
   {
@@ -164,7 +173,9 @@ function openNode(node: WorkflowNodeDto) {
       ? node.slot === null
         ? "brief"
         : "scripts"
-      : node.type === "storyboard" || node.type === "storyboard_review"
+      : node.type === "look" ||
+          node.type === "storyboard" ||
+          node.type === "storyboard_review"
         ? "storyboard"
         : node.type === "video"
           ? "video"
@@ -253,6 +264,15 @@ function storyboardReady(episode: EpisodeDto): boolean {
   );
 }
 
+function lookAssets(episode: EpisodeDto) {
+  const referenced = new Set(referenceAssetIds(episode));
+  return (graph.value?.assets ?? []).filter(
+    (asset) =>
+      asset.role === "look_reference" &&
+      (asset.episodeId === episode.id || referenced.has(asset.id)),
+  );
+}
+
 function latestStoryboardStep(episode: EpisodeDto): StepDto | null {
   return [...(graph.value?.steps ?? [])]
     .filter(
@@ -264,6 +284,21 @@ function latestStoryboardStep(episode: EpisodeDto): StepDto | null {
       (left, right) =>
         right.createdAt.localeCompare(left.createdAt),
     )[0] ?? null;
+}
+
+function latestLookStep(episode: EpisodeDto): StepDto | null {
+  return [...(graph.value?.steps ?? [])]
+    .filter(
+      (step) =>
+        step.episodeId === episode.id && step.operationKey === "image:look",
+    )
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0] ?? null;
+}
+
+function lookRetryRequired(episode: EpisodeDto): boolean {
+  return ["failed", "expired", "cancelled", "submission_unknown"].includes(
+    latestLookStep(episode)?.status ?? "",
+  );
 }
 
 function storyboardRetryRequired(episode: EpisodeDto): boolean {
@@ -309,10 +344,14 @@ function promptsFor(match: {
   );
 }
 
-/** 该集最新图片步骤实际使用的参考图资产ID。 */
+/** 该集最新故事板步骤实际使用的参考图资产ID。 */
 function referenceAssetIds(episode: EpisodeDto): string[] {
   const step = [...(graph.value?.steps ?? [])]
-    .filter((item) => item.kind === "image" && item.episodeId === episode.id)
+    .filter(
+      (item) =>
+        item.operationKey === "image:storyboard" &&
+        item.episodeId === episode.id,
+    )
     .pop();
   const ids = step?.inputSnapshot?.reference_asset_ids;
   return Array.isArray(ids) ? ids.map(String) : [];
@@ -409,7 +448,11 @@ function rememberRequestFailure(
 function focusFailure() {
   const operationKey = visibleFailure.value?.operationKey ?? "";
   const slot = visibleFailure.value?.slot;
-  const nodeId = operationKey.startsWith("image:")
+  const nodeId = operationKey === "image:look"
+    ? slot
+      ? `look:${slot}`
+      : ""
+    : operationKey.startsWith("image:")
     ? slot
       ? `storyboard:${slot}`
       : ""
@@ -652,6 +695,11 @@ async function submitPlan() {
     const accepted = await api.createPlan({
       targetDate: form.targetDate,
       planningContext: form.theme || undefined,
+      creativeProfile: {
+        personPersonality: form.personPersonality || undefined,
+        catPersonality: form.catPersonality || undefined,
+        humorStyle: form.humorStyle || undefined,
+      },
       allowPaidGeneration: true,
       pipelineSettings: {
         allowPaidGeneration: true,
@@ -855,6 +903,26 @@ onMounted(() => {
               inactive-text="手动"
             />
           </span>
+        </el-form-item>
+        <el-form-item label="性格与幽默">
+          <el-collapse style="width: 100%">
+            <el-collapse-item title="可选；留空使用系列默认" name="creative-profile">
+              <el-input
+                v-model="form.personPersonality"
+                placeholder="人物性格，例如：好奇认真，容易被小意外逗笑"
+              />
+              <el-input
+                v-model="form.catPersonality"
+                placeholder="猫咪性格，例如：表面高冷，其实贪玩"
+                style="margin-top: 8px"
+              />
+              <el-input
+                v-model="form.humorStyle"
+                placeholder="幽默方式，例如：可见反差和动作表情，不靠对白"
+                style="margin-top: 8px"
+              />
+            </el-collapse-item>
+          </el-collapse>
         </el-form-item>
         <el-form-item>
           <el-checkbox v-model="form.allowPaidGeneration">
@@ -1087,7 +1155,17 @@ onMounted(() => {
             >
               <template #header>
                 <div style="display: flex; align-items: center; gap: 10px">
-                  <strong>{{ SLOT_LABEL[episode.slot] ?? episode.slot }}</strong>
+                   <strong>{{ SLOT_LABEL[episode.slot] ?? episode.slot }}</strong>
+                  <el-tag
+                    v-if="storyPatterns[episode.slot]?.name"
+                    type="warning"
+                    size="small"
+                  >
+                    {{ storyPatterns[episode.slot]?.name }}
+                    <template v-if="storyPatterns[episode.slot]?.mood">
+                      · {{ storyPatterns[episode.slot]?.mood }}
+                    </template>
+                  </el-tag>
                   <StatusBadge :status="episode.status" />
                   <el-button
                     v-if="['planned', 'failed'].includes(episode.status)"
@@ -1211,6 +1289,17 @@ onMounted(() => {
                     promptsFor({
                       kind: 'image',
                       episodeId: episode.id,
+                      operationKey: 'image:look',
+                      purpose: 'look',
+                    })
+                  "
+                  title="日内定妆实际 Prompt"
+                />
+                <PromptCollapse
+                  :prompts="
+                    promptsFor({
+                      kind: 'image',
+                      episodeId: episode.id,
                       operationKey: 'image:storyboard',
                       purpose: 'storyboard',
                     })
@@ -1218,6 +1307,22 @@ onMounted(() => {
                   title="故事板实际 Prompt"
                 />
               </div>
+              <el-alert
+                v-if="lookRetryRequired(episode)"
+                type="error"
+                :closable="false"
+                show-icon
+                style="margin-top: 10px"
+                title="日内定妆步骤失败，需在定妆节点显式重试"
+              >
+                <el-button
+                  link
+                  type="primary"
+                  @click="openEpisodeNode('look', episode)"
+                >
+                  打开定妆节点并处理
+                </el-button>
+              </el-alert>
               <el-alert
                 v-if="storyboardRetryRequired(episode)"
                 type="error"
@@ -1255,6 +1360,24 @@ onMounted(() => {
                   :size="72"
                 />
               </div>
+              <div v-if="lookAssets(episode).length" style="margin-top: 10px">
+                <span class="muted" style="margin-right: 6px">日内定妆图</span>
+                <template v-for="asset in lookAssets(episode)" :key="asset.id">
+                  <AssetReviewPanel
+                    v-if="asset.status === 'candidate'"
+                    :asset="asset"
+                    :reviews="graph.reviews"
+                    :max-width="180"
+                    @reviewed="refresh"
+                  />
+                  <AssetThumb
+                    v-else
+                    :asset-id="asset.id"
+                    :label="`定妆图 · ${asset.status}`"
+                    :size="110"
+                  />
+                </template>
+              </div>
 
               <div style="margin: 10px 0">
                 <el-button
@@ -1271,12 +1394,13 @@ onMounted(() => {
                   :loading="generating[episode.id]"
                   :disabled="
                     jobs.isActive(`storyboard:${episode.id}`) ||
+                    lookRetryRequired(episode) ||
                     storyboardRetryRequired(episode)
                   "
                   @click="generate(episode)"
                 >
                   {{
-                    storyboardRetryRequired(episode)
+                    lookRetryRequired(episode) || storyboardRetryRequired(episode)
                       ? "需要显式重试"
                       : storyboardAssets(episode).length
                       ? "重新生成故事板"

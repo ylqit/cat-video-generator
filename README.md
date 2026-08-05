@@ -8,6 +8,7 @@
 Day Director
 → Morning / Noon / Evening Director
 → EpisodeScript + SceneContinuity
+→ 按外观生成或复用一张日内定妆图
 → 每条一次 Seedream 故事板组图
 → 故事板整组语义审核
 → Seedance single-pass
@@ -33,8 +34,10 @@ Day Director
 uv sync --extra test
 uv run cvg doctor
 
-uv run cvg canon import --role person --semantic-key person:front `
-  --view front --file "主题示例\人物本体.png"
+uv run cvg canon import --role person --semantic-key person:headshot `
+  --view headshot --file "references\person-headshot.png"
+uv run cvg canon import --role person --semantic-key person:fullbody `
+  --view fullbody --file "references\person-fullbody.png"
 uv run cvg canon import --role cat --semantic-key cat:front `
   --view front --file "主题示例\猫咪本体.png"
 uv run cvg canon import --role style --semantic-key style:line_texture `
@@ -47,7 +50,7 @@ uv run cvg review <assetId> --approve --reason "人工观看通过"
 uv run cvg deliver <runId>
 ```
 
-规划固定为四次独立导演调用：总导演只确定全天边界，三个时段导演分别输出一个 `EpisodeScript`。默认采用2～3镜头的关系弧：建立人物活动、猫咪独立反应或探索、人猫重新汇合并得到可见回报。`SceneContinuity`只保存人物、猫咪和关键道具的起点、终点与生命周期；停步、转头、蹲下、嗅闻等导演动作不进入状态账本，普通背景也不建账。`inside`既可指向盒子等实体，也可指向长椅缝隙等已登记锚点。
+规划固定为四次独立导演调用：总导演只确定全天边界，三个时段导演分别输出一个 `EpisodeScript`。系统从数据化剧情模式池为三个时段选择不同的软创意先验（目标挑战、意外麻烦、幻想奇遇、照顾治愈、比赛游戏、误会和解等），导演按当天环境改编，不把某一种三幕弧写死为模板。人物、猫咪性格和幽默方式可在Web新建主题时覆盖，并随Run冻结。`SceneContinuity`只保存人物、猫咪和关键道具的起点、终点与生命周期；停步、转头、蹲下、嗅闻等导演动作不进入状态账本，普通背景也不建账。`inside`既可指向盒子等实体，也可指向长椅缝隙等已登记锚点。
 
 失败的 Ark 步骤不会由 `run-day` 隐式重试。相同剧本需要重新渲染时必须显式执行：
 
@@ -64,6 +67,8 @@ Seedance 的 `submission_unknown` 必须先通过Ark任务列表人工对账，�
 - 人物只锁定主要面貌、发型、体型和中性儿童定位；服装、鞋帽、背包服从剧情。
 - 猫咪锁定同一只灰白猫的脸型、体型和主要斑纹。
 - 画风使用已批准的二维儿童绘本、彩铅/蜡笔素材，排除明显 3D/CG/PBR 倾向。
+- 人物Canon使用独立大头照和全身照，避免把人物多视图拼图直接送入生图模型；猫咪继续使用正面、侧面和背面参考。
+- 每个时段先按实际服饰生成一张日内定妆图；后续时段外观完全相同则复用，外观变化才新增一次Seedream调用和轻量审核。
 - 同一连续场景中的外观与道具必须连续；跨时段变化只需有合理剧情原因。
 - `STORYBOARD_REVIEW_MODE` 只支持 `semantic_auto` 或 `manual`。
 - 每条Episode只创建一个Seedream组图步骤；面板由镜头而非动作数量编译，2镜头返回3张、3镜头返回4张独立、无文字、9:16故事板。

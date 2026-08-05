@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from ...config import DatabaseOperation, DatabaseSettings
 from .models import SCHEMA_NAME
 
-ALEMBIC_HEAD = "0009_storyboard_prompt_purposes"
+ALEMBIC_HEAD = "0010_look_prompt_purposes"
 
 
 def create_database_engine(

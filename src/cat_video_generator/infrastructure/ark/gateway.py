@@ -25,13 +25,14 @@ from ...application.ports import (
     DirectorResult,
     GatewayError,
     ImageResult,
+    LookReviewResult,
     StoryboardReviewResult,
     VideoDiagnosticResult,
     VideoTaskResult,
 )
 from ...config import RuntimeSettings
 from ...domain.rendering import VideoInputPlan
-from .review_schemas import STORYBOARD_REVIEW_SCHEMA, VIDEO_DIAGNOSTIC_SCHEMA
+from .review_schemas import LOOK_REVIEW_SCHEMA, STORYBOARD_REVIEW_SCHEMA, VIDEO_DIAGNOSTIC_SCHEMA
 
 
 class ArkGatewayError(GatewayError):
@@ -218,11 +219,133 @@ class ArkGateway:
             for item in response.data
         )
 
+    def generate_look(
+        self,
+        *,
+        prompt: str,
+        reference_paths: tuple[Path, ...],
+    ) -> ImageResult:
+        """生成单张日内定妆图。"""
+
+        try:
+            response = self._client.images.generate(
+                model=self.image_model,
+                prompt=prompt,
+                image=[_asset_data_url(path) for path in reference_paths],
+                response_format="url",
+                size="2K",
+                watermark=False,
+                output_format="png",
+                timeout=self._settings.ark_image_request_timeout_seconds,
+            )
+        except ArkAPIError as exc:
+            raise _provider_error(exc, submission=True) from exc
+        except (AttributeError, TypeError) as exc:
+            raise ArkGatewayError(
+                "Seedream定妆图请求参数无法由Ark SDK序列化。",
+                code="provider_request_serialization_failed",
+                retryable=False,
+            ) from exc
+        if len(response.data or ()) != 1 or not getattr(response.data[0], "url", None):
+            raise ArkGatewayError(
+                "Seedream定妆图请求没有返回唯一可下载图片。",
+                code="invalid_look_image_result",
+                retryable=False,
+            )
+        return ImageResult(
+            url=response.data[0].url,
+            model=getattr(response, "model", self.image_model),
+        )
+
+    def review_look(
+        self,
+        *,
+        prompt: str,
+        image_path: Path,
+        reference_paths: tuple[Path, ...],
+    ) -> LookReviewResult:
+        """执行日内定妆图的轻量身份、画风和装扮审核。"""
+
+        schema = LOOK_REVIEW_SCHEMA
+        instructions, text_format = self._structured_output(
+            prompt, schema, "LookSemanticReview"
+        )
+        ordered_paths = (*reference_paths, image_path)
+        request_hash = _json_hash(
+            {
+                "model": self.review_model,
+                "instructions": instructions,
+                "schema": schema,
+                "orderedImageSha256": [
+                    hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in ordered_paths
+                ],
+            }
+        )
+        try:
+            response = self._client.responses.create(
+                model=self.review_model,
+                instructions=instructions,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "按Prompt声明的顺序审核最后一张日内定妆图。",
+                            },
+                            *(
+                                {
+                                    "type": "input_image",
+                                    "image_url": _asset_data_url(path),
+                                }
+                                for path in ordered_paths
+                            ),
+                        ],
+                    }
+                ],
+                text={"format": text_format},
+                temperature=0,
+                max_output_tokens=1200,
+                thinking={"type": "disabled"},
+                store=False,
+                timeout=self._settings.ark_review_request_timeout_seconds,
+            )
+        except ArkAPIError as exc:
+            raise _provider_error(exc, submission=True) from exc
+        if response.status != "completed":
+            raise ArkGatewayError(
+                f"Ark定妆图审核状态为{response.status!r}",
+                code="look_review_not_completed",
+                retryable=False,
+            )
+        try:
+            payload = json.loads(_response_text(response))
+            return LookReviewResult(
+                identity_ok=bool(payload["identityOk"]),
+                style_ok=bool(payload["styleOk"]),
+                appearance_ok=bool(payload["appearanceOk"]),
+                confidence=float(payload["confidence"]),
+                violations=tuple(str(item) for item in payload["violations"]),
+                warnings=tuple(str(item) for item in payload["warnings"]),
+                evidence=tuple(str(item) for item in payload["evidence"]),
+                response_id=response.id,
+                model=response.model,
+                request_hash=request_hash,
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ArkGatewayError(
+                "Ark定妆图审核没有返回合法结构。",
+                code="invalid_look_review_output",
+                retryable=False,
+            ) from exc
+
     def review_storyboard(
         self,
         *,
         prompt: str,
         image_paths: tuple[Path, ...],
+        reference_paths: tuple[Path, ...],
     ) -> StoryboardReviewResult:
         """按顺序一次审核全部故事板面板，不把单帧结论拼成组结论。"""
 
@@ -238,7 +361,10 @@ class ArkGateway:
             schema,
             "StoryboardSemanticReview",
         )
-        image_sha256 = [hashlib.sha256(path.read_bytes()).hexdigest() for path in image_paths]
+        ordered_paths = (*reference_paths, *image_paths)
+        image_sha256 = [
+            hashlib.sha256(path.read_bytes()).hexdigest() for path in ordered_paths
+        ]
         request_hash = _json_hash(
             {
                 "model": self.review_model,
@@ -250,11 +376,12 @@ class ArkGateway:
         content: list[dict[str, str]] = [
             {
                 "type": "input_text",
-                "text": "以下图片按故事板顺序排列，请审核整组并只返回结构化结果。",
+                "text": "先读取基准参考，再按顺序审核其后的故事板面板并只返回结构化结果。",
             }
         ]
         content.extend(
-            {"type": "input_image", "image_url": _asset_data_url(path)} for path in image_paths
+            {"type": "input_image", "image_url": _asset_data_url(path)}
+            for path in ordered_paths
         )
         try:
             response = self._client.responses.create(

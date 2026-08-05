@@ -53,7 +53,7 @@ uv run alembic upgrade head
 uv run cvg doctor
 ```
 
-正式 Schema 当前必须位于 `0009_storyboard_prompt_purposes`。Doctor 还会检查标准 Ark 配置、ffmpeg/ffprobe、Canon 数量、事件种子目录和全部Ark超时参数。
+正式 Schema 当前必须位于 `0010_look_prompt_purposes`。Doctor 还会检查标准 Ark 配置、ffmpeg/ffprobe、Canon 数量、事件种子目录和全部Ark超时参数。
 
 当前明文数据库只有在以下配置同时成立时才允许正式运行：
 
@@ -68,8 +68,10 @@ CAT_VIDEO_DB_SCHEMA=cat_video
 ## 3. Canon 与参考素材
 
 ```powershell
-uv run cvg canon import --role person --semantic-key person:front `
-  --view front --file "主题示例\人物本体.png"
+uv run cvg canon import --role person --semantic-key person:headshot `
+  --view headshot --file "references\person-headshot.png"
+uv run cvg canon import --role person --semantic-key person:fullbody `
+  --view fullbody --file "references\person-fullbody.png"
 uv run cvg canon import --role cat --semantic-key cat:front `
   --view front --file "主题示例\猫咪本体.png"
 uv run cvg canon import --role style --semantic-key style:line_texture `
@@ -89,7 +91,7 @@ uv run cvg run-day <runId> --allow-paid-generation
 uv run cvg status <runId>
 ```
 
-`plan-day` 调用一次总导演和三个时段导演。`run-day` 默认按1、2、3推进，但不会自动重试已经终态失败的收费任务。
+`plan-day` 调用一次总导演和三个时段导演，并为三个时段分配不同的剧情模式软先验。`run-day`先生成或复用日内定妆图，再生成故事板，默认按1、2、3推进，但不会自动重试已经终态失败的收费任务。
 
 需要单独修订某个时段：
 

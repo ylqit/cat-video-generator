@@ -254,4 +254,5 @@ class RecentContentSummary(StrictModel):
     event_keys: tuple[str, ...] = ()
     location_keys: tuple[str, ...] = ()
     element_keys: tuple[str, ...] = ()
+    pattern_ids: tuple[str, ...] = ()
     summary_text: Annotated[str, Field(min_length=1, max_length=2000)]

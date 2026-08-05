@@ -101,6 +101,11 @@ def create_write_router(
                     else default_candidate_count
                 ),
                 allow_paid_generation=True,
+                creative_profile=(
+                    request.creative_profile.to_domain()
+                    if request.creative_profile is not None
+                    else None
+                ),
                 stop_after_day_brief=settings.day_brief is StageMode.MANUAL,
                 pipeline_settings=settings,
             )

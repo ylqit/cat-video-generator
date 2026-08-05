@@ -142,6 +142,9 @@ class EmptySeeds:
     def select(self, **kwargs):
         return ()
 
+    def select_patterns(self, **kwargs):
+        return {}
+
 
 def test_planning_calls_day_and_three_episode_directors(daily_plan) -> None:
     payloads = [

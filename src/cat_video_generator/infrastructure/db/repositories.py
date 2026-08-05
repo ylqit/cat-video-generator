@@ -53,7 +53,12 @@ from .records import (
 from .review_repository import ReviewPersistenceMixin
 
 _GENERATION_PROMPT_PURPOSES = frozenset(
-    {PromptPurpose.DIRECTOR, PromptPurpose.STORYBOARD, PromptPurpose.VIDEO}
+    {
+        PromptPurpose.DIRECTOR,
+        PromptPurpose.LOOK,
+        PromptPurpose.STORYBOARD,
+        PromptPurpose.VIDEO,
+    }
 )
 
 

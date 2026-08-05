@@ -107,6 +107,8 @@ def test_only_three_step_kinds_remain() -> None:
 def test_prompt_purposes_match_storyboard_runtime() -> None:
     assert {item.value for item in PromptPurpose} == {
         "director",
+        "look",
+        "look_review",
         "storyboard",
         "storyboard_review",
         "video",

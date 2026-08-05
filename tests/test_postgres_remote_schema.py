@@ -101,7 +101,7 @@ def test_remote_schema_upgrade_constraints_and_cleanup(monkeypatch) -> None:
             revision = connection.execute(
                 text(f"SELECT version_num FROM {quoted}.alembic_version")
             ).scalar_one()
-            assert revision == "0009_storyboard_prompt_purposes"
+            assert revision == "0010_look_prompt_purposes"
             assert connection.execute(
                 text(
                     f"SELECT purpose FROM {quoted}.prompt_records "

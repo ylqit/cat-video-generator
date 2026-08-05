@@ -1,7 +1,8 @@
-"""故事板参考选择、Seedream组图和整组语义审核用例。
+"""日内定妆、故事板参考选择、Seedream组图和整组语义审核用例。
 
-每个Episode只有一个 ``image:storyboard`` 收费步骤。Canon与元素图只用于生成
-故事板；Seedance只接收审核通过的有序面板。本服务不提交视频任务。
+外观相同的时段复用已批准定妆图，变化时创建 ``image:look``；每个Episode只有
+一个 ``image:storyboard`` 收费步骤。Canon与元素图只用于生成故事板；Seedance
+只接收审核通过的有序面板。本服务不提交视频任务。
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ from typing import Any
 from ..domain.continuity import EntityKind, EntityLifecycle
 from ..domain.prompts import (
     CompiledPrompt,
+    compile_look_prompt,
+    compile_look_review_prompt,
     compile_storyboard_prompt,
     compile_storyboard_review_prompt,
     storyboard_panel_count,
@@ -88,9 +91,14 @@ class VisualPreparationService:
     ) -> tuple[StoredAsset, ...] | None:
         """返回按面板序号排序的已批准故事板；``None``表示等待人工审核。"""
 
+        look = self._ensure_look_reference(episode)
+        if look.status == "rejected":
+            raise RuntimeError("日内定妆图语义审核失败，已阻断故事板和Seedance任务")
+        if look.status not in {"approved", "ready"}:
+            return None
         assets = self._ensure_storyboard(
             episode,
-            self.select_references(episode),
+            self.select_references(episode, look),
             prompt_override=(prompt_overrides or {}).get("storyboard"),
         )
         if any(item.status == "rejected" for item in assets):
@@ -122,9 +130,413 @@ class VisualPreparationService:
             )
         return assets
 
-    def select_references(self, episode: StoredEpisode) -> ReferenceSelectionPlan:
+    def _ensure_look_reference(
+        self,
+        episode: StoredEpisode,
+        *,
+        attempt: int = 1,
+        retry_of_step_id: uuid.UUID | None = None,
+        retry_reason: str | None = None,
+        retry_feedback: str | None = None,
+        auto_timeout_retry_index: int = 0,
+        duplicate_billing_risk_accepted: bool = False,
+    ) -> StoredAsset:
+        """按本时段外观签名生成或复用日内定妆图。"""
+
+        signature = _appearance_signature(episode)
+        existing_looks = self._repository.list_assets(
+            run_id=episode.run_id,
+            roles=("look_reference",),
+            statuses=("approved", "ready"),
+        )
+        matching = [
+            item
+            for item in existing_looks
+            if item.metadata.get("appearanceSignature") == signature
+        ]
+        if matching:
+            return matching[-1]
+
+        series_profile = self._series_profile_for_run(episode.run_id)
+        contextual_style = (
+            self._style_profile.indoor_reference_key
+            if episode.plan.script.style_context == "indoor"
+            else self._style_profile.outdoor_reference_key
+        )
+        desired = (
+            *series_profile.person_reference_keys,
+            self._style_profile.line_reference_key,
+            contextual_style,
+        )
+        candidates = self._repository.list_assets(
+            run_id=episode.run_id,
+            statuses=("approved", "ready"),
+            semantic_keys=desired,
+        )
+        latest: dict[str, StoredAsset] = {}
+        for asset in candidates:
+            if asset.semantic_key in desired and asset.media_type == "image":
+                latest[str(asset.semantic_key)] = asset
+        missing = [key for key in desired if key not in latest]
+        if missing:
+            raise ValueError(f"缺少生成日内定妆图所需Canon: {', '.join(missing)}")
+        references = tuple(latest[key] for key in desired)
+        compiled = compile_look_prompt(
+            episode.plan,
+            reference_roles=desired,
+            series_profile=series_profile,
+            style_profile=self._style_profile,
+            retry_feedback=retry_feedback,
+        )
+        input_hash = _input_hash(
+            compiled.text,
+            signature,
+            *(asset.sha256 for asset in references),
+        )
+        reusable = self._repository.find_reusable_asset(
+            episode_id=episode.id,
+            role="look_reference",
+            input_hash=input_hash,
+            statuses=("candidate", "approved", "ready"),
+        )
+        if reusable is not None:
+            if reusable.status in {"approved", "ready"}:
+                return reusable
+            if reusable.step_id is None:
+                raise RuntimeError("可复用定妆图缺少生成Step")
+            reusable_step = self._repository.get_step(reusable.step_id)
+            if reusable_step.status is StepStatus.AWAITING_REVIEW:
+                # 低置信或manual模式已经把决定权交给人工。重复点击生成按钮
+                # 只能复用同一张候选图，不能再次调用Ark审核产生隐性费用。
+                return reusable
+            return self._semantic_review_look(
+                episode, reusable.step_id, reusable, series_profile
+            )
+
+        prompt_sha = hashlib.sha256(compiled.text.encode("utf-8")).hexdigest()
+        snapshot = ImageInputSnapshot(
+            target="look",
+            expected_panel_count=1,
+            prompt_sha256=prompt_sha,
+            reference_asset_ids=tuple(asset.id for asset in references),
+            reference_sha256=tuple(asset.sha256 for asset in references),
+            retry_of_step_id=retry_of_step_id,
+            retry_reason=retry_reason,
+            request_timeout_seconds=self._image_request_timeout,
+            auto_timeout_retry_index=auto_timeout_retry_index,
+            duplicate_billing_risk_accepted=duplicate_billing_risk_accepted,
+        )
+        step, _ = self._repository.create_step_with_prompt_intent(
+            run_id=episode.run_id,
+            episode_id=episode.id,
+            parent_step_id=None,
+            kind=StepKind.IMAGE,
+            attempt=attempt,
+            operation_key="image:look",
+            provider=self._provider_name,
+            model=self._media_gateway.image_model,
+            input_hash=input_hash,
+            input_snapshot=snapshot.model_dump(mode="json"),
+            prompt_purpose=PromptPurpose.LOOK,
+            prompt_model=self._media_gateway.image_model,
+            prompt_text=compiled.text,
+            parent_prompt_id=None,
+        )
+        if episode.status in {EpisodeStatus.PLANNED, EpisodeStatus.FAILED}:
+            self._repository.set_episode_status(
+                episode.id, EpisodeStatus.PREPARING_VISUALS
+            )
+        if step.status in {StepStatus.FAILED, StepStatus.EXPIRED, StepStatus.CANCELLED}:
+            raise StepRetryRequired(step.id, "image:look")
+        if step.status is StepStatus.SUBMISSION_UNKNOWN:
+            raise RuntimeError("定妆图提交结果未知，需确认潜在重复计费后重试")
+
+        self._repository.set_step_status(step.id, StepStatus.SUBMITTING)
+        try:
+            result = self._media_gateway.generate_look(
+                prompt=compiled.text,
+                reference_paths=tuple(asset.path for asset in references),
+            )
+        except GatewayError as exc:
+            self._repository.fail_step(
+                step.id,
+                code=exc.code,
+                message=str(exc),
+                submission_unknown=exc.submission_unknown,
+                request_id=exc.request_id,
+                input_snapshot_patch={
+                    "provider_task_status": (
+                        "submission_unknown_timeout"
+                        if exc.submission_unknown and exc.timed_out
+                        else "submission_unknown"
+                        if exc.submission_unknown
+                        else "failed"
+                    )
+                },
+            )
+            if (
+                exc.submission_unknown
+                and exc.timed_out
+                and auto_timeout_retry_index < self._image_timeout_auto_retries
+            ):
+                time.sleep(self._image_retry_delay)
+                next_attempt = self._repository.next_step_attempt(
+                    episode_id=episode.id,
+                    kind=StepKind.IMAGE,
+                    operation_key="image:look",
+                )
+                return self._ensure_look_reference(
+                    episode,
+                    attempt=next_attempt,
+                    retry_of_step_id=step.id,
+                    retry_reason="Seedream定妆图同步请求超时，按配置自动重试一次",
+                    auto_timeout_retry_index=auto_timeout_retry_index + 1,
+                    duplicate_billing_risk_accepted=True,
+                )
+            self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
+            raise
+
+        try:
+            landed = self._asset_store.download(result.url, suffix=".png")
+            metadata = {
+                **self._probe.inspect_image(landed.path),
+                "appearanceSignature": signature,
+                "appearanceDescription": episode.plan.script.appearance.description,
+            }
+            deviation = _validate_portrait_image(metadata, label="定妆图")
+            if deviation > 0.01:
+                original = landed
+                box = _center_crop_box(
+                    int(metadata["width"]),
+                    int(metadata["height"]),
+                )
+                cropped = self._asset_store.crop_local(landed.path, box=box)
+                cropped_metadata = self._probe.inspect_image(cropped.path)
+                landed = cropped
+                metadata = {
+                    **cropped_metadata,
+                    "appearanceSignature": signature,
+                    "appearanceDescription": episode.plan.script.appearance.description,
+                    "normalizedToNineSixteen": True,
+                    "normalizedFromPath": str(original.path),
+                    "normalizedFromSha256": original.sha256,
+                    "normalizationCropBox": list(box),
+                }
+            asset = self._repository.save_asset(
+                run_id=episode.run_id,
+                episode_id=episode.id,
+                step_id=step.id,
+                role="look_reference",
+                semantic_key=f"look:{episode.plan.slot.value}-{signature[:12]}",
+                scope="episode",
+                status="candidate",
+                media_type="image",
+                landed=landed,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            # Ark 已返回图片后，下载、探测或画幅检查仍可能失败。这里明确结束本次
+            # Step，避免留下永久 submitting 状态；再次生成必须走显式 retry-step。
+            self._repository.fail_step(
+                step.id,
+                code="look_technical_qc_failed",
+                message=str(exc),
+            )
+            self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
+            raise
+        if self._review_mode == "manual":
+            self._repository.set_step_status(step.id, StepStatus.AWAITING_REVIEW)
+            self._repository.record_review(
+                step_id=step.id,
+                asset_id=asset.id,
+                source="technical",
+                decision="pending",
+                reason="等待人工审核日内定妆图",
+                warnings=[],
+                evidence={"semanticReviewStatus": "pending", "semanticVerified": False},
+            )
+            return asset
+        return self._semantic_review_look(episode, step.id, asset, series_profile)
+
+    def _semantic_review_look(
+        self,
+        episode: StoredEpisode,
+        step_id: uuid.UUID,
+        asset: StoredAsset,
+        series_profile: SeriesVisualProfile,
+    ) -> StoredAsset:
+        reference_assets = self._look_review_references(step_id, series_profile)
+        prompt = compile_look_review_prompt(
+            episode.plan,
+            reference_roles=tuple(
+                str(item.semantic_key)
+                for item in reference_assets
+                if item.semantic_key is not None
+            ),
+            series_profile=series_profile,
+            style_profile=self._style_profile,
+        )
+        generation_prompt = self._repository.get_prompt_for_step(
+            step_id, purpose=PromptPurpose.LOOK
+        )
+        try:
+            self._repository.save_prompt(
+                step_id=step_id,
+                parent_prompt_id=generation_prompt.id,
+                purpose=PromptPurpose.LOOK_REVIEW,
+                model=self._review_gateway.review_model,
+                text=prompt,
+            )
+        except Exception as exc:
+            # 审核输入无法持久化时不调用Ark，保证每一次模型调用都有可追溯Prompt。
+            self._repository.fail_step(
+                step_id,
+                code="look_review_prompt_persistence_failed",
+                message=str(exc),
+            )
+            self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
+            raise
+        try:
+            result = self._review_gateway.review_look(
+                prompt=prompt,
+                image_path=asset.path,
+                reference_paths=tuple(item.path for item in reference_assets),
+            )
+        except Exception as exc:
+            current = self._repository.get_step(step_id)
+            if current.status is StepStatus.SUBMITTING:
+                self._repository.set_step_status(step_id, StepStatus.AWAITING_REVIEW)
+            self._repository.record_review(
+                step_id=step_id,
+                asset_id=asset.id,
+                source="ark_visual",
+                decision="pending",
+                reason=f"定妆图语义审核异常，转人工：{type(exc).__name__}",
+                warnings=[],
+                evidence={"semanticReviewStatus": "pending", "semanticVerified": False},
+            )
+            return asset
+
+        passed = result.identity_ok and result.style_ok and result.appearance_ok
+        evidence = {
+            "semanticReviewStatus": "approved" if passed else "rejected",
+            "semanticVerified": passed and result.confidence >= 0.8,
+            "identityOk": result.identity_ok,
+            "styleOk": result.style_ok,
+            "appearanceOk": result.appearance_ok,
+            "confidence": result.confidence,
+            "violations": list(result.violations),
+            "observations": list(result.evidence),
+            "responseId": result.response_id,
+            "providerRequestHash": result.request_hash,
+        }
+        current = self._repository.get_step(step_id)
+        if current.status is StepStatus.SUBMITTING:
+            self._repository.set_step_status(step_id, StepStatus.AWAITING_REVIEW)
+        if result.confidence < 0.8:
+            self._repository.record_review(
+                step_id=step_id,
+                asset_id=asset.id,
+                source="ark_visual",
+                decision="pending",
+                reason="定妆图审核置信度低，转人工",
+                warnings=[{"code": "look_warning", "message": item} for item in result.warnings],
+                evidence=evidence,
+            )
+            return asset
+        decision = "approved" if passed else "rejected"
+        self._repository.commit_asset_review(
+            asset_id=asset.id,
+            source="ark_visual",
+            decision=decision,
+            reason=(
+                "定妆图通过身份、画风和本时段装扮审核"
+                if passed
+                else "定妆图存在身份、画风或装扮错误"
+            ),
+            warnings=[{"code": "look_warning", "message": item} for item in result.warnings],
+            evidence=evidence,
+        )
+        return replace(asset, status=decision)
+
+    def retry_look(
+        self,
+        episode: StoredEpisode,
+        original_step: StoredStep,
+        *,
+        reason: str,
+        duplicate_billing_risk_accepted: bool = False,
+    ) -> StoredAsset:
+        """为失败或未知提交的定妆图显式创建新attempt。"""
+
+        snapshot = ImageInputSnapshot.model_validate(original_step.input_snapshot)
+        if snapshot.target != "look":
+            raise ValueError("原步骤不是可重试的定妆图任务")
+        if episode.status is EpisodeStatus.FAILED:
+            self._repository.set_episode_status(
+                episode.id, EpisodeStatus.PREPARING_VISUALS
+            )
+            episode = self._repository.get_episode(episode.run_id, episode.plan.slot)
+        attempt = self._repository.next_step_attempt(
+            episode_id=episode.id,
+            kind=StepKind.IMAGE,
+            operation_key="image:look",
+        )
+        return self._ensure_look_reference(
+            episode,
+            attempt=attempt,
+            retry_of_step_id=original_step.id,
+            retry_reason=reason,
+            retry_feedback=(
+                None if original_step.status is StepStatus.SUBMISSION_UNKNOWN else reason
+            ),
+            duplicate_billing_risk_accepted=duplicate_billing_risk_accepted,
+        )
+
+    def _series_profile_for_run(self, run_id: uuid.UUID) -> SeriesVisualProfile:
+        metadata = self._repository.get_planning_context(run_id).get(
+            "planningMetadata", {}
+        )
+        raw = metadata.get("seriesProfile") if isinstance(metadata, dict) else None
+        if isinstance(raw, dict):
+            return SeriesVisualProfile.model_validate(raw)
+        return self._series_profile
+
+    def _look_review_references(
+        self,
+        step_id: uuid.UUID,
+        series_profile: SeriesVisualProfile,
+    ) -> tuple[StoredAsset, ...]:
+        """恢复生成时冻结的人物Canon，避免用后来上传的版本审核旧定妆图。"""
+
+        snapshot = ImageInputSnapshot.model_validate(
+            self._repository.get_step(step_id).input_snapshot
+        )
+        assets = tuple(
+            self._repository.asset_detail(asset_id)
+            for asset_id in snapshot.reference_asset_ids
+        )
+        selected_by_key = {
+            item.semantic_key: item
+            for item in assets
+            if item.semantic_key in series_profile.person_reference_keys
+        }
+        missing = [
+            key for key in series_profile.person_reference_keys if key not in selected_by_key
+        ]
+        if missing:
+            raise RuntimeError(f"定妆图审核缺少生成时冻结的人物Canon: {', '.join(missing)}")
+        return tuple(selected_by_key[key] for key in series_profile.person_reference_keys)
+
+    def select_references(
+        self,
+        episode: StoredEpisode,
+        look: StoredAsset,
+    ) -> ReferenceSelectionPlan:
         """选择固定Canon与最多一张用户显式上传的Episode参考图。"""
 
+        if look.semantic_key is None:
+            raise ValueError("日内定妆图缺少semantic_key，不能建立可审计的参考绑定")
         approved = self._repository.list_assets(
             run_id=episode.run_id,
             episode_id=episode.id,
@@ -143,21 +555,45 @@ class VisualPreparationService:
         desired = storyboard_reference_keys(
             episode.plan,
             self._style_profile,
+            self._series_profile_for_run(episode.run_id),
+            look_key=look.semantic_key,
             explicit_episode_keys=tuple(
                 item.semantic_key
                 for item in explicit_episode_assets
                 if item.semantic_key is not None
             ),
         )
+        explicit_keys = {
+            asset.semantic_key
+            for asset in explicit_episode_assets
+            if asset.semantic_key is not None
+        }
+        canonical_keys = tuple(
+            key
+            for key in desired
+            if key != look.semantic_key and key not in explicit_keys
+        )
         candidates = self._repository.list_assets(
             run_id=episode.run_id,
-            episode_id=episode.id,
             statuses=("approved", "ready"),
-            semantic_keys=desired,
+            semantic_keys=canonical_keys,
         )
-        latest: dict[str, StoredAsset] = {}
+        # 日内定妆图可以由上午生成并在中午、傍晚复用，因此不能按当前 Episode
+        # 过滤。Episode 专属素材则只接受本 Episode 明确上传的资产，避免串片。
+        latest: dict[str, StoredAsset] = {str(look.semantic_key): look}
+        latest.update(
+            {
+                str(asset.semantic_key): asset
+                for asset in explicit_episode_assets
+                if asset.semantic_key is not None
+            }
+        )
         for asset in candidates:
-            if asset.semantic_key in desired and not asset.semantic_key.startswith("legacy:"):
+            if (
+                asset.scope == "canon"
+                and asset.semantic_key in desired
+                and not asset.semantic_key.startswith("legacy:")
+            ):
                 latest[asset.semantic_key] = asset
         missing = [key for key in desired if key not in latest]
         if missing:
@@ -181,11 +617,12 @@ class VisualPreparationService:
         duplicate_billing_risk_accepted: bool = False,
     ) -> tuple[StoredAsset, ...]:
         expected_count = storyboard_panel_count(episode.plan)
+        series_profile = self._series_profile_for_run(episode.run_id)
         compiled = compile_storyboard_prompt(
             episode.plan,
             reference_roles=selection.semantic_keys,
             style_profile=self._style_profile,
-            series_profile=self._series_profile,
+            series_profile=series_profile,
             retry_feedback=prompt_retry_feedback,
         )
         if prompt_override is not None and prompt_override.strip():
@@ -206,8 +643,14 @@ class VisualPreparationService:
             step_ids = {item.step_id for item in reusable}
             if None in step_ids or len(step_ids) != 1:
                 raise RuntimeError("可复用故事板没有唯一的生成Step，无法安全恢复审核")
+            reusable_step_id = next(iter(step_ids))
+            reusable_step = self._repository.get_step(reusable_step_id)
+            if reusable_step.status is StepStatus.AWAITING_REVIEW:
+                # 已转人工的整组面板保持原状态；刷新或重复点击不会再次调用
+                # 视觉审核模型，也不会把manual模式悄悄升级成自动审核。
+                return reusable
             # 图片已经成功落盘时，只恢复语义审核；绝不能因为审核模型异常而再次调用Seedream。
-            return self._semantic_review(episode, next(iter(step_ids)), reusable)
+            return self._semantic_review(episode, reusable_step_id, reusable)
 
         operation_key = "image:storyboard"
         prompt_sha = hashlib.sha256(compiled.text.encode("utf-8")).hexdigest()
@@ -350,7 +793,7 @@ class VisualPreparationService:
         results: tuple[Any, ...],
         expected_count: int,
     ) -> tuple[StoredAsset, ...]:
-        panels: list[StoredAsset] = []
+        downloaded: list[tuple[Any, dict[str, Any]]] = []
         for ordinal, result in enumerate(results, 1):
             landed = self._asset_store.download(result.url, suffix=".png")
             metadata = {
@@ -358,6 +801,45 @@ class VisualPreparationService:
                 "panelOrdinal": ordinal,
                 "panelCount": expected_count,
             }
+            downloaded.append((landed, metadata))
+
+        dimensions = {
+            (int(metadata["width"]), int(metadata["height"]))
+            for _, metadata in downloaded
+        }
+        if len(dimensions) != 1:
+            raise ValueError("同一故事板组的所有原始面板尺寸必须一致")
+        if any(metadata.get("blackBorderDetected") is True for _, metadata in downloaded):
+            raise ValueError("故事板面板检测到明显黑边")
+        deviations = [
+            abs(int(metadata["width"]) / int(metadata["height"]) - 9 / 16)
+            / (9 / 16)
+            for _, metadata in downloaded
+        ]
+        if any(value > 0.02 for value in deviations):
+            raise ValueError("故事板面板的9:16比例偏差超过2%")
+
+        normalized: list[tuple[Any, dict[str, Any]]] = downloaded
+        if any(value > 0.01 for value in deviations):
+            normalized = []
+            width, height = next(iter(dimensions))
+            box = _center_crop_box(width, height)
+            for landed, metadata in downloaded:
+                cropped = self._asset_store.crop_local(landed.path, box=box)
+                cropped_metadata = {
+                    **self._probe.inspect_image(cropped.path),
+                    "panelOrdinal": metadata["panelOrdinal"],
+                    "panelCount": expected_count,
+                    "normalizedToNineSixteen": True,
+                    "normalizedFromPath": str(landed.path),
+                    "normalizedFromSha256": landed.sha256,
+                    "normalizationCropBox": list(box),
+                }
+                normalized.append((cropped, cropped_metadata))
+
+        panels: list[StoredAsset] = []
+        for landed, metadata in normalized:
+            ordinal = int(metadata["panelOrdinal"])
             panels.append(
                 self._repository.save_asset(
                     run_id=episode.run_id,
@@ -380,10 +862,29 @@ class VisualPreparationService:
         step_id: uuid.UUID,
         panels: tuple[StoredAsset, ...],
     ) -> tuple[StoredAsset, ...]:
+        snapshot = ImageInputSnapshot.model_validate(
+            self._repository.get_step(step_id).input_snapshot
+        )
+        generation_references = tuple(
+            self._repository.asset_detail(asset_id)
+            for asset_id in snapshot.reference_asset_ids
+        )
+        review_references = tuple(
+            item
+            for item in generation_references
+            if item.role == "look_reference"
+            or (item.semantic_key or "").startswith("cat:")
+            or item.semantic_key == self._style_profile.line_reference_key
+        )
         prompt = compile_storyboard_review_prompt(
             episode.plan,
             panel_count=len(panels),
-            series_profile=self._series_profile,
+            reference_roles=tuple(
+                str(item.semantic_key)
+                for item in review_references
+                if item.semantic_key is not None
+            ),
+            series_profile=self._series_profile_for_run(episode.run_id),
             style_profile=self._style_profile,
         )
         storyboard_prompt = self._repository.get_prompt_for_step(
@@ -411,6 +912,7 @@ class VisualPreparationService:
             result = self._review_gateway.review_storyboard(
                 prompt=prompt,
                 image_paths=tuple(item.path for item in panels),
+                reference_paths=tuple(item.path for item in review_references),
             )
         except GatewayError as exc:
             return self._await_manual(
@@ -515,9 +1017,10 @@ class VisualPreparationService:
             kind=StepKind.IMAGE,
             operation_key="image:storyboard",
         )
+        look = self._ensure_look_reference(episode)
         return self._ensure_storyboard(
             episode,
-            self.select_references(episode),
+            self.select_references(episode, look),
             attempt=attempt,
             retry_of_step_id=original_step.id,
             retry_reason=reason,
@@ -614,6 +1117,40 @@ class VisualPreparationService:
 
 def _panel_ordinal(asset: StoredAsset) -> int:
     return int(asset.metadata.get("panelOrdinal", 0))
+
+
+def _appearance_signature(episode: StoredEpisode) -> str:
+    appearance = episode.plan.script.appearance
+    # 定妆图只表达当前真正可见的外观。changes_from_previous和change_reason
+    # 属于叙事来源，不应让视觉结果完全相同的下午/傍晚重复产生Seedream费用。
+    payload = {"description": " ".join(appearance.description.split())}
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _validate_portrait_image(metadata: dict[str, Any], *, label: str) -> float:
+    width = int(metadata["width"])
+    height = int(metadata["height"])
+    deviation = abs(width / height - 9 / 16) / (9 / 16)
+    if deviation > 0.02:
+        raise ValueError(f"{label}的9:16比例偏差超过2%")
+    if metadata.get("blackBorderDetected") is True:
+        raise ValueError(f"{label}检测到明显黑边")
+    return deviation
+
+
+def _center_crop_box(width: int, height: int) -> tuple[int, int, int, int]:
+    """以全组相同裁剪框把轻微比例偏差归一到9:16。"""
+
+    target_ratio = 9 / 16
+    if width / height > target_ratio:
+        cropped_width = max(1, round(height * target_ratio))
+        left = (width - cropped_width) // 2
+        return left, 0, left + cropped_width, height
+    cropped_height = max(1, round(width / target_ratio))
+    top = (height - cropped_height) // 2
+    return 0, top, width, top + cropped_height
 
 
 def _override_prompt(value: str) -> CompiledPrompt:
