@@ -633,6 +633,19 @@ class SqlAlchemyWorkflowRepository(
                 )
             ).scalar_one_or_none()
             if existing is not None:
+                if scope == "canon" and status == "approved":
+                    # Canon语义键在生产侧只能有一个活动版本。旧行仍保留给历史Step按ID审计，
+                    # 但降级为rejected后不会再被自动选图或出现在Canon工作台。
+                    existing.status = "approved"
+                    for previous in session.scalars(
+                        select(Asset).where(
+                            Asset.scope == "canon",
+                            Asset.semantic_key == semantic_key,
+                            Asset.id != existing.id,
+                            Asset.status == "approved",
+                        )
+                    ):
+                        previous.status = "rejected"
                 return stored_asset(existing)
             row = Asset(
                 production_run_id=run_id,
@@ -650,6 +663,17 @@ class SqlAlchemyWorkflowRepository(
             )
             session.add(row)
             session.flush()
+            if scope == "canon" and status == "approved":
+                # 新版本写入和旧版本退役处于同一事务，避免并发期间同时暴露两套主体或画风。
+                for previous in session.scalars(
+                    select(Asset).where(
+                        Asset.scope == "canon",
+                        Asset.semantic_key == semantic_key,
+                        Asset.id != row.id,
+                        Asset.status == "approved",
+                    )
+                ):
+                    previous.status = "rejected"
             return stored_asset(row)
 
     def select_video_asset(

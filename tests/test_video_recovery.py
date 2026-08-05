@@ -23,7 +23,10 @@ from cat_video_generator.domain.rendering import (
     build_video_input_plan,
 )
 from cat_video_generator.domain.snapshots import VideoInputSnapshot
-from cat_video_generator.domain.visual_profiles import DEFAULT_STYLE_PROFILE
+from cat_video_generator.domain.visual_profiles import (
+    DEFAULT_SERIES_VISUAL_PROFILE,
+    DEFAULT_STYLE_PROFILE,
+)
 from cat_video_generator.domain.workflow import EpisodeStatus, StepKind, StepStatus
 
 
@@ -157,6 +160,7 @@ def _service(repository: RecoveryRepository, gateway: RecoveryGateway):
         media_probe=object(),
         provider_name="test",
         resolution="480p",
+        series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
         style_profile=DEFAULT_STYLE_PROFILE,
         task_timeout_seconds=0.002,
         poll_interval_seconds=0.01,

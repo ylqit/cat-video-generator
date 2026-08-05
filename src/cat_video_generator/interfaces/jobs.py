@@ -8,6 +8,7 @@ PostgreSQL工作流表持有，这里只登记任务句柄用于去重、进度�
 
 from __future__ import annotations
 
+import logging
 import threading
 import uuid
 from collections.abc import Callable
@@ -17,6 +18,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ..application.ports import GatewayError
+
+logger = logging.getLogger(__name__)
 
 PAID_KINDS = frozenset(
     {
@@ -150,8 +153,21 @@ class JobRegistry:
             else:
                 self._invoke(record, fn)
         except Exception as exc:  # 任务错误必须落进记录而不是丢失
+            # 先构造完整错误，再公开 failed 状态，避免轮询线程读到
+            # ``failed + error=null`` 的短暂矛盾状态。错误分类本身也不得
+            # 覆盖原始异常，否则 Web 将失去唯一可恢复线索。
+            logger.exception("后台任务失败：kind=%s job_id=%s", record.kind, record.job_id)
+            try:
+                error = _classify_error(exc, context=record.context)
+            except Exception as classify_exc:  # pragma: no cover - 最后的故障隔离层
+                logger.exception("后台任务错误分类失败", exc_info=classify_exc)
+                error = {
+                    "code": "internal",
+                    "message": str(exc) or exc.__class__.__name__,
+                    **record.context,
+                }
+            record.error = error
             record.status = "failed"
-            record.error = _classify_error(exc, context=record.context)
         finally:
             record.finished_at = datetime.now(UTC)
 
@@ -180,7 +196,10 @@ def _classify_error(
         code = "provider_timeout"
     else:
         code = "internal"
-    payload: dict[str, Any] = {"code": code, "message": str(exc)}
+    payload: dict[str, Any] = {
+        "code": code,
+        "message": str(exc) or exc.__class__.__name__,
+    }
     payload.update(context or {})
     # 规划审核异常已经在PostgreSQL留下可恢复Run。把稳定标识返回给Web，
     # 让用户直接进入失败现场，而不是回到一张看似什么都没发生的空表单。
@@ -192,5 +211,12 @@ def _classify_error(
         payload["slot"] = getattr(slot, "value", str(slot))
     errors = getattr(exc, "errors", None)
     if errors is not None:
+        # Pydantic ValidationError 暴露的是 errors() 方法；业务规划异常则
+        # 使用 tuple。两种形态都规范化为可序列化列表，不能让分类器再次失败。
+        if callable(errors):
+            try:
+                errors = errors(include_context=False, include_url=False)
+            except TypeError:
+                errors = errors()
         payload["details"] = list(errors)
     return payload

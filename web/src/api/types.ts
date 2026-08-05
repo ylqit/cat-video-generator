@@ -133,6 +133,7 @@ export interface EpisodeScript {
   actions: ActionStageDto[];
   shots: ShotPlanDto[];
   ending: EpisodeEndingDto;
+  sound_design: string;
   duration_seconds: number;
   continuity: SceneContinuityDto;
 }

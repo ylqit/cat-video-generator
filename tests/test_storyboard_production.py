@@ -25,7 +25,6 @@ from cat_video_generator.application.ports import (
 )
 from cat_video_generator.application.retry import RetryService
 from cat_video_generator.application.visual_preparation import VisualPreparationService
-from cat_video_generator.domain.continuity import EntityKind
 from cat_video_generator.domain.contracts import Slot
 from cat_video_generator.domain.visual_profiles import (
     DEFAULT_SERIES_VISUAL_PROFILE,
@@ -250,8 +249,10 @@ class StoryboardGateway:
         return StoryboardReviewResult(
             identity_ok=self.approved,
             style_ok=self.approved,
+            body_proportion_ok=self.approved,
             action_sequence_ok=self.approved,
-            continuity_ok=self.approved,
+            spatial_continuity_ok=self.approved,
+            prop_continuity_ok=self.approved,
             ending_ok=self.approved,
             confidence=0.95,
             violations=() if self.approved else ("continuity",),
@@ -288,6 +289,7 @@ def _canon_assets(
 ) -> tuple[StoredAsset, ...]:
     keys = (
         "person:headshot",
+        "person:front",
         "cat:front",
         "style:line_texture",
         "style:indoor",
@@ -391,7 +393,7 @@ def test_episode_creates_one_storyboard_step_and_reuses_approved_group(tmp_path:
         if item["purpose"] is PromptPurpose.STORYBOARD_REVIEW
     )
     assert review["parent_prompt_id"] == generation["id"]
-    assert len(repository.steps[0].input_snapshot["reference_asset_ids"]) == 5
+    assert len(repository.steps[0].input_snapshot["reference_asset_ids"]) == 2
     assert repository.reviews[0]["warnings"] == [
         {"code": "storyboard_warning", "message": "minor background drift"}
     ]
@@ -496,36 +498,20 @@ def test_semantic_review_exception_waits_for_human_without_recalling_providers(
     assert repository.steps[0].status is StepStatus.AWAITING_REVIEW
 
 
-def test_pose_only_storyboard_keeps_micro_actions_as_diagnostics(tmp_path: Path) -> None:
+def test_pose_only_storyboard_still_requires_valid_director_sequence(tmp_path: Path) -> None:
     service, repository, gateway, episode = _service(tmp_path)
-    pose_only = episode.plan.model_copy(
-        update={
-            "script": episode.plan.script.model_copy(
-                update={
-                    "continuity": episode.plan.script.continuity.model_copy(
-                        update={
-                            "entities": [
-                                item
-                                for item in episode.plan.script.continuity.entities
-                                if item.kind in {EntityKind.PERSON, EntityKind.CAT}
-                            ]
-                        }
-                    )
-                }
-            )
-        }
-    )
-    repository.episode = replace(episode, plan=pose_only)
 
     def pose_drift_only(**_: Any) -> StoryboardReviewResult:
         return StoryboardReviewResult(
             identity_ok=True,
             style_ok=True,
+            body_proportion_ok=True,
             action_sequence_ok=False,
-            continuity_ok=False,
+            spatial_continuity_ok=True,
+            prop_continuity_ok=True,
             ending_ok=False,
             confidence=0.9,
-            violations=("pose drift",),
+            violations=("面板2动作顺序倒置", "面板3未兑现结尾"),
             warnings=(),
             evidence=("same subjects and style",),
             response_id="review-pose-only",
@@ -535,11 +521,15 @@ def test_pose_only_storyboard_keeps_micro_actions_as_diagnostics(tmp_path: Path)
 
     gateway.review_storyboard = pose_drift_only  # type: ignore[method-assign]
 
-    panels = service.prepare(repository.episode)
+    with pytest.raises(RuntimeError, match="语义审核失败"):
+        service.prepare(repository.episode)
 
-    assert panels is not None
-    assert all(item.status == "approved" for item in panels)
-    assert repository.reviews[0]["evidence"]["poseOnlyStoryboardPolicy"] is True
+    assert all(
+        item.status == "rejected"
+        for item in repository.assets
+        if item.role == "storyboard_panel"
+    )
+    assert repository.reviews[0]["evidence"]["actionSequenceOk"] is False
     assert gateway.generate_calls == 1
 
 

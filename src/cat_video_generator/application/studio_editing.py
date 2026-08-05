@@ -60,7 +60,7 @@ class StudioEditingService:
 
         detail = self._repository.episode_detail(episode_id)
         status = str(detail["status"])
-        if status not in {"planned", "failed"}:
+        if status not in {"planned", "video_pending", "failed"}:
             raise ValueError(
                 f"该集状态{status}已进入媒体生产，不能编辑剧本；请先人工拒绝相关资产回到failed"
             )
@@ -90,6 +90,7 @@ class StudioEditingService:
                 episode,
                 resolution=self._video_resolution,
                 style_profile=self._style_profile,
+                series_profile=self._series_profile,
             )
         except PromptCompilationError as exc:
             errors.append(str(exc))

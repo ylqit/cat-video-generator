@@ -236,6 +236,12 @@ class ReviewPersistenceMixin:
                 StepStatus(step.status),
                 StepStatus.SUCCEEDED if decision == "approved" else StepStatus.FAILED,
             ).value
+            if decision == "rejected":
+                violations = evidence.get("violations") or []
+                step.error_json = {
+                    "code": "storyboard_semantic_rejected",
+                    "message": "；".join(str(item) for item in violations) or str(reason or ""),
+                }
             step.completed_at = datetime.now(timezone.utc)
             current_episode_status = EpisodeStatus(episode.status)
             if decision == "approved" and current_episode_status in {

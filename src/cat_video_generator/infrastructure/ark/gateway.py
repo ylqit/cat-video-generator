@@ -413,8 +413,10 @@ class ArkGateway:
             return StoryboardReviewResult(
                 identity_ok=bool(payload["identityOk"]),
                 style_ok=bool(payload["styleOk"]),
+                body_proportion_ok=bool(payload["bodyProportionOk"]),
                 action_sequence_ok=bool(payload["actionSequenceOk"]),
-                continuity_ok=bool(payload["continuityOk"]),
+                spatial_continuity_ok=bool(payload["spatialContinuityOk"]),
+                prop_continuity_ok=bool(payload["propContinuityOk"]),
                 ending_ok=bool(payload["endingOk"]),
                 confidence=float(payload["confidence"]),
                 violations=tuple(str(item) for item in payload["violations"]),

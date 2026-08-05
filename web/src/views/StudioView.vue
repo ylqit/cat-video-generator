@@ -1168,7 +1168,7 @@ onMounted(() => {
                   </el-tag>
                   <StatusBadge :status="episode.status" />
                   <el-button
-                    v-if="['planned', 'failed'].includes(episode.status)"
+                    v-if="['planned', 'video_pending', 'failed'].includes(episode.status)"
                     size="small"
                     style="margin-left: auto"
                     @click="openReplan(episode.slot)"
@@ -1188,7 +1188,7 @@ onMounted(() => {
               />
               <ScriptEditorPanel
                 :episode="episode"
-                :editable="['planned', 'failed'].includes(episode.status)"
+                :editable="['planned', 'video_pending', 'failed'].includes(episode.status)"
                 @saved="loadGraph"
               />
             </el-card>

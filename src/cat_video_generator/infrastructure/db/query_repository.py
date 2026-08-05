@@ -223,11 +223,34 @@ def _workflow_nodes(
             and item.episode_id == episode.id
             and item.operation_key == "video:single_pass"
         ]
-        video_step = max(
-            video_steps,
-            key=lambda item: item.created_at,
-            default=None,
-        )
+        video_step = None
+        if episode is not None and episode.selected_video_asset_id is not None:
+            # 已通过人工审核的成片是Episode的正式选择。即使其后存在失败尝试，
+            # 顶部流程和审核节点也必须展示该资产的真实生产Step。
+            selected_video = next(
+                (
+                    item
+                    for item in episode_assets
+                    if item.id == episode.selected_video_asset_id
+                    and item.role == "video"
+                ),
+                None,
+            )
+            if selected_video is not None:
+                video_step = next(
+                    (
+                        item
+                        for item in video_steps
+                        if item.id == selected_video.producing_step_id
+                    ),
+                    None,
+                )
+        if video_step is None:
+            video_step = max(
+                video_steps,
+                key=lambda item: item.created_at,
+                default=None,
+            )
         storyboard_steps = [
             item
             for item in steps
@@ -235,11 +258,37 @@ def _workflow_nodes(
             and episode is not None
             and item.episode_id == episode.id
         ]
-        storyboard_step = max(
-            storyboard_steps,
-            key=lambda item: item.created_at,
-            default=None,
-        )
+        storyboard_step = None
+        if video_step is not None:
+            # 节点图优先展示当前视频实际消费的故事板血缘，而不是时间上更晚、
+            # 但生成失败或被拒绝的尝试。这样Prompt、面板和成片证据始终对应。
+            consumed_asset_ids = {
+                str(item)
+                for item in video_step.input_snapshot_json.get("input_asset_ids", ())
+            }
+            producing_step_ids = {
+                item.producing_step_id
+                for item in episode_assets
+                if item.role == "storyboard_panel"
+                and str(item.id) in consumed_asset_ids
+                and item.producing_step_id is not None
+            }
+            if len(producing_step_ids) == 1:
+                consumed_step_id = next(iter(producing_step_ids))
+                storyboard_step = next(
+                    (
+                        item
+                        for item in storyboard_steps
+                        if item.id == consumed_step_id
+                    ),
+                    None,
+                )
+        if storyboard_step is None:
+            storyboard_step = max(
+                storyboard_steps,
+                key=lambda item: item.created_at,
+                default=None,
+            )
         look_steps = [
             item
             for item in steps
@@ -267,30 +316,6 @@ def _workflow_nodes(
                 for item in assets
                 if item.role == "look_reference" and str(item.id) in reference_ids
             )
-        if video_step is not None:
-            # 工作台展示当前视频真正消费的故事板，而不是后来一次未进入视频链路的
-            # 失败图片attempt。所有attempt仍保留在节点历史中，生产血缘则保持准确。
-            input_asset_ids = {
-                str(item)
-                for item in video_step.input_snapshot_json.get("input_asset_ids", ())
-            }
-            bound_step_ids = {
-                item.producing_step_id
-                for item in episode_assets
-                if str(item.id) in input_asset_ids
-                and item.role == "storyboard_panel"
-                and item.producing_step_id is not None
-            }
-            if len(bound_step_ids) == 1:
-                bound_step_id = next(iter(bound_step_ids))
-                storyboard_step = next(
-                    (
-                        item
-                        for item in storyboard_steps
-                        if item.id == bound_step_id
-                    ),
-                    storyboard_step,
-                )
         storyboards = tuple(
             item
             for item in episode_assets

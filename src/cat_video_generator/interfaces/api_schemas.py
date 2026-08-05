@@ -15,7 +15,7 @@ from ..domain.visual_profiles import CreativeProfileOverride
 
 CANON_ROLES = frozenset({"person", "cat", "style"})
 CANON_VIEWS = {
-    "person": frozenset({"headshot", "fullbody"}),
+    "person": frozenset({"headshot", "fullbody", "front", "side", "back"}),
     "cat": frozenset({"front", "side", "back"}),
 }
 IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp"})

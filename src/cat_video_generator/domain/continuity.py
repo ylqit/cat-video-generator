@@ -99,15 +99,19 @@ class Placement(StrictModel):
 
 
 class EntityState(StrictModel):
-    """实体在Episode开场或结尾的可见位置。"""
+    """实体在Episode开场或结尾的参与状态与画面位置。
+
+    ``present``表示实体已经属于当前Episode状态，不等于每个采样画面都必须
+    看见它；人物从画外走入、特写时猫暂时在画外都属于合法导演表达。
+    """
 
     present: bool
     placement: Placement
 
     @model_validator(mode="after")
     def validate_presence(self) -> EntityState:
-        if self.present == (self.placement.kind is PlacementKind.OFFSCREEN):
-            raise ValueError("present实体必须有可见位置，非present实体必须offscreen")
+        if not self.present and self.placement.kind is not PlacementKind.OFFSCREEN:
+            raise ValueError("尚未进入或已经离场的实体必须使用offscreen位置")
         return self
 
 
@@ -178,9 +182,14 @@ class TrackedEntity(StrictModel):
         elif self.lifecycle is EntityLifecycle.ENTER:
             if start_present or not end_present:
                 raise ValueError("enter实体必须从离屏进入可见画面")
-        elif self.lifecycle in {EntityLifecycle.EXIT, EntityLifecycle.CONSUME}:
+        elif self.lifecycle is EntityLifecycle.EXIT:
             if not start_present or end_present:
-                raise ValueError(f"{self.lifecycle.value}实体必须从可见变为离屏")
+                raise ValueError("exit实体必须从场景中离开")
+        elif self.lifecycle is EntityLifecycle.CONSUME:
+            # 起终态模型不描述中间每一步：一块零食可以在动作中被人物取出并
+            # 随即吃完，因此开场和结尾都在画外仍是合法的“短暂进入后消耗”。
+            if end_present:
+                raise ValueError("consume实体在结尾不能继续作为独立物体存在")
         elif self.lifecycle is EntityLifecycle.TRANSFORM:
             if not start_present or not end_present:
                 raise ValueError("transform实体在开场和结尾都必须存在")

@@ -190,6 +190,7 @@ class PlanningService:
                 ),
                 story_patterns=story_patterns,
                 series_profile=series_profile,
+                style_profile=self._style_profile,
             )
             day_brief, day_step, day_prompt_id = self._director_invoker.invoke(
                 run_id=run_id,
@@ -475,6 +476,7 @@ class PlanningService:
                 validation_errors=validation_errors,
                 story_pattern=story_pattern,
                 series_profile=series_profile,
+                style_profile=self._style_profile,
             )
             try:
                 draft, step, _ = self._director_invoker.invoke(
@@ -518,6 +520,7 @@ class PlanningService:
                     episode,
                     resolution=self._video_resolution,
                     style_profile=self._style_profile,
+                    series_profile=series_profile,
                 )
             except PromptCompilationError as exc:
                 prompt_error = str(exc)

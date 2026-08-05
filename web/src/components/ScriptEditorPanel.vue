@@ -29,6 +29,7 @@ const draft = reactive({
   main_event: "",
   scene: "",
   ending: "",
+  sound_design: "",
   ending_visual_critical: false,
   duration_seconds: 9,
   style_context: "indoor" as "indoor" | "outdoor",
@@ -48,6 +49,7 @@ function reset() {
   draft.main_event = script.main_event;
   draft.scene = script.scene;
   draft.ending = script.ending.result;
+  draft.sound_design = script.sound_design;
   draft.ending_visual_critical = script.ending.visual_critical;
   draft.duration_seconds = script.duration_seconds;
   draft.style_context = script.style_context;
@@ -102,6 +104,7 @@ async function save() {
         result: draft.ending,
         visual_critical: draft.ending_visual_critical,
       },
+      sound_design: draft.sound_design,
       duration_seconds: draft.duration_seconds,
       style_context: draft.style_context,
       actions: script.actions.map((item) => {
@@ -165,6 +168,14 @@ async function save() {
       <el-checkbox v-model="draft.ending_visual_critical" style="margin-top: 6px">
         结尾画面必须精确（视频仅使用首张和末张故事板作为严格帧输入）
       </el-checkbox>
+    </el-form-item>
+    <el-form-item label="声音设计">
+      <el-input
+        v-model="draft.sound_design"
+        :rows="2"
+        type="textarea"
+        placeholder="环境底声、关键动作声与结尾声音回报；无对白、旁白或歌词"
+      />
     </el-form-item>
     <el-form-item label="只读信息"><span class="muted">{{ readonlyMeta }}</span></el-form-item>
     <el-alert v-if="errors.length" type="error" :closable="false" style="margin-bottom: 10px">

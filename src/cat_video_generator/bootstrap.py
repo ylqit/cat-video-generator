@@ -156,6 +156,7 @@ def build_runtime_container(
         media_probe=probe,
         provider_name=runtime.provider_profile,
         resolution=runtime.ark_video_resolution,
+        series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
         review_gateway=gateway,
         frame_extractor=frame_extractor,
         diagnostic_mode=runtime.video_semantic_review_mode,

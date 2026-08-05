@@ -121,20 +121,20 @@ def storyboard_reference_keys(
         if episode.script.style_context == "indoor"
         else style_profile.outdoor_reference_key
     )
-    person_references = (
-        (series_profile.person_reference_keys[0], look_key)
-        if look_key is not None
-        else series_profile.person_reference_keys
-    )
+    # 已批准定妆图已经融合人物面貌、短发、体型、本集服装和最终画风。
+    # 它既是人物唯一基准，也是故事板的画风载体。此时再混入带有完整场景的
+    # indoor/outdoor 画风图，会把参考图里的茶园、房间等内容误带入当前场景。
+    # 只有没有定妆图的非生产预览/兼容调用才退回人物 Canon 与独立画风参考。
+    if look_key is not None:
+        base = (look_key, f"cat:{view}")
+    else:
+        base = (
+            *series_profile.person_reference_keys,
+            f"cat:{view}",
+            contextual_style,
+        )
     optional_key = explicit_episode_keys[-1] if explicit_episode_keys else None
-    # 日内定妆已经融合场景画风。显式关键元素存在时，用它替换弱相关的第二张
-    # 场景风格图，把Seedream输入稳定控制在五张以内，避免参考职责互相竞争。
-    base = (
-        *person_references,
-        f"cat:{view}",
-        style_profile.line_reference_key,
-        *(() if optional_key else (contextual_style,)),
-    )
+    # 关键道具最多追加一张；不能为了凑素材数量重新加入弱相关或场景冲突图片。
     return tuple(dict.fromkeys((*base, *((optional_key,) if optional_key else ()))))
 
 

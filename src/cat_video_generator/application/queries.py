@@ -93,7 +93,7 @@ class QueryService:
             )
             if item.episode_id == episode_id
             and item.scope == "episode"
-            and item.role in {"element", "scene"}
+            and item.role == "element"
             and item.media_type == "image"
             and item.semantic_key is not None
             and not item.semantic_key.startswith("legacy:")
@@ -102,8 +102,8 @@ class QueryService:
             episode,
             style_profile,
             series_profile,
-            # 故事板生产固定先完成日内定妆。预览使用稳定占位键，确保用户编辑
-            # 的“图2=本时段装扮”职责与实际输入顺序一致，不依赖尚未生成的哈希。
+            # 故事板生产固定先完成日内定妆。预览使用稳定占位键，确保人物、猫咪、
+            # 场景画风三个互斥职责与实际输入顺序一致，不依赖尚未生成的哈希。
             look_key="look:current-appearance",
             explicit_episode_keys=tuple(
                 item.semantic_key
@@ -121,6 +121,7 @@ class QueryService:
             episode,
             resolution=resolution,
             style_profile=style_profile,
+            series_profile=series_profile,
         )
         return {
             "episodeId": str(episode_id),

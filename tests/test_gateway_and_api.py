@@ -627,6 +627,81 @@ def test_video_node_keeps_the_storyboard_set_it_actually_consumed() -> None:
     ]
 
 
+def test_video_node_prefers_selected_asset_over_later_failed_attempt() -> None:
+    now = datetime.now(UTC)
+    run_id = uuid.uuid4()
+    episode_id = uuid.uuid4()
+    selected_asset_id = uuid.uuid4()
+
+    def video_step(*, status: str, created_at: datetime) -> WorkflowStep:
+        return WorkflowStep(
+            id=uuid.uuid4(),
+            production_run_id=run_id,
+            episode_id=episode_id,
+            parent_step_id=None,
+            kind="video",
+            status=status,
+            attempt=1,
+            operation_key="video:single_pass",
+            idempotency_key=uuid.uuid4().hex.ljust(64, "0"),
+            provider="volcengine-ark-standard",
+            provider_task_id=None,
+            model="seedance",
+            input_hash=uuid.uuid4().hex.ljust(64, "0"),
+            input_snapshot_json={},
+            error_json=None,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+
+    selected_step = video_step(status="succeeded", created_at=now)
+    failed_step = video_step(status="failed", created_at=now + timedelta(seconds=1))
+    episode = Episode(
+        id=episode_id,
+        production_run_id=run_id,
+        slot="morning",
+        sort_order=1,
+        script_json=episode_for(Slot.MORNING).script.model_dump(mode="json"),
+        prompt_overrides_json=None,
+        status="ready",
+        selected_video_asset_id=selected_asset_id,
+        created_at=now,
+        updated_at=now,
+    )
+    selected_asset = Asset(
+        id=selected_asset_id,
+        production_run_id=run_id,
+        episode_id=episode_id,
+        producing_step_id=selected_step.id,
+        role="video",
+        semantic_key="video:morning",
+        scope="episode",
+        status="ready",
+        media_type="video",
+        local_path="selected.mp4",
+        sha256="a" * 64,
+        byte_size=1,
+        metadata_json={},
+        created_at=now,
+    )
+
+    nodes = _workflow_nodes(
+        (episode,),
+        (selected_step, failed_step),
+        (),
+        (selected_asset,),
+        (),
+    )
+    video_node = next(item for item in nodes if item["id"] == "video:morning")
+    review_node = next(
+        item for item in nodes if item["id"] == "content-review:morning"
+    )
+
+    assert video_node["stepId"] == str(selected_step.id)
+    assert video_node["status"] == "succeeded"
+    assert review_node["status"] == "approved"
+
+
 @pytest.mark.parametrize("status", ["failed", "expired", "cancelled"])
 def test_terminal_media_steps_advertise_explicit_retry(status: str) -> None:
     now = datetime.now(UTC)

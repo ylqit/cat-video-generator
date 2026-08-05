@@ -36,6 +36,8 @@ def stored_step(row: WorkflowStep) -> StoredStep:
         input_snapshot=row.input_snapshot_json,
         created_at=row.created_at,
         submitted_at=row.submitted_at,
+        error_code=(row.error_json or {}).get("code"),
+        error_message=(row.error_json or {}).get("message"),
     )
 
 

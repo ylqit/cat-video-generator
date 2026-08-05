@@ -15,7 +15,7 @@ export const useCanonStore = defineStore("canon", {
       return (role: string) =>
         [...this.items].reverse().find((item) => item.role === role);
     },
-    /** 按语义键取最新Canon；人物使用headshot/fullbody，猫咪保留三视图。 */
+    /** 按语义键取最新Canon；人物含身份图与三视图，猫咪保留三视图。 */
     bySemanticKey(): (semanticKey: string) => CanonAsset | undefined {
       return (semanticKey: string) =>
         [...this.items]

@@ -103,16 +103,29 @@ class PlanPersistenceMixin:
                 )
             ).scalar_one()
             current = EpisodeStatus(row.status)
-            if current not in {EpisodeStatus.PLANNED, EpisodeStatus.FAILED}:
+            if current not in {
+                EpisodeStatus.PLANNED,
+                EpisodeStatus.VIDEO_PENDING,
+                EpisodeStatus.FAILED,
+            }:
                 raise ValueError(
                     f"{episode.slot.value}状态{current.value}不允许局部重规划"
                 )
+            if current is EpisodeStatus.VIDEO_PENDING:
+                # 故事板批准后、视频尚未提交前仍允许人工修正剧本。旧故事板和审核结果
+                # 保持不可变审计，新剧本会形成新的输入哈希并重新进入视觉准备。
+                current = transition_episode(current, EpisodeStatus.FAILED)
+                row.status = current.value
             if current is EpisodeStatus.FAILED:
                 row.status = transition_episode(
                     current,
                     EpisodeStatus.PLANNED,
                 ).value
             row.script_json = episode.script.model_dump(mode="json")
+            # Prompt覆盖只对创建它时的剧本有效。局部重规划已经替换了剧情、镜头和连续性，
+            # 若继续保留旧覆盖，后续Seedream/Seedance会在新Episode上误用旧Prompt和旧输入哈希。
+            # 历史Prompt、Step与资产仍作为审计记录保留；这里只清除活动Episode的编辑覆盖。
+            row.prompt_overrides_json = None
             drafts = dict(run.planning_json.get("episodeDrafts", {}))
             drafts[episode.slot.value] = episode.script.model_dump(mode="json")
             run.planning_json = {**run.planning_json, "episodeDrafts": drafts}

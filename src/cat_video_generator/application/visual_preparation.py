@@ -14,7 +14,6 @@ import uuid
 from dataclasses import dataclass, replace
 from typing import Any
 
-from ..domain.continuity import EntityKind, EntityLifecycle
 from ..domain.prompts import (
     CompiledPrompt,
     compile_look_prompt,
@@ -547,7 +546,7 @@ class VisualPreparationService:
             for item in approved
             if item.episode_id == episode.id
             and item.scope == "episode"
-            and item.role in {"element", "scene"}
+            and item.role == "element"
             and item.media_type == "image"
             and item.semantic_key is not None
             and not item.semantic_key.startswith("legacy:")
@@ -869,12 +868,32 @@ class VisualPreparationService:
             self._repository.asset_detail(asset_id)
             for asset_id in snapshot.reference_asset_ids
         )
+        # 生成阶段用最少且互斥的素材降低参考冲突；审核阶段需要更完整的比对证据。
+        # 顺序固定为大头照、定妆图、猫咪、定稿画风，使审核模型能分别判断面貌、
+        # 全身比例、猫尾结构和画风，而不会把某张图误当成另一个生成主体。
+        headshots = self._repository.list_assets(
+            run_id=episode.run_id,
+            statuses=("approved", "ready"),
+            semantic_keys=("person:headshot",),
+        )
+        if not headshots:
+            raise RuntimeError("故事板语义审核缺少已批准person:headshot")
+        ordered_review_candidates = (
+            headshots[-1],
+            *(item for item in generation_references if item.role == "look_reference"),
+            *(
+                item
+                for item in generation_references
+                if (item.semantic_key or "").startswith("cat:")
+            ),
+            *(
+                item
+                for item in generation_references
+                if (item.semantic_key or "").startswith("style:")
+            ),
+        )
         review_references = tuple(
-            item
-            for item in generation_references
-            if item.role == "look_reference"
-            or (item.semantic_key or "").startswith("cat:")
-            or item.semantic_key == self._style_profile.line_reference_key
+            {item.id: item for item in ordered_review_candidates}.values()
         )
         prompt = compile_storyboard_review_prompt(
             episode.plan,
@@ -928,34 +947,27 @@ class VisualPreparationService:
                 panels,
                 f"故事板语义审核异常，转人工：{type(exc).__name__}",
             )
-        # 纯人物与猫咪互动的故事板只承担身份、画风和大致构图锚定。
-        # 抚摸、转头、闭眼等连续姿态由Seedance完成；若把每个微动作都设为静态组图硬门，
-        # 会在没有关键道具风险时反复产生图片费用。涉及道具或生命周期变化时仍执行完整硬门。
-        continuity_entities = episode.plan.script.continuity.entities
-        pose_only_storyboard = all(
-            item.kind in {EntityKind.PERSON, EntityKind.CAT}
-            and item.lifecycle is EntityLifecycle.PERSIST
-            and item.start_state == item.end_state
-            for item in continuity_entities
-        )
-        required_checks = [result.identity_ok, result.style_ok]
-        if not pose_only_storyboard:
-            required_checks.extend(
-                (
-                    result.action_sequence_ok,
-                    result.continuity_ok,
-                    result.ending_ok,
-                )
+        passed = all(
+            (
+                result.identity_ok,
+                result.style_ok,
+                result.body_proportion_ok,
+                result.action_sequence_ok,
+                result.spatial_continuity_ok,
+                result.prop_continuity_ok,
+                result.ending_ok,
             )
-        passed = all(required_checks)
+        )
         evidence = {
             "reviewMode": "semantic_auto",
-            "semanticPolicyVersion": "lightweight_relationship_arc_v1",
+            "semanticPolicyVersion": "director_fidelity_v1",
             "semanticVerified": passed and result.confidence >= 0.8,
             "identityOk": result.identity_ok,
             "styleOk": result.style_ok,
+            "bodyProportionOk": result.body_proportion_ok,
             "actionSequenceOk": result.action_sequence_ok,
-            "continuityOk": result.continuity_ok,
+            "spatialContinuityOk": result.spatial_continuity_ok,
+            "propContinuityOk": result.prop_continuity_ok,
             "endingOk": result.ending_ok,
             "confidence": result.confidence,
             "violations": list(result.violations),
@@ -964,7 +976,8 @@ class VisualPreparationService:
             "responseId": result.response_id,
             "providerRequestHash": result.request_hash,
             "orderedPanelSha256": [item.sha256 for item in panels],
-            "poseOnlyStoryboardPolicy": pose_only_storyboard,
+            "reviewReferenceAssetIds": [str(item.id) for item in review_references],
+            "reviewReferenceSha256": [item.sha256 for item in review_references],
         }
         if result.confidence < 0.8:
             return self._await_manual(step_id, panels, "故事板审核置信度低于0.80，转人工", evidence)
@@ -976,15 +989,13 @@ class VisualPreparationService:
                 f"故事板Step状态{current_step.status.value}不允许提交审核结论"
             )
         decision = "approved" if passed else "rejected"
-        if passed and pose_only_storyboard:
+        if passed:
             review_reason = (
-                "整组故事板通过身份与二维画风硬门；动作顺序、连续性和结尾细节"
-                "作为视频阶段诊断证据保留"
+                "整组故事板通过人物与猫咪身份、身体比例、二维画风、动作顺序、"
+                "镜头空间、关键道具和结尾回报审核"
             )
-        elif passed:
-            review_reason = "整组故事板通过身份、二维画风、动作顺序、连续性和结尾审核"
         else:
-            review_reason = "故事板存在明确身份、画风、动作顺序、连续性或结尾错误"
+            review_reason = "；".join(result.violations) or "故事板存在明确语义错误"
         self._repository.commit_storyboard_review(
             step_id=step_id,
             asset_ids=tuple(item.id for item in panels),
@@ -1029,7 +1040,11 @@ class VisualPreparationService:
             prompt_retry_feedback=(
                 None
                 if original_step.status is StepStatus.SUBMISSION_UNKNOWN
-                else reason
+                else "；".join(
+                    item
+                    for item in (reason, original_step.error_message)
+                    if item
+                )
             ),
             auto_timeout_retry_index=(
                 self._image_timeout_auto_retries

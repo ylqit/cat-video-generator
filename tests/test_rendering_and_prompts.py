@@ -1,4 +1,4 @@
-"""故事板渲染计划和五段式Seedance Prompt。"""
+"""故事板渲染计划和三段式Seedance Prompt。"""
 
 from __future__ import annotations
 
@@ -21,6 +21,11 @@ from cat_video_generator.domain.rendering import (
     VideoInputMode,
     VideoInputPlan,
     build_video_input_plan,
+    storyboard_reference_keys,
+)
+from cat_video_generator.domain.visual_profiles import (
+    DEFAULT_SERIES_VISUAL_PROFILE,
+    DEFAULT_STYLE_PROFILE,
 )
 
 
@@ -58,6 +63,39 @@ def test_storyboard_input_plan_contains_ordered_panels() -> None:
     }
     assert [item.prompt_alias for item in plan.bindings] == ["@图片1", "@图片2", "@图片3"]
     assert all(item.provider_role.value == "reference_image" for item in plan.bindings)
+
+
+def test_storyboard_references_use_person_and_cat_view_matching_first_shot(
+    daily_plan,
+) -> None:
+    episode = daily_plan.episodes[0]
+    keys = storyboard_reference_keys(
+        episode,
+        DEFAULT_STYLE_PROFILE,
+        DEFAULT_SERIES_VISUAL_PROFILE,
+        look_key="look:morning-current",
+    )
+
+    assert keys == (
+        "look:morning-current",
+        "cat:front",
+    )
+
+
+def test_all_directors_receive_finalized_style_profile(daily_plan) -> None:
+    day = compile_day_director_prompt(
+        target_date=daily_plan.content_date,
+        planning_context="普通生活日",
+    )
+    episode = compile_episode_director_prompt(
+        day_brief=daily_plan.day_brief,
+        slot_brief=daily_plan.day_brief.slots[0],
+        previous_state_summaries=(),
+    )
+
+    for prompt in (day, episode):
+        assert DEFAULT_STYLE_PROFILE.prompt_positive() in prompt
+        assert DEFAULT_STYLE_PROFILE.prompt_negative() in prompt
 
 
 def test_visual_critical_uses_only_storyboard_first_and_last() -> None:
@@ -145,7 +183,8 @@ def test_two_shots_use_distinct_entry_and_payoff_panels(daily_plan) -> None:
     prompt = compile_storyboard_prompt(relationship_arc)
 
     assert storyboard_panel_count(relationship_arc) == 3
-    assert "不复制面板2的动作构图" in prompt.text
+    assert "沿用镜头2的机位、空间轴线" in prompt.text
+    assert "不重新设计人物、猫咪或场景" in prompt.text
 
 
 def test_single_shot_video_prompt_uses_storyboard_without_redundant_sections(
@@ -159,13 +198,17 @@ def test_single_shot_video_prompt_uses_storyboard_without_redundant_sections(
         sources=storyboard_sources(),
     )
     prompt = compile_video_prompt(episode, input_plan=plan)
-    assert "【输出和画风】" not in prompt.text
+    assert "【整体设定与素材绑定】" in prompt.text
+    assert "【镜头顺序】" in prompt.text
+    assert "【质量、连续性与声音】" in prompt.text
     assert "@图片1" in prompt.text
+    assert "执行主体为" in prompt.text
+    assert episode.script.sound_design in prompt.text
     assert "00:00" not in prompt.text
     assert "assetId" not in prompt.text
 
 
-def test_storyboard_review_uses_lightweight_relationship_arc(daily_plan) -> None:
+def test_storyboard_review_distinguishes_identity_proportion_and_space(daily_plan) -> None:
     episode = daily_plan.episodes[0]
 
     prompt = compile_storyboard_review_prompt(
@@ -173,10 +216,11 @@ def test_storyboard_review_uses_lightweight_relationship_arc(daily_plan) -> None
         panel_count=storyboard_panel_count(episode),
     )
 
-    assert "不要求每个转头、手势或脚步逐字复现" in prompt
-    assert "不要因牵引绳松紧、左右手切换" in prompt
-    assert "静态图不必证明旋转、声音或运动模糊" in prompt
-    assert "最终关系回报不可见" in prompt
+    assert "bodyProportionOk" in prompt
+    assert "spatialContinuityOk" in prompt
+    assert "propContinuityOk" in prompt
+    assert "面板序号" in prompt
+    assert "合理重新取景不算漂移" in prompt
 
 
 def test_legal_long_prompt_is_not_locally_blocked(daily_plan) -> None:
@@ -264,4 +308,4 @@ def test_three_shots_compile_four_storyboard_panels(daily_plan) -> None:
     assert "猫咪近景" in prompt.text
     assert "双主体中近景" in prompt.text
     assert "猫咪重新进入人物关系" in prompt.text
-    assert "不复制面板3的动作构图" in prompt.text
+    assert "沿用镜头3的机位、空间轴线" in prompt.text

@@ -228,11 +228,22 @@ async def _run_validated(operation: Callable[[], Any]) -> Any:
     try:
         return await asyncio.to_thread(operation)
     except ValidationError as exc:
+        # Pydantic 的原始 ``errors()`` 可能把 EpisodeScript 等对象放入 input，
+        # FastAPI 会在序列化错误响应时再次异常，将本应为 422 的契约错误变成 500。
+        # 编辑接口只需向 Web 暴露定位、类型和消息，不回传整个业务对象。
+        errors = [
+            {
+                "loc": list(item.get("loc", ())),
+                "type": str(item.get("type", "validation_error")),
+                "msg": str(item.get("msg", "编辑内容不符合契约")),
+            }
+            for item in exc.errors(include_context=False, include_url=False, include_input=False)
+        ]
         raise HTTPException(
             status_code=422,
             detail={
                 "message": "编辑内容不符合契约",
-                "errors": exc.errors(include_context=False, include_url=False),
+                "errors": errors,
             },
         ) from exc
     except LookupError as exc:

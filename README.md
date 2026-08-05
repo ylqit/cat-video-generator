@@ -35,13 +35,13 @@ uv sync --extra test
 uv run cvg doctor
 
 uv run cvg canon import --role person --semantic-key person:headshot `
-  --view headshot --file "references\person-headshot.png"
-uv run cvg canon import --role person --semantic-key person:fullbody `
-  --view fullbody --file "references\person-fullbody.png"
+  --view headshot --file "风格定稿\Canon-v1\人物-大头照.png"
+uv run cvg canon import --role person --semantic-key person:front `
+  --view front --file "风格定稿\Canon-v1\人物-正面.png"
 uv run cvg canon import --role cat --semantic-key cat:front `
-  --view front --file "主题示例\猫咪本体.png"
+  --view front --file "风格定稿\Canon-v1\猫咪-正面.png"
 uv run cvg canon import --role style --semantic-key style:line_texture `
-  --file "画风示例\已批准线条裁片.png"
+  --file "风格定稿\Canon-v1\画风-线条材质.png"
 
 uv run cvg plan-day --target-date 2026-08-01 --allow-paid-generation
 uv run cvg run-day <runId> --allow-paid-generation
@@ -66,14 +66,17 @@ Seedance 的 `submission_unknown` 必须先通过Ark任务列表人工对账，�
 
 - 人物只锁定主要面貌、发型、体型和中性儿童定位；服装、鞋帽、背包服从剧情。
 - 猫咪锁定同一只灰白猫的脸型、体型和主要斑纹。
-- 画风使用已批准的二维儿童绘本、彩铅/蜡笔素材，排除明显 3D/CG/PBR 倾向。
+- 唯一生产画风为 `风格定稿/Canon-v1` 的日系二维治愈生活插画：细腻手绘线条、
+  柔和哑光水彩式数字绘制、清新自然色、温和自然光和克制景深。
+- 旧 `主题示例`、`画风示例` 以及任意 `style:source_*` 不再是运行时资产来源。
 - 人物Canon使用独立大头照和全身照，避免把人物多视图拼图直接送入生图模型；猫咪继续使用正面、侧面和背面参考。
 - 每个时段先按实际服饰生成一张日内定妆图；后续时段外观完全相同则复用，外观变化才新增一次Seedream调用和轻量审核。
+- 故事板生成只发送“定妆图 + 猫咪匹配视角 + 室内/户外定稿画风”，必要时追加一张关键道具图；人物单视图和线条材质图只用于定妆，不与故事板人物基准竞争。
 - 同一连续场景中的外观与道具必须连续；跨时段变化只需有合理剧情原因。
 - `STORYBOARD_REVIEW_MODE` 只支持 `semantic_auto` 或 `manual`。
 - 每条Episode只创建一个Seedream组图步骤；面板由镜头而非动作数量编译，2镜头返回3张、3镜头返回4张独立、无文字、9:16故事板。
 - 故事板少图、技术失败或整组语义失败时不会创建Seedance任务；低置信结果转人工审核。
-- 普通背景、轻微姿势、构图和非关键外观差异只记为故事板警告；角色数量、关键道具类别、动作顺序和结尾兑现仍是硬门。
+- 普通背景、轻微表情、眼睛画法和明确切镜后的合理重新构图只记为故事板警告；换人、复制、严重头身或猫尾结构失衡、同镜头空间跳变、整层服装消失、关键道具变类和结尾未兑现仍是硬门。
 - 最终视频始终进入 `content_review`，不会自动批准或交付。
 
 Episode需要更精确地固定关键道具或场景时，可选导入图片素材供Seedream使用；普通场景没有专用参考图不会阻断生成：

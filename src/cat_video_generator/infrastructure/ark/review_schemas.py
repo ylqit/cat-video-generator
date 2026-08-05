@@ -28,8 +28,10 @@ STORYBOARD_REVIEW_SCHEMA = {
     "properties": {
         "identityOk": {"type": "boolean"},
         "styleOk": {"type": "boolean"},
+        "bodyProportionOk": {"type": "boolean"},
         "actionSequenceOk": {"type": "boolean"},
-        "continuityOk": {"type": "boolean"},
+        "spatialContinuityOk": {"type": "boolean"},
+        "propContinuityOk": {"type": "boolean"},
         "endingOk": {"type": "boolean"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "violations": {"type": "array", "items": {"type": "string"}},
@@ -39,8 +41,10 @@ STORYBOARD_REVIEW_SCHEMA = {
     "required": [
         "identityOk",
         "styleOk",
+        "bodyProportionOk",
         "actionSequenceOk",
-        "continuityOk",
+        "spatialContinuityOk",
+        "propContinuityOk",
         "endingOk",
         "confidence",
         "violations",

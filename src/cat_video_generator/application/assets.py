@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from ..domain.visual_profiles import DEFAULT_STYLE_PROFILE
 from ..domain.workflow import EpisodeStatus, RunStatus
 from .ports import AssetStore, MediaProbe, ProductionStore
 
@@ -46,6 +47,8 @@ class AssetService:
                 raise ValueError("人物和猫咪semantic_key必须与role和view一致")
         elif view is not None:
             raise ValueError("style Canon不能声明人物视角")
+        elif semantic_key not in DEFAULT_STYLE_PROFILE.reference_keys:
+            raise ValueError("画风Canon只能使用当前定稿的line_texture、indoor或outdoor语义键")
         landed = self._asset_store.import_local(path)
         metadata = {
             **self._probe.inspect_image(landed.path),
@@ -98,6 +101,8 @@ class AssetService:
                 raise ValueError("裁片semantic_key必须与role和view一致")
         elif view is not None:
             raise ValueError("style裁片不能声明人物视角")
+        elif semantic_key not in DEFAULT_STYLE_PROFILE.reference_keys:
+            raise ValueError("画风裁片只能写入当前定稿画风语义键")
         source_meta = self._probe.inspect_image(source.path)
         if box is None:
             if role in {"style", "person"}:
@@ -237,7 +242,7 @@ _SEMANTIC_KEY = re.compile(r"^[a-z][a-z0-9_]*:[a-z0-9][a-z0-9_-]{0,119}$")
 
 def _canon_views(role: str) -> frozenset[str]:
     if role == "person":
-        return frozenset({"headshot", "fullbody"})
+        return frozenset({"headshot", "fullbody", "front", "side", "back"})
     if role == "cat":
         return frozenset({"front", "side", "back"})
     return frozenset()

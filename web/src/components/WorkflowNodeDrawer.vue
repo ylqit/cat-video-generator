@@ -20,9 +20,16 @@ const emit = defineEmits<{
 
 const activePanel = ref("content");
 watch(
-  () => props.node?.id,
-  () => {
-    activePanel.value = "content";
+  [() => props.node?.id, () => props.modelValue],
+  ([, visible]) => {
+    if (!visible) {
+      return;
+    }
+    // 失败节点优先展示可执行的恢复操作，避免用户只看到错误却找不到重试入口。
+    // 重试、继续查询和对账仍由 StepList 统一处理，不在抽屉中复制付费确认逻辑。
+    activePanel.value = props.node?.status === "failed" || props.node?.error
+      ? "provider"
+      : "content";
   },
 );
 

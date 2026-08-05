@@ -164,6 +164,11 @@ class EpisodeScript(StrictModel):
     actions: list[ActionStage] = Field(min_length=2, max_length=4)
     shots: list[ShotPlan] = Field(min_length=1, max_length=3)
     ending: EpisodeEnding
+    # 旧Run早于声音设计字段，读取历史摘要时使用保守默认值；新导演Prompt仍
+    # 明确要求输出本集环境声、动作声和声音回报，不能把兼容默认当成创作模板。
+    sound_design: Annotated[str, Field(min_length=8, max_length=320)] = (
+        "环境声与动作声自然同步，无对白、旁白或歌词。"
+    )
     duration_seconds: Annotated[int, Field(ge=8, le=15)]
     continuity: SceneContinuity
 
@@ -235,15 +240,9 @@ class DailyProductionPlan(StrictModel):
     def validate_day(self) -> DailyProductionPlan:
         if [item.slot for item in self.episodes] != list(Slot):
             raise ValueError("全天Episode必须按morning、noon、evening排序")
-        declared = {item.entity_key: set(item.slots) for item in self.day_brief.shared_elements}
-        observed: dict[str, set[Slot]] = {}
-        for episode in self.episodes:
-            for entity in episode.script.continuity.entities:
-                if entity.entity_key in declared:
-                    observed.setdefault(entity.entity_key, set()).add(episode.slot)
-        for key, slots in declared.items():
-            if observed.get(key, set()) != slots:
-                raise ValueError(f"共享元素{key}未在声明的全部时段以同一entityKey出现")
+        # DayBrief 中的共享元素是导演方向，不是不可撤销的道具配额。
+        # 人工重规划某个时段时可以放弃高风险共享道具；实际使用的共享键
+        # 仍由 ``validate_episode_against_brief`` 校验是否获得该时段授权。
         return self
 
 

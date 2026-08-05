@@ -70,8 +70,10 @@ class StoryboardReviewResult:
 
     identity_ok: bool
     style_ok: bool
+    body_proportion_ok: bool
     action_sequence_ok: bool
-    continuity_ok: bool
+    spatial_continuity_ok: bool
+    prop_continuity_ok: bool
     ending_ok: bool
     confidence: float
     violations: tuple[str, ...]
@@ -145,6 +147,8 @@ class StoredStep:
     input_snapshot: dict[str, Any] = field(default_factory=dict)
     created_at: datetime | None = None
     submitted_at: datetime | None = None
+    error_code: str | None = None
+    error_message: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -14,11 +14,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from ..domain.continuity import EntityKind
+from ..domain.continuity import EntityKind, EntityLifecycle
 from ..domain.prompts import CompiledPrompt, compile_video_diagnostic_prompt, compile_video_prompt
 from ..domain.rendering import MediaSource, VideoInputMode, build_video_input_plan
 from ..domain.snapshots import VideoInputSnapshot
-from ..domain.visual_profiles import StyleProfile
+from ..domain.visual_profiles import SeriesVisualProfile, StyleProfile
 from ..domain.workflow import EpisodeStatus, PromptPurpose, StepKind, StepStatus
 from .errors import StepRetryRequired
 from .ports import (
@@ -48,6 +48,7 @@ class VideoExecutionService:
         media_probe: MediaProbe,
         provider_name: str,
         resolution: str,
+        series_profile: SeriesVisualProfile,
         style_profile: StyleProfile,
         review_gateway: VisualReviewGateway | None = None,
         frame_extractor: ReviewFrameExtractor | None = None,
@@ -66,6 +67,7 @@ class VideoExecutionService:
         self._probe = media_probe
         self._provider_name = provider_name
         self._resolution = resolution
+        self._series_profile = series_profile
         self._style_profile = style_profile
         self._review_gateway = review_gateway
         self._frame_extractor = frame_extractor
@@ -98,6 +100,7 @@ class VideoExecutionService:
             StepStatus.RUNNING,
         }:
             raise ValueError("continue-query只接受已有task ID的queued/running视频步骤")
+        episode = self._restore_episode_for_existing_task(episode, step)
         return self._finish(episode, step)
 
     def reconciliation_candidates(
@@ -172,11 +175,43 @@ class VideoExecutionService:
                 "reconciled_at": now,
             },
         )
-        if episode.status is EpisodeStatus.FAILED:
+        episode = self._restore_episode_for_existing_task(episode, step)
+        return self._finish(episode, self._repository.get_step(step.id))
+
+    def _restore_episode_for_existing_task(
+        self,
+        episode: StoredEpisode,
+        step: StoredStep,
+    ) -> StoredEpisode:
+        """将已有Ark task ID的尝试恢复到可以落盘/QC的Episode状态。
+
+        显式重试可能与旧成片审核状态并存；这里只恢复已经拥有task ID的尝试，
+        绝不创建新的供应商POST。
+        """
+
+        status_changed = False
+        if episode.status is EpisodeStatus.CONTENT_REVIEW:
+            snapshot = VideoInputSnapshot.model_validate(step.input_snapshot)
+            if snapshot.retry_of_step_id is None:
+                raise ValueError("非重试视频不能覆盖当前内容审核阶段")
+            self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
             self._repository.set_episode_status(episode.id, EpisodeStatus.VIDEO_PENDING)
             self._repository.set_episode_status(episode.id, EpisodeStatus.VIDEO_GENERATING)
-            episode = self._repository.get_episode(episode.run_id, episode.plan.slot)
-        return self._finish(episode, self._repository.get_step(step.id))
+            status_changed = True
+        elif episode.status is EpisodeStatus.FAILED:
+            self._repository.set_episode_status(episode.id, EpisodeStatus.VIDEO_PENDING)
+            self._repository.set_episode_status(episode.id, EpisodeStatus.VIDEO_GENERATING)
+            status_changed = True
+        elif episode.status is EpisodeStatus.VIDEO_PENDING:
+            self._repository.set_episode_status(episode.id, EpisodeStatus.VIDEO_GENERATING)
+            status_changed = True
+        elif episode.status not in {EpisodeStatus.VIDEO_GENERATING, EpisodeStatus.MEDIA_QC}:
+            raise ValueError(
+                f"当前Episode状态{episode.status.value}不能继续已有视频任务"
+            )
+        if not status_changed:
+            return episode
+        return self._repository.get_episode(episode.run_id, episode.plan.slot)
 
     def retry_video(
         self,
@@ -189,40 +224,36 @@ class VideoExecutionService:
 
         if original_step.operation_key != "video:single_pass":
             raise ValueError("只支持重试single-pass视频步骤")
-        snapshot = VideoInputSnapshot.model_validate(original_step.input_snapshot)
-        submitted_inputs = tuple(
-            self._repository.asset_detail(asset_id) for asset_id in snapshot.input_asset_ids
-        )
-        storyboard_step_ids = {item.step_id for item in submitted_inputs}
-        if len(storyboard_step_ids) != 1 or None in storyboard_step_ids:
-            raise ValueError("原视频步骤没有绑定同一组故事板")
-        storyboard_step_id = next(iter(storyboard_step_ids))
-        inputs = tuple(
-            item
-            for item in self._repository.list_assets(
-                run_id=episode.run_id,
-                episode_id=episode.id,
-                roles=("storyboard_panel",),
-                statuses=("approved", "ready"),
-            )
-            if item.step_id == storyboard_step_id
-        )
-        prompt = self._repository.get_prompt_for_step(
-            original_step.id,
-            purpose=PromptPurpose.VIDEO,
-        ).text
+        # 剧本重规划后，旧视频attempt绑定的故事板只用于审计。
+        # 新的收费attempt必须只使用当前Episode最新一组完整批准面板，
+        # 否则会把新脚本和旧画面错误组合，无意中再产生一次费用。
+        inputs = self._repository.latest_approved_storyboard(episode.id)
+        if not 3 <= len(inputs) <= 4:
+            raise ValueError("当前Episode没有一组完整批准的最新故事板")
+        # 媒体重试应使用当前Episode与当前输入路由重新编译Prompt；旧attempt的实际
+        # Prompt仍保留作审计。只有用户显式保存的视频覆盖才继续作为唯一覆盖来源。
+        prompt_override = self._repository.get_prompt_overrides(episode.id).get("video")
         attempt = self._repository.next_step_attempt(
             episode_id=episode.id,
             kind=StepKind.VIDEO,
             operation_key=original_step.operation_key,
         )
-        if episode.status is EpisodeStatus.FAILED:
+        if episode.status is EpisodeStatus.CONTENT_REVIEW:
+            # 人工打回不会覆盖原成片；新attempt从合法的失败恢复边重新进入视频阶段。
+            self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
             self._repository.set_episode_status(episode.id, EpisodeStatus.VIDEO_PENDING)
             episode = self._repository.get_episode(episode.run_id, episode.plan.slot)
+        elif episode.status is EpisodeStatus.FAILED:
+            self._repository.set_episode_status(episode.id, EpisodeStatus.VIDEO_PENDING)
+            episode = self._repository.get_episode(episode.run_id, episode.plan.slot)
+        elif episode.status is not EpisodeStatus.VIDEO_PENDING:
+            raise ValueError(
+                f"当前Episode状态{episode.status.value}不允许创建新的视频attempt"
+            )
         return self._generate(
             episode,
             inputs,
-            prompt_override=prompt,
+            prompt_override=prompt_override,
             attempt=attempt,
             retry_of_step_id=original_step.id,
             retry_reason=reason,
@@ -247,12 +278,25 @@ class VideoExecutionService:
         ):
             raise ValueError("Seedance只能使用完整且已批准的故事板面板")
         has_critical_prop = any(
-            item.kind is EntityKind.PROP
-            for item in episode.plan.script.continuity.entities
+            entity.kind is EntityKind.PROP
+            for entity in episode.plan.script.continuity.entities
         )
+        has_moving_critical_prop = any(
+            entity.kind is EntityKind.PROP
+            and (
+                entity.lifecycle is not EntityLifecycle.PERSIST
+                or entity.start_state != entity.end_state
+                or entity.form_key != (entity.final_form_key or entity.form_key)
+            )
+            for entity in episode.plan.script.continuity.entities
+        )
+        # 首尾帧适合固定两个端点；一旦关键道具需要跨镜头移动，中间审核面板就是
+        # 必要执行锚点，优先完整故事板，避免模型在捡起/放下阶段复制或遗失道具。
         input_mode = (
             VideoInputMode.STRICT_FIRST_LAST
-            if episode.plan.script.ending.visual_critical and has_critical_prop
+            if episode.plan.script.ending.visual_critical
+            and has_critical_prop
+            and not has_moving_critical_prop
             else VideoInputMode.STORYBOARD_REFERENCE
         )
         selected_inputs = (
@@ -272,6 +316,7 @@ class VideoExecutionService:
             episode.plan,
             input_plan=input_plan,
             style_profile=self._style_profile,
+            series_profile=self._series_profile,
         )
         if prompt_override is not None and prompt_override.strip():
             compiled = _override_prompt(prompt_override)
@@ -410,7 +455,13 @@ class VideoExecutionService:
         video_url: str,
     ) -> dict[str, Any]:
         landed = self._asset_store.download(video_url, suffix=".mp4")
-        self._repository.set_episode_status(episode.id, EpisodeStatus.MEDIA_QC)
+        episode = self._repository.get_episode(episode.run_id, episode.plan.slot)
+        if episode.status is EpisodeStatus.VIDEO_GENERATING:
+            self._repository.set_episode_status(episode.id, EpisodeStatus.MEDIA_QC)
+        elif episode.status is not EpisodeStatus.MEDIA_QC:
+            raise ValueError(
+                f"当前Episode状态{episode.status.value}不能落盘视频"
+            )
         qc = self._probe.inspect_video(
             landed.path,
             expected_duration_seconds=episode.plan.script.duration_seconds,
@@ -465,7 +516,10 @@ class VideoExecutionService:
         assert self._review_gateway is not None
         assert self._frame_extractor is not None
         assert asset.step_id is not None
-        prompt = compile_video_diagnostic_prompt(episode.plan)
+        prompt = compile_video_diagnostic_prompt(
+            episode.plan,
+            style_profile=self._style_profile,
+        )
         video_prompt = self._repository.get_prompt_for_step(
             asset.step_id, purpose=PromptPurpose.VIDEO
         )
@@ -484,7 +538,9 @@ class VideoExecutionService:
         frames: tuple[Path, ...] = ()
         hashes: list[str] = []
         try:
-            frames = self._frame_extractor.extract_review_frames(asset, count=8)
+            # 单次审核仍只调用一次Ark；提高时序采样密度，降低短暂复制、穿透或
+            # 服装断裂刚好落在两个采样点之间而被漏检的概率。
+            frames = self._frame_extractor.extract_review_frames(asset, count=12)
             hashes = [hashlib.sha256(path.read_bytes()).hexdigest() for path in frames]
             result = self._review_gateway.diagnose_video_frames(
                 prompt=prompt,

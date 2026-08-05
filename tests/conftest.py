@@ -122,6 +122,7 @@ def episode_for(slot: Slot) -> EpisodePlan:
             visual_critical=False,
             key_entity_ids=["pinwheel", "cat"],
         ),
+        sound_design="室内微风和纸页轻响作为底声，纸风车转动声清楚，结尾以猫咪轻嗅声收束；无对白、旁白或歌词",
         duration_seconds=9,
         continuity=continuity,
     )

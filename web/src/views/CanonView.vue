@@ -9,12 +9,12 @@ import { useCanonStore } from "../stores/canon";
 const canon = useCanonStore();
 
 const ROLE_LABEL: Record<string, string> = {
-  person: "人物本体",
-  cat: "猫咪本体",
-  style: "画风示例",
+  person: "定稿人物",
+  cat: "定稿猫咪",
+  style: "定稿画风",
 };
 
-/** person 使用大头照/全身照，cat 保留前侧后三视图。 */
+/** 人物保留身份图与前侧后三视图；猫咪使用前侧后三视图。 */
 const VIEW_LABEL: Record<string, string> = {
   headshot: "大头照",
   fullbody: "全身照",
@@ -38,7 +38,13 @@ const uploading = ref(false);
 const needsView = computed(() => role.value === "person" || role.value === "cat");
 const viewOptions = computed<Record<string, string>>(() =>
   role.value === "person"
-    ? { headshot: VIEW_LABEL.headshot, fullbody: VIEW_LABEL.fullbody }
+    ? {
+        headshot: VIEW_LABEL.headshot,
+        fullbody: VIEW_LABEL.fullbody,
+        front: VIEW_LABEL.front,
+        side: VIEW_LABEL.side,
+        back: VIEW_LABEL.back,
+      }
     : { front: VIEW_LABEL.front, side: VIEW_LABEL.side, back: VIEW_LABEL.back },
 );
 
@@ -47,7 +53,7 @@ watch(role, (value) => {
   if (value === "cat") view.value = "front";
 });
 
-/** 最终提交的 semantic_key：person/cat 由视角组合，style 手填。 */
+/** 最终提交的 semantic_key：主体按视角组合，画风只能使用三个定稿键。 */
 const semanticKey = computed(() =>
   needsView.value ? `${role.value}:${view.value}` : styleKey.value.trim(),
 );
@@ -119,23 +125,18 @@ onMounted(() => canon.fetch(true));
             :value="key"
           />
         </el-select>
-        <el-input
+        <el-select
           v-else
           v-model="styleKey"
-          placeholder="画风语义键，如 style:indoor"
           style="width: 220px"
         >
-          <template #append>
-            <el-select v-model="styleKey" style="width: 150px">
-              <el-option
-                v-for="hint in STYLE_KEY_HINTS"
-                :key="hint"
-                :label="hint"
-                :value="hint"
-              />
-            </el-select>
-          </template>
-        </el-input>
+          <el-option
+            v-for="hint in STYLE_KEY_HINTS"
+            :key="hint"
+            :label="hint"
+            :value="hint"
+          />
+        </el-select>
         <input type="file" accept="image/*" @change="onFileChange" />
         <el-button
           type="primary"

@@ -61,6 +61,7 @@ class SeriesVisualProfile(VisualProfileModel):
         "发髻",
         "妆容",
     )
+
     def fingerprint(self) -> str:
         """生成事件种子筛选和规划幂等使用的稳定摘要。"""
 
@@ -84,7 +85,7 @@ class CreativeProfileOverride(VisualProfileModel):
 
 
 class StyleProfile(VisualProfileModel):
-    """可执行的二维绘本画风定义与允许使用的参考资产语义键。"""
+    """可执行的系列画风定义与允许使用的参考资产语义键。"""
 
     profile_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{1,79}$")
     positive_features: tuple[str, ...] = Field(min_length=3, max_length=10)
@@ -92,6 +93,16 @@ class StyleProfile(VisualProfileModel):
     line_reference_key: str = "style:line_texture"
     indoor_reference_key: str = "style:indoor"
     outdoor_reference_key: str = "style:outdoor"
+
+    @property
+    def reference_keys(self) -> tuple[str, str, str]:
+        """返回生产链唯一允许使用的定稿画风资产键。"""
+
+        return (
+            self.line_reference_key,
+            self.indoor_reference_key,
+            self.outdoor_reference_key,
+        )
 
     def prompt_positive(self) -> str:
         return "、".join(self.positive_features)
@@ -101,31 +112,42 @@ class StyleProfile(VisualProfileModel):
 
 
 DEFAULT_SERIES_VISUAL_PROFILE = SeriesVisualProfile(
-    profile_id="neutral-child-gray-cat-v1",
-    person_identity="同一个中性儿童，主要面貌和整体年龄感稳定，不强化男性或女性特征",
-    person_hair="沿用批准人物本体的真实短发长度与发色，不无故增长或改变发型",
-    person_body="保持相同儿童比例、身高感和体型，可由剧情自然换装",
-    cat_identity="同一只灰白猫，脸型、体型、尾巴和主要灰白斑纹稳定可辨识",
+    profile_id="final-neutral-short-hair-child-gray-cat-v1",
+    person_identity=(
+        "同一个偏中性呈现的东亚儿童，保持批准人物正面图中的柔和椭圆脸、五官比例、"
+        "肤色和自然儿童年龄感，不强化男性或女性特征"
+    ),
+    person_hair=(
+        "保持深棕黑色、齐耳至下颌长度的顺直短波波头与轻薄刘海，"
+        "不得无故变成长发、马尾或发髻"
+    ),
+    person_body="保持约九至十二岁儿童的身高感、头身比例和纤细自然体型，可由剧情自然换装",
+    cat_identity=(
+        "同一只圆润灰白短毛猫，保持白色口鼻胸腹与四肢、灰色头顶和背部虎斑、"
+        "灰白环纹、自然中等粗细且从后躯正常连接的尾巴、圆形琥珀棕眼睛及稳定体型"
+    ),
     person_personality="好奇心旺盛、做事认真，容易被小意外逗笑",
     cat_personality="表面高冷、其实贪玩，常常先假装不在意再忍不住凑近的反差萌",
     humor_style="每集至少一个意外、反差或幽默节拍，靠可见动作与表情而非对白",
 )
 
 DEFAULT_STYLE_PROFILE = StyleProfile(
-    profile_id="storybook-pencil-v2",
+    profile_id="final-healing-2d-watercolor-v1",
     positive_features=(
-        "二维儿童绘本",
-        "彩铅和蜡笔颗粒",
-        "可见手绘线条",
-        "哑光平涂",
-        "简化形体",
-        "克制明暗",
+        "日系二维治愈生活插画",
+        "细腻干净的手绘轮廓线",
+        "柔和哑光的水彩式数字绘制",
+        "清新低至中饱和自然色",
+        "温和自然光与空气透视",
+        "克制景深和轻微远景虚化",
     ),
     excluded_features=(
-        "CG或PBR材质",
+        "真人写实摄影",
+        "CG或PBR三维材质",
         "塑料高光",
-        "3D体积塑形",
-        "写实景深",
+        "强烈3D体积塑形",
+        "过度油亮平滑表面",
+        "高反差商业动画灯光",
         "光滑商业动画渲染",
     ),
 )
