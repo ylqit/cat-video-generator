@@ -416,7 +416,13 @@ def create_write_router(
             if status in {"planned", "generating", "reviewing"}:
                 settings = queries.pipeline_settings(run_id)
                 payload["runId"] = str(run_id)
-                return chain_after_planning(production, run_id, settings, payload)
+                return chain_after_planning(
+                    production,
+                    run_id,
+                    settings,
+                    payload,
+                    slot=slot,
+                )
             return payload
 
         record = _submit(

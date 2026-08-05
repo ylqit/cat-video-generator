@@ -214,6 +214,18 @@ def _workflow_nodes(
             and episode is not None
             else "pending"
         )
+        video_steps = [
+            item
+            for item in steps
+            if episode is not None
+            and item.episode_id == episode.id
+            and item.operation_key == "video:single_pass"
+        ]
+        video_step = max(
+            video_steps,
+            key=lambda item: item.created_at,
+            default=None,
+        )
         storyboard_steps = [
             item
             for item in steps
@@ -226,24 +238,36 @@ def _workflow_nodes(
             key=lambda item: item.created_at,
             default=None,
         )
+        if video_step is not None:
+            # 工作台展示当前视频真正消费的故事板，而不是后来一次未进入视频链路的
+            # 失败图片attempt。所有attempt仍保留在节点历史中，生产血缘则保持准确。
+            input_asset_ids = {
+                str(item)
+                for item in video_step.input_snapshot_json.get("input_asset_ids", ())
+            }
+            bound_step_ids = {
+                item.producing_step_id
+                for item in episode_assets
+                if str(item.id) in input_asset_ids
+                and item.role == "storyboard_panel"
+                and item.producing_step_id is not None
+            }
+            if len(bound_step_ids) == 1:
+                bound_step_id = next(iter(bound_step_ids))
+                storyboard_step = next(
+                    (
+                        item
+                        for item in storyboard_steps
+                        if item.id == bound_step_id
+                    ),
+                    storyboard_step,
+                )
         storyboards = tuple(
             item
             for item in episode_assets
             if item.role == "storyboard_panel"
             and storyboard_step is not None
             and item.producing_step_id == storyboard_step.id
-        )
-        video_steps = [
-            item
-            for item in steps
-            if episode is not None
-            and item.episode_id == episode.id
-            and item.operation_key == "video:single_pass"
-        ]
-        video_step = max(
-            video_steps,
-            key=lambda item: item.created_at,
-            default=None,
         )
         videos = tuple(
             item
@@ -275,7 +299,18 @@ def _workflow_nodes(
         )
         storyboard_review_status = storyboard_status
         storyboard_semantic_status = storyboard_status
-        if storyboard_step is not None and storyboard_step.status in {
+        storyboard_review = latest_review(storyboard_step)
+        storyboard_provider_status = (
+            "succeeded"
+            if storyboard_step is not None and len(storyboards) in {3, 4}
+            else None
+        )
+        if storyboard_review is not None:
+            # Storyboard Step最终可能因语义拒绝而写成failed，但Provider事实上已经成功
+            # 返回并落盘了全部面板。节点必须把“生成成功”和“审核拒绝”分开展示。
+            storyboard_review_status = storyboard_review.decision
+            storyboard_semantic_status = storyboard_review.decision
+        elif storyboard_step is not None and storyboard_step.status in {
             "failed",
             "expired",
             "cancelled",
@@ -312,6 +347,7 @@ def _workflow_nodes(
                     label=f"{slot}故事板",
                     step=storyboard_step,
                     node_assets=storyboards,
+                    provider_status=storyboard_provider_status,
                 ),
                 {
                     **step_node(
@@ -321,6 +357,7 @@ def _workflow_nodes(
                         label=f"{slot}故事板审核",
                         step=storyboard_step,
                         node_assets=storyboards,
+                        provider_status=storyboard_provider_status,
                         semantic_review_status=storyboard_semantic_status,
                     ),
                     "status": storyboard_review_status,

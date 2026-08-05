@@ -1,0 +1,109 @@
+patterns:
+  - pattern_id: goal-challenge
+    name: 目标挑战
+    structure:
+      - 为一个明确目标做准备，装备和期待感要可见
+      - 过程中出现一个小危机或意外
+      - 人物与猫咪共同解决，猫咪有实质动作贡献
+      - 收获结果并以温情画面收束
+    example_themes: [出去钓鱼, 放风筝, 采摘果子]
+    humor_mechanisms: [尺寸反差, 物理意外, 自作聪明被拆台]
+    prop_hints: [便携装备, 容器, 工具]
+    suitable_slots: []
+    mood: 热闹
+  - pattern_id: unexpected-trouble
+    name: 意外麻烦
+    structure:
+      - 平静日常中突然发现一件不对劲的事
+      - 顺着线索追查，误会逐渐升级
+      - 真相揭晓，与预想完全不同
+      - 哭笑不得地收拾残局
+    example_themes: [单只袜子失踪案, 会逃跑的拖鞋, 桌上脚印之谜]
+    humor_mechanisms: [误会, 拟人化, 自作聪明被拆台]
+    prop_hints: [日常小物, 可疑痕迹]
+    suitable_slots: []
+    mood: 滑稽
+  - pattern_id: fantasy-encounter
+    name: 幻想奇遇
+    structure:
+      - 发现一个不合常理的微小异常
+      - 小心翼翼地试探和验证
+      - 异常给出出人意料的回应
+      - 将信将疑地收尾，保留一点奇妙
+    example_themes: [影子先动半步, 回声会回答, 云影送来一封信]
+    humor_mechanisms: [拟人化, 假装不在乎]
+    prop_hints: [光影, 声音, 镜子]
+    suitable_slots: []
+    mood: 奇妙
+  - pattern_id: care-healing
+    name: 照顾治愈
+    structure:
+      - 发现伙伴或植物状态不对劲
+      - 用自己理解的方式笨拙地照顾
+      - 状况好转，中间闹出小笑话
+      - 亲密依偎的温情收尾
+    example_themes: [猫咪假装生病, 蔫掉的盆栽, 给玩偶看病]
+    humor_mechanisms: [假装不在乎, 拟人化, 误会]
+    prop_hints: [水杯, 毛巾, 小药箱]
+    suitable_slots: []
+    mood: 温馨
+  - pattern_id: game-contest
+    name: 比赛游戏
+    structure:
+      - 约定一个简单比赛或游戏规则
+      - 过程波折，意外频出
+      - 胜负揭晓或被打断
+      - 得到输赢之外的回报
+    example_themes: [纸船比赛, 和猫咪赛跑, 叠叠乐对决]
+    humor_mechanisms: [物理意外, 自作聪明被拆台, 尺寸反差]
+    prop_hints: [手工道具, 计分小物]
+    suitable_slots: []
+    mood: 热闹
+  - pattern_id: misunderstanding-reconcile
+    name: 误会和解
+    structure:
+      - 一个现场让人物误以为猫咪闯了祸
+      - 猫咪被错怪后的委屈反应
+      - 真相反转，误会解除
+      - 补偿与和解的温情画面
+    example_themes: [打翻的水杯, 被撕的纸片, 消失的鱼干]
+    humor_mechanisms: [误会, 假装不在乎]
+    prop_hints: [易碎小物, 食物]
+    suitable_slots: []
+    mood: 温馨
+  - pattern_id: pretend-play
+    name: 假想游戏
+    structure:
+      - 搭起一个假装的游戏场景
+      - 全情入戏，猫咪被分配角色
+      - 入戏太深闹出笑话
+      - 出戏时刻的温情收束
+    example_themes: [开一家小商店, 当一回医生, 猫咪餐厅开业]
+    humor_mechanisms: [拟人化, 尺寸反差, 自作聪明被拆台]
+    prop_hints: [纸箱, 玩具道具, 手工招牌]
+    suitable_slots: []
+    mood: 滑稽
+  - pattern_id: craft-creation
+    name: 创作手工
+    structure:
+      - 开始制作一件具体的东西
+      - 猫咪热心帮忙反而添乱
+      - 补救并顺利完成
+      - 展示成果的满足收尾
+    example_themes: [做饼干, 画一幅画, 包一顿饺子]
+    humor_mechanisms: [物理意外, 假装不在乎, 尺寸反差]
+    prop_hints: [食材或画材, 围裙, 工具]
+    suitable_slots: []
+    mood: 温馨
+  - pattern_id: micro-observation
+    name: 日常观察
+    structure:
+      - 环境中出现一个细微变化
+      - 人物与猫咪各自用自己的方式探究
+      - 发现来源并得到轻量回报
+      - 平静满足的收尾
+    example_themes: [追随移动的光斑, 循声找来源, 窗台上的访客]
+    humor_mechanisms: [拟人化, 假装不在乎]
+    prop_hints: [光影, 声音, 小生物]
+    suitable_slots: []
+    mood: 温馨

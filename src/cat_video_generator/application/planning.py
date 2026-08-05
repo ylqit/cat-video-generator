@@ -162,7 +162,8 @@ class PlanningService:
                 planning_context=planning_context,
                 recent_summaries=recent_summaries,
                 event_seeds=tuple(
-                    f"[{','.join(slot.value for slot in item.slots)}]{item.direction}"
+                    f"[{item.seed_id}|{','.join(slot.value for slot in item.slots)}]"
+                    f"{item.direction}"
                     for item in event_seeds
                 ),
                 series_profile=self._series_profile,

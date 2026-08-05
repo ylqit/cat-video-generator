@@ -363,16 +363,17 @@ def test_review_hook_stays_silent_without_full_conditions() -> None:
 class StudioProduction:
     def __init__(self, *, ready: bool = True) -> None:
         self.ready = ready
-        self.storyboard_calls = 0
+        self.storyboard_calls: list[str | None] = []
         self.video_calls: list[dict] = []
 
-    def prepare_storyboards_only(self, run_id, *, allow_paid_generation):
-        self.storyboard_calls += 1
+    def prepare_storyboards_only(self, run_id, *, slot=None, allow_paid_generation):
+        self.storyboard_calls.append(None if slot is None else slot.value)
+        slots = (slot.value,) if slot is not None else ("morning", "noon", "evening")
         return {
             "runId": str(run_id),
             "episodes": [
                 {"episodeId": str(uuid.uuid4()), "slot": slot, "storyboardReady": self.ready}
-                for slot in ("morning", "noon", "evening")
+                for slot in slots
             ],
         }
 
@@ -421,7 +422,7 @@ def test_continue_accepts_failed_status_and_resumes(daily_plan) -> None:
     accepted = client.post(f"/api/v1/runs/{uuid.uuid4()}/continue")
     assert accepted.status_code == 202
     assert resume_calls == [{"paid": True}]
-    assert production.storyboard_calls == 1
+    assert production.storyboard_calls == [None]
 
 
 def _write_client(*, tmp_path, settings, production, planning, status):
@@ -470,7 +471,8 @@ def test_replan_endpoint_continues_pipeline_from_draft_or_finalized(tmp_path) ->
         json={"reason": "共享元素声明与其他时段保持一致", "allowPaidGeneration": True},
     )
     assert accepted.status_code == 202
-    assert finalized.video_calls == [{"slot": None}]
+    assert finalized.storyboard_calls == ["morning"]
+    assert finalized.video_calls == [{"slot": "morning"}]
 
     draft = StudioProduction()
     client_draft = _write_client(
@@ -485,7 +487,8 @@ def test_replan_endpoint_continues_pipeline_from_draft_or_finalized(tmp_path) ->
         json={"reason": "共享元素声明与其他时段保持一致", "allowPaidGeneration": True},
     )
     assert accepted.status_code == 202
-    assert draft.video_calls == [{"slot": None}]
+    assert draft.storyboard_calls == ["morning"]
+    assert draft.video_calls == [{"slot": "morning"}]
     assert len(resumed) == 1
 
 
@@ -502,7 +505,7 @@ def test_continue_endpoint_chains_by_settings(daily_plan) -> None:
     )
     accepted = client.post(f"/api/v1/runs/{uuid.uuid4()}/continue")
     assert accepted.status_code == 202
-    assert production.storyboard_calls == 1
+    assert production.storyboard_calls == [None]
     assert production.video_calls == []
 
     production_auto = StudioProduction()

@@ -201,7 +201,13 @@ class VisualPreparationService:
             statuses=("candidate", "approved", "ready"),
         )
         if len(reusable) == expected_count:
-            return reusable
+            if all(item.status in {"approved", "ready"} for item in reusable):
+                return reusable
+            step_ids = {item.step_id for item in reusable}
+            if None in step_ids or len(step_ids) != 1:
+                raise RuntimeError("可复用故事板没有唯一的生成Step，无法安全恢复审核")
+            # 图片已经成功落盘时，只恢复语义审核；绝不能因为审核模型异常而再次调用Seedream。
+            return self._semantic_review(episode, next(iter(step_ids)), reusable)
 
         operation_key = "image:storyboard"
         prompt_sha = hashlib.sha256(compiled.text.encode("utf-8")).hexdigest()
@@ -412,6 +418,14 @@ class VisualPreparationService:
                 panels,
                 f"故事板语义审核异常，转人工：{exc.code}",
             )
+        except Exception as exc:
+            # 审核响应解析失败、SDK内部异常等都不能被误认为生图失败，更不能触发新的媒体费用。
+            # 已下载组图保持candidate，允许后续对同一批图片重新审核或由人工决定。
+            return self._await_manual(
+                step_id,
+                panels,
+                f"故事板语义审核异常，转人工：{type(exc).__name__}",
+            )
         # 纯人物与猫咪互动的故事板只承担身份、画风和大致构图锚定。
         # 抚摸、转头、闭眼等连续姿态由Seedance完成；若把每个微动作都设为静态组图硬门，
         # 会在没有关键道具风险时反复产生图片费用。涉及道具或生命周期变化时仍执行完整硬门。
@@ -434,6 +448,7 @@ class VisualPreparationService:
         passed = all(required_checks)
         evidence = {
             "reviewMode": "semantic_auto",
+            "semanticPolicyVersion": "lightweight_relationship_arc_v1",
             "semanticVerified": passed and result.confidence >= 0.8,
             "identityOk": result.identity_ok,
             "styleOk": result.style_ok,
@@ -451,7 +466,13 @@ class VisualPreparationService:
         }
         if result.confidence < 0.8:
             return self._await_manual(step_id, panels, "故事板审核置信度低于0.80，转人工", evidence)
-        self._repository.set_step_status(step_id, StepStatus.AWAITING_REVIEW)
+        current_step = self._repository.get_step(step_id)
+        if current_step.status is StepStatus.SUBMITTING:
+            self._repository.set_step_status(step_id, StepStatus.AWAITING_REVIEW)
+        elif current_step.status is not StepStatus.AWAITING_REVIEW:
+            raise RuntimeError(
+                f"故事板Step状态{current_step.status.value}不允许提交审核结论"
+            )
         decision = "approved" if passed else "rejected"
         if passed and pose_only_storyboard:
             review_reason = (

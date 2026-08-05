@@ -121,6 +121,10 @@ def test_explicit_workflow_transitions() -> None:
         is EpisodeStatus.PREPARING_VISUALS
     )
     assert transition_step(StepStatus.PENDING, StepStatus.SUBMITTING) is StepStatus.SUBMITTING
+    assert (
+        transition_episode(EpisodeStatus.FAILED, EpisodeStatus.CONTENT_REVIEW)
+        is EpisodeStatus.CONTENT_REVIEW
+    )
     with pytest.raises(ValueError):
         transition_step(StepStatus.SUCCEEDED, StepStatus.SUBMITTING)
 

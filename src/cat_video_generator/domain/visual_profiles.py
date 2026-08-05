@@ -25,6 +25,21 @@ class SeriesVisualProfile(VisualProfileModel):
     person_hair: str = Field(min_length=4, max_length=160)
     person_body: str = Field(min_length=4, max_length=160)
     cat_identity: str = Field(min_length=8, max_length=300)
+    person_personality: str = Field(
+        default="好奇心旺盛、做事认真，容易被小意外逗笑",
+        min_length=8,
+        max_length=200,
+    )
+    cat_personality: str = Field(
+        default="表面高冷、其实贪玩，常常先假装不在意再忍不住凑近的反差萌",
+        min_length=8,
+        max_length=200,
+    )
+    humor_style: str = Field(
+        default="每集至少一个意外、反差或幽默节拍，靠可见动作与表情呈现，不靠对白",
+        min_length=8,
+        max_length=200,
+    )
     mutable_appearance: tuple[str, ...] = (
         "衣服",
         "鞋",
@@ -41,6 +56,36 @@ class SeriesVisualProfile(VisualProfileModel):
         "马尾",
         "发髻",
         "妆容",
+    )
+    person_personality: str = Field(
+        default="好奇心旺盛、做事认真，容易被小意外逗笑",
+        min_length=4,
+        max_length=200,
+    )
+    cat_personality: str = Field(
+        default="表面高冷、其实贪玩，常常先假装不在意再忍不住凑近的反差萌",
+        min_length=4,
+        max_length=200,
+    )
+    humor_style: str = Field(
+        default="每集至少一个意外、反差或幽默节拍，靠可见动作与表情而非对白",
+        min_length=4,
+        max_length=200,
+    )
+    person_personality: str = Field(
+        default="好奇心旺盛、做事认真，容易被小意外逗笑",
+        min_length=4,
+        max_length=160,
+    )
+    cat_personality: str = Field(
+        default="表面高冷、其实贪玩，常常先假装不在意再忍不住凑近的反差萌",
+        min_length=4,
+        max_length=160,
+    )
+    humor_style: str = Field(
+        default="每集至少一个意外、反差或幽默节拍，靠可见动作与表情而非对白",
+        min_length=4,
+        max_length=200,
     )
 
     def fingerprint(self) -> str:
@@ -74,6 +119,9 @@ DEFAULT_SERIES_VISUAL_PROFILE = SeriesVisualProfile(
     person_hair="沿用批准人物本体的真实短发长度与发色，不无故增长或改变发型",
     person_body="保持相同儿童比例、身高感和体型，可由剧情自然换装",
     cat_identity="同一只灰白猫，脸型、体型、尾巴和主要灰白斑纹稳定可辨识",
+    person_personality="好奇心旺盛、做事认真，容易被小意外逗笑",
+    cat_personality="表面高冷、其实贪玩，常常先假装不在意再忍不住凑近的反差萌",
+    humor_style="每集至少一个意外、反差或幽默节拍，靠可见动作与表情而非对白",
 )
 
 DEFAULT_STYLE_PROFILE = StyleProfile(

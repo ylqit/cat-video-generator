@@ -74,7 +74,11 @@ class SceneAnchor(StrictModel):
 
 
 class Placement(StrictModel):
-    """实体位置；离屏没有目标，其余位置必须指向锚点或实体。"""
+    """实体位置；目标的具体类型由 ``SceneContinuity`` 统一校验。
+
+    ``inside`` 既可以表示容器实体内部，也可以表示长椅缝隙、柜格等场景锚点
+    内部。这里仅校验有没有目标，避免底层字段模型擅自猜测场景语义。
+    """
 
     kind: PlacementKind
     target_id: (
@@ -222,11 +226,18 @@ class SceneContinuity(StrictModel):
                 target_id = state.placement.target_id
                 if state.placement.kind is PlacementKind.ANCHOR and target_id not in anchor_set:
                     raise ValueError(f"实体{entity.id}的{label}引用未知锚点{target_id}")
-                if state.placement.kind in {PlacementKind.HELD_BY, PlacementKind.INSIDE}:
+                if state.placement.kind is PlacementKind.HELD_BY:
                     if target_id not in entity_set:
                         raise ValueError(f"实体{entity.id}的{label}引用未知实体{target_id}")
                     if target_id == entity.id:
-                        raise ValueError(f"实体{entity.id}不能包含或持有自身")
+                        raise ValueError(f"实体{entity.id}不能持有自身")
+                if state.placement.kind is PlacementKind.INSIDE:
+                    if target_id not in entity_set | anchor_set:
+                        raise ValueError(
+                            f"实体{entity.id}的{label}引用未知容器或锚点{target_id}"
+                        )
+                    if target_id == entity.id:
+                        raise ValueError(f"实体{entity.id}不能包含自身")
         return self
 
 
@@ -309,13 +320,15 @@ def _validate_state_reference(
             )
         )
         return
+    if state.placement.kind is PlacementKind.INSIDE and target_id in anchors:
+        return
     if state.placement.kind not in {PlacementKind.HELD_BY, PlacementKind.INSIDE}:
         return
     if target_id not in entities:
         issues.append(
             ContinuityIssue(
                 "unknown_placement_target",
-                f"实体{entity_id}的{phase}State引用未知实体{target_id}",
+                f"实体{entity_id}的{phase}State引用未知容器、持有者或锚点{target_id}",
                 entity_id,
             )
         )

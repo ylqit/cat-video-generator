@@ -14,6 +14,8 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..domain.contracts import Slot
+from ..domain.story_patterns import StoryPattern
+from ..domain.story_patterns import StoryPattern
 
 
 class EventSeed(BaseModel):
@@ -78,6 +80,42 @@ class EventSeedCatalog:
                 selected.append(seed)
         return tuple(selected)
 
+    def select_patterns(
+        self,
+        *,
+        series_profile_hash: str,
+        content_date: date,
+        planning_revision: int,
+    ) -> dict[Slot, StoryPattern]:
+        """为一天三个时段各确定性抽签一个不同剧情模式。
+
+        同一天内模式绝不重复（结构差异是多样性底线）；跨天变化由日期哈希
+        自然轮转，模式池足够大时不会长期重复。模式不足时缺口的时段回退
+        导演自由发挥，本模块同样不做单点故障。
+        """
+
+        pool = self._load_patterns()
+        key = f"{series_profile_hash}|{content_date.isoformat()}|{planning_revision}"
+        chosen: dict[Slot, StoryPattern] = {}
+        for slot in Slot:
+            eligible = [
+                pattern
+                for pattern in pool
+                if (not pattern.suitable_slots or slot in pattern.suitable_slots)
+                and pattern.pattern_id
+                not in {item.pattern_id for item in chosen.values()}
+            ]
+            if not eligible:
+                continue
+            ranked = sorted(
+                eligible,
+                key=lambda item: hashlib.sha256(
+                    f"{key}|{slot.value}|{item.pattern_id}".encode("utf-8")
+                ).hexdigest(),
+            )
+            chosen[slot] = ranked[0]
+        return chosen
+
     def _load(self) -> tuple[EventSeed, ...]:
         if not self._root.is_dir():
             return ()
@@ -91,4 +129,16 @@ class EventSeedCatalog:
         ids = [item.seed_id for item in result]
         if len(ids) != len(set(ids)):
             raise ValueError("content/events中的seed_id不能重复")
+        return tuple(result)
+
+    def _load_patterns(self) -> tuple[StoryPattern, ...]:
+        path = self._root / "patterns.yaml"
+        if not path.is_file():
+            return ()
+        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        items = payload.get("patterns", []) if isinstance(payload, dict) else []
+        result = [StoryPattern.model_validate(item) for item in items]
+        ids = [item.pattern_id for item in result]
+        if len(ids) != len(set(ids)):
+            raise ValueError("patterns.yaml中的pattern_id不能重复")
         return tuple(result)

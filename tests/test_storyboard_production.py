@@ -425,6 +425,35 @@ def test_semantic_storyboard_rejection_is_atomic(tmp_path: Path) -> None:
     assert repository.steps[0].status is StepStatus.FAILED
 
 
+def test_semantic_review_exception_reuses_existing_panels_without_new_seedream(
+    tmp_path: Path,
+) -> None:
+    service, repository, gateway, episode = _service(tmp_path)
+    original_review = gateway.review_storyboard
+
+    def invalid_review_response(**_: Any) -> StoryboardReviewResult:
+        raise AttributeError("invalid review payload")
+
+    gateway.review_storyboard = invalid_review_response  # type: ignore[method-assign]
+
+    assert service.prepare(episode) is None
+    candidate_ids = [
+        item.id for item in repository.assets if item.role == "storyboard_panel"
+    ]
+    assert gateway.generate_calls == 1
+    assert repository.steps[0].status is StepStatus.AWAITING_REVIEW
+    assert repository.reviews[-1]["decision"] == "pending"
+
+    gateway.review_storyboard = original_review  # type: ignore[method-assign]
+    panels = service.prepare(repository.episode)
+
+    assert panels is not None
+    assert [item.id for item in panels] == candidate_ids
+    assert all(item.status == "approved" for item in panels)
+    assert gateway.generate_calls == 1
+    assert repository.episode.status is EpisodeStatus.VIDEO_PENDING
+
+
 def test_pose_only_storyboard_keeps_micro_actions_as_diagnostics(tmp_path: Path) -> None:
     service, repository, gateway, episode = _service(tmp_path)
     pose_only = episode.plan.model_copy(
@@ -487,7 +516,12 @@ def test_storyboard_retry_returns_new_step_and_advances_episode(tmp_path: Path) 
     gateway.approved = True
     repository.list_episodes = lambda _: (repository.episode,)  # type: ignore[attr-defined]
     repository.get_run = lambda _: SimpleNamespace(status="generating")  # type: ignore[attr-defined]
-    repository.get_step = lambda _: original_step  # type: ignore[method-assign]
+    stored_get_step = repository.get_step
+    repository.get_step = (  # type: ignore[method-assign]
+        lambda step_id: original_step
+        if step_id == original_step.id
+        else stored_get_step(step_id)
+    )
     retry = RetryService(
         repository=repository,  # type: ignore[arg-type]
         visual_preparation=service,

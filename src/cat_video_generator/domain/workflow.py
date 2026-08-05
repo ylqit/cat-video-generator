@@ -170,6 +170,10 @@ _EPISODE_TRANSITIONS = {
         EpisodeStatus.PLANNED,
         EpisodeStatus.PREPARING_VISUALS,
         EpisodeStatus.VIDEO_PENDING,
+        # 已落盘的视频可能因为同一Episode后来发起的无关图片尝试而遗留为failed。
+        # 只有Repository在锁定候选视频和AWAITING_REVIEW步骤后才会使用此恢复边，
+        # 让已有成片重新进入审核，而不是伪造一次新的收费生成过程。
+        EpisodeStatus.CONTENT_REVIEW,
     },
 }
 

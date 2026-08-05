@@ -33,12 +33,17 @@ def chain_after_planning(
     run_id: uuid.UUID,
     settings: PipelineSettings,
     payload: dict[str, Any],
+    *,
+    slot: Slot | None = None,
 ) -> dict[str, Any]:
     """按流水线开关在规划之后串联关键帧与视频阶段。
 
     所有调用都在同一个后台任务、同一把付费串行门内顺序执行；
     任一阶段为manual或等待人工审核时记录pausedAt并停住，
     之后由POST /runs/{id}/continue或审核钩子继续。
+
+    局部重规划必须把slot传入，只推进被修改的Episode。否则重新评估全天
+    会让已经批准的其他时段因Prompt哈希变化再次产生图片费用。
     """
 
     stages = payload.setdefault("stages", {})
@@ -50,6 +55,7 @@ def chain_after_planning(
         return payload
     storyboard = production.prepare_storyboards_only(
         run_id,
+        slot=slot,
         allow_paid_generation=True,
     )
     stages["storyboard"] = storyboard
@@ -62,7 +68,7 @@ def chain_after_planning(
         return payload
     stages["video"] = production.run_day(
         run_id,
-        slot=None,
+        slot=slot,
         allow_paid_generation=True,
     )
     return payload

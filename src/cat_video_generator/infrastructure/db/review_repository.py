@@ -136,6 +136,13 @@ class ReviewPersistenceMixin:
                 elif asset.role == "video":
                     if asset.episode_id != episode.id:
                         raise ValueError("视频资产不属于被锁定的Episode")
+                    if EpisodeStatus(episode.status) is EpisodeStatus.FAILED:
+                        # 视频步骤和候选资产都已在本事务内锁定且确认等待审核。
+                        # 后续失败的故事板attempt不能抹掉已经落盘成片的审核资格。
+                        episode.status = transition_episode(
+                            EpisodeStatus.FAILED,
+                            EpisodeStatus.CONTENT_REVIEW,
+                        ).value
                     episode.selected_video_asset_id = asset.id
                     episode.status = transition_episode(
                         EpisodeStatus(episode.status),
@@ -230,9 +237,30 @@ class ReviewPersistenceMixin:
                 StepStatus.SUCCEEDED if decision == "approved" else StepStatus.FAILED,
             ).value
             step.completed_at = datetime.now(timezone.utc)
-            if decision == "rejected":
+            current_episode_status = EpisodeStatus(episode.status)
+            if decision == "approved" and current_episode_status in {
+                EpisodeStatus.PLANNED,
+                EpisodeStatus.PREPARING_VISUALS,
+                EpisodeStatus.FAILED,
+            }:
+                if current_episode_status is not EpisodeStatus.PREPARING_VISUALS:
+                    current_episode_status = transition_episode(
+                        current_episode_status,
+                        EpisodeStatus.PREPARING_VISUALS,
+                    )
                 episode.status = transition_episode(
-                    EpisodeStatus(episode.status), EpisodeStatus.FAILED
+                    current_episode_status,
+                    EpisodeStatus.VIDEO_PENDING,
+                ).value
+            elif decision == "rejected" and current_episode_status in {
+                EpisodeStatus.PLANNED,
+                EpisodeStatus.PREPARING_VISUALS,
+            }:
+                # 拒绝当前准备中的故事板会停止本次媒体链路；但Episode已经拥有
+                # 可审核视频或旧批准故事板时，新的失败attempt只保留在节点历史中。
+                episode.status = transition_episode(
+                    current_episode_status,
+                    EpisodeStatus.FAILED,
                 ).value
             session.flush()
             return ReviewCommitResult(review.id, decision, False)

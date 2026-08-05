@@ -281,7 +281,7 @@ function videoAssets(episode: EpisodeDto) {
 function canSubmitVideo(episode: EpisodeDto): boolean {
   return (
     storyboardReady(episode) &&
-    ["video_pending", "failed"].includes(episode.status)
+    ["preparing_visuals", "video_pending", "failed"].includes(episode.status)
   );
 }
 

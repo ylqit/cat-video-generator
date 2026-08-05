@@ -7,10 +7,12 @@ import uuid
 import pytest
 from pydantic import ValidationError
 
+from cat_video_generator.domain.contracts import EpisodePlan
 from cat_video_generator.domain.prompts import (
     compile_day_director_prompt,
     compile_episode_director_prompt,
     compile_storyboard_prompt,
+    compile_storyboard_review_prompt,
     compile_video_prompt,
     storyboard_panel_count,
 )
@@ -108,6 +110,42 @@ def test_storyboard_prompt_requests_separate_clean_panels(daily_plan) -> None:
     assert "3张相互连贯但彼此独立" in prompt.text
     assert "不要拼成网格" in prompt.text
     assert "不得包含文字、序号" in prompt.text
+    assert "景别为中景" in prompt.text
+    assert episode.script.shots[0].direction in prompt.text
+    assert "唯一运镜为缓慢推近" in prompt.text
+    assert "人物孩子" not in prompt.text
+    assert "灰白猫灰白猫" not in prompt.text
+    assert "formKey" not in prompt.text
+    assert "生命周期" not in prompt.text
+
+
+def test_two_shots_use_distinct_entry_and_payoff_panels(daily_plan) -> None:
+    episode = daily_plan.episodes[0]
+    payload = episode.model_dump(mode="json")
+    payload["script"]["shots"] = [
+        {
+            "order": 1,
+            "action_orders": [1],
+            "framing": "环境中景",
+            "camera_move": "fixed",
+            "dominant_view": "front",
+            "direction": "人物活动，猫咪已经在同一空间观察",
+        },
+        {
+            "order": 2,
+            "action_orders": [2],
+            "framing": "猫咪近景",
+            "camera_move": "push",
+            "dominant_view": "side",
+            "direction": "猫咪独立探索后回到人物关系中",
+        },
+    ]
+    relationship_arc = EpisodePlan.model_validate(payload)
+
+    prompt = compile_storyboard_prompt(relationship_arc)
+
+    assert storyboard_panel_count(relationship_arc) == 3
+    assert "不复制面板2的动作构图" in prompt.text
 
 
 def test_video_prompt_uses_storyboard_and_has_five_sections(daily_plan) -> None:
@@ -130,6 +168,20 @@ def test_video_prompt_uses_storyboard_and_has_five_sections(daily_plan) -> None:
     assert "@图片1" in prompt.text
     assert "00:00" not in prompt.text
     assert "assetId" not in prompt.text
+
+
+def test_storyboard_review_uses_lightweight_relationship_arc(daily_plan) -> None:
+    episode = daily_plan.episodes[0]
+
+    prompt = compile_storyboard_review_prompt(
+        episode,
+        panel_count=storyboard_panel_count(episode),
+    )
+
+    assert "不要求每个转头、手势或脚步逐字复现" in prompt
+    assert "不要因牵引绳松紧、左右手切换" in prompt
+    assert "静态图不必证明旋转、声音或运动模糊" in prompt
+    assert "最终关系回报不可见" in prompt
 
 
 def test_legal_long_prompt_is_not_locally_blocked(daily_plan) -> None:
@@ -165,3 +217,56 @@ def test_directors_are_four_separate_contract_prompts(daily_plan) -> None:
     assert "首个动作" in episode_prompt
     assert "start_state" in episode_prompt
     assert "全天三个" not in episode_prompt
+    assert "动作阶段服务于镜头叙事" in episode_prompt
+    assert "猫咪产生独立反应" in episode_prompt
+    assert "事件种子一天最多分配给一个时段" in day_prompt
+
+
+def test_three_shots_compile_four_storyboard_panels(daily_plan) -> None:
+    episode = daily_plan.episodes[0]
+    payload = episode.model_dump(mode="json")
+    payload["script"]["actions"].append(
+        {
+            "order": 3,
+            "actor_id": "cat",
+            "action": "灰白猫探索后回到人物脚边，用鼻尖轻碰纸风车",
+            "visible_result": "人物低头回应，猫咪重新进入人物关系",
+        }
+    )
+    payload["script"]["shots"] = [
+        {
+            "order": 1,
+            "action_orders": [1],
+            "framing": "环境中景",
+            "camera_move": "fixed",
+            "dominant_view": "front",
+            "direction": "人物在桌边活动，猫咪已在画面下方观察",
+        },
+        {
+            "order": 2,
+            "action_orders": [2],
+            "framing": "猫咪近景",
+            "camera_move": "follow",
+            "dominant_view": "side",
+            "direction": "猫咪离开人物脚边，独立探索转动的纸风车",
+        },
+        {
+            "order": 3,
+            "action_orders": [3],
+            "framing": "双主体中近景",
+            "camera_move": "push",
+            "dominant_view": "mixed",
+            "direction": "猫咪回到人物身边，人物俯身作出回应",
+        },
+    ]
+    relationship_arc = EpisodePlan.model_validate(payload)
+
+    prompt = compile_storyboard_prompt(relationship_arc)
+
+    assert storyboard_panel_count(relationship_arc) == 4
+    assert "4张相互连贯但彼此独立" in prompt.text
+    assert "环境中景" in prompt.text
+    assert "猫咪近景" in prompt.text
+    assert "双主体中近景" in prompt.text
+    assert "猫咪重新进入人物关系" in prompt.text
+    assert "不复制面板3的动作构图" in prompt.text
