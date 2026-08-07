@@ -81,18 +81,18 @@ def maybe_continue_video(
     job_registry: JobRegistry,
     asset_id: uuid.UUID,
 ) -> None:
-    """人工批准关键帧后按流水线开关自动续跑该集视频。
+    """人工批准故事板或镜头片段后按流水线开关自动续跑该集视频。
 
-    三个条件缺一不可：video阶段为auto、Run级付费授权为真、该集首末帧
-    均已有approved/ready资产。审核人的"批准"点击即该帧的显式人工确认；
-    重复批准与同集在途任务由run_day幂等与dedup吞掉。
+    三个条件缺一不可：video阶段为auto、Run级付费授权为真、触发资产属于
+    该集。审核人的"批准"点击即显式人工确认；逐镜头模式下批准某镜头片段
+    会续跑下一镜头（run_day→execute→_generate_per_shot幂等复用已批准镜头）。
     """
 
     try:
         asset = queries.asset(asset_id)
     except LookupError:
         return
-    if asset.role != "storyboard_panel" or asset.episode_id is None:
+    if asset.role not in {"storyboard_panel", "video_shot"} or asset.episode_id is None:
         return
     episode = queries.episode(asset.episode_id)
     run_id = uuid.UUID(str(episode["runId"]))
@@ -117,7 +117,11 @@ def maybe_continue_video(
                 "runId": run_id,
                 "episodeId": asset.episode_id,
                 "slot": slot.value,
-                "operationKey": "video:single_pass",
+                "operationKey": (
+                    "video:single_pass"
+                    if asset.role == "storyboard_panel"
+                    else "video:shot:continue"
+                ),
             },
         )
 

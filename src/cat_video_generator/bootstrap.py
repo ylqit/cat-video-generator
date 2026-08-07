@@ -160,6 +160,13 @@ def build_runtime_container(
         review_gateway=gateway,
         frame_extractor=frame_extractor,
         diagnostic_mode=runtime.video_semantic_review_mode,
+        generation_mode=(
+            runtime.ark_video_generation_mode
+            if frame_extractor is not None
+            or runtime.ark_video_generation_mode == "single_pass"
+            else "single_pass"
+        ),
+        shot_minimum_seconds=runtime.ark_shot_minimum_seconds,
         api_timeout_seconds=runtime.ark_video_api_timeout_seconds,
         poll_interval_seconds=runtime.ark_poll_interval_seconds,
         task_timeout_seconds=runtime.ark_task_timeout_seconds,

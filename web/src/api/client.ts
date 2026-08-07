@@ -73,6 +73,7 @@ export interface PlanPayload {
   candidateCount?: number;
   allowPaidGeneration: boolean;
   pipelineSettings?: PipelineSettings;
+  storyMode?: "auto" | "create" | "expand";
 }
 
 export interface GeneratePayload {

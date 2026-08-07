@@ -123,6 +123,8 @@ class RuntimeSettings:
     candidate_count: int
     storyboard_review_mode: StoryboardReviewMode
     video_semantic_review_mode: str
+    ark_video_generation_mode: str
+    ark_shot_minimum_seconds: int
     configuration_warnings: tuple[str, ...]
     ffmpeg_path: Path | None
     ffprobe_path: Path | None
@@ -200,6 +202,22 @@ class RuntimeSettings:
             raise ConfigurationError(
                 "VIDEO_SEMANTIC_REVIEW_MODE必须是off或diagnostic"
             )
+        video_generation_mode = values.get(
+            "ARK_VIDEO_GENERATION_MODE",
+            "per_shot",
+        ).strip().lower()
+        if video_generation_mode not in {"per_shot", "single_pass"}:
+            raise ConfigurationError(
+                "ARK_VIDEO_GENERATION_MODE必须是per_shot或single_pass"
+            )
+        try:
+            shot_minimum_seconds = int(
+                values.get("ARK_SHOT_MINIMUM_SECONDS", "4").strip()
+            )
+        except ValueError as exc:
+            raise ConfigurationError(
+                "ARK_SHOT_MINIMUM_SECONDS必须是整数"
+            ) from exc
         structured_mode = values.get(
             "ARK_RESPONSES_STRUCTURED_OUTPUT_MODE",
             "json_object_schema_prompt",
@@ -260,6 +278,8 @@ class RuntimeSettings:
             candidate_count=candidate_count,
             storyboard_review_mode=storyboard_review_mode,
             video_semantic_review_mode=video_review_mode,
+            ark_video_generation_mode=video_generation_mode,
+            ark_shot_minimum_seconds=shot_minimum_seconds,
             configuration_warnings=tuple(configuration_warnings),
             ffmpeg_path=_executable(
                 values.get("FFMPEG_PATH"),
@@ -307,6 +327,8 @@ class RuntimeSettings:
             )
         if self.ark_video_resolution not in {"480p", "720p"}:
             issues.append("ARK_VIDEO_RESOLUTION必须是480p或720p")
+        if not 3 <= self.ark_shot_minimum_seconds <= 8:
+            issues.append("ARK_SHOT_MINIMUM_SECONDS必须在3至8秒之间")
         if issues:
             raise ConfigurationError("; ".join(issues))
 
@@ -348,6 +370,8 @@ class RuntimeSettings:
             "arkImageRetryDelaySeconds": self.ark_image_retry_delay_seconds,
             "storyboardReviewMode": self.storyboard_review_mode.value,
             "videoSemanticReviewMode": self.video_semantic_review_mode,
+            "arkVideoGenerationMode": self.ark_video_generation_mode,
+            "arkShotMinimumSeconds": self.ark_shot_minimum_seconds,
             "configurationWarnings": list(self.configuration_warnings),
             "eventSeedRoot": str(self.event_seed_root),
             "eventSeedRootAvailable": self.event_seed_root.is_dir(),

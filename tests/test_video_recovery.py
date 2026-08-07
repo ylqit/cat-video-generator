@@ -162,6 +162,7 @@ def _service(repository: RecoveryRepository, gateway: RecoveryGateway):
         resolution="480p",
         series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
         style_profile=DEFAULT_STYLE_PROFILE,
+        generation_mode="single_pass",
         task_timeout_seconds=0.002,
         poll_interval_seconds=0.01,
     )

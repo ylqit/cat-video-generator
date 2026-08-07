@@ -71,6 +71,7 @@ class StoryboardReviewResult:
     identity_ok: bool
     style_ok: bool
     body_proportion_ok: bool
+    pose_naturalness_ok: bool
     action_sequence_ok: bool
     spatial_continuity_ok: bool
     prop_continuity_ok: bool
@@ -480,7 +481,7 @@ class MediaProbe(Protocol):
 
 
 class ReviewFrameExtractor(Protocol):
-    """只为最终视频语义诊断抽帧，不承担拼接或转码。"""
+    """视频语义诊断抽帧、逐镜头尾帧提取与同规格片段拼接。"""
 
     def extract_review_frames(
         self,
@@ -488,3 +489,7 @@ class ReviewFrameExtractor(Protocol):
         *,
         count: int,
     ) -> tuple[Path, ...]: ...
+
+    def extract_last_frame(self, source: Path, *, target: Path) -> Path: ...
+
+    def concat_videos(self, sources: tuple[Path, ...], *, target: Path) -> Path: ...

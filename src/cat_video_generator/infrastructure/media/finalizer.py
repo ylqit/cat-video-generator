@@ -1,7 +1,7 @@
-"""最终视频语义诊断所需的FFmpeg抽帧边界。
+"""逐镜头生成所需的FFmpeg边界：抽帧、尾帧提取与同规格片段拼接。
 
-single-pass供应商MP4通过技术QC后直接落盘。本模块不拼接、不转码，也不修改
-成片；抽取的临时帧只用于Ark语义诊断，并由调用方在请求结束后删除。
+诊断帧与尾帧的临时文件删除责任属于调用方；拼接优先无损copy，仅当编码参数
+不一致时回退重编码。
 """
 
 from __future__ import annotations
@@ -64,6 +64,87 @@ class FfmpegFrameExtractor:
             for frame in self._work_root.glob(f".review-{token}-*.png"):
                 frame.unlink(missing_ok=True)
             raise
+
+    def extract_last_frame(self, source: Path, *, target: Path) -> Path:
+        """提取视频最后一帧作为下一镜头的首帧锚点。"""
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _run_ffmpeg(
+            self._ffmpeg_path,
+            [
+                "-sseof",
+                "-0.15",
+                "-i",
+                str(source.expanduser().resolve()),
+                "-frames:v",
+                "1",
+                "-update",
+                "1",
+                str(target.expanduser().resolve()),
+            ],
+        )
+        if not target.is_file() or target.stat().st_size == 0:
+            raise FrameExtractionError("尾帧提取没有产出可用图片")
+        return target
+
+    def concat_videos(self, sources: tuple[Path, ...], *, target: Path) -> Path:
+        """按序拼接同模型同规格的镜头片段；优先无损copy。"""
+
+        if len(sources) < 2:
+            raise ValueError("拼接至少需要两个镜头片段")
+        self._work_root.mkdir(parents=True, exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        list_file = self._work_root / f".concat-{uuid.uuid4().hex}.txt"
+        list_file.write_text(
+            "\n".join(
+                f"file '{str(path.expanduser().resolve())}'" for path in sources
+            ),
+            encoding="utf-8",
+        )
+        resolved_target = target.expanduser().resolve()
+        try:
+            try:
+                _run_ffmpeg(
+                    self._ffmpeg_path,
+                    [
+                        "-f",
+                        "concat",
+                        "-safe",
+                        "0",
+                        "-i",
+                        str(list_file),
+                        "-c",
+                        "copy",
+                        str(resolved_target),
+                    ],
+                )
+            except FrameExtractionError:
+                # 编码参数不一致时回退重编码，保证拼接总能完成。
+                _run_ffmpeg(
+                    self._ffmpeg_path,
+                    [
+                        "-f",
+                        "concat",
+                        "-safe",
+                        "0",
+                        "-i",
+                        str(list_file),
+                        "-c:v",
+                        "libx264",
+                        "-crf",
+                        "18",
+                        "-preset",
+                        "medium",
+                        "-c:a",
+                        "aac",
+                        str(resolved_target),
+                    ],
+                )
+        finally:
+            list_file.unlink(missing_ok=True)
+        if not resolved_target.is_file() or resolved_target.stat().st_size == 0:
+            raise FrameExtractionError("镜头片段拼接没有产出可用视频")
+        return resolved_target
 
 
 def _run_ffmpeg(executable: Path, arguments: list[str]) -> None:

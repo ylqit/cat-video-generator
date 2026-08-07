@@ -330,6 +330,59 @@ def _workflow_nodes(
             and video_step is not None
             and item.producing_step_id == video_step.id
         )
+        # 逐镜头生成的镜头级节点：每个video:shot:{n}步骤一个节点，
+        # 附带片段资产与真实尾帧锚点，前端据此展示分镜进度与审核入口。
+        latest_shot_steps: dict[str, WorkflowStep] = {}
+        for item in steps:
+            if (
+                episode is not None
+                and item.episode_id == episode.id
+                and item.operation_key.startswith("video:shot:")
+            ):
+                latest_shot_steps[item.operation_key] = item
+        shot_nodes = []
+        for operation_key in sorted(latest_shot_steps):
+            shot_order = operation_key.rsplit(":", 1)[1]
+            shot_step = latest_shot_steps[operation_key]
+            clip = next(
+                (
+                    item
+                    for item in episode_assets
+                    if item.role == "video_shot"
+                    and item.semantic_key == f"shot_clip:{shot_order}"
+                    and item.producing_step_id == shot_step.id
+                ),
+                next(
+                    (
+                        item
+                        for item in episode_assets
+                        if item.role == "video_shot"
+                        and item.semantic_key == f"shot_clip:{shot_order}"
+                    ),
+                    None,
+                ),
+            )
+            tail = next(
+                (
+                    item
+                    for item in episode_assets
+                    if item.role == "shot_tail_frame"
+                    and item.semantic_key == f"shot_tail:{shot_order}"
+                ),
+                None,
+            )
+            shot_nodes.append(
+                step_node(
+                    node_id=f"shot:{slot}:{shot_order}",
+                    node_type="video_shot",
+                    slot=slot,
+                    label=f"{slot}镜头{shot_order}",
+                    step=shot_step,
+                    node_assets=tuple(
+                        item for item in (clip, tail) if item is not None
+                    ),
+                )
+            )
         director_node = step_node(
             node_id=f"director:{slot}",
             node_type="director",
@@ -442,6 +495,7 @@ def _workflow_nodes(
                     ),
                     "status": storyboard_review_status,
                 },
+                *shot_nodes,
                 step_node(
                     node_id=f"video:{slot}",
                     node_type="video",

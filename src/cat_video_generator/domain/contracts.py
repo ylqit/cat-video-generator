@@ -120,7 +120,8 @@ class DayBrief(StrictModel):
     """总导演输出的全天方向，不包含时段动作与镜头。"""
 
     content_date: date
-    theme: Annotated[str, Field(min_length=4, max_length=160)]
+    # 主题允许短至2字（如"放风筝""钓鱼"），避免短主题在结构化时被误拒。
+    theme: Annotated[str, Field(min_length=2, max_length=160)]
     day_context: Annotated[str, Field(min_length=8, max_length=500)]
     shared_elements: list[SharedElement] = Field(default_factory=list, max_length=8)
     slots: list[SlotBrief] = Field(min_length=3, max_length=3)

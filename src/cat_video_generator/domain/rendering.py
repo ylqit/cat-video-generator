@@ -19,9 +19,10 @@ from .visual_profiles import SeriesVisualProfile, StyleProfile
 
 
 class VideoInputMode(StrEnum):
-    """故事板参考与严格首尾帧两种互斥模式。"""
+    """故事板参考、严格首帧与严格首尾帧三种互斥模式。"""
 
     STORYBOARD_REFERENCE = "storyboard_reference"
+    STRICT_FIRST = "strict_first"
     STRICT_FIRST_LAST = "strict_first_last"
 
 
@@ -54,12 +55,16 @@ class MediaBinding(StrictModel):
 
 
 class VideoInputPlan(StrictModel):
-    """Seedance single-pass任务的最终业务输入。"""
+    """Seedance视频任务的最终业务输入（整集或单镜头片段）。
+
+    duration_seconds允许低至3秒以支持逐镜头片段；bindings上限7张
+    （身份参考2张+面板4张+余量），供应商侧真实上限由Ark响应兜底。
+    """
 
     input_mode: VideoInputMode
     resolution: Literal["480p", "720p"]
-    duration_seconds: Annotated[int, Field(ge=8, le=15)]
-    bindings: list[MediaBinding] = Field(default_factory=list, max_length=4)
+    duration_seconds: Annotated[int, Field(ge=3, le=15)]
+    bindings: list[MediaBinding] = Field(default_factory=list, max_length=7)
 
     @model_validator(mode="after")
     def validate_bindings(self) -> VideoInputPlan:
@@ -71,17 +76,37 @@ class VideoInputPlan(StrictModel):
             raise ValueError("故事板素材序号必须从1连续递增")
 
         roles = [item.provider_role for item in self.bindings]
+        first_positions = [
+            index
+            for index, role in enumerate(roles)
+            if role is ProviderMediaRole.FIRST_FRAME
+        ]
+        last_positions = [
+            index
+            for index, role in enumerate(roles)
+            if role is ProviderMediaRole.LAST_FRAME
+        ]
         if self.input_mode is VideoInputMode.STRICT_FIRST_LAST:
-            if roles != [ProviderMediaRole.FIRST_FRAME, ProviderMediaRole.LAST_FRAME]:
-                raise ValueError("strict_first_last必须按顺序发送first_frame和last_frame")
-        elif any(
-            role
-            not in {
-                ProviderMediaRole.REFERENCE_IMAGE,
-            }
-            for role in roles
-        ):
+            if (
+                len(first_positions) != 1
+                or len(last_positions) != 1
+                or first_positions[0] > last_positions[0]
+            ):
+                raise ValueError(
+                    "strict_first_last必须按顺序发送first_frame和last_frame"
+                )
+        elif self.input_mode is VideoInputMode.STRICT_FIRST:
+            if len(first_positions) != 1 or last_positions:
+                raise ValueError("strict_first必须且只能发送一个first_frame")
+        elif first_positions or last_positions:
             raise ValueError("storyboard_reference只能使用reference媒体角色")
+        allowed = {
+            ProviderMediaRole.REFERENCE_IMAGE,
+            ProviderMediaRole.FIRST_FRAME,
+            ProviderMediaRole.LAST_FRAME,
+        }
+        if any(role not in allowed for role in roles):
+            raise ValueError("视频任务出现未知媒体角色")
         return self
 
 
@@ -149,19 +174,25 @@ def build_video_input_plan(
 
     if resolution not in {"480p", "720p"}:
         raise ValueError(f"不支持的视频分辨率{resolution}")
+    # 面板数量与身份参考的合法性校验已在_select_sources内完成。
     selected = _select_sources(input_mode, sources)
-    if input_mode is VideoInputMode.STORYBOARD_REFERENCE and not 3 <= len(selected) <= 4:
-        raise ValueError("storyboard_reference必须按顺序提供3至4张故事板面板")
 
+    frame_index = 0
     bindings: list[MediaBinding] = []
     for ordinal, source in enumerate(selected, 1):
         _validate_source(source)
+        if _is_frame_key(source.semantic_key):
+            frame_index += 1
         bindings.append(
             MediaBinding(
                 asset_id=source.asset_id,
                 semantic_key=source.semantic_key,
                 modality=MediaModality.IMAGE,
-                provider_role=_provider_role(input_mode, source.semantic_key),
+                provider_role=_provider_role(
+                    input_mode,
+                    source.semantic_key,
+                    frame_position=frame_index or None,
+                ),
                 ordinal=ordinal,
                 sha256=source.sha256,
             )
@@ -174,28 +205,63 @@ def build_video_input_plan(
     )
 
 
+def _is_identity_key(semantic_key: str) -> bool:
+    """人物/猫咪本体身份参考键；它们是身份锚点，不是构图素材。"""
+
+    return semantic_key.startswith(("person:", "cat:"))
+
+
+def _is_frame_key(semantic_key: str) -> bool:
+    """故事板面板或上一镜头真实尾帧——逐镜头生成的首尾帧素材。"""
+
+    return semantic_key.startswith(("storyboard:panel-", "shot_tail:"))
+
+
 def _select_sources(
     mode: VideoInputMode,
     sources: tuple[MediaSource, ...],
 ) -> tuple[MediaSource, ...]:
-    ordered = tuple(sorted(sources, key=lambda item: item.semantic_key))
-    if any(not item.semantic_key.startswith("storyboard:panel-") for item in ordered):
-        raise ValueError("Seedance生产输入只能使用已批准故事板面板")
+    identity = tuple(
+        sorted(
+            (item for item in sources if _is_identity_key(item.semantic_key)),
+            key=lambda item: item.semantic_key,
+        )
+    )
+    # 帧素材按调用方给定顺序保留（首帧→尾帧），不再按键排序，
+    # 因为shot_tail键无法与面板键按语义比较先后。
+    frames = tuple(item for item in sources if _is_frame_key(item.semantic_key))
+    if len(identity) + len(frames) != len(sources):
+        raise ValueError(
+            "Seedance生产输入只能使用本体身份参考、故事板面板与镜头尾帧"
+        )
     if mode is VideoInputMode.STRICT_FIRST_LAST:
-        if len(ordered) != 2:
-            raise ValueError("strict_first_last必须只发送故事板首尾两张面板")
-        return ordered
-    return ordered
+        if len(frames) != 2:
+            raise ValueError("strict_first_last必须只发送首帧与尾帧两张素材")
+    elif mode is VideoInputMode.STRICT_FIRST:
+        if len(frames) != 1:
+            raise ValueError("strict_first必须只发送一张首帧素材")
+    elif not 3 <= len(frames) <= 4:
+        raise ValueError("storyboard_reference必须按顺序提供3至4张故事板面板")
+    # 身份参考恒排在帧素材之前：Prompt的@图片序号与content数组顺序一致，
+    # 身份锚点前置后面板序号紧随其后。
+    return (*identity, *frames)
 
 
 def _provider_role(
     mode: VideoInputMode,
     semantic_key: str,
+    frame_position: int | None = None,
 ) -> ProviderMediaRole:
+    if _is_identity_key(semantic_key):
+        # 身份参考永远是reference_image；首尾帧角色只属于帧素材。
+        return ProviderMediaRole.REFERENCE_IMAGE
+    if mode is VideoInputMode.STRICT_FIRST:
+        return ProviderMediaRole.FIRST_FRAME
     if mode is VideoInputMode.STRICT_FIRST_LAST:
+        # 按帧素材顺序：第一张为首帧、第二张为尾帧（面板或镜头尾帧均可）。
         return (
             ProviderMediaRole.FIRST_FRAME
-            if semantic_key.endswith("01")
+            if frame_position == 1
             else ProviderMediaRole.LAST_FRAME
         )
     return ProviderMediaRole.REFERENCE_IMAGE

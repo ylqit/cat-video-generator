@@ -71,6 +71,11 @@ class PlanRequest(BaseModel):
     candidate_count: int | None = Field(None, alias="candidateCount", ge=1, le=5)
     allow_paid_generation: bool = Field(False, alias="allowPaidGeneration")
     pipeline_settings: dict | None = Field(None, alias="pipelineSettings")
+    story_mode: str = Field(
+        "auto",
+        alias="storyMode",
+        pattern=r"^(auto|create|expand)$",
+    )
 
 
 class GenerateRequest(BaseModel):

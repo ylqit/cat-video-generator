@@ -12,7 +12,8 @@ from typing import Any, TypeVar
 
 from pydantic import ValidationError
 
-from ..domain.contracts import Slot, StrictModel
+from ..domain.contracts import EpisodeScript, Slot, StrictModel
+from ..domain.normalization import normalize_episode_payload
 from ..domain.workflow import PromptPurpose, StepKind, StepStatus
 from .ports import DirectorGateway, GatewayError, PlanningStore, StoredStep
 
@@ -64,8 +65,12 @@ class DirectorInvoker:
         prompt: str,
         contract: type[ContractT],
         repair_of_step_id: uuid.UUID | None = None,
-    ) -> tuple[ContractT, StoredStep, uuid.UUID]:
-        """执行一个结构化导演调用；未知提交结果绝不自动重发。"""
+    ) -> tuple[ContractT, StoredStep, uuid.UUID, tuple[str, ...]]:
+        """执行一个结构化导演调用；未知提交结果绝不自动重发。
+
+        第四返回值为归一化警告：EpisodeScript候选先经可恢复矛盾归一化再校验，
+        避免为意图明确的表述违规浪费付费修复调用。
+        """
 
         input_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         operation_key = "director:day" if slot is None else f"director:episode:{slot.value}"
@@ -97,7 +102,7 @@ class DirectorInvoker:
             saved = step.input_snapshot.get("output")
             if not isinstance(saved, dict):
                 raise RuntimeError("导演步骤已成功但缺少持久化输出")
-            return contract.model_validate(saved), step, prompt_id
+            return contract.model_validate(saved), step, prompt_id, ()
 
         # 先提交收费意图，再调用Ark。进程即使在响应前中断，恢复流程也能通过
         # submission_unknown阻止第二次POST。
@@ -120,8 +125,12 @@ class DirectorInvoker:
                     "导演提交结果未知，必须先对账，禁止重复调用"
                 ) from exc
             raise
+        normalizations: tuple[str, ...] = ()
+        output = result.payload
+        if contract is EpisodeScript:
+            output, normalizations = normalize_episode_payload(result.payload)
         try:
-            parsed = contract.model_validate(result.payload)
+            parsed = contract.model_validate(output)
         except ValidationError as exc:
             errors = (_validation_summary(exc),)
             self._repository.fail_director_step(
@@ -142,9 +151,9 @@ class DirectorInvoker:
             step_id=step.id,
             response_id=result.response_id,
             request_hash=result.request_hash,
-            output=result.payload,
+            output=output,
         )
-        return parsed, self._repository.get_step(step.id), prompt_id
+        return parsed, self._repository.get_step(step.id), prompt_id, normalizations
 
 
 def _validation_summary(exc: ValidationError) -> str:

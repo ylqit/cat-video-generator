@@ -14,6 +14,7 @@ import uuid
 from dataclasses import dataclass, replace
 from typing import Any
 
+from ..domain.contracts import Slot
 from ..domain.prompts import (
     CompiledPrompt,
     compile_look_prompt,
@@ -100,6 +101,10 @@ class VisualPreparationService:
             self.select_references(episode, look),
             prompt_override=(prompt_overrides or {}).get("storyboard"),
         )
+        if any(item.status == "rejected" for item in assets):
+            # 高置信拒绝不再一次打死整天：违规清单是确定性反馈，自动重修一次
+            # 仍失败才转人工/阻断（与导演修复循环同一预算哲学，仅一次机会）。
+            assets = self._auto_repair_storyboard(episode, assets)
         if any(item.status == "rejected" for item in assets):
             raise RuntimeError("故事板语义审核失败，已阻断Seedance任务")
         if not all(item.status in {"approved", "ready"} for item in assets):
@@ -600,7 +605,47 @@ class VisualPreparationService:
         assets = tuple(latest[key] for key in desired)
         if any(asset.media_type != "image" for asset in assets):
             raise ValueError("当前Seedream故事板参考只允许图片资产")
+        chain = self._style_chain_reference(episode)
+        if chain is not None:
+            # 跨集画风链：前一时段已批准的首张面板作为"仅画风"参考，
+            # 收敛早中晚三组独立生成的风格方差。语义键用专用标记，
+            # Prompt职责与审核拾取都靠它区分，不参与Canon匹配。
+            return ReferenceSelectionPlan(
+                (*desired, "style_chain:previous_panel"),
+                (*assets, chain),
+            )
         return ReferenceSelectionPlan(desired, assets)
+
+    def _style_chain_reference(self, episode: StoredEpisode) -> StoredAsset | None:
+        """前一时段已批准故事板的首张面板；找不到时静默跳过（增强项非必需项）。"""
+
+        if episode.plan.slot.sort_order <= 1:
+            return None
+        previous = next(
+            item
+            for item in Slot
+            if item.sort_order == episode.plan.slot.sort_order - 1
+        )
+        try:
+            prev_episode = self._repository.get_episode(episode.run_id, previous)
+        except Exception:
+            # 局部重规划等场景下前集可能不存在，链式参考直接跳过。
+            return None
+        candidates = self._repository.list_assets(
+            run_id=episode.run_id,
+            episode_id=prev_episode.id,
+            roles=("storyboard_panel",),
+            statuses=("approved", "ready"),
+        )
+        panels = [
+            item
+            for item in candidates
+            # list_assets会混入episode_id为NULL的行，必须精确过滤
+            if item.episode_id == prev_episode.id
+            and item.semantic_key == "storyboard:panel-01"
+            and item.media_type == "image"
+        ]
+        return panels[-1] if panels else None
 
     def _ensure_storyboard(
         self,
@@ -952,6 +997,7 @@ class VisualPreparationService:
                 result.identity_ok,
                 result.style_ok,
                 result.body_proportion_ok,
+                result.pose_naturalness_ok,
                 result.action_sequence_ok,
                 result.spatial_continuity_ok,
                 result.prop_continuity_ok,
@@ -965,6 +1011,7 @@ class VisualPreparationService:
             "identityOk": result.identity_ok,
             "styleOk": result.style_ok,
             "bodyProportionOk": result.body_proportion_ok,
+            "poseNaturalnessOk": result.pose_naturalness_ok,
             "actionSequenceOk": result.action_sequence_ok,
             "spatialContinuityOk": result.spatial_continuity_ok,
             "propContinuityOk": result.prop_continuity_ok,
@@ -991,8 +1038,8 @@ class VisualPreparationService:
         decision = "approved" if passed else "rejected"
         if passed:
             review_reason = (
-                "整组故事板通过人物与猫咪身份、身体比例、二维画风、动作顺序、"
-                "镜头空间、关键道具和结尾回报审核"
+                "整组故事板通过人物与猫咪身份、身体比例、姿态自然性、二维画风、"
+                "动作顺序、镜头空间、关键道具和结尾回报审核"
             )
         else:
             review_reason = "；".join(result.violations) or "故事板存在明确语义错误"
@@ -1006,6 +1053,26 @@ class VisualPreparationService:
             evidence=evidence,
         )
         return tuple(replace(item, status=decision) for item in panels)
+
+    def _auto_repair_storyboard(
+        self,
+        episode: StoredEpisode,
+        rejected_assets: tuple[StoredAsset, ...],
+    ) -> tuple[StoredAsset, ...]:
+        """语义审核高置信拒绝后的唯一一次自动重修，违规清单回灌Prompt。"""
+
+        step_id = rejected_assets[0].step_id
+        if step_id is None:
+            raise RuntimeError("被拒绝故事板缺少生成Step，无法自动重修")
+        original_step = self._repository.get_step(step_id)
+        violations = (
+            getattr(original_step, "error_message", None) or "故事板存在明确语义错误"
+        )
+        return self.retry_storyboard(
+            episode,
+            original_step,
+            reason=f"上一次语义审核发现确定性违规，必须逐条修正：{violations}",
+        )
 
     def retry_storyboard(
         self,

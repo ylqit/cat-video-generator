@@ -26,17 +26,33 @@ sequential_image_generation_options.max_images=3或4
 
 Prompt使用`图1`、`图2`说明每个输入职责，并把内部semantic key翻译为人物面貌、服饰、猫咪斑纹或画风等模型可理解职责。它要求输出3～4张独立、无文字、无编号、无边框、9:16面板。原始比例偏差不超过1%直接使用，1%～2%按全组同一居中裁切归一化，超过2%、尺寸不一致、黑边或部分失败则阻断视频；原始文件和派生哈希均保留。
 
-## Seedance两种输入模式
+## Seedance三种输入模式
 
-### storyboard_reference
+**供应商硬约束（真实请求验证）**：同一次请求内 `first_frame`/`last_frame`
+不能与 `reference_image` 混用（Ark返回 `InvalidParameter: first/last frame
+content cannot be mixed with reference media content`）。因此身份参考直喂
+只出现在全参考模式；严格帧模式完全依赖首尾帧素材自身承载身份。
 
-普通Episode按顺序发送全部3～4张批准面板，均映射为`reference_image`。Prompt中的`@图片N`与实际content数组顺序完全一致。
+### storyboard_reference（含身份直喂）
+
+普通Episode按顺序发送全部3～4张批准面板，均映射为`reference_image`；
+人物大头照（锁面容发型本体，不锁衣着）与猫咪Canon同时作为
+`reference_image`前置直喂，身份不再经故事板转译。Prompt中的`@图片N`
+与实际content数组顺序完全一致，身份基准与面板构图职责分开描述。
 
 ### strict_first_last
 
 当`ending.visualCritical=true`时，只发送故事板第一张和最后一张，分别映射为`first_frame`和`last_frame`。中间面板用于导演规划与整组审核，不与严格帧混传。
 
-人物、猫咪、画风和元素Canon不再额外发送给Seedance，因为这些信息已融合进批准故事板，避免重复输入分散注意力。
+### per_shot逐镜头（默认，ARK_VIDEO_GENERATION_MODE=per_shot）
+
+多镜头Episode逐镜头生成短片：镜头1以第一张面板为`first_frame`；
+后续镜头以上一镜头已批准视频的**真实尾帧**（FFmpeg提取）为`first_frame`；
+末镜头额外以最后一张面板为`last_frame`双端锚定。每镜头独立Seedance任务、
+独立抽帧诊断（高置信自动批准、高置信违规带反馈重修一次、否则转人工），
+全部批准后FFmpeg拼接为成片进入人工终审。单镜头时长不足
+`ARK_SHOT_MINIMUM_SECONDS`（默认4秒）的Episode回退single-pass。
+身份由首帧素材传递（故事板生成阶段已注入身份参考与四足姿态护栏）。
 
 ## Prompt方言
 
@@ -54,7 +70,10 @@ Seedance执行Prompt只描述本Episode：
 
 故事板整组先通过技术硬门，再由一次Responses请求判断身份、二维画风、动作顺序、关键连续性和结尾。角色数量、关键道具类别/数量、动作错序、座位来源、同场景服饰和结尾兑现属于硬门；普通背景、植物、轻微姿势、构图和面貌差异写入`warnings`。明确失败整组拒绝；低置信转人工。
 
-Seedance仍以single-pass生成一条完整视频。技术QC通过后原始MP4直通本地资产目录，最终内容停在`content_review`等待人工批准。FFmpeg只用于抽帧诊断，不负责固定拼接。
+single-pass与逐镜头两种模式都以技术QC为第一道门：通过后原始MP4直通本地
+资产目录。single-pass成片直接进入`content_review`；逐镜头模式的镜头片段
+先经抽帧诊断自动审（或人工审），全部批准后FFmpeg拼接成片再进入
+`content_review`等待人工终审。FFmpeg负责抽帧诊断、尾帧提取与同规格拼接。
 
 ## 资料
 

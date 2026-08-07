@@ -40,6 +40,15 @@ class SeriesVisualProfile(VisualProfileModel):
         min_length=8,
         max_length=200,
     )
+    cat_motion_rules: str = Field(
+        default=(
+            "猫咪保持真实猫科四足生物力学：行走、坐卧、跳跃、攀爬均四足自然完成，"
+            "禁止直立、双足站立、拟人行走或人手式抓握；前爪只能在四足姿态下完成"
+            "拨、按、扶、轻拍，移动物品一律用嘴叼"
+        ),
+        min_length=8,
+        max_length=300,
+    )
     person_reference_keys: tuple[str, str] = (
         "person:headshot",
         "person:fullbody",

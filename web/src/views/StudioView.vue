@@ -67,6 +67,7 @@ const form = reactive({
   personPersonality: "",
   catPersonality: "",
   humorStyle: "",
+  storyMode: "auto" as "auto" | "create" | "expand",
   allowPaidGeneration: false,
   stages: {
     dayBrief: "auto",
@@ -156,7 +157,9 @@ const workflowGroups = computed(() => [
   {
     key: "video",
     label: "视频成片",
-    nodes: workflowNodes.value.filter((item) => item.type === "video"),
+    nodes: workflowNodes.value.filter(
+      (item) => item.type === "video" || item.type === "video_shot",
+    ),
   },
   {
     key: "review",
@@ -311,6 +314,15 @@ function videoAssets(episode: EpisodeDto) {
   return (graph.value?.assets ?? []).filter(
     (asset) => asset.episodeId === episode.id && asset.role === "video",
   );
+}
+
+/** 逐镜头生成的镜头片段，按镜头序号排序。 */
+function shotClips(episode: EpisodeDto) {
+  return (graph.value?.assets ?? [])
+    .filter(
+      (asset) => asset.episodeId === episode.id && asset.role === "video_shot",
+    )
+    .sort((a, b) => (a.semanticKey ?? "").localeCompare(b.semanticKey ?? ""));
 }
 
 function canSubmitVideo(episode: EpisodeDto): boolean {
@@ -705,6 +717,7 @@ async function submitPlan() {
         allowPaidGeneration: true,
         ...form.stages,
       },
+      storyMode: form.storyMode,
     });
     jobs.track(accepted);
     ElMessage.info("规划任务已提交，按流水线开关自动推进…");
@@ -871,12 +884,26 @@ onMounted(() => {
 
     <el-card v-if="!runId" shadow="never" style="margin-bottom: 16px">
       <el-form label-width="130px">
+        <el-form-item label="剧情模式">
+          <el-radio-group v-model="form.storyMode">
+            <el-radio value="auto">自动识别</el-radio>
+            <el-radio value="create">导演创作</el-radio>
+            <el-radio value="expand">我的剧情扩写</el-radio>
+          </el-radio-group>
+          <span class="muted" style="margin-left: 10px">
+            自动识别：粘贴「主题一：… 剧本1：… 剧本2：… 剧本3：…」完整剧情即按原文改编，不重新创作
+          </span>
+        </el-form-item>
         <el-form-item label="主题" required>
           <el-input
             v-model="form.theme"
             type="textarea"
-            :rows="3"
-            placeholder="例：雨天窝在家里的一天 / 第一次出门野餐。导演将围绕主题规划早中晚三集。"
+            :rows="form.storyMode === 'create' ? 3 : 8"
+            :placeholder="
+              form.storyMode === 'create'
+                ? '例：雨天窝在家里的一天 / 第一次出门野餐。导演将围绕主题规划早中晚三集。'
+                : '可只写主题；或粘贴完整剧情：主题一：出去钓鱼 ⏎ 剧本1：… ⏎ 剧本2：… ⏎ 剧本3：…，导演将按你的原文逐拍改编。'
+            "
           />
         </el-form-item>
         <el-form-item label="内容日期" required>
@@ -1502,6 +1529,36 @@ onMounted(() => {
                 "
                 title="视频实际 Prompt"
               />
+              <template v-if="shotClips(episode).length">
+                <div class="muted" style="margin: 10px 0 6px">
+                  镜头片段（逐镜头生成：上一镜真实尾帧锚定下一镜首帧）
+                </div>
+                <div style="display: flex; gap: 14px; flex-wrap: wrap">
+                  <div
+                    v-for="asset in shotClips(episode)"
+                    :key="asset.id"
+                    style="width: 220px"
+                  >
+                    <AssetReviewPanel
+                      v-if="asset.status === 'candidate'"
+                      :asset="asset"
+                      :reviews="graph.reviews"
+                      :max-width="220"
+                      @reviewed="loadGraph"
+                    />
+                    <div v-else class="video-preview">
+                      <video
+                        :src="assetContentUrl(asset.id)"
+                        controls
+                        preload="metadata"
+                      />
+                      <div class="muted">
+                        {{ asset.semanticKey }} · {{ asset.status }}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </template>
               <template v-if="videoAssets(episode).length">
                 <div
                   v-for="asset in videoAssets(episode)"

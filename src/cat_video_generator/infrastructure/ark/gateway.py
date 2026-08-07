@@ -414,6 +414,7 @@ class ArkGateway:
                 identity_ok=bool(payload["identityOk"]),
                 style_ok=bool(payload["styleOk"]),
                 body_proportion_ok=bool(payload["bodyProportionOk"]),
+                pose_naturalness_ok=bool(payload["poseNaturalnessOk"]),
                 action_sequence_ok=bool(payload["actionSequenceOk"]),
                 spatial_continuity_ok=bool(payload["spatialContinuityOk"]),
                 prop_continuity_ok=bool(payload["propContinuityOk"]),

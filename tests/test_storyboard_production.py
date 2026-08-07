@@ -250,6 +250,7 @@ class StoryboardGateway:
             identity_ok=self.approved,
             style_ok=self.approved,
             body_proportion_ok=self.approved,
+            pose_naturalness_ok=self.approved,
             action_sequence_ok=self.approved,
             spatial_continuity_ok=self.approved,
             prop_continuity_ok=self.approved,
@@ -454,12 +455,14 @@ def test_gateway_failure_is_not_misclassified_as_storyboard_qc(tmp_path: Path) -
 
 
 def test_semantic_storyboard_rejection_is_atomic(tmp_path: Path) -> None:
-    service, repository, _, episode = _service(tmp_path, approved=False)
+    service, repository, gateway, episode = _service(tmp_path, approved=False)
     with pytest.raises(RuntimeError, match="语义审核失败"):
         service.prepare(episode)
     panels = [item for item in repository.assets if item.role == "storyboard_panel"]
-    assert len(panels) == 3
+    # 高置信拒绝触发一次带违规反馈的自动重修：原始+重修共两组面板均被原子拒绝。
+    assert len(panels) == 6
     assert all(item.status == "rejected" for item in panels)
+    assert gateway.generate_calls == 2
     assert repository.steps[0].status is StepStatus.FAILED
 
 
@@ -506,6 +509,7 @@ def test_pose_only_storyboard_still_requires_valid_director_sequence(tmp_path: P
             identity_ok=True,
             style_ok=True,
             body_proportion_ok=True,
+            pose_naturalness_ok=True,
             action_sequence_ok=False,
             spatial_continuity_ok=True,
             prop_continuity_ok=True,
@@ -530,7 +534,8 @@ def test_pose_only_storyboard_still_requires_valid_director_sequence(tmp_path: P
         if item.role == "storyboard_panel"
     )
     assert repository.reviews[0]["evidence"]["actionSequenceOk"] is False
-    assert gateway.generate_calls == 1
+    # 语义拒绝后自动带反馈重修一次（第二次仍被同一违规拒绝）。
+    assert gateway.generate_calls == 2
 
 
 def test_storyboard_retry_returns_new_step_and_advances_episode(tmp_path: Path) -> None:

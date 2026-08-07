@@ -110,7 +110,7 @@ def test_visual_critical_uses_only_storyboard_first_and_last() -> None:
         "first_frame",
         "last_frame",
     ]
-    with pytest.raises(ValueError, match="只发送故事板首尾"):
+    with pytest.raises(ValueError, match="只发送首帧与尾帧"):
         build_video_input_plan(
             input_mode=VideoInputMode.STRICT_FIRST_LAST,
             resolution="480p",

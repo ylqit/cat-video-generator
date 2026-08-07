@@ -265,6 +265,7 @@ export interface WorkflowNodeDto {
     | "look"
     | "storyboard"
     | "storyboard_review"
+    | "video_shot"
     | "video"
     | "content_review";
   slot: string | null;

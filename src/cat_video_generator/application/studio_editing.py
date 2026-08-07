@@ -20,6 +20,7 @@ from ..domain.contracts import (
     EpisodeScript,
     Slot,
 )
+from ..domain.normalization import normalize_episode_payload
 from ..domain.pipeline import PipelineSettings
 from ..domain.prompts import (
     PromptCompilationError,
@@ -64,7 +65,8 @@ class StudioEditingService:
             raise ValueError(
                 f"该集状态{status}已进入媒体生产，不能编辑剧本；请先人工拒绝相关资产回到failed"
             )
-        script = EpisodeScript.model_validate(payload)
+        normalized, normalizations = normalize_episode_payload(payload)
+        script = EpisodeScript.model_validate(normalized)
         run_id = uuid.UUID(str(detail["runId"]))
         slot = Slot(str(detail["slot"]))
         context = self._repository.get_planning_context(run_id)
@@ -122,6 +124,7 @@ class StudioEditingService:
             "slot": slot.value,
             "saved": True,
             "promptOverridesKept": bool(detail.get("promptOverrides")),
+            "normalizations": list(normalizations),
         }
 
     def update_day_brief(

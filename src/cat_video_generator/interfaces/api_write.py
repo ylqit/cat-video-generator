@@ -108,6 +108,7 @@ def create_write_router(
                 ),
                 stop_after_day_brief=settings.day_brief is StageMode.MANUAL,
                 pipeline_settings=settings,
+                story_mode=request.story_mode,
             )
             payload = build_plan_payload(result)
             if isinstance(result, DayBriefPause):

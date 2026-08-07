@@ -213,11 +213,14 @@ def test_semantic_director_failure_requires_explicit_replan(daily_plan) -> None:
     gendered = daily_plan.episodes[0].script.model_copy(
         update={"main_event": "固定女孩在阳台发现风吹动纸风车并拿起来观察"}
     )
+    # 语义失败会带反馈自动修复（原始+两次修复共三次尝试），
+    # 三次都不合格才进入人工规划审核。
     director = Director(
         [
             daily_plan.day_brief.model_dump(mode="json"),
             gendered.model_dump(mode="json"),
-            daily_plan.episodes[0].script.model_dump(mode="json"),
+            gendered.model_dump(mode="json"),
+            gendered.model_dump(mode="json"),
         ]
     )
     repository = PlanningRepository()
@@ -238,5 +241,5 @@ def test_semantic_director_failure_requires_explicit_replan(daily_plan) -> None:
             allow_paid_generation=True,
         )
 
-    assert len(director.prompts) == 2
+    assert len(director.prompts) == 4
     assert repository.run_status == RunStatus.PLANNING_REVIEW.value
