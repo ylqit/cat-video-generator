@@ -33,9 +33,7 @@ def _require_empty_runtime() -> None:
     connection = op.get_bind()
     populated = {
         table: int(
-            connection.execute(
-                sa.text(f"SELECT count(*) FROM {schema}.{table}")
-            ).scalar_one()
+            connection.execute(sa.text(f"SELECT count(*) FROM {schema}.{table}")).scalar_one()
         )
         for table in (
             "production_runs",

@@ -120,6 +120,13 @@ function close() {
             <h4>{{ episode.title }}</h4>
             <p>{{ episode.script.main_event }}</p>
             <div class="muted">{{ episode.script.scene }}</div>
+            <el-descriptions :column="1" border size="small" style="margin-top: 12px">
+              <el-descriptions-item label="活动焦点">{{ episode.activityFocus }}</el-descriptions-item>
+              <el-descriptions-item label="主活动">{{ episode.relationshipArc.lead_activity }}</el-descriptions-item>
+              <el-descriptions-item label="副活动">{{ episode.relationshipArc.secondary_activity }}</el-descriptions-item>
+              <el-descriptions-item label="关系汇合">{{ episode.relationshipArc.convergence }}</el-descriptions-item>
+              <el-descriptions-item label="精确时长">{{ episode.script.duration_seconds }}秒</el-descriptions-item>
+            </el-descriptions>
           </template>
           <div v-if="assets.length" class="asset-grid">
             <AssetThumb

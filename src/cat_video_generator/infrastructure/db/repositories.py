@@ -55,8 +55,7 @@ from .review_repository import ReviewPersistenceMixin
 _GENERATION_PROMPT_PURPOSES = frozenset(
     {
         PromptPurpose.DIRECTOR,
-        PromptPurpose.LOOK,
-        PromptPurpose.STORYBOARD,
+        PromptPurpose.IMAGE,
         PromptPurpose.VIDEO,
     }
 )
@@ -379,9 +378,7 @@ class SqlAlchemyWorkflowRepository(
 
         with self._sessions() as session:
             row = session.execute(
-                select(WorkflowStep).where(
-                    WorkflowStep.provider_task_id == provider_task_id
-                )
+                select(WorkflowStep).where(WorkflowStep.provider_task_id == provider_task_id)
             ).scalar_one_or_none()
             return None if row is None else stored_step(row)
 
@@ -490,67 +487,6 @@ class SqlAlchemyWorkflowRepository(
             row = session.execute(statement).scalar_one_or_none()
             return None if row is None else stored_asset(row)
 
-    def find_reusable_storyboard(
-        self,
-        *,
-        episode_id: uuid.UUID,
-        input_hash: str,
-        statuses: tuple[str, ...],
-    ) -> tuple[StoredAsset, ...]:
-        """按同一组图Step复用完整面板集合，不拼接不同attempt的单张图片。"""
-
-        statement = (
-            select(Asset)
-            .join(WorkflowStep, Asset.producing_step_id == WorkflowStep.id)
-            .where(
-                Asset.episode_id == episode_id,
-                Asset.role == "storyboard_panel",
-                Asset.status.in_(statuses),
-                WorkflowStep.operation_key == "image:storyboard",
-                WorkflowStep.input_hash == input_hash,
-            )
-            .order_by(Asset.created_at, Asset.id)
-        )
-        with self._sessions() as session:
-            rows = tuple(session.execute(statement).scalars())
-            if not rows:
-                return ()
-            latest_step_id = rows[-1].producing_step_id
-            selected = [row for row in rows if row.producing_step_id == latest_step_id]
-            selected.sort(key=lambda row: int(row.metadata_json.get("panelOrdinal", 0)))
-            return tuple(stored_asset(row) for row in selected)
-
-    def latest_approved_storyboard(
-        self,
-        episode_id: uuid.UUID,
-    ) -> tuple[StoredAsset, ...]:
-        """返回Episode最近一次完整批准的故事板，不回退到旧失败attempt。
-
-        故事板一旦把Episode推进到视频阶段，就是该次视频提交的冻结视觉输入。
-        后续Canon更新或旧失败Prompt都不能让视频入口隐式重新生图。
-        """
-
-        statement = (
-            select(Asset)
-            .join(WorkflowStep, Asset.producing_step_id == WorkflowStep.id)
-            .where(
-                Asset.episode_id == episode_id,
-                Asset.role == "storyboard_panel",
-                Asset.status.in_(("approved", "ready")),
-                WorkflowStep.operation_key == "image:storyboard",
-                WorkflowStep.status == StepStatus.SUCCEEDED.value,
-            )
-            .order_by(WorkflowStep.created_at.desc(), Asset.created_at, Asset.id)
-        )
-        with self._sessions() as session:
-            rows = tuple(session.execute(statement).scalars())
-            if not rows:
-                return ()
-            latest_step_id = rows[0].producing_step_id
-            selected = [row for row in rows if row.producing_step_id == latest_step_id]
-            selected.sort(key=lambda row: int(row.metadata_json.get("panelOrdinal", 0)))
-            return tuple(stored_asset(row) for row in selected)
-
     def set_episode_status(
         self,
         episode_id: uuid.UUID,
@@ -593,6 +529,31 @@ class SqlAlchemyWorkflowRepository(
                 StepStatus.CANCELLED,
             }:
                 row.completed_at = datetime.now(timezone.utc)
+
+    def reopen_video_step_for_local_recovery(self, step_id: uuid.UUID) -> None:
+        """恢复已有成功Ark task的本地落盘，不创建新attempt或新收费请求。"""
+
+        with self._sessions.begin() as session:
+            row = required_record(session, WorkflowStep, step_id)
+            error_code = (row.error_json or {}).get("code")
+            provider_status = row.input_snapshot_json.get("provider_task_status")
+            if (
+                row.kind != StepKind.VIDEO.value
+                or row.status != StepStatus.FAILED.value
+                or not row.provider_task_id
+                or error_code != "media_qc_failed"
+                or provider_status != "succeeded"
+            ):
+                raise ValueError("只有供应商已成功且仅本地QC失败的视频Step可以无付费恢复")
+            row.status = transition_step(StepStatus.FAILED, StepStatus.RUNNING).value
+            row.error_json = None
+            row.completed_at = None
+            row.input_snapshot_json = validate_input_snapshot(
+                {
+                    **row.input_snapshot_json,
+                    "local_recovery_started_at": datetime.now(timezone.utc),
+                }
+            ).model_dump(mode="json")
 
     def patch_step_snapshot(
         self,
@@ -675,25 +636,3 @@ class SqlAlchemyWorkflowRepository(
                 ):
                     previous.status = "rejected"
             return stored_asset(row)
-
-    def select_video_asset(
-        self,
-        *,
-        episode_id: uuid.UUID,
-        asset_id: uuid.UUID,
-    ) -> None:
-        with self._sessions.begin() as session:
-            episode = required_record(session, Episode, episode_id)
-            asset = required_record(session, Asset, asset_id)
-            if asset.episode_id != episode_id or asset.role != "video":
-                raise ValueError("只能选择属于当前Episode的视频资产")
-            episode.selected_video_asset_id = asset_id
-            episode.status = transition_episode(
-                EpisodeStatus(episode.status),
-                EpisodeStatus.READY,
-            ).value
-            asset.status = "ready"
-
-    def set_asset_status(self, asset_id: uuid.UUID, status: str) -> None:
-        with self._sessions.begin() as session:
-            required_record(session, Asset, asset_id).status = status

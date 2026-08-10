@@ -1,11 +1,13 @@
 """Ark Responses 视觉审核使用的严格结构化输出 Schema。"""
 
-LOOK_REVIEW_SCHEMA = {
+IMAGE_REVIEW_SCHEMA = {
     "type": "object",
     "properties": {
         "identityOk": {"type": "boolean"},
         "styleOk": {"type": "boolean"},
         "appearanceOk": {"type": "boolean"},
+        "compositionOk": {"type": "boolean"},
+        "criticalPropsOk": {"type": "boolean"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "violations": {"type": "array", "items": {"type": "string"}},
         "warnings": {"type": "array", "items": {"type": "string"}},
@@ -15,39 +17,8 @@ LOOK_REVIEW_SCHEMA = {
         "identityOk",
         "styleOk",
         "appearanceOk",
-        "confidence",
-        "violations",
-        "warnings",
-        "evidence",
-    ],
-    "additionalProperties": False,
-}
-
-STORYBOARD_REVIEW_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "identityOk": {"type": "boolean"},
-        "styleOk": {"type": "boolean"},
-        "bodyProportionOk": {"type": "boolean"},
-        "poseNaturalnessOk": {"type": "boolean"},
-        "actionSequenceOk": {"type": "boolean"},
-        "spatialContinuityOk": {"type": "boolean"},
-        "propContinuityOk": {"type": "boolean"},
-        "endingOk": {"type": "boolean"},
-        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-        "violations": {"type": "array", "items": {"type": "string"}},
-        "warnings": {"type": "array", "items": {"type": "string"}},
-        "evidence": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": [
-        "identityOk",
-        "styleOk",
-        "bodyProportionOk",
-        "poseNaturalnessOk",
-        "actionSequenceOk",
-        "spatialContinuityOk",
-        "propContinuityOk",
-        "endingOk",
+        "compositionOk",
+        "criticalPropsOk",
         "confidence",
         "violations",
         "warnings",
@@ -61,7 +32,7 @@ VIDEO_DIAGNOSTIC_SCHEMA = {
     "properties": {
         "identityOk": {"type": "boolean"},
         "styleOk": {"type": "boolean"},
-        "worldContinuityOk": {"type": "boolean"},
+        "criticalPropsOk": {"type": "boolean"},
         "narrativeOrderOk": {"type": "boolean"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "violations": {"type": "array", "items": {"type": "string"}},
@@ -70,7 +41,7 @@ VIDEO_DIAGNOSTIC_SCHEMA = {
     "required": [
         "identityOk",
         "styleOk",
-        "worldContinuityOk",
+        "criticalPropsOk",
         "narrativeOrderOk",
         "confidence",
         "violations",

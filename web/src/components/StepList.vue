@@ -18,7 +18,7 @@ const emit = defineEmits<{
 
 const KIND_LABEL: Record<string, string> = {
   director: "导演规划",
-  image: "故事板生成",
+  image: "视觉图片生成",
   video: "视频生成",
 };
 

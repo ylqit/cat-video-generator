@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Any
 
 from ...application.ports import StoredAsset, StoredEpisode, StoredPrompt, StoredStep
-from ...domain.continuity import validate_continuity
 from ...domain.contracts import EpisodePlan, EpisodeScript, Slot
 from ...domain.pipeline import PipelineSettings
+from ...domain.rendering import build_render_plan
 from ...domain.workflow import EpisodeStatus, PromptPurpose, StepKind, StepStatus
 from .models import (
     Asset,
@@ -86,9 +86,7 @@ def stored_asset(row: Asset) -> StoredAsset:
 def run_dict(row: ProductionRun) -> dict[str, Any]:
     settings = PipelineSettings.model_validate(row.pipeline_settings_json)
     available_actions = (
-        [{"type": "deliver", "label": "构建交付包", "paid": False}]
-        if row.status == "ready"
-        else []
+        [{"type": "deliver", "label": "构建交付包", "paid": False}] if row.status == "ready" else []
     )
     return {
         "id": str(row.id),
@@ -118,7 +116,7 @@ def episode_dict(row: Episode) -> dict[str, Any]:
         slot=Slot(row.slot),
         script=EpisodeScript.model_validate(row.script_json),
     )
-    report = validate_continuity(plan.script.continuity)
+    render_plan = build_render_plan(plan)
     return {
         "id": str(row.id),
         "runId": str(row.production_run_id),
@@ -126,20 +124,18 @@ def episode_dict(row: Episode) -> dict[str, Any]:
         "sortOrder": row.sort_order,
         "title": plan.script.title,
         "status": row.status,
-        "videoInputMode": (
-            "strict_first_last" if plan.script.ending.visual_critical else "storyboard_reference"
-        ),
-        "worldConsistencyStatus": "valid" if report.valid else "contradiction",
-        "contradictions": [item.message for item in report.issues],
+        "activityFocus": plan.script.activity_focus.value,
+        "relationshipArc": plan.script.relationship_arc.model_dump(mode="json"),
+        "renderPlan": render_plan.model_dump(mode="json"),
         "nextAction": {
-            "planned": "生成整组故事板",
-            "preparing_visuals": "完成故事板语义审核",
+            "planned": "生成定妆图与开场锚点",
+            "preparing_visuals": "完成视觉锚点审核",
             "video_pending": "提交Seedance视频任务",
             "video_generating": "轮询并下载已有Ark任务",
             "media_qc": "完成媒体技术检查",
             "content_review": "人工观看并批准或拒绝视频",
             "ready": "等待全天其余时段或构建交付包",
-            "failed": "人工检查失败原因后局部重规划",
+            "failed": "查看失败节点后选择重试媒体或局部重规划",
         }.get(row.status),
         "selectedVideoAssetId": (
             None if row.selected_video_asset_id is None else str(row.selected_video_asset_id)
@@ -152,19 +148,26 @@ def episode_dict(row: Episode) -> dict[str, Any]:
 def step_dict(row: WorkflowStep) -> dict[str, Any]:
     operation_key = row.operation_key
     actions: list[dict[str, Any]] = []
-    if (
+    local_recovery = (
+        row.status == StepStatus.FAILED.value
+        and row.kind == StepKind.VIDEO.value
+        and row.provider_task_id is not None
+        and (row.error_json or {}).get("code") == "media_qc_failed"
+        and row.input_snapshot_json.get("provider_task_status") == "succeeded"
+    )
+    if local_recovery:
+        actions.append(
+            {"type": "continue_query", "label": "重新执行本地落盘与QC", "paid": False}
+        )
+    elif (
         row.status in {StepStatus.QUEUED.value, StepStatus.RUNNING.value}
         and row.kind == StepKind.VIDEO.value
         and row.provider_task_id
     ):
-        actions.append(
-            {"type": "continue_query", "label": "继续查询", "paid": False}
-        )
+        actions.append({"type": "continue_query", "label": "继续查询", "paid": False})
     elif row.status == StepStatus.SUBMISSION_UNKNOWN.value:
         if row.kind == StepKind.VIDEO.value:
-            actions.append(
-                {"type": "reconcile", "label": "查询并对账", "paid": False}
-            )
+            actions.append({"type": "reconcile", "label": "查询并对账", "paid": False})
         elif row.kind == StepKind.IMAGE.value:
             actions.append(
                 {
@@ -174,11 +177,16 @@ def step_dict(row: WorkflowStep) -> dict[str, Any]:
                     "requiresDuplicateBillingAck": True,
                 }
             )
-    elif row.status in {
-        StepStatus.FAILED.value,
-        StepStatus.EXPIRED.value,
-        StepStatus.CANCELLED.value,
-    } and row.kind in {StepKind.IMAGE.value, StepKind.VIDEO.value} and operation_key:
+    elif (
+        row.status
+        in {
+            StepStatus.FAILED.value,
+            StepStatus.EXPIRED.value,
+            StepStatus.CANCELLED.value,
+        }
+        and row.kind in {StepKind.IMAGE.value, StepKind.VIDEO.value}
+        and operation_key
+    ):
         actions.append({"type": "retry", "label": "重试该节点", "paid": True})
     elif row.status == StepStatus.AWAITING_REVIEW.value:
         actions.append({"type": "review", "label": "进入审核", "paid": False})

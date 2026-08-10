@@ -121,9 +121,7 @@ class DirectorInvoker:
                 submission_unknown=exc.submission_unknown,
             )
             if exc.submission_unknown:
-                raise RuntimeError(
-                    "导演提交结果未知，必须先对账，禁止重复调用"
-                ) from exc
+                raise RuntimeError("导演提交结果未知，必须先对账，禁止重复调用") from exc
             raise
         normalizations: tuple[str, ...] = ()
         output = result.payload

@@ -83,16 +83,8 @@ def create_app(
         return _not_found(lambda: query_service.episode(episode_id))
 
     @app.get("/api/v1/episodes/{episode_id}/prompt-preview")
-    def episode_prompt_preview(
-        episode_id: uuid.UUID,
-        resolution: str = Query("480p", pattern=r"^(480p|720p)$"),
-    ) -> dict:
-        return _not_found(
-            lambda: query_service.prompt_preview(
-                episode_id,
-                resolution=resolution,
-            )
-        )
+    def episode_prompt_preview(episode_id: uuid.UUID) -> dict:
+        return _not_found(lambda: query_service.prompt_preview(episode_id))
 
     @app.get("/api/v1/steps/{step_id}")
     def step_detail(step_id: uuid.UUID) -> dict:

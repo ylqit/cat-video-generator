@@ -1,311 +1,164 @@
-"""故事板渲染计划和三段式Seedance Prompt。"""
+"""RenderPlan、视觉Prompt和Seedance执行Prompt。"""
 
 from __future__ import annotations
 
-import uuid
+from uuid import uuid4
 
 import pytest
-from pydantic import ValidationError
+from conftest import episode_for
 
-from cat_video_generator.domain.contracts import EpisodePlan
+from cat_video_generator.domain.contracts import Slot
 from cat_video_generator.domain.prompts import (
+    PromptCompilationError,
     compile_day_director_prompt,
     compile_episode_director_prompt,
-    compile_storyboard_prompt,
-    compile_storyboard_review_prompt,
+    compile_look_prompt,
+    compile_opening_anchor_prompt,
     compile_video_prompt,
-    storyboard_panel_count,
+    compile_video_prompt_preview,
 )
 from cat_video_generator.domain.rendering import (
     MediaSource,
-    VideoInputMode,
-    VideoInputPlan,
+    RenderMode,
+    RenderOperation,
+    build_render_plan,
     build_video_input_plan,
-    storyboard_reference_keys,
-)
-from cat_video_generator.domain.visual_profiles import (
-    DEFAULT_SERIES_VISUAL_PROFILE,
-    DEFAULT_STYLE_PROFILE,
+    supports_video_extension,
 )
 
 
-def source(key: str, *, media_type: str = "image") -> MediaSource:
-    metadata = (
-        {"width": 720, "height": 1280}
-        if media_type == "image"
-        else {"durationSeconds": 4}
+@pytest.mark.parametrize(
+    ("duration", "mode", "section_durations"),
+    [
+        (12, RenderMode.SINGLE_PASS, [12]),
+        (22, RenderMode.EXTENDED, [11, 11]),
+        (45, RenderMode.EXTENDED, [15, 15, 15]),
+    ],
+)
+def test_render_plan_maps_duration_to_one_to_three_tasks(duration, mode, section_durations) -> None:
+    plan = build_render_plan(episode_for(Slot.NOON, duration=duration))
+
+    assert plan.mode is mode
+    assert [item.duration_seconds for item in plan.sections] == section_durations
+    assert [order for item in plan.sections for order in item.shot_orders] == list(
+        range(1, len(episode_for(Slot.NOON, duration=duration).script.shots) + 1)
     )
-    return MediaSource(
-        asset_id=uuid.uuid4(),
-        semantic_key=key,
-        media_type=media_type,
-        sha256="a" * 64,
-        metadata=metadata,
-    )
 
 
-def storyboard_sources(count: int = 3) -> tuple[MediaSource, ...]:
-    return tuple(source(f"storyboard:panel-{index:02d}") for index in range(1, count + 1))
+def test_only_full_seedance_profile_supports_extension() -> None:
+    assert supports_video_extension("doubao-seedance-2-0-260128")
+    assert not supports_video_extension("doubao-seedance-2-0-mini-260615")
 
 
-def test_storyboard_input_plan_contains_ordered_panels() -> None:
-    plan = build_video_input_plan(
-        input_mode=VideoInputMode.STORYBOARD_REFERENCE,
+def test_initial_and_extension_input_plans_use_one_semantic_source() -> None:
+    image = MediaSource(uuid4(), "opening:morning", "image", "a" * 64, {})
+    video = MediaSource(uuid4(), "video:section-1", "video", "b" * 64, {})
+
+    initial = build_video_input_plan(
+        operation=RenderOperation.INITIAL,
         resolution="720p",
-        duration_seconds=9,
-        sources=storyboard_sources(),
+        duration_seconds=12,
+        source=image,
     )
-    assert set(plan.model_dump()) == {
-        "input_mode",
-        "resolution",
-        "duration_seconds",
-        "bindings",
-    }
-    assert [item.prompt_alias for item in plan.bindings] == ["@图片1", "@图片2", "@图片3"]
-    assert all(item.provider_role.value == "reference_image" for item in plan.bindings)
-
-
-def test_storyboard_references_use_person_and_cat_view_matching_first_shot(
-    daily_plan,
-) -> None:
-    episode = daily_plan.episodes[0]
-    keys = storyboard_reference_keys(
-        episode,
-        DEFAULT_STYLE_PROFILE,
-        DEFAULT_SERIES_VISUAL_PROFILE,
-        look_key="look:morning-current",
-    )
-
-    assert keys == (
-        "look:morning-current",
-        "cat:front",
-    )
-
-
-def test_all_directors_receive_finalized_style_profile(daily_plan) -> None:
-    day = compile_day_director_prompt(
-        target_date=daily_plan.content_date,
-        planning_context="普通生活日",
-    )
-    episode = compile_episode_director_prompt(
-        day_brief=daily_plan.day_brief,
-        slot_brief=daily_plan.day_brief.slots[0],
-        previous_state_summaries=(),
-    )
-
-    for prompt in (day, episode):
-        assert DEFAULT_STYLE_PROFILE.prompt_positive() in prompt
-        assert DEFAULT_STYLE_PROFILE.prompt_negative() in prompt
-
-
-def test_visual_critical_uses_only_storyboard_first_and_last() -> None:
-    sources = storyboard_sources(4)
-    plan = build_video_input_plan(
-        input_mode=VideoInputMode.STRICT_FIRST_LAST,
-        resolution="480p",
-        duration_seconds=10,
-        sources=(sources[0], sources[-1]),
-    )
-    assert [item.provider_role.value for item in plan.bindings] == [
-        "first_frame",
-        "last_frame",
-    ]
-    with pytest.raises(ValueError, match="只发送首帧与尾帧"):
-        build_video_input_plan(
-            input_mode=VideoInputMode.STRICT_FIRST_LAST,
-            resolution="480p",
-            duration_seconds=10,
-            sources=(sources[0],),
-        )
-
-
-def test_storyboard_plan_rejects_non_image_binding() -> None:
-    with pytest.raises(ValidationError):
-        VideoInputPlan(
-            input_mode="storyboard_reference",
-            resolution="720p",
-            duration_seconds=8,
-            bindings=[
-                {
-                    "asset_id": uuid.uuid4(),
-                    "semantic_key": "storyboard:panel-01",
-                    "modality": "audio",
-                    "provider_role": "reference_image",
-                    "ordinal": 1,
-                    "sha256": "b" * 64,
-                }
-            ],
-        )
-
-
-def test_storyboard_prompt_requests_separate_clean_panels(daily_plan) -> None:
-    episode = daily_plan.episodes[0]
-    prompt = compile_storyboard_prompt(
-        episode,
-        reference_roles=("person:front", "cat:front", "style:line_texture"),
-    )
-    assert storyboard_panel_count(episode) == 3
-    assert "3张相互连贯但彼此独立" in prompt.text
-    assert "不要拼成网格" in prompt.text
-    assert "不得包含文字、序号" in prompt.text
-    assert "景别为中景" in prompt.text
-    assert episode.script.shots[0].direction in prompt.text
-    assert "唯一运镜为缓慢推近" in prompt.text
-    assert "人物孩子" not in prompt.text
-    assert "灰白猫灰白猫" not in prompt.text
-    assert "formKey" not in prompt.text
-    assert "生命周期" not in prompt.text
-
-
-def test_two_shots_use_distinct_entry_and_payoff_panels(daily_plan) -> None:
-    episode = daily_plan.episodes[0]
-    payload = episode.model_dump(mode="json")
-    payload["script"]["shots"] = [
-        {
-            "order": 1,
-            "action_orders": [1],
-            "framing": "环境中景",
-            "camera_move": "fixed",
-            "dominant_view": "front",
-            "direction": "人物活动，猫咪已经在同一空间观察",
-        },
-        {
-            "order": 2,
-            "action_orders": [2],
-            "framing": "猫咪近景",
-            "camera_move": "push",
-            "dominant_view": "side",
-            "direction": "猫咪独立探索后回到人物关系中",
-        },
-    ]
-    relationship_arc = EpisodePlan.model_validate(payload)
-
-    prompt = compile_storyboard_prompt(relationship_arc)
-
-    assert storyboard_panel_count(relationship_arc) == 3
-    assert "沿用镜头2的机位、空间轴线" in prompt.text
-    assert "不重新设计人物、猫咪或场景" in prompt.text
-
-
-def test_single_shot_video_prompt_uses_storyboard_without_redundant_sections(
-    daily_plan,
-) -> None:
-    episode = daily_plan.episodes[0]
-    plan = build_video_input_plan(
-        input_mode=VideoInputMode.STORYBOARD_REFERENCE,
+    extension = build_video_input_plan(
+        operation=RenderOperation.EXTEND,
         resolution="720p",
-        duration_seconds=episode.duration_seconds,
-        sources=storyboard_sources(),
-    )
-    prompt = compile_video_prompt(episode, input_plan=plan)
-    assert "【整体设定与素材绑定】" in prompt.text
-    assert "【镜头顺序】" in prompt.text
-    assert "【质量、连续性与声音】" in prompt.text
-    assert "@图片1" in prompt.text
-    assert "执行主体为" in prompt.text
-    assert episode.script.sound_design in prompt.text
-    assert "00:00" not in prompt.text
-    assert "assetId" not in prompt.text
-
-
-def test_storyboard_review_distinguishes_identity_proportion_and_space(daily_plan) -> None:
-    episode = daily_plan.episodes[0]
-
-    prompt = compile_storyboard_review_prompt(
-        episode,
-        panel_count=storyboard_panel_count(episode),
+        duration_seconds=11,
+        source=video,
     )
 
-    assert "bodyProportionOk" in prompt
-    assert "spatialContinuityOk" in prompt
-    assert "propContinuityOk" in prompt
-    assert "面板序号" in prompt
-    assert "合理重新取景不算漂移" in prompt
+    assert initial.bindings[0].prompt_alias == "@图片1"
+    assert initial.bindings[0].provider_role.value == "first_frame"
+    assert extension.bindings[0].prompt_alias == "@视频1"
+    assert extension.bindings[0].provider_role.value == "reference_video"
 
 
-def test_legal_long_prompt_is_not_locally_blocked(daily_plan) -> None:
-    episode = daily_plan.episodes[0]
-    long_scene = "明亮而自然的生活空间" * 120
-    script = episode.script.model_copy(update={"scene": long_scene})
-    long_episode = episode.model_copy(update={"script": script})
-    plan = build_video_input_plan(
-        input_mode=VideoInputMode.STORYBOARD_REFERENCE,
-        resolution="720p",
-        duration_seconds=episode.duration_seconds,
-        sources=storyboard_sources(),
-    )
-    prompt = compile_video_prompt(long_episode, input_plan=plan)
-    assert prompt.char_count > 1600
-    assert prompt.warnings == ()
-
-
-def test_directors_are_four_separate_contract_prompts(daily_plan) -> None:
+def test_director_prompts_separate_day_capacity_from_episode_execution(daily_plan) -> None:
     day_prompt = compile_day_director_prompt(
         target_date=daily_plan.content_date,
-        planning_context="设计自然的普通生活日",
+        planning_context="放风筝主题",
     )
-    episode_prompt = compile_episode_director_prompt(
+    slot_prompt = compile_episode_director_prompt(
         day_brief=daily_plan.day_brief,
-        slot_brief=daily_plan.day_brief.slots[0],
-        previous_state_summaries=(),
+        slot_brief=daily_plan.day_brief.slot_briefs[1],
+        previous_state_summaries=("上午已完成风筝制作",),
     )
-    assert "DayBrief" in day_prompt
-    assert "EpisodeScript" not in day_prompt
-    assert "EpisodeScript" in episode_prompt
-    assert "SceneContinuity" in episode_prompt
-    assert "首个动作" in episode_prompt
-    assert "start_state" in episode_prompt
-    assert "全天三个" not in episode_prompt
-    assert "动作阶段服务于镜头叙事" in episode_prompt
-    assert "猫咪产生独立反应" in episode_prompt
-    assert "事件种子一天最多分配给一个时段" in day_prompt
+
+    assert "不得输出具体动作、镜头、精确秒数" in day_prompt
+    assert "猫咪主活动" in day_prompt
+    assert "精确时长必须在16至30秒" in slot_prompt
+    assert "relationshipArc" in slot_prompt
+    assert "猫咪保持四足自然行为" in slot_prompt
 
 
-def test_three_shots_compile_four_storyboard_panels(daily_plan) -> None:
-    episode = daily_plan.episodes[0]
-    payload = episode.model_dump(mode="json")
-    payload["script"]["actions"].append(
-        {
-            "order": 3,
-            "actor_id": "cat",
-            "action": "灰白猫探索后回到人物脚边，用鼻尖轻碰纸风车",
-            "visible_result": "人物低头回应，猫咪重新进入人物关系",
-        }
+def test_visual_prompts_use_one_look_and_one_opening_anchor() -> None:
+    episode = episode_for(Slot.MORNING)
+    look = compile_look_prompt(
+        episode,
+        reference_roles=("person:front", "style:line_texture"),
     )
-    payload["script"]["shots"] = [
-        {
-            "order": 1,
-            "action_orders": [1],
-            "framing": "环境中景",
-            "camera_move": "fixed",
-            "dominant_view": "front",
-            "direction": "人物在桌边活动，猫咪已在画面下方观察",
-        },
-        {
-            "order": 2,
-            "action_orders": [2],
-            "framing": "猫咪近景",
-            "camera_move": "follow",
-            "dominant_view": "side",
-            "direction": "猫咪离开人物脚边，独立探索转动的纸风车",
-        },
-        {
-            "order": 3,
-            "action_orders": [3],
-            "framing": "双主体中近景",
-            "camera_move": "push",
-            "dominant_view": "mixed",
-            "direction": "猫咪回到人物身边，人物俯身作出回应",
-        },
-    ]
-    relationship_arc = EpisodePlan.model_validate(payload)
+    anchor = compile_opening_anchor_prompt(
+        episode,
+        reference_roles=("look:episode", "cat:front", "style:indoor"),
+    )
 
-    prompt = compile_storyboard_prompt(relationship_arc)
+    assert "全身定妆图" in look.text
+    assert "不包含猫咪" in look.text
+    assert "开场视觉锚点" in anchor.text
+    assert "活动焦点" in anchor.text
+    assert "故事板" not in look.text + anchor.text
 
-    assert storyboard_panel_count(relationship_arc) == 4
-    assert "4张相互连贯但彼此独立" in prompt.text
-    assert "环境中景" in prompt.text
-    assert "猫咪近景" in prompt.text
-    assert "双主体中近景" in prompt.text
-    assert "猫咪重新进入人物关系" in prompt.text
-    assert "沿用镜头3的机位、空间轴线" in prompt.text
+
+def test_short_video_prompt_keeps_director_execution_depth() -> None:
+    episode = episode_for(Slot.MORNING, duration=12)
+    prompt = compile_video_prompt_preview(episode, resolution="720p").text
+
+    assert prompt.count("镜头1：") == 1
+    assert "固定镜头" in prompt
+    assert "肢体" not in prompt  # 动作本身已具体，不输出抽象字段名。
+    assert "灰白猫" in prompt and "人物" in prompt
+    assert "关系弧" in prompt
+    assert "同一只彩色风筝" in prompt
+    assert "原生音频" in prompt
+    assert "绝对时间" not in prompt
+    assert "数据库" not in prompt
+    assert "storyboard" not in prompt.lower()
+
+
+def test_extension_prompt_does_not_reveal_final_prop_state_early() -> None:
+    episode = episode_for(Slot.NOON, duration=22)
+    render_plan = build_render_plan(episode)
+    source = MediaSource(uuid4(), "video:section-1", "video", "c" * 64, {})
+    input_plan = build_video_input_plan(
+        operation=RenderOperation.EXTEND,
+        resolution="480p",
+        duration_seconds=render_plan.sections[1].duration_seconds,
+        source=source,
+    )
+    prompt = compile_video_prompt(
+        episode,
+        input_plan=input_plan,
+        section=render_plan.sections[1],
+    ).text
+
+    assert "向后延长 @视频1" in prompt
+    assert episode.script.critical_props[0].end in prompt
+    assert "最终可见回报" in prompt
+
+
+def test_first_medium_section_defers_final_payoff() -> None:
+    episode = episode_for(Slot.NOON, duration=22)
+    prompt = compile_video_prompt_preview(episode, resolution="480p", section_order=1).text
+
+    assert "暂不进入最终结果" in prompt
+    assert "不提前完成" in prompt
+    assert "最终可见回报" not in prompt
+
+
+def test_invalid_preview_section_raises_business_error() -> None:
+    with pytest.raises(PromptCompilationError, match="不存在渲染区段3"):
+        compile_video_prompt_preview(
+            episode_for(Slot.NOON, duration=22),
+            resolution="720p",
+            section_order=3,
+        )

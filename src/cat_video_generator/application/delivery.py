@@ -30,8 +30,7 @@ class DeliveryService:
             raise ValueError("只有ready Run可以构建交付包")
         episodes = self._repository.list_episodes(run_id)
         if len(episodes) != 3 or any(
-            episode.status is not EpisodeStatus.READY
-            or episode.selected_video_asset_id is None
+            episode.status is not EpisodeStatus.READY or episode.selected_video_asset_id is None
             for episode in episodes
         ):
             raise ValueError("交付要求三个Episode均选择ready视频")

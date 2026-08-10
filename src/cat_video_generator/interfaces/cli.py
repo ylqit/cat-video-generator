@@ -118,7 +118,7 @@ def reference_import(
     semantic_key: str = typer.Option(..., "--semantic-key"),
     file: Path = typer.Option(..., "--file"),  # noqa: B008
 ) -> None:
-    """导入Episode专用的场景、元素、动作视频或氛围音频。"""
+    """导入Episode专用的场景或关键道具图片。"""
 
     container = build_local_container()
     try:

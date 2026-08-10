@@ -19,9 +19,7 @@ class DeliveryPersistenceMixin:
     def next_delivery_revision(self, run_id: uuid.UUID) -> int:
         with self._sessions() as session:  # type: ignore[attr-defined]
             revisions = session.execute(
-                select(DeliveryPackage.revision).where(
-                    DeliveryPackage.production_run_id == run_id
-                )
+                select(DeliveryPackage.revision).where(DeliveryPackage.production_run_id == run_id)
             ).scalars()
             return max(revisions, default=0) + 1
 

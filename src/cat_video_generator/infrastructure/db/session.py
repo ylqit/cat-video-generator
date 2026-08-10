@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from ...config import DatabaseOperation, DatabaseSettings
 from .models import SCHEMA_NAME
 
-ALEMBIC_HEAD = "0010_look_prompt_purposes"
+ALEMBIC_HEAD = "0011_narrative_render_core"
 
 
 def create_database_engine(
@@ -65,9 +65,7 @@ def ensure_database_ready(
 
     with engine.connect() as connection:
         row = connection.execute(
-            text(
-                "SELECT current_database(), current_setting('server_version_num')::int"
-            )
+            text("SELECT current_database(), current_setting('server_version_num')::int")
         ).one()
         if row[0] != settings.database:
             raise RuntimeError(f"实际数据库{row[0]!r}与配置{settings.database!r}不一致")

@@ -1,136 +1,93 @@
-"""标准Ark配置与显式状态机。"""
+"""环境配置、五阶段设置与收费恢复状态机。"""
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 
 from cat_video_generator.config import ConfigurationError, RuntimeSettings
+from cat_video_generator.domain.pipeline import PIPELINE_STAGES, PipelineSettings, StageMode
 from cat_video_generator.domain.workflow import (
-    EpisodeStatus,
     PromptPurpose,
-    RunStatus,
     StepKind,
     StepStatus,
-    transition_episode,
-    transition_run,
+    WorkflowTransitionError,
     transition_step,
+    validate_prompt_purpose,
 )
 
 
-def settings_env(**updates: str) -> dict[str, str]:
-    values = {
+def runtime_env(tmp_path: Path) -> dict[str, str]:
+    event_root = tmp_path / "events"
+    event_root.mkdir()
+    return {
         "ARK_API_KEY": "test-key",
-        "ARK_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
         "ARK_IMAGE_MODEL": "doubao-seedream-5-0-260128",
-        "ARK_VIDEO_MODEL": "doubao-seedance-2-0-mini-260615",
+        "ARK_VIDEO_MODEL": "doubao-seedance-2-0-260128",
         "ARK_PLANNING_MODEL": "doubao-seed-2-1-pro-260628",
         "ARK_REVIEW_MODEL": "doubao-seed-2-1-pro-260628",
-        "STORYBOARD_REVIEW_MODE": "semantic_auto",
         "ARK_VIDEO_RESOLUTION": "720p",
-        "PATH": "",
+        "IMAGE_REVIEW_MODE": "semantic_auto",
+        "CAT_VIDEO_EVENT_SEED_ROOT": str(event_root),
+        "FFMPEG_PATH": str(tmp_path / "ffmpeg"),
+        "FFPROBE_PATH": str(tmp_path / "ffprobe"),
     }
-    values.update(updates)
-    return values
 
 
-def test_standard_ark_configuration_is_valid(tmp_path) -> None:
-    settings = RuntimeSettings.from_env(settings_env(), config_root=tmp_path)
-    settings.validate_for_ark_access()
-    assert settings.provider_profile == "volcengine-ark-standard"
-    assert settings.ark_video_resolution == "720p"
-    assert settings.ark_image_request_timeout_seconds == 600
-    assert settings.ark_director_request_timeout_seconds == 240
-    assert settings.ark_review_request_timeout_seconds == 240
-    assert settings.ark_video_api_timeout_seconds == 120
-    assert settings.ark_image_timeout_auto_retries == 1
-    assert settings.ark_image_retry_delay_seconds == 15
-    assert settings.preflight_report()["arkImageRequestTimeoutSeconds"] == 600
-    assert "ark_access_mode" not in settings.__dataclass_fields__
+def test_runtime_exposes_full_model_extension_and_timeouts(tmp_path: Path) -> None:
+    settings = RuntimeSettings.from_env(runtime_env(tmp_path), config_root=tmp_path)
+    report = settings.preflight_report()
 
-
-def test_image_request_timeout_must_be_positive(tmp_path) -> None:
-    with pytest.raises(ConfigurationError, match="请求超时必须大于0"):
-        RuntimeSettings.from_env(
-            settings_env(ARK_IMAGE_REQUEST_TIMEOUT_SECONDS="0"),
-            config_root=tmp_path,
-        )
+    assert report["supportsVideoExtension"] is True
+    assert report["arkTaskTimeoutSeconds"] == 1800.0
+    assert report["arkImageTimeoutAutoRetries"] == 1
+    assert report["imageReviewMode"] == "semantic_auto"
 
 
 @pytest.mark.parametrize(
-    "name",
+    ("name", "value", "message"),
     [
-        "ARK_DIRECTOR_REQUEST_TIMEOUT_SECONDS",
-        "ARK_REVIEW_REQUEST_TIMEOUT_SECONDS",
-        "ARK_VIDEO_API_TIMEOUT_SECONDS",
-        "ARK_TASK_TIMEOUT_SECONDS",
-        "ARK_POLL_INTERVAL_SECONDS",
-        "ARK_IMAGE_RETRY_DELAY_SECONDS",
+        ("ARK_TASK_TIMEOUT_SECONDS", "0", "必须大于0"),
+        ("ARK_IMAGE_TIMEOUT_AUTO_RETRIES", "2", "只允许0或1"),
+        ("IMAGE_REVIEW_MODE", "technical_auto", "semantic_auto或manual"),
     ],
 )
-def test_all_runtime_timeouts_must_be_positive(name: str, tmp_path) -> None:
-    with pytest.raises(ConfigurationError, match="必须大于0"):
-        RuntimeSettings.from_env(
-            settings_env(**{name: "0"}),
-            config_root=tmp_path,
-        )
+def test_invalid_runtime_values_fail_at_startup(tmp_path, name, value, message) -> None:
+    env = runtime_env(tmp_path)
+    env[name] = value
+
+    with pytest.raises(ConfigurationError, match=message):
+        RuntimeSettings.from_env(env, config_root=tmp_path)
 
 
-@pytest.mark.parametrize("value", ["-1", "2"])
-def test_seedream_timeout_retry_count_is_bounded(value: str, tmp_path) -> None:
-    with pytest.raises(ConfigurationError, match="只允许0或1"):
-        RuntimeSettings.from_env(
-            settings_env(ARK_IMAGE_TIMEOUT_AUTO_RETRIES=value),
-            config_root=tmp_path,
-        )
-
-
-@pytest.mark.parametrize("mode", ["technical_auto", "auto"])
-def test_removed_storyboard_review_modes_fail(mode: str, tmp_path) -> None:
-    settings = settings_env(STORYBOARD_REVIEW_MODE=mode)
-    with pytest.raises(ConfigurationError, match="semantic_auto或manual"):
-        RuntimeSettings.from_env(settings, config_root=tmp_path)
-
-
-def test_agent_plan_url_is_rejected(tmp_path) -> None:
-    settings = RuntimeSettings.from_env(
-        settings_env(ARK_BASE_URL="https://ark.cn-beijing.volces.com/api/plan/v3"),
-        config_root=tmp_path,
+def test_pipeline_has_only_five_current_stages() -> None:
+    assert PIPELINE_STAGES == ("dayBrief", "script", "visual", "video", "review")
+    settings = PipelineSettings.model_validate(
+        {
+            "allowPaidGeneration": True,
+            "dayBrief": "manual",
+            "script": "auto",
+            "visual": "manual",
+            "video": "manual",
+            "review": "manual",
+        }
     )
-    with pytest.raises(ConfigurationError, match="标准API"):
-        settings.validate_for_ark_access()
+    assert settings.stage("dayBrief") is StageMode.MANUAL
+    assert settings.stage("visual") is StageMode.MANUAL
 
 
-def test_only_three_step_kinds_remain() -> None:
-    assert {item.value for item in StepKind} == {"director", "image", "video"}
+def test_prompt_purposes_are_reduced_to_four_values() -> None:
+    assert {item.value for item in PromptPurpose} == {"director", "image", "video", "review"}
+    assert validate_prompt_purpose(StepKind.IMAGE, PromptPurpose.IMAGE, generation_intent=True)
+    assert validate_prompt_purpose(StepKind.VIDEO, PromptPurpose.REVIEW)
+
+    with pytest.raises(ValueError, match="生成Prompt必须是image"):
+        validate_prompt_purpose(StepKind.IMAGE, PromptPurpose.REVIEW, generation_intent=True)
 
 
-def test_prompt_purposes_match_storyboard_runtime() -> None:
-    assert {item.value for item in PromptPurpose} == {
-        "director",
-        "look",
-        "look_review",
-        "storyboard",
-        "storyboard_review",
-        "video",
-        "review",
-    }
+def test_submission_unknown_cannot_return_to_submitting() -> None:
+    with pytest.raises(WorkflowTransitionError):
+        transition_step(StepStatus.SUBMISSION_UNKNOWN, StepStatus.SUBMITTING)
 
-
-def test_explicit_workflow_transitions() -> None:
-    assert transition_run(RunStatus.DRAFT, RunStatus.PLANNED) is RunStatus.PLANNED
-    assert (
-        transition_episode(EpisodeStatus.PLANNED, EpisodeStatus.PREPARING_VISUALS)
-        is EpisodeStatus.PREPARING_VISUALS
-    )
-    assert transition_step(StepStatus.PENDING, StepStatus.SUBMITTING) is StepStatus.SUBMITTING
-    assert (
-        transition_episode(EpisodeStatus.FAILED, EpisodeStatus.CONTENT_REVIEW)
-        is EpisodeStatus.CONTENT_REVIEW
-    )
-    with pytest.raises(ValueError):
-        transition_step(StepStatus.SUCCEEDED, StepStatus.SUBMITTING)
-
-
-def test_archived_statuses_are_removed() -> None:
-    assert "archived" not in {item.value for item in RunStatus}
-    assert "archived" not in {item.value for item in EpisodeStatus}
+    assert transition_step(StepStatus.SUBMISSION_UNKNOWN, StepStatus.RUNNING) is StepStatus.RUNNING

@@ -1,7 +1,7 @@
-"""PostgreSQL只读投影。
+"""PostgreSQL 只读投影。
 
-本模块把八张核心表转换为CLI与HTTP共用结果，不推进状态、不编译Prompt，
-也不调用Ark。所有运行状态都以PostgreSQL记录为准。
+本模块把核心表转换为 CLI 与 Web 共用结果，不推进状态、不编译 Prompt，
+也不调用 Ark。流程图只展示当前生产内核：导演、定妆、开场锚点、视频与审核。
 """
 
 from __future__ import annotations
@@ -13,7 +13,8 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from ...application.ports import StoredAsset, StoredPrompt
-from ...domain.contracts import EpisodeScript, RecentContentSummary, Slot
+from ...domain.contracts import EpisodePlan, EpisodeScript, RecentContentSummary, Slot
+from ...domain.rendering import build_render_plan
 from ...domain.workflow import PromptPurpose, RunStatus
 from .models import (
     Asset,
@@ -47,32 +48,22 @@ def _current_stage(
     run: ProductionRun,
     episodes: tuple[Episode, ...],
     steps: tuple[WorkflowStep, ...],
-    assets: tuple[Asset, ...],
 ) -> str:
-    """推导创作台步进条的当前阶段，前端无需自行拼接状态。"""
-
     if "dayBrief" not in run.planning_json:
         return "dayBrief"
     if run.status == RunStatus.DRAFT.value:
-        return "dayBriefReview"
+        return "dayBrief"
     if run.status == RunStatus.PLANNING_REVIEW.value:
         return "script"
     statuses = {item.status for item in episodes}
     if statuses and statuses <= {"ready"}:
-        return "done"
+        return "review"
     if statuses & {"video_pending", "video_generating", "media_qc", "content_review"}:
         return "video"
-    # 失败的故事板可能还没有产生任何Asset。仅依赖图片资产会让页面退回
-    # “三集剧本”，因此以已经持久化的工作流意图作为阶段事实。
-    if any(
-        item.operation_key in {"image:look", "image:storyboard"} for item in steps
-    ):
-        return "storyboard"
-    storyboards = [
-        item for item in assets if item.role == "storyboard_panel" and item.episode_id is not None
-    ]
-    if storyboards:
-        return "storyboard"
+    if any(item.kind == "video" for item in steps):
+        return "video"
+    if any(item.operation_key in {"image:look", "image:opening_anchor"} for item in steps):
+        return "visual"
     return "script"
 
 
@@ -83,32 +74,33 @@ def _workflow_nodes(
     assets: tuple[Asset, ...],
     reviews: tuple[Review, ...],
 ) -> list[dict[str, Any]]:
-    """生成创作台使用的固定节点投影，不把前端变成第二套状态机。"""
-
-    prompt_ids_by_step: dict[uuid.UUID, list[str]] = {}
+    prompt_ids: dict[uuid.UUID, list[str]] = {}
+    review_ids: dict[uuid.UUID, list[str]] = {}
     for prompt in prompts:
-        prompt_ids_by_step.setdefault(prompt.step_id, []).append(str(prompt.id))
-    review_ids_by_step: dict[uuid.UUID, list[str]] = {}
+        prompt_ids.setdefault(prompt.step_id, []).append(str(prompt.id))
     for review in reviews:
-        review_ids_by_step.setdefault(review.step_id, []).append(str(review.id))
+        review_ids.setdefault(review.step_id, []).append(str(review.id))
 
-    def latest_step(operation_key: str) -> WorkflowStep | None:
-        matches = [item for item in steps if item.operation_key == operation_key]
-        # 局部重规划会开始一组新的媒体attempt，数字可能重新从1开始。
-        # 节点当前态因此必须按真实创建时间选择，不能让旧剧本的attempt=2遮住新剧本的attempt=1。
+    def latest(operation_key: str, episode_id: uuid.UUID | None = None) -> WorkflowStep | None:
+        matches = [
+            item
+            for item in steps
+            if item.operation_key == operation_key
+            and (episode_id is None or item.episode_id == episode_id)
+        ]
         return max(matches, key=lambda item: item.created_at, default=None)
 
-    def step_node(
+    def node(
         *,
         node_id: str,
         node_type: str,
-        slot: str | None,
         label: str,
         step: WorkflowStep | None,
+        slot: str | None = None,
         node_assets: tuple[Asset, ...] = (),
-        provider_status: str | None = None,
+        status: str | None = None,
         contract_status: str = "not_applicable",
-        semantic_review_status: str = "not_applicable",
+        semantic_status: str = "not_applicable",
     ) -> dict[str, Any]:
         step_payload = None if step is None else step_dict(step)
         attempts = (
@@ -132,390 +124,203 @@ def _workflow_nodes(
             "type": node_type,
             "slot": slot,
             "label": label,
-            "status": "pending" if step is None else step.status,
-            "providerStatus": (
-                provider_status
-                if provider_status is not None
-                else "pending"
-                if step is None
-                else step.status
-            ),
+            "status": status or ("pending" if step is None else step.status),
+            "providerStatus": "pending" if step is None else step.status,
             "contractStatus": contract_status,
-            "semanticReviewStatus": semantic_review_status,
+            "semanticReviewStatus": semantic_status,
             "stepId": None if step is None else str(step.id),
-            "promptIds": [] if step is None else prompt_ids_by_step.get(step.id, []),
+            "promptIds": [] if step is None else prompt_ids.get(step.id, []),
             "assetIds": [str(item.id) for item in node_assets],
-            "reviewIds": [] if step is None else review_ids_by_step.get(step.id, []),
+            "reviewIds": [] if step is None else review_ids.get(step.id, []),
             "error": None if step_payload is None else step_payload["error"],
             "nextAction": None if step_payload is None else step_payload["nextAction"],
-            "availableActions": (
-                [] if step_payload is None else step_payload["availableActions"]
-            ),
+            "availableActions": [] if step_payload is None else step_payload["availableActions"],
             "attempts": attempts,
         }
 
-    def latest_review(
-        step: WorkflowStep | None,
-        *,
-        phase: str | None = None,
-    ) -> Review | None:
+    def director_state(step: WorkflowStep | None) -> tuple[str, str]:
         if step is None:
-            return None
-        matches = [item for item in reviews if item.step_id == step.id]
-        if phase is not None:
-            matches = [item for item in matches if item.evidence_json.get("phase") == phase]
-        return max(matches, key=lambda item: item.created_at, default=None)
-
-    def director_contract_status(step: WorkflowStep | None) -> str:
-        if step is None:
-            return "pending"
+            return "pending", "pending"
         if (step.error_json or {}).get("code") == "invalid_director_output":
-            return "rejected"
-        if step.status == "succeeded":
-            return "parsed"
-        return "not_available"
+            return "succeeded", "rejected"
+        return step.status, "parsed" if step.status == "succeeded" else "not_available"
 
-    def director_provider_status(step: WorkflowStep | None) -> str:
-        if step is None:
-            return "pending"
-        # invalid_director_output说明Ark已经返回了响应，只是本地契约解析拒绝。
-        if (step.error_json or {}).get("code") == "invalid_director_output":
-            return "succeeded"
-        return step.status
-
-    day_step = latest_step("director:day")
+    day_step = latest("director:day")
+    provider, contract = director_state(day_step)
     nodes = [
-        step_node(
-            node_id="director:day",
-            node_type="director",
-            slot=None,
-            label="全天总导演",
-            step=day_step,
-            provider_status=director_provider_status(day_step),
-            contract_status=director_contract_status(day_step),
-        )
+        {
+            **node(
+                node_id="director:day",
+                node_type="director",
+                label="全天总导演",
+                step=day_step,
+                contract_status=contract,
+            ),
+            "providerStatus": provider,
+        }
     ]
     episodes_by_slot = {item.slot: item for item in episodes}
     for slot_item in Slot:
         slot = slot_item.value
         episode = episodes_by_slot.get(slot)
-        episode_assets = (
-            ()
-            if episode is None
-            else tuple(item for item in assets if item.episode_id == episode.id)
+        episode_id = None if episode is None else episode.id
+        episode_assets = tuple(
+            item for item in assets if episode_id is not None and item.episode_id == episode_id
         )
-        director_step = latest_step(f"director:episode:{slot}")
-        contract_status = director_contract_status(director_step)
-        contract_review = latest_review(director_step, phase="episode_contract")
-        semantic_status = (
-            contract_review.decision
-            if contract_review is not None
-            else "approved"
-            if director_step is not None
-            and director_step.status == "succeeded"
-            and episode is not None
-            else "pending"
-        )
-        video_steps = [
-            item
-            for item in steps
-            if episode is not None
-            and item.episode_id == episode.id
-            and item.operation_key == "video:single_pass"
-        ]
-        video_step = None
-        if episode is not None and episode.selected_video_asset_id is not None:
-            # 已通过人工审核的成片是Episode的正式选择。即使其后存在失败尝试，
-            # 顶部流程和审核节点也必须展示该资产的真实生产Step。
-            selected_video = next(
-                (
-                    item
-                    for item in episode_assets
-                    if item.id == episode.selected_video_asset_id
-                    and item.role == "video"
-                ),
-                None,
-            )
-            if selected_video is not None:
-                video_step = next(
-                    (
-                        item
-                        for item in video_steps
-                        if item.id == selected_video.producing_step_id
-                    ),
-                    None,
-                )
-        if video_step is None:
-            video_step = max(
-                video_steps,
-                key=lambda item: item.created_at,
-                default=None,
-            )
-        storyboard_steps = [
-            item
-            for item in steps
-            if item.operation_key == "image:storyboard"
-            and episode is not None
-            and item.episode_id == episode.id
-        ]
-        storyboard_step = None
-        if video_step is not None:
-            # 节点图优先展示当前视频实际消费的故事板血缘，而不是时间上更晚、
-            # 但生成失败或被拒绝的尝试。这样Prompt、面板和成片证据始终对应。
-            consumed_asset_ids = {
-                str(item)
-                for item in video_step.input_snapshot_json.get("input_asset_ids", ())
-            }
-            producing_step_ids = {
-                item.producing_step_id
-                for item in episode_assets
-                if item.role == "storyboard_panel"
-                and str(item.id) in consumed_asset_ids
-                and item.producing_step_id is not None
-            }
-            if len(producing_step_ids) == 1:
-                consumed_step_id = next(iter(producing_step_ids))
-                storyboard_step = next(
-                    (
-                        item
-                        for item in storyboard_steps
-                        if item.id == consumed_step_id
-                    ),
-                    None,
-                )
-        if storyboard_step is None:
-            storyboard_step = max(
-                storyboard_steps,
-                key=lambda item: item.created_at,
-                default=None,
-            )
-        look_steps = [
-            item
-            for item in steps
-            if item.operation_key == "image:look"
-            and episode is not None
-            and item.episode_id == episode.id
-        ]
-        look_step = max(look_steps, key=lambda item: item.created_at, default=None)
-        looks = tuple(
-            item
-            for item in episode_assets
-            if item.role == "look_reference"
-            and look_step is not None
-            and item.producing_step_id == look_step.id
-        )
-        if not looks and storyboard_step is not None:
-            reference_ids = {
-                str(item)
-                for item in storyboard_step.input_snapshot_json.get(
-                    "reference_asset_ids", ()
-                )
-            }
-            looks = tuple(
-                item
-                for item in assets
-                if item.role == "look_reference" and str(item.id) in reference_ids
-            )
-        storyboards = tuple(
-            item
-            for item in episode_assets
-            if item.role == "storyboard_panel"
-            and storyboard_step is not None
-            and item.producing_step_id == storyboard_step.id
-        )
-        videos = tuple(
-            item
-            for item in episode_assets
-            if item.role == "video"
-            and video_step is not None
-            and item.producing_step_id == video_step.id
-        )
-        # 逐镜头生成的镜头级节点：每个video:shot:{n}步骤一个节点，
-        # 附带片段资产与真实尾帧锚点，前端据此展示分镜进度与审核入口。
-        latest_shot_steps: dict[str, WorkflowStep] = {}
-        for item in steps:
-            if (
-                episode is not None
-                and item.episode_id == episode.id
-                and item.operation_key.startswith("video:shot:")
-            ):
-                latest_shot_steps[item.operation_key] = item
-        shot_nodes = []
-        for operation_key in sorted(latest_shot_steps):
-            shot_order = operation_key.rsplit(":", 1)[1]
-            shot_step = latest_shot_steps[operation_key]
-            clip = next(
-                (
-                    item
-                    for item in episode_assets
-                    if item.role == "video_shot"
-                    and item.semantic_key == f"shot_clip:{shot_order}"
-                    and item.producing_step_id == shot_step.id
-                ),
-                next(
-                    (
-                        item
-                        for item in episode_assets
-                        if item.role == "video_shot"
-                        and item.semantic_key == f"shot_clip:{shot_order}"
-                    ),
-                    None,
-                ),
-            )
-            tail = next(
-                (
-                    item
-                    for item in episode_assets
-                    if item.role == "shot_tail_frame"
-                    and item.semantic_key == f"shot_tail:{shot_order}"
-                ),
-                None,
-            )
-            shot_nodes.append(
-                step_node(
-                    node_id=f"shot:{slot}:{shot_order}",
-                    node_type="video_shot",
-                    slot=slot,
-                    label=f"{slot}镜头{shot_order}",
-                    step=shot_step,
-                    node_assets=tuple(
-                        item for item in (clip, tail) if item is not None
-                    ),
-                )
-            )
-        director_node = step_node(
+        director = latest(f"director:episode:{slot}")
+        provider, contract = director_state(director)
+        director_node = node(
             node_id=f"director:{slot}",
             node_type="director",
             slot=slot,
             label=f"{slot}导演",
-            step=director_step,
-            provider_status=director_provider_status(director_step),
-            contract_status=contract_status,
-            semantic_review_status=semantic_status,
+            step=director,
+            contract_status=contract,
+            semantic_status=("approved" if contract == "parsed" and episode else "pending"),
         )
-        if contract_status == "rejected" or semantic_status == "rejected":
+        director_node["providerStatus"] = provider
+        if contract == "rejected":
             director_node["status"] = "planning_rejected"
-            director_node["nextAction"] = "查看契约或语义原因后显式重规划本时段"
-        storyboard_status = (
-            "approved"
-            if len(storyboards) in {3, 4}
-            and all(item.status in {"approved", "ready"} for item in storyboards)
-            else "rejected"
-            if any(item.status == "rejected" for item in storyboards)
-            else "pending"
-        )
-        storyboard_review_status = storyboard_status
-        storyboard_semantic_status = storyboard_status
-        storyboard_review = latest_review(storyboard_step)
-        storyboard_provider_status = (
-            "succeeded"
-            if storyboard_step is not None and len(storyboards) in {3, 4}
-            else None
-        )
-        if storyboard_review is not None:
-            # Storyboard Step最终可能因语义拒绝而写成failed，但Provider事实上已经成功
-            # 返回并落盘了全部面板。节点必须把“生成成功”和“审核拒绝”分开展示。
-            storyboard_review_status = storyboard_review.decision
-            storyboard_semantic_status = storyboard_review.decision
-        elif storyboard_step is not None and storyboard_step.status in {
-            "failed",
-            "expired",
-            "cancelled",
-            "submission_unknown",
-        }:
-            # 生成未完成时语义审核根本没有发生。审核节点继承上游失败，
-            # 但不能再谎报为pending或已经得到语义结论。
-            storyboard_review_status = storyboard_step.status
-            storyboard_semantic_status = "not_started"
-        content_status = (
-            "approved"
-            if any(item.status == "ready" for item in videos)
-            else "rejected"
-            if any(item.status == "rejected" for item in videos)
-            else "pending"
-        )
-        content_review_status = content_status
-        content_semantic_status = content_status
-        if video_step is not None and video_step.status in {
-            "failed",
-            "expired",
-            "cancelled",
-            "submission_unknown",
-        }:
-            content_review_status = video_step.status
-            content_semantic_status = "not_started"
-        nodes.extend(
-            (
-                director_node,
-                {
-                    **step_node(
+            director_node["nextAction"] = "查看契约原因后显式重规划本时段"
+        nodes.append(director_node)
+        if episode is None:
+            nodes.extend(
+                (
+                    node(
                         node_id=f"look:{slot}",
                         node_type="look",
                         slot=slot,
                         label=f"{slot}定妆图",
-                        step=look_step,
-                        node_assets=looks,
-                        semantic_review_status=(
-                            "approved"
-                            if any(item.status in {"approved", "ready"} for item in looks)
-                            else "rejected"
-                            if any(item.status == "rejected" for item in looks)
-                            else "pending"
-                        ),
+                        step=None,
                     ),
-                    # 中午、傍晚可以复用上午定妆图，此时没有属于当前Episode的
-                    # Image Step；资产已经批准仍应显示成功，而不是误导为待处理。
-                    "status": (
-                        "approved"
-                        if any(item.status in {"approved", "ready"} for item in looks)
-                        else "rejected"
-                        if any(item.status == "rejected" for item in looks)
-                        else "pending"
-                    ),
-                },
-                step_node(
-                    node_id=f"storyboard:{slot}",
-                    node_type="storyboard",
-                    slot=slot,
-                    label=f"{slot}故事板",
-                    step=storyboard_step,
-                    node_assets=storyboards,
-                    provider_status=storyboard_provider_status,
-                ),
-                {
-                    **step_node(
-                        node_id=f"storyboard-review:{slot}",
-                        node_type="storyboard_review",
+                    node(
+                        node_id=f"opening-anchor:{slot}",
+                        node_type="opening_anchor",
                         slot=slot,
-                        label=f"{slot}故事板审核",
-                        step=storyboard_step,
-                        node_assets=storyboards,
-                        provider_status=storyboard_provider_status,
-                        semantic_review_status=storyboard_semantic_status,
+                        label=f"{slot}开场锚点",
+                        step=None,
                     ),
-                    "status": storyboard_review_status,
-                },
-                *shot_nodes,
-                step_node(
-                    node_id=f"video:{slot}",
-                    node_type="video",
-                    slot=slot,
-                    label=f"{slot}视频",
-                    step=video_step,
-                    node_assets=videos,
-                ),
-                {
-                    **step_node(
+                    node(
+                        node_id=f"video:{slot}:1",
+                        node_type="video",
+                        slot=slot,
+                        label=f"{slot}视频",
+                        step=None,
+                    ),
+                    node(
                         node_id=f"content-review:{slot}",
                         node_type="content_review",
                         slot=slot,
                         label=f"{slot}内容审核",
-                        step=video_step,
-                        node_assets=videos,
-                        semantic_review_status=content_semantic_status,
+                        step=None,
                     ),
-                    "status": content_review_status,
-                },
+                )
+            )
+            continue
+        for operation_key, role, node_type, label in (
+            ("image:look", "look_reference", "look", f"{slot}定妆图"),
+            ("image:opening_anchor", "opening_anchor", "opening_anchor", f"{slot}开场锚点"),
+        ):
+            operation_steps = tuple(
+                item
+                for item in steps
+                if item.operation_key == operation_key and item.episode_id == episode.id
+            )
+            approved_assets = tuple(
+                item
+                for item in episode_assets
+                if item.role == role and item.status in {"approved", "ready"}
+            )
+            # 当前节点优先展示真正可供生产使用的批准资产；较晚的失败尝试仍完整
+            # 出现在 attempts 中，但不能把一个已经可继续的视频节点伪装成 rejected。
+            effective_asset = max(
+                approved_assets,
+                key=lambda item: item.created_at,
+                default=None,
+            )
+            step = (
+                next(
+                    (
+                        item
+                        for item in operation_steps
+                        if effective_asset is not None
+                        and item.id == effective_asset.producing_step_id
+                    ),
+                    None,
+                )
+                or latest(operation_key, episode.id)
+            )
+            node_assets = tuple(
+                item
+                for item in episode_assets
+                if item.role == role and step is not None and item.producing_step_id == step.id
+            )
+            semantic = (
+                "approved"
+                if any(item.status in {"approved", "ready"} for item in node_assets)
+                else "rejected"
+                if any(item.status == "rejected" for item in node_assets)
+                else "pending"
+            )
+            nodes.append(
+                node(
+                    node_id=f"{node_type.replace('_', '-')}:{slot}",
+                    node_type=node_type,
+                    slot=slot,
+                    label=label,
+                    step=step,
+                    node_assets=node_assets,
+                    status=None if semantic == "pending" else semantic,
+                    semantic_status=semantic,
+                )
+            )
+        render_plan = build_render_plan(
+            EpisodePlan(slot=slot_item, script=EpisodeScript.model_validate(episode.script_json))
+        )
+        final_video_assets: tuple[Asset, ...] = ()
+        final_video_step: WorkflowStep | None = None
+        for section in render_plan.sections:
+            operation_key = (
+                "video:single_pass" if section.order == 1 else f"video:extend:{section.order}"
+            )
+            step = latest(operation_key, episode.id)
+            node_assets = tuple(
+                item
+                for item in episode_assets
+                if step is not None
+                and item.producing_step_id == step.id
+                and item.media_type == "video"
+            )
+            nodes.append(
+                node(
+                    node_id=f"video:{slot}:{section.order}",
+                    node_type="video" if section.order == 1 else "video_extension",
+                    slot=slot,
+                    label=(f"{slot}视频" if section.order == 1 else f"{slot}延展{section.order}"),
+                    step=step,
+                    node_assets=node_assets,
+                )
+            )
+            if section.order == len(render_plan.sections):
+                final_video_assets = tuple(item for item in node_assets if item.role == "video")
+                final_video_step = step
+        content_status = (
+            "approved"
+            if any(item.status == "ready" for item in final_video_assets)
+            else "rejected"
+            if any(item.status == "rejected" for item in final_video_assets)
+            else "pending"
+        )
+        nodes.append(
+            node(
+                node_id=f"content-review:{slot}",
+                node_type="content_review",
+                slot=slot,
+                label=f"{slot}内容审核",
+                step=final_video_step,
+                node_assets=final_video_assets,
+                status=None if content_status == "pending" else content_status,
+                semantic_status=content_status,
             )
         )
     return nodes
@@ -526,8 +331,6 @@ def required_record(
     model: type[Any],
     record_id: uuid.UUID,
 ) -> Any:
-    """把SQLAlchemy的空结果转换为稳定的领域错误。"""
-
     row = session.get(model, record_id)
     if row is None:
         raise RecordNotFoundError(f"{model.__name__} {record_id} 不存在")
@@ -535,7 +338,7 @@ def required_record(
 
 
 class SqlAlchemyReadRepository:
-    """为QueryService提供统一只读投影。"""
+    """为 QueryService 提供统一只读投影。"""
 
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._sessions = session_factory
@@ -563,49 +366,28 @@ class SqlAlchemyReadRepository:
             assets = tuple(
                 session.execute(select(Asset).where(Asset.production_run_id == run_id)).scalars()
             )
-            episode_payloads = [episode_dict(item) for item in episodes]
-            contradictions = [
-                issue for episode in episode_payloads for issue in episode["contradictions"]
-            ]
             payload = run_dict(run)
             payload.update(
                 {
-                    "worldConsistencyStatus": (
-                        "contradictory"
-                        if contradictions
-                        else "consistent"
-                        if len(episode_payloads) == 3
-                        else "not_available"
-                    ),
-                    "contradictions": contradictions,
                     "dayBrief": run.planning_json.get("dayBrief"),
                     "episodeDrafts": run.planning_json.get("episodeDrafts", {}),
                     "planningMetadata": run.planning_json.get("planningMetadata", {}),
-                    "currentStage": _current_stage(run, episodes, steps, assets),
+                    "currentStage": _current_stage(run, episodes, steps),
                 }
             )
             return {
                 "run": payload,
-                "episodes": episode_payloads,
+                "episodes": [episode_dict(item) for item in episodes],
                 "steps": [step_dict(item) for item in steps],
                 "prompts": [prompt_dict(item) for item in prompts],
                 "assets": [asset_dict(item) for item in assets],
                 "reviews": [review_dict(item) for item in reviews],
-                "workflowNodes": _workflow_nodes(
-                    episodes,
-                    steps,
-                    prompts,
-                    assets,
-                    reviews,
-                ),
+                "workflowNodes": _workflow_nodes(episodes, steps, prompts, assets, reviews),
             }
 
     def get_planning_context(self, run_id: uuid.UUID) -> dict[str, Any]:
-        """返回导演与创意档案的持久化上下文，不在查询层重建默认值。"""
-
         with self._sessions() as session:
-            run = required_record(session, ProductionRun, run_id)
-            return dict(run.planning_json or {})
+            return dict(required_record(session, ProductionRun, run_id).planning_json or {})
 
     @staticmethod
     def _rows_for_steps(
@@ -615,10 +397,9 @@ class SqlAlchemyReadRepository:
     ) -> tuple[Any, ...]:
         if not step_ids:
             return ()
-        order = model.created_at
         return tuple(
             session.execute(
-                select(model).where(model.step_id.in_(step_ids)).order_by(order)
+                select(model).where(model.step_id.in_(step_ids)).order_by(model.created_at)
             ).scalars()
         )
 
@@ -626,10 +407,7 @@ class SqlAlchemyReadRepository:
         with self._sessions() as session:
             rows = session.execute(
                 select(ProductionRun)
-                .order_by(
-                    ProductionRun.content_date.desc(),
-                    ProductionRun.created_at.desc(),
-                )
+                .order_by(ProductionRun.content_date.desc(), ProductionRun.created_at.desc())
                 .limit(limit)
                 .offset(offset)
             ).scalars()
@@ -640,10 +418,8 @@ class SqlAlchemyReadRepository:
         *,
         limit: int,
     ) -> tuple[RecentContentSummary, ...]:
-        """只使用已批准或交付Run的结构化字段进行选题冷却。"""
-
         if not 1 <= limit <= 6:
-            raise ValueError("近期内容摘要limit必须在1至6之间")
+            raise ValueError("近期内容摘要 limit 必须在 1 至 6 之间")
         with self._sessions() as session:
             runs = tuple(
                 session.execute(
@@ -651,10 +427,7 @@ class SqlAlchemyReadRepository:
                     .where(
                         ProductionRun.status.in_((RunStatus.READY.value, RunStatus.DELIVERED.value))
                     )
-                    .order_by(
-                        ProductionRun.content_date.desc(),
-                        ProductionRun.created_at.desc(),
-                    )
+                    .order_by(ProductionRun.content_date.desc(), ProductionRun.created_at.desc())
                     .limit(limit)
                 ).scalars()
             )
@@ -670,31 +443,18 @@ class SqlAlchemyReadRepository:
                 if len(rows) != 3:
                     continue
                 scripts = [EpisodeScript.model_validate(row.script_json) for row in rows]
-                keys = tuple(
+                elements = tuple(
                     dict.fromkeys(
-                        entity.entity_key
-                        for script in scripts
-                        for entity in script.continuity.entities
-                        if entity.kind.value == "prop"
+                        prop.entity_key for script in scripts for prop in script.critical_props
                     )
-                )
-                raw_patterns = (
-                    run.planning_json.get("planningMetadata", {}).get("storyPatterns", {})
-                )
-                pattern_ids = tuple(
-                    value.get("pattern_id", value.get("patternId", ""))
-                    if isinstance(value, dict)
-                    else str(value)
-                    for value in raw_patterns.values()
-                    if value
                 )
                 result.append(
                     RecentContentSummary(
                         content_date=run.content_date,
                         event_keys=tuple(item.event_key for item in scripts),
                         location_keys=tuple(item.location_key for item in scripts),
-                        element_keys=keys,
-                        pattern_ids=tuple(item for item in pattern_ids if item),
+                        element_keys=elements,
+                        pattern_ids=tuple(item.story_pattern.value for item in scripts),
                         summary_text=(
                             f"{run.content_date.isoformat()}主题="
                             f"{run.planning_json.get('dayBrief', {}).get('theme', '')}；"
@@ -721,15 +481,12 @@ class SqlAlchemyReadRepository:
         with self._sessions() as session:
             row = session.execute(
                 select(PromptRecord)
-                .where(
-                    PromptRecord.step_id == step_id,
-                    PromptRecord.purpose == purpose.value,
-                )
+                .where(PromptRecord.step_id == step_id, PromptRecord.purpose == purpose.value)
                 .order_by(PromptRecord.created_at.desc())
             ).scalar_one_or_none()
             if row is None:
                 raise RecordNotFoundError(
-                    f"Step {step_id}不存在purpose={purpose.value!r}的Prompt"
+                    f"Step {step_id} 不存在 purpose={purpose.value!r} 的 Prompt"
                 )
             return stored_prompt(row)
 
@@ -758,14 +515,13 @@ class SqlAlchemyReadRepository:
 
     def delivery_package_detail(self, package_id: uuid.UUID) -> dict[str, Any]:
         with self._sessions() as session:
-            row = required_record(session, DeliveryPackage, package_id)
-            return self._delivery_dict(session, row)
+            return self._delivery_dict(
+                session,
+                required_record(session, DeliveryPackage, package_id),
+            )
 
     @staticmethod
-    def _delivery_dict(
-        session: Session,
-        package: DeliveryPackage,
-    ) -> dict[str, Any]:
+    def _delivery_dict(session: Session, package: DeliveryPackage) -> dict[str, Any]:
         items = tuple(
             session.execute(
                 select(DeliveryItem)

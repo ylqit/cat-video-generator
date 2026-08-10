@@ -38,7 +38,6 @@ from .api_schemas import (
 from .api_schemas import (
     DeriveCropRequest,
     GenerateRequest,
-    GenerateStoryboardsRequest,
     PaidRequest,
     PlanRequest,
     PromptOverridesRequest,
@@ -50,7 +49,7 @@ from .api_schemas import (
 from .api_studio import (
     build_plan_payload,
     chain_after_planning,
-    maybe_continue_video,
+    maybe_continue_media,
 )
 from .jobs import JobRegistry
 
@@ -83,10 +82,10 @@ def create_write_router(
         settings = (
             PipelineSettings.model_validate(request.pipeline_settings)
             if request.pipeline_settings
-            # 未显式给流水线开关时，故事板自动推进，视频等待人工确认。
+            # 未显式给流水线开关时，视觉锚点自动推进，视频等待人工确认。
             else PipelineSettings(
                 allow_paid_generation=True,
-                storyboard=StageMode.AUTO,
+                visual=StageMode.AUTO,
                 video=StageMode.MANUAL,
             )
         )
@@ -109,6 +108,7 @@ def create_write_router(
                 stop_after_day_brief=settings.day_brief is StageMode.MANUAL,
                 pipeline_settings=settings,
                 story_mode=request.story_mode,
+                creative_controls=request.creative_controls,
             )
             payload = build_plan_payload(result)
             if isinstance(result, DayBriefPause):
@@ -174,9 +174,9 @@ def create_write_router(
             )
         )
         if request.approve:
-            # 故事板整组批准后按流水线开关自动续跑该集视频；manual不触发。
+            # 定妆图或开场锚点批准后按流水线设置推进；最终视频仍由人工审核。
             await asyncio.to_thread(
-                lambda: maybe_continue_video(
+                lambda: maybe_continue_media(
                     queries=queries,
                     production=production,
                     job_registry=job_registry,
@@ -506,15 +506,15 @@ def create_write_router(
         )
         return {"episodeId": str(episode_id), "saved": True}
 
-    @router.post("/episodes/{episode_id}/storyboards", status_code=202)
-    def generate_storyboards(
+    @router.post("/episodes/{episode_id}/visuals", status_code=202)
+    def generate_visuals(
         episode_id: uuid.UUID,
-        request: GenerateStoryboardsRequest,
+        request: PaidRequest,
     ) -> dict[str, Any]:
         if not request.allow_paid_generation:
             raise HTTPException(
                 status_code=422,
-                detail="故事板生成调用付费模型，必须显式确认allowPaidGeneration",
+                detail="视觉锚点生成调用付费模型，必须显式确认allowPaidGeneration",
             )
         try:
             episode = queries.episode(episode_id)
@@ -522,26 +522,24 @@ def create_write_router(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         run_id = uuid.UUID(episode["runId"])
         slot = Slot(episode["slot"])
-        overrides = request.overrides
 
         def task() -> dict[str, Any]:
-            return production.prepare_storyboards_only(
+            return production.prepare_visuals_only(
                 run_id,
                 slot=slot,
-                prompt_overrides=(None if overrides is None else {slot.value: overrides}),
                 allow_paid_generation=True,
             )
 
         record = _submit(
             job_registry,
-            kind="prepare_storyboard",
-            dedup_key=f"storyboard:{episode_id}",
+            kind="prepare_visuals",
+            dedup_key=f"visuals:{episode_id}",
             fn=task,
             context={
                 "runId": run_id,
                 "episodeId": episode_id,
                 "slot": slot.value,
-                "operationKey": "image:storyboard",
+                "operationKey": "image:look",
             },
         )
         return _accepted(record)

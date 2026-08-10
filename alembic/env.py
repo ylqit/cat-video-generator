@@ -56,9 +56,7 @@ def run_migrations_online() -> None:
     engine = create_database_engine(settings, DatabaseOperation.MIGRATION)
     try:
         with engine.connect() as connection:
-            quoted_schema = connection.dialect.identifier_preparer.quote_schema(
-                settings.schema
-            )
+            quoted_schema = connection.dialect.identifier_preparer.quote_schema(settings.schema)
             connection.execute(text(f"CREATE SCHEMA IF NOT EXISTS {quoted_schema}"))
             connection.commit()
             _run_migrations(connection, settings.schema)

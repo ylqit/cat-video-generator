@@ -3,124 +3,42 @@ import { ElMessage } from "element-plus";
 import { computed, reactive, ref, watch } from "vue";
 
 import { api, ApiError } from "../api/client";
-import type { EpisodeDto } from "../api/types";
+import type { EpisodeDto, EpisodeScript } from "../api/types";
 
-const props = defineProps<{
-  episode: EpisodeDto;
-  /** 只有尚未进入收费生产的脚本才允许编辑。 */
-  editable: boolean;
-}>();
+const props = defineProps<{ episode: EpisodeDto; editable: boolean }>();
 const emit = defineEmits<{ saved: [] }>();
+const draft = reactive<EpisodeScript>(structuredClone(props.episode.script));
+const loaded = ref("");
+const saving = ref(false);
+const errors = ref<string[]>([]);
 
-interface ActionDraft {
-  order: number;
-  action: string;
-  visible_result: string;
-}
-
-interface ShotDraft {
-  order: number;
-  framing: string;
-  direction: string;
-}
-
-const draft = reactive({
-  title: "",
-  main_event: "",
-  scene: "",
-  ending: "",
-  sound_design: "",
-  ending_visual_critical: false,
-  duration_seconds: 9,
-  style_context: "indoor" as "indoor" | "outdoor",
-  actions: [] as ActionDraft[],
-  shots: [] as ShotDraft[],
-});
-
-const loadedDraftSnapshot = ref("");
-
-function currentDraftSnapshot(): string {
-  return JSON.stringify(draft);
-}
-
+function snapshot() { return JSON.stringify(draft); }
 function reset() {
-  const script = props.episode.script;
-  draft.title = script.title;
-  draft.main_event = script.main_event;
-  draft.scene = script.scene;
-  draft.ending = script.ending.result;
-  draft.sound_design = script.sound_design;
-  draft.ending_visual_critical = script.ending.visual_critical;
-  draft.duration_seconds = script.duration_seconds;
-  draft.style_context = script.style_context;
-  draft.actions = script.actions.map((item) => ({
-    order: item.order,
-    action: item.action,
-    visible_result: item.visible_result,
-  }));
-  draft.shots = script.shots.map((item) => ({
-    order: item.order,
-    framing: item.framing,
-    direction: item.direction,
-  }));
-  loadedDraftSnapshot.value = currentDraftSnapshot();
+  Object.assign(draft, structuredClone(props.episode.script));
+  loaded.value = snapshot();
 }
 watch(
   () => props.episode.script,
   () => {
-    // 轮询或重规划会在同一Episode ID下替换脚本。只有用户尚未编辑时才同步
-    // 后端新版本，避免旧草稿遮住真实数据，也不覆盖尚未保存的输入。
-    if (
-      !loadedDraftSnapshot.value ||
-      currentDraftSnapshot() === loadedDraftSnapshot.value
-    ) {
-      reset();
-    }
+    if (!loaded.value || snapshot() === loaded.value) reset();
   },
   { deep: true, immediate: true },
 );
 
-const saving = ref(false);
-const errors = ref<string[]>([]);
+const durationBand = computed(() =>
+  draft.duration_seconds <= 15 ? "短片" : draft.duration_seconds <= 30 ? "中片·一次延展" : "长片·两次延展",
+);
 
-const readonlyMeta = computed(() => {
-  const script = props.episode.script;
-  return `事件键 ${script.event_key} · 地点键 ${script.location_key} · 服饰 ${script.appearance.description}`;
-});
-
-/** 合并可编辑字段后整体提交，连续性账本等未展示字段保持原样。 */
 async function save() {
   saving.value = true;
   errors.value = [];
   try {
-    const script = props.episode.script;
-    const payload = {
-      ...script,
-      title: draft.title,
-      main_event: draft.main_event,
-      scene: draft.scene,
-      ending: {
-        ...script.ending,
-        result: draft.ending,
-        visual_critical: draft.ending_visual_critical,
-      },
-      sound_design: draft.sound_design,
-      duration_seconds: draft.duration_seconds,
-      style_context: draft.style_context,
-      actions: script.actions.map((item) => {
-        const edited = draft.actions.find((action) => action.order === item.order);
-        return edited ? { ...item, ...edited } : item;
-      }),
-      shots: script.shots.map((item) => {
-        const edited = draft.shots.find((shot) => shot.order === item.order);
-        return edited ? { ...item, ...edited } : item;
-      }),
-    };
-    const result = await api.updateScript(props.episode.id, payload);
+    const result = await api.updateScript(props.episode.id, structuredClone(draft));
+    loaded.value = snapshot();
     ElMessage.success(
       result.promptOverridesKept
-        ? "剧本已保存；现有 Prompt 覆盖仍然保留，请确认其是否仍适用"
-        : "剧本已保存，下游故事板和视频 Prompt 将按新版本重新编译",
+        ? "剧本已保存；请确认既有Prompt覆盖仍适用"
+        : "剧本已保存，视觉锚点和视频Prompt将按新脚本编译",
     );
     emit("saved");
   } catch (error) {
@@ -129,9 +47,7 @@ async function save() {
       errors.value = Array.isArray(detail?.errors)
         ? detail.errors.map((item) => String(item.msg ?? item))
         : [error.message];
-    } else {
-      errors.value = [String(error)];
-    }
+    } else errors.value = [String(error)];
   } finally {
     saving.value = false;
   }
@@ -141,53 +57,82 @@ async function save() {
 <template>
   <el-form label-width="96px" :disabled="!editable" size="small">
     <el-form-item label="标题"><el-input v-model="draft.title" /></el-form-item>
+    <el-form-item label="观众问题">
+      <el-input v-model="draft.episode_question" type="textarea" :rows="1" />
+    </el-form-item>
     <el-form-item label="主事件">
-      <el-input v-model="draft.main_event" :rows="2" type="textarea" />
+      <el-input v-model="draft.main_event" type="textarea" :rows="2" />
     </el-form-item>
     <el-form-item label="场景">
-      <el-input v-model="draft.scene" :rows="2" type="textarea" />
+      <el-input v-model="draft.scene" type="textarea" :rows="2" />
     </el-form-item>
-    <el-form-item label="场景/时长">
-      <el-radio-group v-model="draft.style_context">
-        <el-radio value="indoor">室内</el-radio>
-        <el-radio value="outdoor">室外</el-radio>
-      </el-radio-group>
-      <el-input-number v-model="draft.duration_seconds" :min="8" :max="15" style="margin-left: 12px" />
-      <span class="muted" style="margin-left: 6px">秒</span>
+    <el-form-item label="活动焦点">
+      <el-select v-model="draft.activity_focus" style="width: 180px">
+        <el-option label="猫咪主活动" value="cat_lead" />
+        <el-option label="人物主活动" value="person_lead" />
+        <el-option label="人猫平衡" value="balanced" />
+      </el-select>
+      <el-input-number v-model="draft.duration_seconds" :min="8" :max="45" style="margin-left: 12px" />
+      <span class="muted" style="margin-left: 8px">秒 · {{ durationBand }}</span>
     </el-form-item>
+    <el-form-item label="主活动">
+      <el-input v-model="draft.relationship_arc.lead_activity" type="textarea" :rows="1" />
+    </el-form-item>
+    <el-form-item label="副活动">
+      <el-input v-model="draft.relationship_arc.secondary_activity" type="textarea" :rows="1" />
+    </el-form-item>
+    <el-form-item label="关系汇合">
+      <el-input v-model="draft.relationship_arc.convergence" type="textarea" :rows="1" />
+    </el-form-item>
+    <el-form-item label="人物定妆">
+      <el-input v-model="draft.appearance.description" type="textarea" :rows="2" />
+    </el-form-item>
+
+    <el-divider content-position="left">动作阶段</el-divider>
     <el-form-item v-for="action in draft.actions" :key="action.order" :label="`动作${action.order}`">
-      <el-input v-model="action.action" :rows="1" type="textarea" />
-      <el-input v-model="action.visible_result" :rows="1" type="textarea" placeholder="可见结果" style="margin-top: 4px" />
+      <el-select v-model="action.actor_id" style="width: 105px">
+        <el-option label="猫咪" value="cat" />
+        <el-option label="人物" value="person" />
+        <el-option label="环境" value="environment" />
+        <el-option v-if="draft.guest" :label="draft.guest.name" :value="draft.guest.id" />
+      </el-select>
+      <el-input v-model="action.action" type="textarea" :rows="1" style="margin-top: 5px" />
+      <el-input v-model="action.visible_result" type="textarea" :rows="1" placeholder="动作后的可见结果" style="margin-top: 5px" />
     </el-form-item>
+
+    <el-divider content-position="left">文字镜头设计</el-divider>
     <el-form-item v-for="shot in draft.shots" :key="shot.order" :label="`镜头${shot.order}`">
-      <el-input v-model="shot.framing" placeholder="景别" style="width: 120px" />
-      <el-input v-model="shot.direction" :rows="1" type="textarea" placeholder="镜头指引" style="margin-top: 4px" />
+      <div style="display: flex; gap: 8px; width: 100%">
+        <el-input v-model="shot.framing" placeholder="景别/机位" style="width: 180px" />
+        <el-select v-model="shot.camera_move" style="width: 130px">
+          <el-option label="固定" value="fixed" />
+          <el-option label="跟拍" value="follow" />
+          <el-option label="推近" value="push" />
+          <el-option label="拉远" value="pull" />
+          <el-option label="摇摄" value="pan" />
+          <el-option label="横移" value="track" />
+        </el-select>
+        <span class="muted">动作 {{ shot.action_orders.join(", ") }}</span>
+      </div>
+      <el-input v-model="shot.direction" type="textarea" :rows="2" placeholder="主体位置、动作路径、结果与稳定切点" style="margin-top: 5px" />
     </el-form-item>
-    <el-form-item label="结尾结果">
-      <el-input v-model="draft.ending" :rows="2" type="textarea" />
-      <el-checkbox v-model="draft.ending_visual_critical" style="margin-top: 6px">
-        结尾画面必须精确（视频仅使用首张和末张故事板作为严格帧输入）
-      </el-checkbox>
+
+    <el-form-item label="结尾回报">
+      <el-input v-model="draft.ending.result" type="textarea" :rows="2" />
     </el-form-item>
     <el-form-item label="声音设计">
-      <el-input
-        v-model="draft.sound_design"
-        :rows="2"
-        type="textarea"
-        placeholder="环境底声、关键动作声与结尾声音回报；无对白、旁白或歌词"
-      />
+      <el-input v-model="draft.sound_design" type="textarea" :rows="2" />
     </el-form-item>
-    <el-form-item label="只读信息"><span class="muted">{{ readonlyMeta }}</span></el-form-item>
     <el-alert v-if="errors.length" type="error" :closable="false" style="margin-bottom: 10px">
       <div v-for="(item, index) in errors" :key="index">{{ item }}</div>
     </el-alert>
     <el-form-item v-if="editable">
-      <el-button type="primary" :loading="saving" @click="save">保存剧本编辑</el-button>
-      <span class="muted" style="margin-left: 10px">保存后已有故事板将因输入哈希变化而不再复用。</span>
+      <el-button type="primary" :loading="saving" @click="save">保存时段脚本</el-button>
+      <span class="muted" style="margin-left: 10px">长片会按8–15秒区段使用官方视频延展。</span>
     </el-form-item>
   </el-form>
 </template>
 
 <style scoped>
-.muted { color: #8a8f99; font-size: 12px; }
+.muted { color: #8a8f99; font-size: 12px; line-height: 32px; }
 </style>

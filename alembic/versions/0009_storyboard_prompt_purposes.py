@@ -27,15 +27,18 @@ def _schema() -> str:
 
 
 def _assert_known_purposes(allowed: tuple[str, ...]) -> None:
-    table = sa.table(
-        "prompt_records", sa.column("purpose", sa.String()), schema=_schema()
+    table = sa.table("prompt_records", sa.column("purpose", sa.String()), schema=_schema())
+    unknown = (
+        op.get_bind()
+        .execute(
+            sa.select(table.c.purpose)
+            .select_from(table)
+            .where(table.c.purpose.not_in(allowed))
+            .distinct()
+        )
+        .scalars()
+        .all()
     )
-    unknown = op.get_bind().execute(
-        sa.select(table.c.purpose)
-        .select_from(table)
-        .where(table.c.purpose.not_in(allowed))
-        .distinct()
-    ).scalars().all()
     if unknown:
         raise RuntimeError(f"prompt_records存在未知purpose，拒绝迁移: {sorted(unknown)}")
 
@@ -48,9 +51,7 @@ def upgrade() -> None:
         type_="check",
         schema=_schema(),
     )
-    prompt_records = sa.table(
-        "prompt_records", sa.column("purpose", sa.String()), schema=_schema()
-    )
+    prompt_records = sa.table("prompt_records", sa.column("purpose", sa.String()), schema=_schema())
     # 0008及更早版本用image表示图片生成Prompt。新生产链路只有故事板图片，
     # 先完成语义迁移再收紧CHECK，避免旧记录因约束重建而成为非法数据。
     op.get_bind().execute(

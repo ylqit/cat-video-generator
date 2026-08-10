@@ -1,147 +1,75 @@
-"""核心Schema和去冗余架构门。"""
+"""新内核的依赖方向与已删除运行路径。"""
 
 from __future__ import annotations
 
 import ast
-import re
 from pathlib import Path
 
-from cat_video_generator.infrastructure.db.models import (
-    Asset,
-    Episode,
-    ProductionRun,
-    PromptRecord,
-    WorkflowStep,
-)
-from cat_video_generator.infrastructure.db.session import ALEMBIC_HEAD
-
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "src" / "cat_video_generator"
+PACKAGE = ROOT / "src" / "cat_video_generator"
 
 
-def test_core_columns_do_not_duplicate_json_facts() -> None:
-    assert {column.name for column in ProductionRun.__table__.c} >= {
-        "id",
-        "content_date",
-        "planning_json",
-        "status",
-    }
-    run_columns = {column.name for column in ProductionRun.__table__.c}
-    episode_columns = {column.name for column in Episode.__table__.c}
-    step_columns = {column.name for column in WorkflowStep.__table__.c}
-    prompt_columns = {column.name for column in PromptRecord.__table__.c}
-    asset_columns = {column.name for column in Asset.__table__.c}
-    assert "theme" not in run_columns
-    assert "plan_json" not in run_columns
-    assert "title" not in episode_columns
-    assert "video_input_mode" not in episode_columns
-    assert "operation_key" in step_columns
-    assert "input_snapshot_json" in step_columns
-    assert "request_summary_json" not in step_columns
-    assert "char_count" not in prompt_columns
-    assert "utf8_bytes" not in prompt_columns
-    assert "semantic_key" in asset_columns
-    assert "pipeline_settings_json" in run_columns
-    assert ALEMBIC_HEAD == "0010_look_prompt_purposes"
+def _python_files(path: Path):
+    return tuple(item for item in path.rglob("*.py") if "__pycache__" not in item.parts)
 
 
-def test_deleted_runtime_modules_and_commands_are_absent() -> None:
-    removed = (
-        "application/resolution_comparison.py",
-        "application/multi_clip_finalization.py",
-        "application/video_landing.py",
-        "domain/media_contracts.py",
-        "infrastructure/db/archive_import.py",
-    )
-    assert all(not (SOURCE / item).exists() for item in removed)
-    cli = (SOURCE / "interfaces" / "cli.py").read_text(encoding="utf-8")
-    assert "compare-resolution" not in cli
-    assert "allow-multi-clip" not in cli
-    assert "allow-unverified-keyframes" not in cli
-
-
-def test_domain_does_not_import_framework_or_io_boundaries() -> None:
-    forbidden = {"sqlalchemy", "typer", "fastapi", "volcenginesdkarkruntime"}
+def test_domain_does_not_import_framework_or_infrastructure() -> None:
+    forbidden = {"sqlalchemy", "fastapi", "typer", "cat_video_generator.infrastructure"}
     violations: list[str] = []
-    for path in (SOURCE / "domain").glob("*.py"):
+    for path in _python_files(PACKAGE / "domain"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                names = (
-                    [item.name for item in node.names]
-                    if isinstance(node, ast.Import)
-                    else [node.module or ""]
-                )
-                if any(name.split(".", 1)[0] in forbidden for name in names):
-                    violations.append(f"{path.name}:{node.lineno}")
-    assert violations == []
-
-
-def test_application_services_use_capability_stores() -> None:
-    files = [
-        SOURCE / "application" / name
-        for name in (
-            "planning.py",
-            "production.py",
-            "video_execution.py",
-            "visual_preparation.py",
-            "queries.py",
-        )
-    ]
-    text = "\n".join(path.read_text(encoding="utf-8") for path in files)
-    assert "WorkflowRepository" not in text
-    assert "PlanningStore" in text
-    assert "ProductionStore" in text
-    assert "QueryStore" in text
-
-
-def test_env_example_has_no_agent_plan_or_accidental_analysis() -> None:
-    text = (ROOT / ".env.example").read_text(encoding="utf-8")
-    assert "ARK_ACCESS_MODE" not in text
-    assert "technical_auto" not in text
-    assert "Update Todos" not in text
-
-
-def test_active_documentation_describes_only_core_runtime() -> None:
-    active = (
-        ROOT / "README.md",
-        ROOT / "docs" / "README.md",
-        ROOT / "docs" / "architecture" / "ADR-001-explicit-workflow.md",
-        ROOT / "docs" / "http-api.md",
-        ROOT / "docs" / "workflows" / "complete-production.md",
-        ROOT / "docs" / "workflows" / "windows-runbook.md",
-        ROOT / "docs" / "providers" / "volcengine-multimodal.md",
-    )
-    forbidden = (
-        "multi_clip",
-        "technical_auto",
-        "allow-unverified",
-        "allow-multi",
-        "compare-resolution",
-        "ARK_ACCESS_MODE",
-    )
-    for path in active:
-        text = path.read_text(encoding="utf-8")
-        assert all(term not in text for term in forbidden), path
-        for target in re.findall(r"\[[^]]+\]\(([^)]+)\)", text):
-            if "://" in target or target.startswith("#"):
+            if isinstance(node, ast.Import):
+                names = [item.name for item in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module or ""]
+            else:
                 continue
-            resolved = (path.parent / target.replace("%20", " ")).resolve()
-            assert resolved.exists(), f"{path}: 缺失链接 {target}"
+            if any(any(name.startswith(prefix) for prefix in forbidden) for name in names):
+                violations.append(str(path.relative_to(ROOT)))
+    assert not violations
 
 
-def test_studio_tab_is_owned_by_url_instead_of_polling() -> None:
-    """轮询只能刷新数据，不能把用户从当前浏览页签强制跳回后端阶段。"""
-
-    source = (ROOT / "web" / "src" / "views" / "StudioView.vue").read_text(
-        encoding="utf-8"
+def test_removed_runtime_symbols_do_not_return() -> None:
+    forbidden = (
+        "SceneContinuity",
+        "TrackedEntity",
+        "storyboard_reference",
+        "image:storyboard",
+        "storyboard_review",
+        "strict_first_last",
+        "video:shot:",
+        "shot_tail",
+        "multi_clip",
+        "per_shot",
     )
-    load_graph = source[
-        source.index("async function loadGraph") : source.index("/** 拉取实时")
-    ]
-    assert "initializedTabRunId.value !== runId.value" in load_graph
-    assert "route.query.stage" in source
-    assert "() => route.query.run" in source
-    assert "query: { ...route.query, run: runId.value, stage }" in source
-    assert "if (activeTab.value !== stage)" not in load_graph
-    assert "purpose: 'image'" not in source
+    offenders: dict[str, list[str]] = {}
+    for root in (PACKAGE, ROOT / "web" / "src"):
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix not in {".py", ".ts", ".vue"}:
+                continue
+            text = path.read_text(encoding="utf-8")
+            hits = [symbol for symbol in forbidden if symbol in text]
+            if hits:
+                offenders[str(path.relative_to(ROOT))] = hits
+    assert not offenders
+
+
+def test_obsolete_modules_and_empty_layer_directories_are_absent() -> None:
+    absent = (
+        PACKAGE / "domain" / "continuity.py",
+        PACKAGE / "infrastructure" / "media" / "finalizer.py",
+        PACKAGE / "application" / "multi_clip_finalization.py",
+        PACKAGE / "generation",
+        PACKAGE / "commands",
+    )
+    assert all(not path.exists() for path in absent)
+
+
+def test_application_does_not_import_web_frameworks() -> None:
+    offenders: list[str] = []
+    for path in _python_files(PACKAGE / "application"):
+        text = path.read_text(encoding="utf-8")
+        if "import fastapi" in text or "import typer" in text or "from fastapi" in text:
+            offenders.append(str(path.relative_to(ROOT)))
+    assert not offenders

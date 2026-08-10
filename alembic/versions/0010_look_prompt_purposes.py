@@ -36,15 +36,18 @@ def _schema() -> str:
 
 
 def _assert_known_purposes(allowed: tuple[str, ...]) -> None:
-    table = sa.table(
-        "prompt_records", sa.column("purpose", sa.String()), schema=_schema()
+    table = sa.table("prompt_records", sa.column("purpose", sa.String()), schema=_schema())
+    unknown = (
+        op.get_bind()
+        .execute(
+            sa.select(table.c.purpose)
+            .select_from(table)
+            .where(table.c.purpose.not_in(allowed))
+            .distinct()
+        )
+        .scalars()
+        .all()
     )
-    unknown = op.get_bind().execute(
-        sa.select(table.c.purpose)
-        .select_from(table)
-        .where(table.c.purpose.not_in(allowed))
-        .distinct()
-    ).scalars().all()
     if unknown:
         raise RuntimeError(f"prompt_records存在未知purpose，拒绝迁移: {sorted(unknown)}")
 

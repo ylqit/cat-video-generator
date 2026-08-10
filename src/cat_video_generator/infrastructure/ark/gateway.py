@@ -19,20 +19,18 @@ from volcenginesdkarkruntime._exceptions import (
     ArkAPIError,
     ArkAPITimeoutError,
 )
-from volcenginesdkarkruntime.types.images import SequentialImageGenerationOptions
 
 from ...application.ports import (
     DirectorResult,
     GatewayError,
     ImageResult,
-    LookReviewResult,
-    StoryboardReviewResult,
+    ImageReviewResult,
     VideoDiagnosticResult,
     VideoTaskResult,
 )
 from ...config import RuntimeSettings
 from ...domain.rendering import VideoInputPlan
-from .review_schemas import LOOK_REVIEW_SCHEMA, STORYBOARD_REVIEW_SCHEMA, VIDEO_DIAGNOSTIC_SCHEMA
+from .review_schemas import IMAGE_REVIEW_SCHEMA, VIDEO_DIAGNOSTIC_SCHEMA
 
 
 class ArkGatewayError(GatewayError):
@@ -163,69 +161,13 @@ class ArkGateway:
             request_hash=request_hash,
         )
 
-    def generate_storyboard(
-        self,
-        *,
-        prompt: str,
-        reference_paths: tuple[Path, ...],
-        max_images: int,
-    ) -> tuple[ImageResult, ...]:
-        if max_images not in {3, 4}:
-            raise ArkGatewayError(
-                "故事板组图数量只允许3或4张",
-                code="invalid_storyboard_panel_count",
-                retryable=False,
-            )
-        try:
-            response = self._client.images.generate(
-                model=self.image_model,
-                prompt=prompt,
-                image=[_asset_data_url(path) for path in reference_paths],
-                response_format="url",
-                size="2K",
-                watermark=False,
-                output_format="png",
-                sequential_image_generation="auto",
-                # Ark SDK在序列组图请求中会直接调用该对象的model_dump()。
-                # 这里必须使用SDK声明的类型，普通dict会在HTTP请求发出前失败。
-                sequential_image_generation_options=SequentialImageGenerationOptions(
-                    max_images=max_images
-                ),
-                # 组图同步生成明显慢于单图；独立超时避免把仍在供应商侧
-                # 处理的请求过早冻结为submission_unknown。
-                timeout=self._settings.ark_image_request_timeout_seconds,
-            )
-        except ArkAPIError as exc:
-            raise _provider_error(exc, submission=True) from exc
-        except (AttributeError, TypeError) as exc:
-            # SDK请求序列化失败发生在网络提交之前，因此不是submission_unknown，
-            # 也不能伪装成图片技术QC失败。
-            raise ArkGatewayError(
-                "Seedream故事板请求参数无法由Ark SDK序列化。",
-                code="provider_request_serialization_failed",
-                retryable=False,
-            ) from exc
-        if not response.data or any(not getattr(item, "url", None) for item in response.data):
-            raise ArkGatewayError(
-                "Seedream没有返回完整可下载故事板组图。",
-                code="empty_image_result",
-                retryable=False,
-            )
-        return tuple(
-            ImageResult(
-                url=item.url,
-                model=getattr(response, "model", self.image_model),
-            )
-            for item in response.data
-        )
-
-    def generate_look(
+    def generate_image(
         self,
         *,
         prompt: str,
         reference_paths: tuple[Path, ...],
     ) -> ImageResult:
-        """生成单张日内定妆图。"""
+        """生成一张定妆图或开场视觉锚点。"""
 
         try:
             response = self._client.images.generate(
@@ -242,14 +184,14 @@ class ArkGateway:
             raise _provider_error(exc, submission=True) from exc
         except (AttributeError, TypeError) as exc:
             raise ArkGatewayError(
-                "Seedream定妆图请求参数无法由Ark SDK序列化。",
+                "Seedream单图请求参数无法由Ark SDK序列化。",
                 code="provider_request_serialization_failed",
                 retryable=False,
             ) from exc
         if len(response.data or ()) != 1 or not getattr(response.data[0], "url", None):
             raise ArkGatewayError(
-                "Seedream定妆图请求没有返回唯一可下载图片。",
-                code="invalid_look_image_result",
+                "Seedream单图请求没有返回唯一可下载图片。",
+                code="invalid_image_result",
                 retryable=False,
             )
         return ImageResult(
@@ -257,19 +199,17 @@ class ArkGateway:
             model=getattr(response, "model", self.image_model),
         )
 
-    def review_look(
+    def review_image(
         self,
         *,
         prompt: str,
         image_path: Path,
         reference_paths: tuple[Path, ...],
-    ) -> LookReviewResult:
-        """执行日内定妆图的轻量身份、画风和装扮审核。"""
+    ) -> ImageReviewResult:
+        """执行定妆图或开场锚点的身份、画风、构图审核。"""
 
-        schema = LOOK_REVIEW_SCHEMA
-        instructions, text_format = self._structured_output(
-            prompt, schema, "LookSemanticReview"
-        )
+        schema = IMAGE_REVIEW_SCHEMA
+        instructions, text_format = self._structured_output(prompt, schema, "ImageSemanticReview")
         ordered_paths = (*reference_paths, image_path)
         request_hash = _json_hash(
             {
@@ -277,8 +217,7 @@ class ArkGateway:
                 "instructions": instructions,
                 "schema": schema,
                 "orderedImageSha256": [
-                    hashlib.sha256(path.read_bytes()).hexdigest()
-                    for path in ordered_paths
+                    hashlib.sha256(path.read_bytes()).hexdigest() for path in ordered_paths
                 ],
             }
         )
@@ -292,7 +231,7 @@ class ArkGateway:
                         "content": [
                             {
                                 "type": "input_text",
-                                "text": "按Prompt声明的顺序审核最后一张日内定妆图。",
+                                "text": "按Prompt声明的顺序审核最后一张生产图片。",
                             },
                             *(
                                 {
@@ -315,16 +254,18 @@ class ArkGateway:
             raise _provider_error(exc, submission=True) from exc
         if response.status != "completed":
             raise ArkGatewayError(
-                f"Ark定妆图审核状态为{response.status!r}",
-                code="look_review_not_completed",
+                f"Ark图片审核状态为{response.status!r}",
+                code="image_review_not_completed",
                 retryable=False,
             )
         try:
             payload = json.loads(_response_text(response))
-            return LookReviewResult(
+            return ImageReviewResult(
                 identity_ok=bool(payload["identityOk"]),
                 style_ok=bool(payload["styleOk"]),
                 appearance_ok=bool(payload["appearanceOk"]),
+                composition_ok=bool(payload["compositionOk"]),
+                critical_props_ok=bool(payload["criticalPropsOk"]),
                 confidence=float(payload["confidence"]),
                 violations=tuple(str(item) for item in payload["violations"]),
                 warnings=tuple(str(item) for item in payload["warnings"]),
@@ -335,102 +276,8 @@ class ArkGateway:
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ArkGatewayError(
-                "Ark定妆图审核没有返回合法结构。",
-                code="invalid_look_review_output",
-                retryable=False,
-            ) from exc
-
-    def review_storyboard(
-        self,
-        *,
-        prompt: str,
-        image_paths: tuple[Path, ...],
-        reference_paths: tuple[Path, ...],
-    ) -> StoryboardReviewResult:
-        """按顺序一次审核全部故事板面板，不把单帧结论拼成组结论。"""
-
-        if len(image_paths) not in {3, 4}:
-            raise ArkGatewayError(
-                "故事板语义审核需要3或4张有序面板",
-                code="invalid_storyboard_review_count",
-                retryable=False,
-            )
-        schema = STORYBOARD_REVIEW_SCHEMA
-        instructions, text_format = self._structured_output(
-            prompt,
-            schema,
-            "StoryboardSemanticReview",
-        )
-        ordered_paths = (*reference_paths, *image_paths)
-        image_sha256 = [
-            hashlib.sha256(path.read_bytes()).hexdigest() for path in ordered_paths
-        ]
-        request_hash = _json_hash(
-            {
-                "model": self.review_model,
-                "instructions": instructions,
-                "schema": schema,
-                "orderedImageSha256": image_sha256,
-            }
-        )
-        content: list[dict[str, str]] = [
-            {
-                "type": "input_text",
-                "text": "先读取基准参考，再按顺序审核其后的故事板面板并只返回结构化结果。",
-            }
-        ]
-        content.extend(
-            {"type": "input_image", "image_url": _asset_data_url(path)}
-            for path in ordered_paths
-        )
-        try:
-            response = self._client.responses.create(
-                model=self.review_model,
-                instructions=instructions,
-                input=[
-                    {
-                        "role": "user",
-                        "content": content,
-                    }
-                ],
-                text={"format": text_format},
-                temperature=0,
-                max_output_tokens=1800,
-                thinking={"type": "disabled"},
-                store=False,
-                timeout=self._settings.ark_review_request_timeout_seconds,
-            )
-        except ArkAPIError as exc:
-            raise _provider_error(exc, submission=True) from exc
-        if response.status != "completed":
-            raise ArkGatewayError(
-                f"Ark故事板审核状态为{response.status!r}",
-                code="visual_review_not_completed",
-                retryable=False,
-            )
-        try:
-            payload = json.loads(_response_text(response))
-            return StoryboardReviewResult(
-                identity_ok=bool(payload["identityOk"]),
-                style_ok=bool(payload["styleOk"]),
-                body_proportion_ok=bool(payload["bodyProportionOk"]),
-                pose_naturalness_ok=bool(payload["poseNaturalnessOk"]),
-                action_sequence_ok=bool(payload["actionSequenceOk"]),
-                spatial_continuity_ok=bool(payload["spatialContinuityOk"]),
-                prop_continuity_ok=bool(payload["propContinuityOk"]),
-                ending_ok=bool(payload["endingOk"]),
-                confidence=float(payload["confidence"]),
-                violations=tuple(str(item) for item in payload["violations"]),
-                warnings=tuple(str(item) for item in payload["warnings"]),
-                evidence=tuple(str(item) for item in payload["evidence"]),
-                response_id=response.id,
-                model=response.model,
-                request_hash=request_hash,
-            )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ArkGatewayError(
-                "Ark故事板审核没有返回合法结构。",
-                code="invalid_visual_review_output",
+                "Ark图片审核没有返回合法结构。",
+                code="invalid_image_review_output",
                 retryable=False,
             ) from exc
 
@@ -501,7 +348,7 @@ class ArkGateway:
             return VideoDiagnosticResult(
                 identity_ok=bool(payload["identityOk"]),
                 style_ok=bool(payload["styleOk"]),
-                world_continuity_ok=bool(payload["worldContinuityOk"]),
+                critical_props_ok=bool(payload["criticalPropsOk"]),
                 narrative_order_ok=bool(payload["narrativeOrderOk"]),
                 confidence=float(payload["confidence"]),
                 violations=tuple(str(item) for item in payload["violations"]),
@@ -522,11 +369,19 @@ class ArkGateway:
         *,
         prompt: str,
         input_plan: VideoInputPlan,
-        input_paths: tuple[Path, ...],
+        input_paths: tuple[Path, ...] = (),
+        input_urls: tuple[str, ...] = (),
     ) -> VideoTaskResult:
-        if len(input_plan.bindings) != len(input_paths):
+        if bool(input_paths) == bool(input_urls):
             raise ArkGatewayError(
-                "多模态输入计划与本地文件数量不一致",
+                "视频输入必须且只能选择本地图片或供应商视频URL",
+                code="invalid_visual_input_source",
+                retryable=False,
+            )
+        inputs: tuple[Path | str, ...] = input_paths or input_urls
+        if len(input_plan.bindings) != len(inputs):
+            raise ArkGatewayError(
+                "多模态输入计划与实际素材数量不一致",
                 code="invalid_visual_input_count",
                 retryable=False,
             )
@@ -537,17 +392,33 @@ class ArkGateway:
                 retryable=False,
             )
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-        for path, binding in zip(
-            input_paths,
+        for source, binding in zip(
+            inputs,
             input_plan.bindings,
             strict=True,
         ):
-            _validate_reference_file(path)
-            field_name = "image_url"
+            field_name = "image_url" if binding.modality.value == "image" else "video_url"
+            if isinstance(source, Path):
+                if binding.modality.value != "image":
+                    raise ArkGatewayError(
+                        "Seedance视频延展的reference_video必须使用供应商Web URL",
+                        code="reference_video_url_required",
+                        retryable=False,
+                    )
+                _validate_reference_file(source)
+                url = _asset_data_url(source)
+            else:
+                if binding.modality.value != "video" or not source.startswith("https://"):
+                    raise ArkGatewayError(
+                        "供应商视频参考必须是HTTPS URL",
+                        code="invalid_reference_video_url",
+                        retryable=False,
+                    )
+                url = source
             content.append(
                 {
                     "type": field_name,
-                    field_name: {"url": _asset_data_url(path)},
+                    field_name: {"url": url},
                     "role": binding.provider_role.value,
                 }
             )
@@ -657,7 +528,32 @@ def _response_text(response: Any) -> str:
             code="empty_director_result",
             retryable=False,
         )
-    return "".join(parts)
+    return _repair_utf8_mojibake("".join(parts))
+
+
+def _repair_utf8_mojibake(value: str) -> str:
+    """修复供应商SDK把UTF-8响应按Latin-1展开后的可逆乱码。
+
+    正常中文无法编码为Latin-1，会原样返回；只有整段文本能够无损还原，且原文
+    命中常见UTF-8乱码标记时才替换，避免改写合法的拉丁文本或结构化字段名。
+    """
+
+    best = value
+    best_cjk = _cjk_count(value)
+    for encoding in ("latin-1", "cp1252"):
+        try:
+            candidate = value.encode(encoding).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        candidate_cjk = _cjk_count(candidate)
+        if candidate_cjk > best_cjk:
+            best = candidate
+            best_cjk = candidate_cjk
+    return best
+
+
+def _cjk_count(value: str) -> int:
+    return sum(0x3400 <= ord(character) <= 0x9FFF for character in value)
 
 
 def _asset_data_url(path: Path) -> str:

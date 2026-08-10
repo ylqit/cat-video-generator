@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import uuid
 from datetime import date
 from pathlib import Path
@@ -30,11 +31,13 @@ class LocalAssetStore:
         work_root: Path,
         asset_root: Path,
         delivery_root: Path,
+        ffmpeg_path: Path | None = None,
         max_bytes: int = 2_000_000_000,
     ) -> None:
         self._work_root = work_root.expanduser().resolve()
         self._asset_root = asset_root.expanduser().resolve()
         self._delivery_root = delivery_root.expanduser().resolve()
+        self._ffmpeg_path = None if ffmpeg_path is None else ffmpeg_path.expanduser().resolve()
         self._max_bytes = max_bytes
         if (
             self._work_root.drive
@@ -49,10 +52,13 @@ class LocalAssetStore:
         digest = hashlib.sha256()
         byte_size = 0
         try:
-            with httpx.Client(
-                follow_redirects=True,
-                timeout=httpx.Timeout(120.0, connect=15.0),
-            ) as client, client.stream("GET", url) as response:
+            with (
+                httpx.Client(
+                    follow_redirects=True,
+                    timeout=httpx.Timeout(120.0, connect=15.0),
+                ) as client,
+                client.stream("GET", url) as response,
+            ):
                 response.raise_for_status()
                 with temporary.open("xb") as output:
                     for chunk in response.iter_bytes():
@@ -96,9 +102,7 @@ class LocalAssetStore:
             raise AssetStorageError(f"本地素材不存在: {source}")
         digest = hashlib.sha256(source.read_bytes()).hexdigest()
         suffix = source.suffix.lower()
-        destination = (
-            self._asset_root / "imported" / "sha256" / digest[:2] / f"{digest}{suffix}"
-        )
+        destination = self._asset_root / "imported" / "sha256" / digest[:2] / f"{digest}{suffix}"
         destination.parent.mkdir(parents=True, exist_ok=True)
         if not destination.exists():
             temporary = destination.with_suffix(destination.suffix + ".part")
@@ -132,6 +136,65 @@ class LocalAssetStore:
             return self.import_local(temporary)
         finally:
             temporary.unlink(missing_ok=True)
+
+    def concatenate_videos(self, paths: tuple[Path, ...]) -> LandedAsset:
+        """顺序合并Ark续写尾段，不重新编码画面或声音。
+
+        标准Ark接口把reference_video续写结果作为新的尾段返回。这里只负责把同规格的原片与
+        尾段封装为一个交付MP4；任何编码不兼容都会显式失败，不会偷偷转码或掩盖断点。
+        """
+
+        if self._ffmpeg_path is None:
+            raise AssetStorageError("视频续写成片需要配置ffmpeg")
+        if len(paths) not in {2, 3}:
+            raise AssetStorageError("视频续写只允许合并2或3个连续区段")
+        resolved = tuple(path.expanduser().resolve() for path in paths)
+        if any(not path.is_file() for path in resolved):
+            raise AssetStorageError("视频续写区段文件缺失")
+        self._work_root.mkdir(parents=True, exist_ok=True)
+        token = uuid.uuid4().hex
+        manifest = self._work_root / f".concat-{token}.txt"
+        output = self._work_root / f".concat-{token}.mp4"
+        try:
+            lines = []
+            for path in resolved:
+                value = path.as_posix().replace("'", "'\\''")
+                lines.append(f"file '{value}'")
+            manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            subprocess.run(
+                [
+                    str(self._ffmpeg_path),
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(manifest),
+                    "-c",
+                    "copy",
+                    str(output),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=600,
+            )
+            return self.import_local(output)
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            detail = (
+                exc.stderr.strip()[-1000:]
+                if isinstance(exc, subprocess.CalledProcessError)
+                else str(exc)
+            )
+            raise AssetStorageError(f"视频续写区段合并失败: {detail}") from exc
+        finally:
+            manifest.unlink(missing_ok=True)
+            output.unlink(missing_ok=True)
 
     def build_delivery(
         self,

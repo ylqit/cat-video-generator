@@ -50,17 +50,14 @@ class EventSeedCatalog:
         eligible = [
             seed
             for seed in self._load()
-            if not seed.weather_tags and not seed.context_tags
+            if not seed.weather_tags
+            and not seed.context_tags
             or any(tag.casefold() in context for tag in (*seed.weather_tags, *seed.context_tags))
         ]
-        key = (
-            f"{series_profile_hash}|{content_date.isoformat()}|{planning_revision}"
-        )
+        key = f"{series_profile_hash}|{content_date.isoformat()}|{planning_revision}"
         ranked = sorted(
             eligible,
-            key=lambda item: hashlib.sha256(
-                f"{key}|{item.seed_id}".encode("utf-8")
-            ).hexdigest(),
+            key=lambda item: hashlib.sha256(f"{key}|{item.seed_id}".encode("utf-8")).hexdigest(),
         )
         # 先覆盖尽可能多的不同时段，再用稳定哈希顺序补足。这样slots真正参与
         # 选择，而不是只作为写进YAML却从未生效的装饰字段。
@@ -101,8 +98,7 @@ class EventSeedCatalog:
                 pattern
                 for pattern in pool
                 if (not pattern.suitable_slots or slot in pattern.suitable_slots)
-                and pattern.pattern_id
-                not in {item.pattern_id for item in chosen.values()}
+                and pattern.pattern_id not in {item.pattern_id for item in chosen.values()}
             ]
             if not eligible:
                 continue

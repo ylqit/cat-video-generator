@@ -9,6 +9,7 @@ import type {
   PromptFull,
   PromptOverrides,
   ReconciliationCandidateDto,
+  RunCreativeControlsDto,
   RunGraph,
   RunSummary,
 } from "./types";
@@ -74,6 +75,7 @@ export interface PlanPayload {
   allowPaidGeneration: boolean;
   pipelineSettings?: PipelineSettings;
   storyMode?: "auto" | "create" | "expand";
+  creativeControls?: RunCreativeControlsDto;
 }
 
 export interface GeneratePayload {
@@ -195,10 +197,8 @@ export const api = {
       view?: string;
     },
   ) => post<{ assetId: string }>(`/canon/${assetId}/derive-crop`, payload),
-  getPromptPreview: (episodeId: string, resolution: "480p" | "720p" = "480p") =>
-    request<EpisodePromptPreview>(
-      `/episodes/${episodeId}/prompt-preview?resolution=${resolution}`,
-    ),
+  getPromptPreview: (episodeId: string) =>
+    request<EpisodePromptPreview>(`/episodes/${episodeId}/prompt-preview`),
   savePromptOverrides: (episodeId: string, overrides: PromptOverrides) =>
     request<{ episodeId: string; saved: boolean }>(
       `/episodes/${episodeId}/prompt-overrides`,
@@ -207,14 +207,12 @@ export const api = {
         body: JSON.stringify({ overrides }),
       },
     ),
-  generateStoryboard: (
+  generateVisuals: (
     episodeId: string,
     allowPaidGeneration: boolean,
-    overrides?: PromptOverrides,
   ) =>
-    post<JobAccepted>(`/episodes/${episodeId}/storyboards`, {
+    post<JobAccepted>(`/episodes/${episodeId}/visuals`, {
       allowPaidGeneration,
-      overrides: overrides ?? null,
     }),
   continueRun: (runId: string) =>
     post<JobAccepted>(`/runs/${runId}/continue`),

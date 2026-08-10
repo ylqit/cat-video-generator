@@ -28,7 +28,8 @@ PAID_KINDS = frozenset(
         "resume_planning",
         "replan_episode",
         "retry_step",
-        "prepare_storyboard",
+        "prepare_visuals",
+        "continue_media",
         "continue_pipeline",
     }
 )

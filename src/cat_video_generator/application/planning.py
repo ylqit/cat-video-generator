@@ -13,11 +13,13 @@ from pathlib import Path
 from typing import Any
 
 from ..domain.contracts import (
+    ActivityFocusMode,
     DailyProductionPlan,
     DayBrief,
     EpisodePlan,
     EpisodeScript,
     RecentContentSummary,
+    RunCreativeControls,
     Slot,
     SlotBrief,
 )
@@ -88,9 +90,7 @@ class PlanningReviewRequired(RuntimeError):
         slot: Slot,
         errors: tuple[str, ...],
     ) -> None:
-        super().__init__(
-            f"Run {run_id} 的 {slot.value} 时段需要人工规划审核：" + "；".join(errors)
-        )
+        super().__init__(f"Run {run_id} 的 {slot.value} 时段需要人工规划审核：" + "；".join(errors))
         self.run_id = run_id
         self.slot = slot
         self.errors = errors
@@ -132,6 +132,7 @@ class PlanningService:
         stop_after_day_brief: bool = False,
         pipeline_settings: PipelineSettings | None = None,
         story_mode: str = "auto",
+        creative_controls: RunCreativeControls | None = None,
     ) -> PlanningResult | DayBriefPause:
         """按总导演→早→中→晚生成一份可执行全天方案。
 
@@ -148,12 +149,11 @@ class PlanningService:
             raise ValueError("分层导演模式固定生成一份DayBrief；DAILY_PLAN_CANDIDATE_COUNT必须为1")
         if story_mode not in {"auto", "create", "expand"}:
             raise ValueError("story_mode只支持auto/create/expand")
-        user_story = (
-            None if story_mode == "create" else parse_user_story(planning_context)
-        )
+        user_story = None if story_mode == "create" else parse_user_story(planning_context)
         if story_mode == "expand" and user_story is None:
             raise ValueError("扩写模式未识别到“剧本1/剧本2/剧本3”三个段落")
 
+        controls = creative_controls or RunCreativeControls()
         series_profile = (creative_profile or CreativeProfileOverride()).apply_to(
             self._series_profile
         )
@@ -165,9 +165,7 @@ class PlanningService:
             planning_context=planning_context,
         )
         recent_pattern_ids = tuple(
-            pattern_id
-            for summary in recent_summaries
-            for pattern_id in summary.pattern_ids
+            pattern_id for summary in recent_summaries for pattern_id in summary.pattern_ids
         )
         story_patterns = self._event_seed_catalog.select_patterns(
             series_profile_hash=series_profile.fingerprint(),
@@ -186,9 +184,8 @@ class PlanningService:
                 for slot, pattern in story_patterns.items()
             },
             # 扩写模式的用户原文随元数据冻结，resume/replan继续走改编路径。
-            "userStory": (
-                user_story.model_dump(mode="json") if user_story is not None else None
-            ),
+            "userStory": (user_story.model_dump(mode="json") if user_story is not None else None),
+            "creativeControls": controls.model_dump(mode="json"),
         }
         run_id = self._repository.create_draft_run(target_date)
         self._repository.save_pipeline_settings(
@@ -203,6 +200,7 @@ class PlanningService:
                     target_date=target_date,
                     series_profile=series_profile,
                     style_profile=self._style_profile,
+                    creative_controls=controls,
                 )
             else:
                 day_prompt = compile_day_director_prompt(
@@ -217,6 +215,7 @@ class PlanningService:
                     story_patterns=story_patterns,
                     series_profile=series_profile,
                     style_profile=self._style_profile,
+                    creative_controls=controls,
                 )
             day_brief, day_step, day_prompt_id, _ = self._director_invoker.invoke(
                 run_id=run_id,
@@ -231,6 +230,7 @@ class PlanningService:
             )
             if day_brief.content_date != target_date:
                 raise RuntimeError("DayBrief内容日期与目标日期不一致")
+            _validate_day_brief_controls(day_brief, controls)
 
             drafts: dict[str, dict[str, Any]] = {}
             self._save_context(
@@ -318,7 +318,7 @@ class PlanningService:
         story_patterns = _story_patterns_from_metadata(planning_metadata)
         user_story = _user_story_from_metadata(planning_metadata)
         episodes: list[EpisodePlan] = []
-        for slot_brief in day_brief.slots:
+        for slot_brief in day_brief.slot_briefs:
             saved = drafts.get(slot_brief.slot.value)
             if saved is not None:
                 episode = EpisodePlan(
@@ -382,13 +382,13 @@ class PlanningService:
             RunStatus.READY.value,
         }:
             raise ValueError(f"Run状态{stored_run.status}不允许重规划")
-        # 局部重规划会覆盖该时段剧本并作废其下游媒体。被中断任务卡在
-        # video_generating等媒体状态的Episode先回到failed再重生成，
-        # 避免在终态校验上浪费一次付费导演调用。
-        stored_episode = self._repository.get_episode(run_id, slot)
-        if stored_episode.status not in {EpisodeStatus.PLANNED, EpisodeStatus.FAILED}:
-            self._repository.set_episode_status(stored_episode.id, EpisodeStatus.FAILED)
+        # 已完成方案的局部重规划需要先作废该Episode的下游媒体；初始规划若在
+        # Episode落库前进入planning_review，数据库里本来就没有对应Episode，
+        # 此时直接使用已保存的DayBrief与候选上下文生成缺失时段。
+        if stored_run.plan is not None:
             stored_episode = self._repository.get_episode(run_id, slot)
+            if stored_episode.status not in {EpisodeStatus.PLANNED, EpisodeStatus.FAILED}:
+                self._repository.set_episode_status(stored_episode.id, EpisodeStatus.FAILED)
         context = self._repository.get_planning_context(run_id)
         if "dayBrief" not in context:
             raise ValueError("该Run没有分层导演DayBrief，不能局部重规划")
@@ -400,7 +400,7 @@ class PlanningService:
         if stored_run.plan is not None:
             drafts.update({item.slot.value: item for item in stored_run.plan.episodes})
 
-        slot_brief = next(item for item in day_brief.slots if item.slot is slot)
+        slot_brief = next(item for item in day_brief.slot_briefs if item.slot is slot)
         previous = tuple(
             drafts[item.value]
             for item in Slot
@@ -505,9 +505,9 @@ class PlanningService:
         rejected_candidate: dict[str, Any] | None = None
         validation_errors: tuple[str, ...] = ()
         repair_of_step_id: uuid.UUID | None = None
-        # 原始+两次带反馈修复：契约拒绝与语义不合格共享同一修复预算，
+        # 原始调用+一次带反馈修复：契约拒绝与语义不合格共享同一修复预算，
         # 每次都把确定性错误回灌给导演，而不是一次失败就把整天打入人工审核。
-        max_repairs = 2
+        max_repairs = 1
         for repair_index in range(max_repairs + 1):
             attempt = first_attempt + repair_index
             if user_episode_text is not None:
@@ -529,7 +529,9 @@ class PlanningService:
                 prompt = compile_episode_director_prompt(
                     day_brief=day_brief,
                     slot_brief=slot_brief,
-                    previous_state_summaries=tuple(summarize_episode_state(item) for item in previous),
+                    previous_state_summaries=tuple(
+                        summarize_episode_state(item) for item in previous
+                    ),
                     retry_reason=retry_reason,
                     rejected_candidate=rejected_candidate,
                     validation_errors=validation_errors,
@@ -559,8 +561,7 @@ class PlanningService:
                         decision="approved",
                         reason="导演候选经归一化修正后通过契约校验",
                         warnings=[
-                            {"code": "normalized", "message": item}
-                            for item in normalizations
+                            {"code": "normalized", "message": item} for item in normalizations
                         ],
                         evidence={"phase": "normalization"},
                     )
@@ -638,7 +639,7 @@ class PlanningService:
                 slot=slot_brief.slot,
                 errors=validation_errors,
             )
-        raise AssertionError("每个时段最多执行一次原始导演调用和两次带反馈修复")
+        raise AssertionError("每个时段最多执行一次原始导演调用和一次结构修复")
 
     def _assemble_plan(
         self,
@@ -736,6 +737,24 @@ def _user_story_from_metadata(metadata: dict[str, Any]) -> UserStory | None:
     if not isinstance(value, dict):
         return None
     return UserStory.model_validate(value)
+
+
+def _validate_day_brief_controls(
+    day_brief: DayBrief,
+    controls: RunCreativeControls,
+) -> None:
+    """总导演只能解析adaptive，不能改写用户固定的主次关系和时长档。"""
+
+    for brief in day_brief.slot_briefs:
+        control = next(item for item in controls.slot_controls if item.slot is brief.slot)
+        requested_focus = controls.requested_focus(brief.slot)
+        if (
+            requested_focus is not ActivityFocusMode.ADAPTIVE
+            and brief.resolved_activity_focus.value != requested_focus.value
+        ):
+            raise ValueError(f"总导演改写了{brief.slot.value}固定活动焦点")
+        if brief.duration_intent.requested_mode is not control.duration_mode:
+            raise ValueError(f"总导演改写了{brief.slot.value}时长意图")
 
 
 def _user_episode_text(user_story: UserStory | None, slot: Slot) -> str | None:

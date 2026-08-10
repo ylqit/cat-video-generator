@@ -10,7 +10,7 @@ from datetime import date
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..domain.contracts import Slot
+from ..domain.contracts import RunCreativeControls, Slot
 from ..domain.visual_profiles import CreativeProfileOverride
 
 CANON_ROLES = frozenset({"person", "cat", "style"})
@@ -75,6 +75,10 @@ class PlanRequest(BaseModel):
         "auto",
         alias="storyMode",
         pattern=r"^(auto|create|expand)$",
+    )
+    creative_controls: RunCreativeControls | None = Field(
+        None,
+        alias="creativeControls",
     )
 
 
@@ -145,17 +149,8 @@ class DeriveCropRequest(BaseModel):
 
 
 class PromptOverridesRequest(BaseModel):
-    """主题创作台的Prompt编辑保存；键只允许故事板和视频。"""
+    """主题创作台的Prompt编辑保存。"""
 
     model_config = ConfigDict(populate_by_name=True)
 
     overrides: dict[str, str] = Field(default_factory=dict)
-
-
-class GenerateStoryboardsRequest(BaseModel):
-    """为单个Episode生成或按编辑版重新生成整组故事板。"""
-
-    model_config = ConfigDict(populate_by_name=True)
-
-    overrides: dict[str, str] | None = None
-    allow_paid_generation: bool = Field(False, alias="allowPaidGeneration")

@@ -16,6 +16,9 @@ from typing import Any
 from ..domain.contracts import (
     DailyProductionPlan,
     DayBrief,
+    DurationBand,
+    DurationIntent,
+    DurationMode,
     EpisodePlan,
     EpisodeScript,
     Slot,
@@ -73,7 +76,8 @@ class StudioEditingService:
         if "dayBrief" not in context:
             raise ValueError("该Run没有DayBrief，不能校验剧本编辑")
         day_brief = DayBrief.model_validate(context["dayBrief"])
-        slot_brief = next(item for item in day_brief.slots if item.slot is slot)
+        day_brief = _apply_episode_controls(day_brief, slot=slot, script=script)
+        slot_brief = next(item for item in day_brief.slot_briefs if item.slot is slot)
         episode = EpisodePlan(slot=slot, script=script)
 
         errors = [
@@ -118,7 +122,13 @@ class StudioEditingService:
         if errors:
             raise ValueError("；".join(errors))
 
-        self._repository.replace_episode_plan(run_id=run_id, episode=episode)
+        # 活动焦点和时长是用户在收费前可以调整的创作控制。Episode与DayBrief
+        # 必须在同一事务中更新，否则任一只更新一半都会让全天方案暂时不可读取。
+        self._repository.replace_episode_plan(
+            run_id=run_id,
+            episode=episode,
+            day_brief=day_brief,
+        )
         return {
             "episodeId": str(episode_id),
             "slot": slot.value,
@@ -165,3 +175,37 @@ class StudioEditingService:
             "runId": str(run_id),
             "pipelineSettings": settings.model_dump(mode="json", by_alias=True),
         }
+
+
+def _apply_episode_controls(
+    day_brief: DayBrief,
+    *,
+    slot: Slot,
+    script: EpisodeScript,
+) -> DayBrief:
+    """把Web对焦点与精确时长的修改同步回总导演边界。"""
+
+    band = (
+        DurationBand.SHORT
+        if script.duration_seconds <= 15
+        else DurationBand.MEDIUM
+        if script.duration_seconds <= 30
+        else DurationBand.LONG
+    )
+    mode = DurationMode(band.value)
+    briefs = [
+        item.model_copy(
+            update={
+                "resolved_activity_focus": script.activity_focus,
+                "duration_intent": DurationIntent(
+                    requested_mode=mode,
+                    resolved_band=band,
+                    resolution_reason="用户在时段剧本阶段固定活动焦点与时长档",
+                ),
+            }
+        )
+        if item.slot is slot
+        else item
+        for item in day_brief.slot_briefs
+    ]
+    return day_brief.model_copy(update={"slot_briefs": briefs})

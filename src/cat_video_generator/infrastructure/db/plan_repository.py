@@ -10,7 +10,7 @@ from typing import Any
 
 from sqlalchemy import select
 
-from ...domain.contracts import DailyProductionPlan, DayBrief, EpisodePlan, Slot
+from ...domain.contracts import DailyProductionPlan, DayBrief, EpisodePlan
 from ...domain.pipeline import PipelineSettings
 from ...domain.workflow import (
     EpisodeStatus,
@@ -91,8 +91,9 @@ class PlanPersistenceMixin:
         *,
         run_id: uuid.UUID,
         episode: EpisodePlan,
+        day_brief: DayBrief | None = None,
     ) -> None:
-        """局部重规划只替换指定时段脚本，旧步骤和媒体继续保留审计。"""
+        """原子替换时段脚本及可选的总导演边界。"""
 
         with self._sessions.begin() as session:  # type: ignore[attr-defined]
             run = _required(session, ProductionRun, run_id)
@@ -108,11 +109,9 @@ class PlanPersistenceMixin:
                 EpisodeStatus.VIDEO_PENDING,
                 EpisodeStatus.FAILED,
             }:
-                raise ValueError(
-                    f"{episode.slot.value}状态{current.value}不允许局部重规划"
-                )
+                raise ValueError(f"{episode.slot.value}状态{current.value}不允许局部重规划")
             if current is EpisodeStatus.VIDEO_PENDING:
-                # 故事板批准后、视频尚未提交前仍允许人工修正剧本。旧故事板和审核结果
+                # 开场锚点批准后、视频尚未提交前仍允许人工修正剧本。旧视觉资产和审核
                 # 保持不可变审计，新剧本会形成新的输入哈希并重新进入视觉准备。
                 current = transition_episode(current, EpisodeStatus.FAILED)
                 row.status = current.value
@@ -128,7 +127,10 @@ class PlanPersistenceMixin:
             row.prompt_overrides_json = None
             drafts = dict(run.planning_json.get("episodeDrafts", {}))
             drafts[episode.slot.value] = episode.script.model_dump(mode="json")
-            run.planning_json = {**run.planning_json, "episodeDrafts": drafts}
+            planning_json = {**run.planning_json, "episodeDrafts": drafts}
+            if day_brief is not None:
+                planning_json["dayBrief"] = day_brief.model_dump(mode="json")
+            run.planning_json = planning_json
 
     def get_prompt_overrides(self, episode_id: uuid.UUID) -> dict[str, str]:
         """读取页面编辑后的Prompt覆盖；缺省为空字典。"""
@@ -169,21 +171,6 @@ class PlanPersistenceMixin:
                 "dayBrief": day_brief.model_dump(mode="json"),
                 "episodeDrafts": {},
             }
-
-    def update_episode_draft(
-        self,
-        *,
-        run_id: uuid.UUID,
-        slot: Slot,
-        script: dict[str, Any],
-    ) -> None:
-        """方案未定稿时把人工编辑的时段脚本写回可恢复草稿。"""
-
-        with self._sessions.begin() as session:  # type: ignore[attr-defined]
-            run = _required(session, ProductionRun, run_id)
-            drafts = dict(run.planning_json.get("episodeDrafts", {}))
-            drafts[slot.value] = script
-            run.planning_json = {**run.planning_json, "episodeDrafts": drafts}
 
     def save_pipeline_settings(
         self,

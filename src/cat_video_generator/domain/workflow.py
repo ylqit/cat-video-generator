@@ -46,10 +46,7 @@ class PromptPurpose(StrEnum):
     """供应商调用及其审核使用的稳定Prompt用途。"""
 
     DIRECTOR = "director"
-    LOOK = "look"
-    LOOK_REVIEW = "look_review"
-    STORYBOARD = "storyboard"
-    STORYBOARD_REVIEW = "storyboard_review"
+    IMAGE = "image"
     VIDEO = "video"
     REVIEW = "review"
 
@@ -69,20 +66,13 @@ class StepStatus(StrEnum):
 
 _PROMPT_PURPOSES_BY_STEP_KIND = {
     StepKind.DIRECTOR: frozenset({PromptPurpose.DIRECTOR}),
-    StepKind.IMAGE: frozenset(
-        {
-            PromptPurpose.LOOK,
-            PromptPurpose.LOOK_REVIEW,
-            PromptPurpose.STORYBOARD,
-            PromptPurpose.STORYBOARD_REVIEW,
-        }
-    ),
+    StepKind.IMAGE: frozenset({PromptPurpose.IMAGE, PromptPurpose.REVIEW}),
     StepKind.VIDEO: frozenset({PromptPurpose.VIDEO, PromptPurpose.REVIEW}),
 }
 
 _GENERATION_PROMPTS_BY_STEP_KIND = {
     StepKind.DIRECTOR: frozenset({PromptPurpose.DIRECTOR}),
-    StepKind.IMAGE: frozenset({PromptPurpose.LOOK, PromptPurpose.STORYBOARD}),
+    StepKind.IMAGE: frozenset({PromptPurpose.IMAGE}),
     StepKind.VIDEO: frozenset({PromptPurpose.VIDEO}),
 }
 
@@ -224,7 +214,9 @@ _STEP_TRANSITIONS = {
         StepStatus.FAILED,
     },
     StepStatus.SUCCEEDED: set(),
-    StepStatus.FAILED: set(),
+    # 供应商任务已经成功、但本地下载/QC/封装失败时，可以在同一attempt内重新进入RUNNING。
+    # 该边只供Repository的受约束恢复入口使用，不允许借此重新POST收费任务。
+    StepStatus.FAILED: {StepStatus.RUNNING},
     StepStatus.EXPIRED: set(),
     StepStatus.CANCELLED: set(),
 }
@@ -240,9 +232,7 @@ def _transition(
     if target == current:
         return current
     if target not in transitions[current]:
-        raise WorkflowTransitionError(
-            f"非法状态转换: {current.value} -> {target.value}"
-        )
+        raise WorkflowTransitionError(f"非法状态转换: {current.value} -> {target.value}")
     return target
 
 

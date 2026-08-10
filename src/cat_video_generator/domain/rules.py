@@ -1,6 +1,7 @@
-"""规划、身份、输入和连续性的少量确定性硬门。
+"""规划、身份、输入与叙事连续性的少量确定性规则。
 
-规则只阻断明确矛盾，不用动作数量预测生成难度。渲染效果在关键帧和成片审核中判断。
+这里只阻断引用错误、固定身份改写和跨时段道具键冲突。镜头复杂度、Prompt长度与
+动作难度只产生诊断，实际画面质量由视觉审核和人工内容审核决定。
 """
 
 from __future__ import annotations
@@ -10,7 +11,6 @@ from datetime import date
 from enum import StrEnum
 from typing import Iterable
 
-from .continuity import EntityKind, validate_continuity
 from .contracts import (
     DailyProductionPlan,
     DayBrief,
@@ -18,10 +18,8 @@ from .contracts import (
     RecentContentSummary,
     SlotBrief,
 )
-from .visual_profiles import (
-    DEFAULT_SERIES_VISUAL_PROFILE,
-    SeriesVisualProfile,
-)
+from .rendering import build_render_plan
+from .visual_profiles import DEFAULT_SERIES_VISUAL_PROFILE, SeriesVisualProfile
 
 
 class IssueLevel(StrEnum):
@@ -43,17 +41,17 @@ def validate_plan_gate(
     expected_date: date | None = None,
     series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
 ) -> tuple[GateIssue, ...]:
-    """检查全天日期、事件差异和中性主体描述。"""
-
     issues: list[GateIssue] = []
     if expected_date is not None and plan.content_date != expected_date:
         issues.append(_hard("plan", "content_date_mismatch", "内容日期与规划目标不一致"))
-    if len({item.script.title for item in plan.episodes}) != 3:
-        issues.append(_hard("plan", "duplicate_title", "早中晚标题必须互不重复"))
-    if len({item.script.event_key for item in plan.episodes}) != 3:
-        issues.append(_hard("plan", "duplicate_event", "早中晚不能重复同一主事件"))
     for episode in plan.episodes:
         issues.extend(_identity_issues(episode, series_profile))
+    if len({item.script.story_pattern for item in plan.episodes}) == 1:
+        issues.append(
+            _warning(
+                "planning", "repeated_story_pattern", "早中晚使用了相同关系弧，建议增加信息组织差异"
+            )
+        )
     return tuple(issues)
 
 
@@ -64,33 +62,37 @@ def validate_episode_against_brief(
     slot_brief: SlotBrief,
     series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
 ) -> tuple[GateIssue, ...]:
-    """检查时段边界、共享语义键和可见世界终态。"""
-
     issues = list(_identity_issues(episode, series_profile))
     if episode.slot is not slot_brief.slot:
         issues.append(_hard("plan", "slot_mismatch", "时段导演返回了错误的slot"))
-    allowed_shared = {
-        item.entity_key for item in day_brief.shared_elements if episode.slot in item.slots
-    }
-    used_shared = {
+    if episode.script.activity_focus is not slot_brief.resolved_activity_focus:
+        issues.append(_hard("plan", "activity_focus_mismatch", "时段导演改写了固定活动焦点"))
+    minimum, maximum = slot_brief.duration_intent.resolved_band.range
+    if not minimum <= episode.duration_seconds <= maximum:
+        issues.append(_hard("plan", "duration_band_mismatch", "精确时长超出总导演解析档位"))
+    try:
+        build_render_plan(episode)
+    except ValueError as exc:
+        issues.append(_hard("rendering", "invalid_render_sections", str(exc)))
+
+    handoff_keys = {
         item.entity_key
-        for item in episode.script.continuity.entities
-        if item.entity_key in {shared.entity_key for shared in day_brief.shared_elements}
+        for item in day_brief.handoffs
+        if episode.slot in {item.from_slot, item.to_slot}
     }
-    if not used_shared.issubset(allowed_shared):
-        issues.append(
-            _hard("continuity", "undeclared_shared_element", "脚本使用了未授权的共享元素")
-        )
-    # 这里只检查关键实体起终态引用；中间姿态与动作由故事板语义审核判断。
-    result = validate_continuity(episode.script.continuity)
-    issues.extend(_hard("continuity", item.code, item.message) for item in result.issues)
-    if len(episode.script.ending.key_entity_ids) > 4:
+    prop_keys = {item.entity_key for item in episode.script.critical_props}
+    missing = handoff_keys - prop_keys
+    if missing:
         issues.append(
             _warning(
-                "rendering",
-                "many_ending_entities",
-                "结尾关键实体较多，可能降低画面聚焦度，但不阻断生成",
+                "continuity",
+                "handoff_not_visible_in_slot",
+                "本时段未显式展示交接元素：" + ", ".join(sorted(missing)),
             )
+        )
+    if len(episode.script.critical_props) > 4:
+        issues.append(
+            _warning("rendering", "many_critical_props", "关键道具较多，可能降低画面聚焦度")
         )
     return tuple(issues)
 
@@ -99,8 +101,7 @@ def validate_input_gate(
     episode: EpisodePlan,
     available_reference_roles: Iterable[str],
 ) -> tuple[GateIssue, ...]:
-    """固定要求人物、猫咪和画风；剧情实体不会自动升级为参考资产。"""
-
+    del episode
     available = set(available_reference_roles)
     required = {"person", "cat", "style"}
     return tuple(
@@ -113,24 +114,18 @@ def validate_episode_cooldown(
     episode: EpisodePlan,
     recent_summaries: Iterable[RecentContentSummary],
 ) -> tuple[GateIssue, ...]:
-    """按结构化键精确比较，不用中文子串猜测相似度。"""
-
     recent = tuple(recent_summaries)
     event_keys = {key for item in recent for key in item.event_keys}
     location_keys = {key for item in recent for key in item.location_keys}
     element_keys = {key for item in recent for key in item.element_keys}
-    current_elements = {
-        item.entity_key
-        for item in episode.script.continuity.entities
-        if item.kind is EntityKind.PROP
-    }
+    current_elements = {item.entity_key for item in episode.script.critical_props}
     issues: list[GateIssue] = []
     if episode.script.event_key in event_keys:
         issues.append(_warning("planning", "recent_event_repeat", "事件仍在近期冷却期"))
     if episode.script.location_key in location_keys:
         issues.append(_warning("planning", "recent_location_repeat", "地点仍在近期冷却期"))
     if current_elements and current_elements.issubset(element_keys):
-        issues.append(_warning("planning", "recent_element_repeat", "关键元素组合仍在冷却期"))
+        issues.append(_warning("planning", "recent_element_repeat", "关键元素组合仍在近期冷却期"))
     return tuple(issues)
 
 
@@ -143,14 +138,13 @@ def _identity_issues(
     profile: SeriesVisualProfile,
 ) -> tuple[GateIssue, ...]:
     text = _episode_text(episode)
-    scrubbed = text.replace("少年宫", "").replace("马尾松", "")
-    forbidden = tuple(item.casefold() for item in profile.forbidden_identity_rewrites)
-    if any(item in scrubbed for item in forbidden):
+    protected = text.replace("少年宫", "").replace("马尾松", "")
+    if any(item.casefold() in protected for item in profile.forbidden_identity_rewrites):
         return (
             _hard(
                 "identity",
                 "gendered_identity_rewrite",
-                f"{episode.slot.value}把中性儿童改写为性别化身份或改变固定发长",
+                f"{episode.slot.value}改写了中性儿童身份或固定发长",
             ),
         )
     return ()
@@ -160,16 +154,20 @@ def _episode_text(episode: EpisodePlan) -> str:
     script = episode.script
     return " ".join(
         (
+            script.episode_question,
             script.main_event,
             script.scene,
             script.appearance.description,
+            script.appearance.change_reason or "",
+            script.relationship_arc.lead_activity,
+            script.relationship_arc.secondary_activity,
+            script.relationship_arc.convergence,
             script.ending.result,
             *(item.action for item in script.actions),
             *(item.visible_result for item in script.actions),
             *(item.framing for item in script.shots),
             *(item.direction for item in script.shots),
-            *(item.name for item in script.continuity.entities),
-            *(item.form_key for item in script.continuity.entities),
+            *(item.name for item in script.critical_props),
         )
     ).casefold()
 

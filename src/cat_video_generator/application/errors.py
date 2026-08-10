@@ -10,8 +10,7 @@ class StepRetryRequired(RuntimeError):
 
     def __init__(self, step_id: uuid.UUID, operation_key: str) -> None:
         super().__init__(
-            f"步骤{step_id}已经终止；如需重做，请执行"
-            f"cvg retry-step {step_id} --reason <原因>"
+            f"步骤{step_id}已经终止；如需重做，请执行cvg retry-step {step_id} --reason <原因>"
         )
         self.step_id = step_id
         self.operation_key = operation_key

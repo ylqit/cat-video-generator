@@ -74,9 +74,7 @@ class SeriesVisualProfile(VisualProfileModel):
     def fingerprint(self) -> str:
         """生成事件种子筛选和规划幂等使用的稳定摘要。"""
 
-        return hashlib.sha256(
-            self.model_dump_json(exclude_none=True).encode("utf-8")
-        ).hexdigest()
+        return hashlib.sha256(self.model_dump_json(exclude_none=True).encode("utf-8")).hexdigest()
 
 
 class CreativeProfileOverride(VisualProfileModel):
@@ -127,8 +125,7 @@ DEFAULT_SERIES_VISUAL_PROFILE = SeriesVisualProfile(
         "肤色和自然儿童年龄感，不强化男性或女性特征"
     ),
     person_hair=(
-        "保持深棕黑色、齐耳至下颌长度的顺直短波波头与轻薄刘海，"
-        "不得无故变成长发、马尾或发髻"
+        "保持深棕黑色、齐耳至下颌长度的顺直短波波头与轻薄刘海，不得无故变成长发、马尾或发髻"
     ),
     person_body="保持约九至十二岁儿童的身高感、头身比例和纤细自然体型，可由剧情自然换装",
     cat_identity=(

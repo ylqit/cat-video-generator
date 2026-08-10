@@ -4,6 +4,7 @@ import { reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 
 import { api, ApiError } from "../api/client";
+import type { ActivityFocusMode, DurationMode, HealthStatus, Slot } from "../api/types";
 import { useJobsStore } from "../stores/jobs";
 
 const emit = defineEmits<{ created: [] }>();
@@ -12,6 +13,7 @@ const jobs = useJobsStore();
 
 const visible = ref(false);
 const submitting = ref(false);
+const health = ref<HealthStatus | null>(null);
 const form = reactive({
   targetDate: "",
   planningContext: "",
@@ -19,11 +21,25 @@ const form = reactive({
   catPersonality: "",
   humorStyle: "",
   allowPaidGeneration: false,
+  pauseAfterDayBrief: true,
+  autoVisual: false,
+  autoVideo: false,
+  defaultActivityFocus: "cat_lead" as Exclude<ActivityFocusMode, "inherit">,
+  slotControls: (["morning", "noon", "evening"] as Slot[]).map((slot) => ({
+    slot,
+    activityFocus: "inherit" as ActivityFocusMode,
+    durationMode: "adaptive" as DurationMode,
+  })),
 });
 
-function open() {
+async function open() {
   form.allowPaidGeneration = false;
   visible.value = true;
+  try {
+    health.value = await api.health();
+  } catch {
+    health.value = null;
+  }
 }
 
 /** 提交规划并跟踪后台任务；成功后跳转到新Run详情。 */
@@ -42,6 +58,22 @@ async function submit() {
         humorStyle: form.humorStyle || undefined,
       },
       allowPaidGeneration: true,
+      pipelineSettings: {
+        allowPaidGeneration: true,
+        dayBrief: form.pauseAfterDayBrief ? "manual" : "auto",
+        script: "auto",
+        visual: form.autoVisual ? "auto" : "manual",
+        video: form.autoVisual && form.autoVideo ? "auto" : "manual",
+        review: "manual",
+      },
+      creativeControls: {
+        default_activity_focus: form.defaultActivityFocus,
+        slot_controls: form.slotControls.map((item) => ({
+          slot: item.slot,
+          activity_focus: item.activityFocus,
+          duration_mode: item.durationMode,
+        })),
+      },
     });
     jobs.track(accepted);
     visible.value = false;
@@ -102,6 +134,56 @@ defineExpose({ open });
             <el-input v-model="form.humorStyle" placeholder="幽默方式；留空使用系列默认" style="margin-top: 8px" />
           </el-collapse-item>
         </el-collapse>
+      </el-form-item>
+      <el-form-item label="全天活动焦点">
+        <el-select v-model="form.defaultActivityFocus" style="width: 100%">
+          <el-option label="猫咪主活动（默认）" value="cat_lead" />
+          <el-option label="人物主活动" value="person_lead" />
+          <el-option label="人猫平衡" value="balanced" />
+          <el-option label="总导演自适应" value="adaptive" />
+        </el-select>
+      </el-form-item>
+      <el-form-item label="时段覆盖">
+        <div style="width: 100%">
+          <div
+            v-for="control in form.slotControls"
+            :key="control.slot"
+            style="display: grid; grid-template-columns: 58px 1fr 1fr; gap: 8px; margin-bottom: 8px"
+          >
+            <span class="muted" style="line-height: 32px">{{
+              { morning: "上午", noon: "中午", evening: "傍晚" }[control.slot]
+            }}</span>
+            <el-select v-model="control.activityFocus">
+              <el-option label="继承全天" value="inherit" />
+              <el-option label="猫咪主活动" value="cat_lead" />
+              <el-option label="人物主活动" value="person_lead" />
+              <el-option label="人猫平衡" value="balanced" />
+              <el-option label="自适应" value="adaptive" />
+            </el-select>
+            <el-select v-model="control.durationMode">
+              <el-option label="自适应时长" value="adaptive" />
+              <el-option label="短 8–15秒" value="short" />
+              <el-option label="中 16–30秒" value="medium" />
+              <el-option label="长 31–45秒" value="long" />
+            </el-select>
+          </div>
+          <div class="muted">总导演只解析自适应档；时段导演在档内决定精确秒数。</div>
+          <el-alert
+            v-if="health && !health.supportsVideoExtension && form.slotControls.some((item) => ['medium', 'long'].includes(item.durationMode))"
+            type="warning"
+            :closable="false"
+            title="当前视频模型不支持官方延展；中片或长片可以先规划，但在收费视频任务前会被阻断。"
+            style="margin-top: 8px"
+          />
+        </div>
+      </el-form-item>
+      <el-form-item label="推进方式">
+        <div style="width: 100%">
+          <el-checkbox v-model="form.pauseAfterDayBrief">总导演后暂停，先确认主次关系与时长档</el-checkbox>
+          <el-checkbox v-model="form.autoVisual">三集导演完成后自动生成视觉锚点</el-checkbox>
+          <el-checkbox v-model="form.autoVideo" :disabled="!form.autoVisual">视觉锚点通过后自动生成视频</el-checkbox>
+          <div class="muted">关闭自动项后，可在统一工作台逐节点确认并付费生成。</div>
+        </div>
       </el-form-item>
       <el-form-item>
         <el-checkbox v-model="form.allowPaidGeneration">

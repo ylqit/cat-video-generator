@@ -1,32 +1,22 @@
 # Windows 运行手册
 
-## 1. 环境准备
+## 1. 环境与配置
 
 ```powershell
 uv sync --extra test
 uv run cvg doctor
 ```
 
-需要：Python 3.12/3.13、uv、ffmpeg、ffprobe、可访问的 PostgreSQL 14+ 和 Ark 标准 API Key。
-
-`.env` 是本机运行配置，PowerShell 会话环境变量优先。不要把 `.env`、数据库密码或 Ark Key 提交到 Git。
-
-核心配置：
+需要Python 3.12/3.13、uv、ffmpeg、ffprobe、PostgreSQL 14+和Ark标准API Key。
+`.env`保存本机配置，PowerShell环境变量优先；不要提交`.env`。
 
 ```text
-CAT_VIDEO_DB_HOST
-CAT_VIDEO_DB_PORT
-CAT_VIDEO_DB_NAME
-CAT_VIDEO_DB_USER
-CAT_VIDEO_DB_PASSWORD
-CAT_VIDEO_DB_SSLMODE
-CAT_VIDEO_DB_SCHEMA=cat_video
+CAT_VIDEO_DB_HOST / PORT / NAME / USER / PASSWORD / SSLMODE / SCHEMA
 CAT_VIDEO_ALLOW_INSECURE_RUNTIME
-
 ARK_API_KEY
 ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
 ARK_PLANNING_MODEL
-ARK_IMAGE_MODEL
+ARK_IMAGE_MODEL=doubao-seedream-5-0-260128
 ARK_VIDEO_MODEL
 ARK_REVIEW_MODEL
 ARK_VIDEO_RESOLUTION=480p|720p
@@ -38,144 +28,110 @@ ARK_REVIEW_REQUEST_TIMEOUT_SECONDS=240
 ARK_VIDEO_API_TIMEOUT_SECONDS=120
 ARK_TASK_TIMEOUT_SECONDS=1800
 ARK_POLL_INTERVAL_SECONDS=10
-
-STORYBOARD_REVIEW_MODE=semantic_auto|manual
-MEDIA_WORK_ROOT
-MEDIA_ASSET_ROOT
-DELIVERY_OUTPUT_ROOT
+IMAGE_REVIEW_MODE=semantic_auto|manual
+MEDIA_WORK_ROOT / MEDIA_ASSET_ROOT / DELIVERY_OUTPUT_ROOT
 ```
 
-## 2. 预检与迁移
+## 2. 迁移到0011
+
+0011要求旧生产Run为空。先预览并保存诊断清单：
 
 ```powershell
-uv run cvg doctor
+uv run python scripts/clear_production_history.py
+```
+
+核对`var/diagnostics/`中的Run、资产路径和SHA-256，再使用程序打印的精确口令：
+
+```powershell
+uv run python scripts/clear_production_history.py --confirm DELETE-<Run数量>-RUNS-AND-<旧Canon数量>-OLD-CANON
 uv run alembic upgrade head
 uv run cvg doctor
 ```
 
-正式 Schema 当前必须位于 `0010_look_prompt_purposes`。Doctor 还会检查标准 Ark 配置、ffmpeg/ffprobe、Canon 数量、事件种子目录和全部Ark超时参数。
+清理删除带Run外键的业务记录和已验证位于媒体根下的历史文件，同时只保留当前正式
+语义键的最新批准Canon；仍被保留Canon引用的文件路径永远不会被删除。
+Doctor最终必须报告`0011_narrative_render_core`。
 
-当前明文数据库只有在以下配置同时成立时才允许正式运行：
+## 3. Canon
 
-```text
-CAT_VIDEO_DB_SSLMODE=disable
-CAT_VIDEO_ALLOW_INSECURE_RUNTIME=true
-CAT_VIDEO_DB_SCHEMA=cat_video
-```
-
-这是临时风险许可；迁移到 TLS 或安全隧道后应关闭。
-
-## 3. Canon 与参考素材
-
-```powershell
-uv run cvg canon import --role person --semantic-key person:headshot `
-  --view headshot --file "references\person-headshot.png"
-uv run cvg canon import --role person --semantic-key person:fullbody `
-  --view fullbody --file "references\person-fullbody.png"
-uv run cvg canon import --role cat --semantic-key cat:front `
-  --view front --file "主题示例\猫咪本体.png"
-uv run cvg canon import --role style --semantic-key style:line_texture `
-  --file "画风示例\线条裁片.png"
-```
-
-新 Run 只自动选择精确 `semantic_key` 的最新已批准资产。候选、拒绝和 `legacy:*` 资产不会被复用。
-
-## 4. 规划与生成
-
-```powershell
-uv run cvg plan-day --target-date 2026-08-01 --allow-paid-generation
-uv run cvg status <runId>
-
-uv run cvg run-day <runId> --slot morning --allow-paid-generation
-uv run cvg run-day <runId> --allow-paid-generation
-uv run cvg status <runId>
-```
-
-`plan-day` 调用一次总导演和三个时段导演，并为三个时段分配不同的剧情模式软先验。`run-day`先生成或复用日内定妆图，再生成故事板，默认按1、2、3推进，但不会自动重试已经终态失败的收费任务。
-
-需要单独修订某个时段：
-
-```powershell
-uv run cvg replan-episode <runId> --slot noon `
-  --reason "说明剧情或世界状态修改原因" `
-  --allow-paid-generation
-```
-
-## 5. 审核、重试与恢复
-
-```powershell
-uv run cvg review <assetId> --approve --reason "人工观看通过"
-uv run cvg review <assetId> --reject --reason "说明身份、物理或内容错误"
-
-uv run cvg retry-step <stepId> `
-  --reason "同一剧本重新渲染" `
-  --allow-paid-generation
-
-uv run cvg resume <runId>
-```
-
-- `retry-step`通常只接受failed、expired、cancelled，并创建新的attempt。
-- Seedance `submission_unknown`必须通过Web节点对账，不能普通重试；已有Task ID时使用“继续查询”。
-- Seedream同步超时不能查询原任务；系统默认最多自动重试一次。再次人工生成必须在Web明确接受原请求可能已计费。
-- 被拒绝故事板不会复用；新attempt保留旧组图和审核结论。
-- 导演JSON解析或必填字段缺失最多自动结构修复一次；可解析脚本的语义审核失败会进入`planning_review`，必须由用户显式点击重规划。
-- `resume` 只恢复已有 task ID 的轮询、下载或 QC，不重复创建收费 POST。
-- 最终视频必须人工审核，不会自动交付。
-
-## 6. 交付与本地文件
-
-```powershell
-uv run cvg deliver <runId>
-```
-
-目录：
+生产至少需要当前批准版本：
 
 ```text
-var/       工作文件和Prompt导出
-assets/    按 SHA-256 保存的不可变媒体
-output/    01-morning、02-noon、03-evening 与 manifest
+person:headshot
+person:front / person:side / person:back（按现有系列档案）
+cat:front / cat:side / cat:back
+style:line_texture
+style:indoor
+style:outdoor
 ```
 
-系统不会在普通运行中自动清理当前Run媒体；清理必须使用精确数据库路径和SHA-256对账。
+新Run只选择精确semantic_key的最新已批准资产；`legacy:*`、候选和拒绝资产不会自动复用。
 
-## 7. 本机 Web
+## 4. 本地Web
+
+开发模式使用两个进程：
 
 ```powershell
 # 终端一
 uv run cvg api
 
 # 终端二
-cd web
-npm install
-npm run dev
+npm --prefix web install
+npm --prefix web run dev
 ```
 
-生产前端：
+访问`http://localhost:5173/studio`。生产构建可由同一个后端托管：
 
 ```powershell
-cd web
-npm run build
-cd ..
+npm --prefix web run build
 uv run cvg api --static-dir web/dist
 ```
 
-## 8. 常见故障
+## 5. 创建与生成
+
+Web新建Run时配置全天默认活动焦点和早中晚覆盖；每个时段选择short、medium、long
+或adaptive。总导演只解析全天容量，时段导演在档位内确定精确秒数。
+
+CLI核心入口仍可使用：
+
+```powershell
+uv run cvg plan-day --target-date 2026-08-10 --allow-paid-generation
+uv run cvg status <runId>
+uv run cvg run-day <runId> --slot morning --allow-paid-generation
+```
+
+`run-day`依次确保定妆图、开场锚点和RenderPlan视频任务。8～15秒一个任务；中长
+视频按模型能力使用官方延展。延展返回的新增尾段会在各自QC通过后，通过FFmpeg
+`stream copy`与前序区段顺序封装；不会生成故事板组图、逐镜视频，也不会转码。
+
+## 6. 恢复、审核和交付
+
+```powershell
+uv run cvg retry-step <stepId> --reason "明确原因" --allow-paid-generation
+uv run cvg resume <runId>
+uv run cvg replan-episode <runId> --slot noon --reason "调整剧情原因" --allow-paid-generation
+uv run cvg review <assetId> --approve --reason "人工观看通过"
+uv run cvg deliver <runId>
+```
+
+- `retry-step`创建新attempt，不覆盖原Prompt、Task ID或错误。
+- 已有视频Task ID使用resume继续查询，不产生第二次POST。
+- 视频`submission_unknown`在Web节点列出候选并人工对账。
+- 图片同步超时按配置最多自动重试一次，可能重复计费。
+- 最终视频必须人工批准；三条都ready后才能交付1/2/3。
+
+## 7. 常见故障
 
 | 现象 | 处理 |
 | --- | --- |
-| 迁移落后 | 先运行`uv run alembic upgrade head`，再执行Doctor |
-| 明文连接被拒绝 | 检查显式不安全许可；正式环境优先启用 TLS/隧道 |
-| 缺少 Canon 或语义键 | 导入并批准精确人物、猫咪和画风资产 |
-| `planning_review` | 查看矛盾后运行 `replan-episode` 或 `resume-planning` |
-| 故事板少图或语义失败 | 使用`retry-step`创建新attempt，不覆盖旧组图与审核 |
-| 视频 Step 失败 | 明确原因后显式付费重试；`run-day` 不代替重试 |
-| Seedance `submission_unknown` | 在工作台节点查询候选并确认Task ID，禁止重复POST |
-| Seedream同步超时 | 查看两个attempt与重复计费警告；自动重试用尽后再决定是否人工生成 |
-| 本地视频监看窗口结束 | 点击“继续查询”恢复同一Task ID，不创建第二次收费任务 |
-| ffprobe 失败 | 检查路径、容器和文件完整性，不重新提交 Seedance |
-| 交付被拒绝 | 确认三个 slot 都有已批准且 ready 的视频资产 |
+| 迁移落后 | 先生成清理Manifest并按口令清理，再`alembic upgrade head` |
+| 长视频收费前失败 | 当前模型不支持官方延展；换用已开通完整模型或把该时段改为short |
+| 图片语义失败 | 在具体图片Step显式重试，不覆盖拒绝结论 |
+| 视频监看窗口结束 | 继续查询已有Task ID |
+| `submission_unknown` | 视频人工对账；图片需确认重复计费后新attempt |
+| 交付不可用 | 确认早中晚最终`video`资产均已人工批准 |
 
-## 9. 验证命令
+## 8. 最终验证
 
 ```powershell
 uv run ruff check .
@@ -183,8 +139,9 @@ uv run pytest -q
 $env:CAT_VIDEO_POSTGRES_TEST_MODE='remote-schema'
 uv run pytest -m postgres -q
 Remove-Item Env:CAT_VIDEO_POSTGRES_TEST_MODE
+npm --prefix web run build
 git diff --check
 uv run cvg doctor
 ```
 
-远程 PostgreSQL 测试只创建唯一临时 Schema，并在结束时清理；不得在正式 `cat_video` 内运行破坏性测试。
+远程PostgreSQL测试只创建唯一临时Schema，禁止在正式`cat_video`中执行破坏性测试。

@@ -7,14 +7,77 @@ from __future__ import annotations
 
 import json
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Any
 
 from PIL import Image
 
+from ...application.ports import StoredAsset
+
 
 class MediaQcError(RuntimeError):
     """媒体不可读取或不满足交付技术要求。"""
+
+
+class FrameExtractionError(RuntimeError):
+    """FFmpeg无法稳定抽取指定数量的诊断帧。"""
+
+
+class FfmpegFrameExtractor:
+    """从已通过技术QC的视频均匀抽取只读诊断帧。
+
+    本类只服务最终视频语义诊断，不提取镜头尾帧，也不承担视频拼接或转码。
+    临时帧由调用方在审核请求结束后删除。
+    """
+
+    def __init__(self, *, ffmpeg_path: Path, work_root: Path) -> None:
+        self._ffmpeg_path = ffmpeg_path.expanduser().resolve()
+        self._work_root = work_root.expanduser().resolve()
+
+    def extract_review_frames(
+        self,
+        source: StoredAsset,
+        *,
+        count: int,
+    ) -> tuple[Path, ...]:
+        if not 4 <= count <= 12:
+            raise ValueError("视频语义诊断抽帧数量必须在4至12之间")
+        # 视频落盘元数据把完整技术检查保存在 qc 下；历史资产可能仍把时长放在顶层。
+        # 两种布局都读取，避免已通过技术QC的成片在语义诊断阶段被误判为缺少时长。
+        qc_metadata = source.metadata.get("qc")
+        duration_ms = (
+            qc_metadata.get("durationMs")
+            if isinstance(qc_metadata, dict)
+            else source.metadata.get("durationMs")
+        )
+        if not isinstance(duration_ms, int) or duration_ms <= 0:
+            raise ValueError("视频资产缺少可用于均匀抽帧的durationMs")
+        self._work_root.mkdir(parents=True, exist_ok=True)
+        token = uuid.uuid4().hex
+        pattern = self._work_root / f".review-{token}-%02d.png"
+        frame_rate = count / (duration_ms / 1000)
+        try:
+            _run_ffmpeg(
+                self._ffmpeg_path,
+                [
+                    "-i",
+                    str(source.path),
+                    "-vf",
+                    f"fps={frame_rate:.8f}",
+                    "-frames:v",
+                    str(count),
+                    str(pattern),
+                ],
+            )
+            frames = tuple(sorted(self._work_root.glob(f".review-{token}-*.png")))
+            if len(frames) != count:
+                raise FrameExtractionError(f"期望抽取{count}帧，实际得到{len(frames)}帧")
+            return frames
+        except Exception:
+            for frame in self._work_root.glob(f".review-{token}-*.png"):
+                frame.unlink(missing_ok=True)
+            raise
 
 
 class FfprobeMediaProbe:
@@ -104,11 +167,8 @@ class FfprobeMediaProbe:
             failures.append("ratio_not_9_16")
         if (
             duration_ms is None
-            or not minimum_duration_seconds * 1000
-            <= duration_ms
-            <= maximum_duration_seconds * 1000
-            or abs(duration_ms - expected_duration_seconds * 1000)
-            > duration_tolerance_ms
+            or not minimum_duration_seconds * 1000 <= duration_ms <= maximum_duration_seconds * 1000
+            or abs(duration_ms - expected_duration_seconds * 1000) > duration_tolerance_ms
         ):
             failures.append("duration_invalid")
         return {
@@ -122,46 +182,11 @@ class FfprobeMediaProbe:
             "pixelFormat": None if video is None else video.get("pix_fmt"),
             "audioSampleRate": None if audio is None else audio.get("sample_rate"),
             "audioChannels": None if audio is None else audio.get("channels"),
-            "audioChannelLayout": (
-                None if audio is None else audio.get("channel_layout")
-            ),
+            "audioChannelLayout": (None if audio is None else audio.get("channel_layout")),
             "width": width,
             "height": height,
             "durationMs": duration_ms,
             "hasAudio": audio is not None,
-        }
-
-    def inspect_reference(
-        self,
-        path: Path,
-        *,
-        media_type: str,
-    ) -> dict[str, Any]:
-        """检查参考视频或音频可读取且时长满足Seedance输入要求。"""
-
-        if media_type not in {"video", "audio"}:
-            raise MediaQcError("参考媒体类型必须是video或audio")
-        payload = self._ffprobe(path)
-        streams = payload.get("streams", [])
-        expected_stream = next(
-            (item for item in streams if item.get("codec_type") == media_type),
-            None,
-        )
-        format_info = payload.get("format", {})
-        try:
-            duration_seconds = float(format_info.get("duration"))
-        except (TypeError, ValueError) as exc:
-            raise MediaQcError("参考媒体缺少有效时长") from exc
-        if expected_stream is None:
-            raise MediaQcError(f"参考媒体缺少{media_type}轨道")
-        if not 2 <= duration_seconds <= 15:
-            raise MediaQcError("参考视频或音频时长必须在2至15秒")
-        return {
-            "passed": True,
-            "mediaType": media_type,
-            "durationSeconds": duration_seconds,
-            "codec": expected_stream.get("codec_name"),
-            "container": format_info.get("format_name"),
         }
 
     def _ffprobe(self, path: Path) -> dict[str, Any]:
@@ -193,3 +218,20 @@ class FfprobeMediaProbe:
             json.JSONDecodeError,
         ) as exc:
             raise MediaQcError(f"ffprobe检查失败: {exc}") from exc
+
+
+def _run_ffmpeg(executable: Path, arguments: list[str]) -> None:
+    try:
+        subprocess.run(
+            [str(executable), "-hide_banner", "-loglevel", "error", "-y", *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=600,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        detail = ""
+        if isinstance(exc, subprocess.CalledProcessError):
+            detail = (exc.stderr or "").strip()[-1000:]
+        raise FrameExtractionError(f"FFmpeg抽帧失败: {detail or exc}") from exc

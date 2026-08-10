@@ -1,33 +1,48 @@
-"""纯业务领域层。
-
-该包只描述三时段内容、状态转换和 Prompt 规则，不依赖数据库、CLI、
-FastAPI、Ark SDK 或本地文件系统。
-"""
+"""纯业务领域层，不依赖数据库、Web框架、Ark SDK或文件系统。"""
 
 from .contracts import (
     ActionStage,
+    ActivityFocus,
+    ActivityFocusMode,
     AppearancePlan,
+    CriticalProp,
     DailyProductionPlan,
+    DayBrief,
+    DurationBand,
+    DurationIntent,
+    DurationMode,
     EpisodePlan,
     EpisodeScript,
-    SharedElement,
+    Handoff,
+    RelationshipArc,
+    RunCreativeControls,
     Slot,
+    SlotCreativeControl,
+    StoryPatternId,
 )
-from .rendering import (
-    MediaBinding,
-    VideoInputMode,
-    VideoInputPlan,
-)
+from .rendering import MediaBinding, RenderMode, RenderPlan, VideoInputPlan
 
 __all__ = [
     "ActionStage",
+    "ActivityFocus",
+    "ActivityFocusMode",
     "AppearancePlan",
+    "CriticalProp",
     "DailyProductionPlan",
+    "DayBrief",
     "EpisodePlan",
     "EpisodeScript",
+    "Handoff",
+    "DurationBand",
+    "DurationIntent",
+    "DurationMode",
     "MediaBinding",
-    "SharedElement",
+    "RenderMode",
+    "RenderPlan",
+    "RelationshipArc",
+    "RunCreativeControls",
     "Slot",
-    "VideoInputMode",
+    "SlotCreativeControl",
+    "StoryPatternId",
     "VideoInputPlan",
 ]

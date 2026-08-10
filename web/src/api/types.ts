@@ -1,32 +1,61 @@
-/** 与后端 camelCase 读模型对齐的接口类型。
- * 以 src/cat_video_generator/infrastructure/db/records.py 与
- * infrastructure/db/query_repository.py 的返回结构为准；
- * EpisodeScript 对应 domain/contracts.py；slot由Episode关系字段单独返回。
- */
+/** 与后端只读投影保持一致的生产工作台类型。 */
 
+export type Slot = "morning" | "noon" | "evening";
 export type StageMode = "auto" | "manual";
+export type ActivityFocus = "cat_lead" | "person_lead" | "balanced";
+export type ActivityFocusMode = ActivityFocus | "inherit" | "adaptive";
+export type DurationMode = "short" | "medium" | "long" | "adaptive";
 
 export interface PipelineSettings {
   allowPaidGeneration: boolean;
   dayBrief: StageMode;
   script: StageMode;
-  storyboard: StageMode;
+  visual: StageMode;
   video: StageMode;
+  review: StageMode;
+}
+
+export interface SlotCreativeControlDto {
+  slot: Slot;
+  activity_focus: ActivityFocusMode;
+  duration_mode: DurationMode;
+}
+
+export interface RunCreativeControlsDto {
+  default_activity_focus: Exclude<ActivityFocusMode, "inherit">;
+  slot_controls: SlotCreativeControlDto[];
+}
+
+export interface DurationIntentDto {
+  requested_mode: DurationMode;
+  resolved_band: "short" | "medium" | "long";
+  resolution_reason: string;
 }
 
 export interface SlotBriefDto {
-  slot: string;
-  narrative_purpose: string;
+  slot: Slot;
+  narrative_role: string;
   scene_direction: string;
   event_direction: string;
   appearance_intent: string;
+  resolved_activity_focus: ActivityFocus;
+  relationship_direction: string;
+  duration_intent: DurationIntentDto;
 }
 
 export interface DayBriefDto {
   content_date: string;
   theme: string;
+  day_objective: string;
   day_context: string;
-  slots: SlotBriefDto[];
+  shared_motif: string;
+  slot_briefs: SlotBriefDto[];
+  handoffs: Array<{
+    entity_key: string;
+    from_slot: Slot;
+    to_slot: Slot;
+    state: string;
+  }>;
 }
 
 export interface RunSummary {
@@ -39,28 +68,24 @@ export interface RunSummary {
   pipelineSettings?: PipelineSettings;
   createdAt: string;
   updatedAt: string;
-  /** 以下字段仅 /runs/{id}/graph 响应存在 */
-  worldConsistencyStatus?: string;
-  contradictions?: string[];
   dayBrief?: DayBriefDto | null;
   planningMetadata?: {
-    seriesProfile?: {
-      person_personality?: string;
-      cat_personality?: string;
-      humor_style?: string;
-    };
-    storyPatterns?: Record<
-      string,
-      { pattern_id?: string; name?: string; mood?: string }
-    >;
+    creativeControls?: RunCreativeControlsDto;
+    seriesProfile?: Record<string, unknown>;
+    storyPatterns?: Record<string, Record<string, unknown>>;
   };
   currentStage?: string;
 }
 
 export interface AppearancePlanDto {
   description: string;
-  changes_from_previous: string[];
   change_reason: string | null;
+}
+
+export interface RelationshipArcDto {
+  lead_activity: string;
+  secondary_activity: string;
+  convergence: string;
 }
 
 export interface ActionStageDto {
@@ -70,84 +95,66 @@ export interface ActionStageDto {
   visible_result: string;
 }
 
-export type CameraMove = "fixed" | "follow" | "push" | "pull" | "pan" | "track";
-export type DominantView = "front" | "side" | "back" | "mixed";
-
 export interface ShotPlanDto {
   order: number;
   action_orders: number[];
   framing: string;
-  camera_move: CameraMove;
-  dominant_view: DominantView;
+  camera_move: "fixed" | "follow" | "push" | "pull" | "pan" | "track";
   direction: string;
-}
-
-export type PlacementKind = "anchor" | "held_by" | "inside" | "offscreen";
-
-export interface PlacementDto {
-  kind: PlacementKind;
-  target_id: string | null;
-}
-
-export interface EntityStateDto {
-  present: boolean;
-  placement: PlacementDto;
-}
-
-export type EntityKind = "person" | "cat" | "prop";
-export type EntityLifecycle = "persist" | "enter" | "exit" | "consume" | "transform";
-
-export interface SceneContinuityDto {
-  anchors: Array<{ id: string; name: string; type: string }>;
-  entities: Array<{
-    id: string;
-    name: string;
-    kind: EntityKind;
-    entity_key: string;
-    start_state: EntityStateDto;
-    end_state: EntityStateDto;
-    lifecycle: EntityLifecycle;
-    form_key: string;
-    final_form_key: string | null;
-    change_reason: string | null;
-  }>;
-}
-
-export type VideoInputMode = "storyboard_reference" | "strict_first_last";
-export type StyleContext = "indoor" | "outdoor";
-
-export interface EpisodeEndingDto {
-  result: string;
-  visual_critical: boolean;
-  key_entity_ids: string[];
 }
 
 export interface EpisodeScript {
   title: string;
   event_key: string;
   location_key: string;
+  story_pattern:
+    | "parallel_convergence"
+    | "watch_trigger_payoff"
+    | "setup_mishap_recovery"
+    | "choice_reveal"
+    | "routine_tag"
+    | "process_montage";
+  episode_question: string;
   main_event: string;
   scene: string;
-  style_context: StyleContext;
+  style_context: "indoor" | "outdoor";
   appearance: AppearancePlanDto;
+  activity_focus: ActivityFocus;
+  relationship_arc: RelationshipArcDto;
+  guest: { id: string; name: string; role: string } | null;
   actions: ActionStageDto[];
   shots: ShotPlanDto[];
-  ending: EpisodeEndingDto;
+  ending: { result: string };
   sound_design: string;
   duration_seconds: number;
-  continuity: SceneContinuityDto;
+  critical_props: Array<{
+    entity_key: string;
+    name: string;
+    start: string;
+    end: string;
+  }>;
+}
+
+export interface RenderPlanDto {
+  mode: "single_pass" | "extended";
+  total_duration_seconds: number;
+  sections: Array<{
+    order: number;
+    duration_seconds: number;
+    shot_orders: number[];
+  }>;
 }
 
 export interface EpisodeDto {
   id: string;
   runId: string;
-  slot: string;
+  slot: Slot;
   sortOrder: number;
   title: string;
   status: string;
-  videoInputMode: string;
-  worldConsistencyStatus: string;
-  contradictions: string[];
+  activityFocus: ActivityFocus;
+  relationshipArc: RelationshipArcDto;
+  renderPlan: RenderPlanDto;
   nextAction: string | null;
   selectedVideoAssetId: string | null;
   promptOverrides: Record<string, string>;
@@ -201,14 +208,7 @@ export interface PromptDto {
   id: string;
   stepId: string;
   parentPromptId: string | null;
-  purpose:
-    | "director"
-    | "look"
-    | "look_review"
-    | "storyboard"
-    | "storyboard_review"
-    | "video"
-    | "review";
+  purpose: "director" | "image" | "video" | "review";
   model: string;
   sha256: string;
   charCount: number;
@@ -246,29 +246,16 @@ export interface ReviewDto {
   evidence: Record<string, unknown>;
 }
 
-export interface RunGraph {
-  run: RunSummary;
-  episodes: EpisodeDto[];
-  steps: StepDto[];
-  prompts: PromptDto[];
-  assets: AssetDto[];
-  reviews: ReviewDto[];
-  /** 未定稿Run的时段剧本草稿（planning_json.episodeDrafts），键为slot */
-  episodeDrafts?: Record<string, EpisodeScript>;
-  workflowNodes?: WorkflowNodeDto[];
-}
-
 export interface WorkflowNodeDto {
   id: string;
   type:
     | "director"
     | "look"
-    | "storyboard"
-    | "storyboard_review"
-    | "video_shot"
+    | "opening_anchor"
     | "video"
+    | "video_extension"
     | "content_review";
-  slot: string | null;
+  slot: Slot | null;
   label: string;
   status: string;
   providerStatus: string;
@@ -282,6 +269,17 @@ export interface WorkflowNodeDto {
   nextAction: string | null;
   availableActions: StepActionDto[];
   attempts: StepDto[];
+}
+
+export interface RunGraph {
+  run: RunSummary;
+  episodes: EpisodeDto[];
+  steps: StepDto[];
+  prompts: PromptDto[];
+  assets: AssetDto[];
+  reviews: ReviewDto[];
+  episodeDrafts?: Record<string, EpisodeScript>;
+  workflowNodes?: WorkflowNodeDto[];
 }
 
 export interface ReconciliationCandidateDto {
@@ -314,12 +312,7 @@ export interface JobAccepted {
   context: Record<string, string>;
 }
 
-export interface Job {
-  jobId: string;
-  kind: string;
-  dedupKey: string;
-  context: Record<string, string>;
-  status: string;
+export interface Job extends JobAccepted {
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;
@@ -339,7 +332,7 @@ export interface DeliveryItemDto {
   id: string;
   episodeId: string;
   assetId: string;
-  slot: string;
+  slot: Slot;
   sortOrder: number;
   filename: string;
   sha256: string;
@@ -362,6 +355,9 @@ export interface HealthStatus {
   alembicRevision: string | null;
   expectedAlembicRevision: string;
   ready: boolean;
+  arkVideoModel?: string;
+  arkVideoResolution?: "480p" | "720p";
+  supportsVideoExtension?: boolean;
   arkDirectorRequestTimeoutSeconds?: number;
   arkImageRequestTimeoutSeconds?: number;
   arkImageTimeoutAutoRetries?: number;
@@ -372,16 +368,19 @@ export interface HealthStatus {
   arkPollIntervalSeconds?: number;
 }
 
-/** 生产工作台：单集 Prompt 预览与编辑覆盖。 */
 export interface PromptOverrides {
-  storyboard?: string;
+  look?: string;
+  opening_anchor?: string;
   video?: string;
 }
 
 export interface EpisodePromptPreview {
   episodeId: string;
-  slot: string;
-  storyboard: string;
-  video: string;
+  slot: Slot;
+  look: string;
+  openingAnchor: string;
+  videoSections: Array<{ order: number; durationSeconds: number; prompt: string }>;
+  renderPlan: RenderPlanDto;
+  resolution: "480p" | "720p";
   overrides: PromptOverrides;
 }

@@ -41,7 +41,7 @@ class DirectorResult:
 
 @dataclass(frozen=True, slots=True)
 class ImageResult:
-    """Seedream返回的一张独立图片，可属于定妆或故事板组图。"""
+    """Seedream返回的一张定妆图或开场锚点。"""
 
     url: str
     model: str
@@ -65,33 +65,14 @@ class VideoTaskResult:
 
 
 @dataclass(frozen=True, slots=True)
-class StoryboardReviewResult:
-    """Ark对整组故事板的原子语义判断；证据不包含Base64。"""
-
-    identity_ok: bool
-    style_ok: bool
-    body_proportion_ok: bool
-    pose_naturalness_ok: bool
-    action_sequence_ok: bool
-    spatial_continuity_ok: bool
-    prop_continuity_ok: bool
-    ending_ok: bool
-    confidence: float
-    violations: tuple[str, ...]
-    warnings: tuple[str, ...]
-    evidence: tuple[str, ...]
-    response_id: str
-    model: str
-    request_hash: str
-
-
-@dataclass(frozen=True, slots=True)
-class LookReviewResult:
-    """日内定妆图的轻量语义审核结果。"""
+class ImageReviewResult:
+    """定妆图或开场锚点的轻量语义审核结果。"""
 
     identity_ok: bool
     style_ok: bool
     appearance_ok: bool
+    composition_ok: bool
+    critical_props_ok: bool
     confidence: float
     violations: tuple[str, ...]
     warnings: tuple[str, ...]
@@ -107,7 +88,7 @@ class VideoDiagnosticResult:
 
     identity_ok: bool
     style_ok: bool
-    world_continuity_ok: bool
+    critical_props_ok: bool
     narrative_order_ok: bool
     confidence: float
     violations: tuple[str, ...]
@@ -250,15 +231,7 @@ class MediaGenerationGateway(Protocol):
     @property
     def video_model(self) -> str: ...
 
-    def generate_storyboard(
-        self,
-        *,
-        prompt: str,
-        reference_paths: tuple[Path, ...],
-        max_images: int,
-    ) -> tuple[ImageResult, ...]: ...
-
-    def generate_look(
+    def generate_image(
         self,
         *,
         prompt: str,
@@ -270,7 +243,8 @@ class MediaGenerationGateway(Protocol):
         *,
         prompt: str,
         input_plan: VideoInputPlan,
-        input_paths: tuple[Path, ...],
+        input_paths: tuple[Path, ...] = (),
+        input_urls: tuple[str, ...] = (),
     ) -> VideoTaskResult: ...
 
     def get_video_task(self, task_id: str) -> VideoTaskResult: ...
@@ -284,26 +258,18 @@ class MediaGenerationGateway(Protocol):
 
 
 class VisualReviewGateway(Protocol):
-    """故事板整组审核与视频诊断的独立Ark边界。"""
+    """视觉图片审核与视频诊断的独立Ark边界。"""
 
     @property
     def review_model(self) -> str: ...
 
-    def review_storyboard(
-        self,
-        *,
-        prompt: str,
-        image_paths: tuple[Path, ...],
-        reference_paths: tuple[Path, ...],
-    ) -> StoryboardReviewResult: ...
-
-    def review_look(
+    def review_image(
         self,
         *,
         prompt: str,
         image_path: Path,
         reference_paths: tuple[Path, ...],
-    ) -> LookReviewResult: ...
+    ) -> ImageReviewResult: ...
 
     def diagnose_video_frames(
         self,
@@ -317,9 +283,7 @@ class PlanningStore(Protocol):
     """导演规划所需的最小持久化能力。"""
 
     def create_draft_run(self, content_date: date) -> uuid.UUID: ...
-    def create_step_with_prompt_intent(
-        self, **kwargs: Any
-    ) -> tuple[StoredStep, uuid.UUID]: ...
+    def create_step_with_prompt_intent(self, **kwargs: Any) -> tuple[StoredStep, uuid.UUID]: ...
     def save_prompt(self, **kwargs: Any) -> uuid.UUID: ...
     def finish_director_step(self, **kwargs: Any) -> None: ...
     def fail_director_step(self, **kwargs: Any) -> None: ...
@@ -344,19 +308,15 @@ class PlanningStore(Protocol):
 class ProductionStore(Protocol):
     """媒体生产、恢复、审核与交付所需的持久化能力。"""
 
-    def create_step_with_prompt_intent(
-        self, **kwargs: Any
-    ) -> tuple[StoredStep, uuid.UUID]: ...
+    def create_step_with_prompt_intent(self, **kwargs: Any) -> tuple[StoredStep, uuid.UUID]: ...
     def save_prompt(self, **kwargs: Any) -> uuid.UUID: ...
     def fail_step(self, step_id: uuid.UUID, **kwargs: Any) -> None: ...
     def next_step_attempt(
         self, *, episode_id: uuid.UUID, kind: StepKind, operation_key: str
     ) -> int: ...
-    def replace_episode_plan(self, **kwargs: Any) -> None: ...
     def get_prompt_overrides(self, episode_id: uuid.UUID) -> dict[str, str]: ...
     def save_prompt_overrides(self, **kwargs: Any) -> None: ...
     def get_run(self, run_id: uuid.UUID) -> StoredRun: ...
-    def get_planning_context(self, run_id: uuid.UUID) -> dict[str, Any]: ...
     def get_episode(self, run_id: uuid.UUID, slot: Slot) -> StoredEpisode: ...
     def list_episodes(self, run_id: uuid.UUID) -> tuple[StoredEpisode, ...]: ...
     def get_step(self, step_id: uuid.UUID) -> StoredStep: ...
@@ -367,23 +327,15 @@ class ProductionStore(Protocol):
     def list_resumable_steps(self, run_id: uuid.UUID | None) -> tuple[StoredStep, ...]: ...
     def list_assets(self, **kwargs: Any) -> tuple[StoredAsset, ...]: ...
     def find_reusable_asset(self, **kwargs: Any) -> StoredAsset | None: ...
-    def find_reusable_storyboard(self, **kwargs: Any) -> tuple[StoredAsset, ...]: ...
-    def latest_approved_storyboard(
-        self, episode_id: uuid.UUID
-    ) -> tuple[StoredAsset, ...]: ...
     def set_episode_status(self, episode_id: uuid.UUID, target: EpisodeStatus) -> None: ...
     def set_run_status(self, run_id: uuid.UUID, target: RunStatus) -> None: ...
     def set_step_status(self, step_id: uuid.UUID, target: StepStatus, **kwargs: Any) -> None: ...
+    def reopen_video_step_for_local_recovery(self, step_id: uuid.UUID) -> None: ...
     def patch_step_snapshot(self, step_id: uuid.UUID, patch: dict[str, Any]) -> None: ...
-    def find_step_by_provider_task_id(
-        self, provider_task_id: str
-    ) -> StoredStep | None: ...
+    def find_step_by_provider_task_id(self, provider_task_id: str) -> StoredStep | None: ...
     def save_asset(self, **kwargs: Any) -> StoredAsset: ...
-    def select_video_asset(self, **kwargs: Any) -> None: ...
     def record_review(self, **kwargs: Any) -> uuid.UUID: ...
     def commit_asset_review(self, **kwargs: Any) -> ReviewCommitResult: ...
-    def commit_storyboard_review(self, **kwargs: Any) -> ReviewCommitResult: ...
-    def set_asset_status(self, asset_id: uuid.UUID, status: str) -> None: ...
     def asset_detail(self, asset_id: uuid.UUID) -> StoredAsset: ...
     def episode_detail(self, episode_id: uuid.UUID) -> dict[str, Any]: ...
     def next_delivery_revision(self, run_id: uuid.UUID) -> int: ...
@@ -412,13 +364,10 @@ class StudioStore(Protocol):
     """创作台人工编辑（剧本/日导演/流水线开关）所需的持久化能力。"""
 
     def get_run(self, run_id: uuid.UUID) -> StoredRun: ...
-    def get_episode(self, run_id: uuid.UUID, slot: Slot) -> StoredEpisode: ...
-    def list_episodes(self, run_id: uuid.UUID) -> tuple[StoredEpisode, ...]: ...
     def episode_detail(self, episode_id: uuid.UUID) -> dict[str, Any]: ...
     def get_planning_context(self, run_id: uuid.UUID) -> dict[str, Any]: ...
     def replace_episode_plan(self, **kwargs: Any) -> None: ...
     def update_day_brief(self, **kwargs: Any) -> None: ...
-    def update_episode_draft(self, **kwargs: Any) -> None: ...
     def save_pipeline_settings(self, **kwargs: Any) -> None: ...
     def get_pipeline_settings(self, run_id: uuid.UUID) -> PipelineSettings: ...
 
@@ -446,6 +395,8 @@ class AssetStore(Protocol):
         box: tuple[int, int, int, int],
     ) -> LandedAsset: ...
 
+    def concatenate_videos(self, paths: tuple[Path, ...]) -> LandedAsset: ...
+
     def build_delivery(
         self,
         *,
@@ -461,13 +412,6 @@ class MediaProbe(Protocol):
 
     def inspect_image(self, path: Path) -> dict[str, Any]: ...
 
-    def inspect_reference(
-        self,
-        path: Path,
-        *,
-        media_type: str,
-    ) -> dict[str, Any]: ...
-
     def inspect_video(
         self,
         path: Path,
@@ -481,7 +425,7 @@ class MediaProbe(Protocol):
 
 
 class ReviewFrameExtractor(Protocol):
-    """视频语义诊断抽帧、逐镜头尾帧提取与同规格片段拼接。"""
+    """视频语义诊断所需的均匀抽帧边界。"""
 
     def extract_review_frames(
         self,
@@ -489,7 +433,3 @@ class ReviewFrameExtractor(Protocol):
         *,
         count: int,
     ) -> tuple[Path, ...]: ...
-
-    def extract_last_frame(self, source: Path, *, target: Path) -> Path: ...
-
-    def concat_videos(self, sources: tuple[Path, ...], *, target: Path) -> Path: ...

@@ -37,8 +37,7 @@ from .infrastructure.db.session import (
     create_session_factory,
     ensure_database_ready,
 )
-from .infrastructure.media.finalizer import FfmpegFrameExtractor
-from .infrastructure.media.qc import FfprobeMediaProbe
+from .infrastructure.media.qc import FfmpegFrameExtractor, FfprobeMediaProbe
 from .infrastructure.media.storage import LocalAssetStore
 
 
@@ -71,9 +70,16 @@ def build_query_container() -> QueryContainer:
 
     load_local_env()
     database = DatabaseSettings.from_env()
+    runtime = RuntimeSettings.from_env()
     engine = _ready_engine(database)
     repository = SqlAlchemyWorkflowRepository(create_session_factory(engine))
-    return QueryContainer(engine=engine, queries=QueryService(repository))
+    return QueryContainer(
+        engine=engine,
+        queries=QueryService(
+            repository,
+            video_resolution=runtime.ark_video_resolution,
+        ),
+    )
 
 
 def build_diagnostic_container() -> QueryContainer:
@@ -85,6 +91,7 @@ def build_diagnostic_container() -> QueryContainer:
 
     load_local_env()
     database = DatabaseSettings.from_env()
+    runtime = RuntimeSettings.from_env()
     engine = create_database_engine(
         database,
         DatabaseOperation.READ_ONLY_SMOKE,
@@ -92,7 +99,13 @@ def build_diagnostic_container() -> QueryContainer:
         max_overflow=0,
     )
     repository = SqlAlchemyWorkflowRepository(create_session_factory(engine))
-    return QueryContainer(engine=engine, queries=QueryService(repository))
+    return QueryContainer(
+        engine=engine,
+        queries=QueryService(
+            repository,
+            video_resolution=runtime.ark_video_resolution,
+        ),
+    )
 
 
 def build_runtime_container(
@@ -125,6 +138,7 @@ def build_runtime_container(
         work_root=runtime.work_root,
         asset_root=runtime.asset_root,
         delivery_root=runtime.delivery_root,
+        ffmpeg_path=runtime.ffmpeg_path,
     )
     probe = FfprobeMediaProbe(runtime.ffprobe_path)
     frame_extractor = (
@@ -142,7 +156,7 @@ def build_runtime_container(
         asset_store=store,
         media_probe=probe,
         provider_name=runtime.provider_profile,
-        storyboard_review_mode=runtime.storyboard_review_mode,
+        image_review_mode=runtime.image_review_mode.value,
         image_request_timeout_seconds=runtime.ark_image_request_timeout_seconds,
         image_timeout_auto_retries=runtime.ark_image_timeout_auto_retries,
         image_retry_delay_seconds=runtime.ark_image_retry_delay_seconds,
@@ -160,13 +174,6 @@ def build_runtime_container(
         review_gateway=gateway,
         frame_extractor=frame_extractor,
         diagnostic_mode=runtime.video_semantic_review_mode,
-        generation_mode=(
-            runtime.ark_video_generation_mode
-            if frame_extractor is not None
-            or runtime.ark_video_generation_mode == "single_pass"
-            else "single_pass"
-        ),
-        shot_minimum_seconds=runtime.ark_shot_minimum_seconds,
         api_timeout_seconds=runtime.ark_video_api_timeout_seconds,
         poll_interval_seconds=runtime.ark_poll_interval_seconds,
         task_timeout_seconds=runtime.ark_task_timeout_seconds,
@@ -174,7 +181,10 @@ def build_runtime_container(
     )
     return RuntimeContainer(
         engine=engine,
-        queries=QueryService(repository),
+        queries=QueryService(
+            repository,
+            video_resolution=runtime.ark_video_resolution,
+        ),
         assets=AssetService(
             repository=repository,
             asset_store=store,
@@ -231,11 +241,15 @@ def build_local_container() -> LocalContainer:
         work_root=runtime.work_root,
         asset_root=runtime.asset_root,
         delivery_root=runtime.delivery_root,
+        ffmpeg_path=runtime.ffmpeg_path,
     )
     probe = FfprobeMediaProbe(runtime.ffprobe_path)
     return LocalContainer(
         engine=engine,
-        queries=QueryService(repository),
+        queries=QueryService(
+            repository,
+            video_resolution=runtime.ark_video_resolution,
+        ),
         assets=AssetService(
             repository=repository,
             asset_store=store,

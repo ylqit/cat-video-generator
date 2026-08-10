@@ -4,113 +4,69 @@
 
 ## 决策
 
-系统采用：
-
-```text
-显式 Python 状态机
-+ PostgreSQL 工作流
-+ Pydantic 业务契约
-+ Ark 导演 / 图片 / 视频 / 视觉审核边界
-+ 本地不可变媒体
-+ Typer / FastAPI 接口
-```
-
-不采用 LangGraph、AgentScope、Celery、Redis 或微服务。工作量为每天三个 Episode，PostgreSQL 已能提供幂等、锁、恢复和审计；增加新的编排框架只会制造第二状态源。
-
-## 分层与依赖
+系统使用显式Python状态机、PostgreSQL、Pydantic、Ark网关、本地不可变媒体、
+FastAPI和Vue。日生产规模只有三个Episode，不引入LangGraph、AgentScope、
+Celery、Redis或第二套检查点。
 
 ```mermaid
 flowchart TB
-    I["interfaces<br/>Typer / FastAPI"] --> A["application<br/>用例编排"]
-    A --> D["domain<br/>契约 / 状态机 / 连续性 / Prompt"]
-    X["infrastructure<br/>PostgreSQL / Ark / 本地媒体 / ffprobe"] -. "实现 ports" .-> A
-    B["bootstrap.py<br/>唯一组合根"] --> I
-    B --> A
-    B --> X
+  I["interfaces：CLI / FastAPI"] --> A["application：用例编排"]
+  A --> D["domain：契约 / Prompt / 状态机 / 渲染计划"]
+  X["infrastructure：PostgreSQL / Ark / 媒体 / ffprobe"] -. "实现 ports" .-> A
+  B["bootstrap.py：唯一组合根"] --> I
+  B --> A
+  B --> X
 ```
 
-强制方向：
+Domain不依赖框架或I/O；Application只依赖Domain和所需Port；Infrastructure不
+决定业务状态；接口层不直接写数据库或调用Ark。禁止只改名、转发参数或格式化
+路径的薄包装。
 
-- Domain 不依赖 SQLAlchemy、Typer、FastAPI、Ark SDK 或文件系统。
-- Application 只依赖 Domain 和实际需要的 Port。
-- Infrastructure 实现 Port，不决定业务状态。
-- CLI/API 只解析输入、调用 Application、格式化结果。
-- `bootstrap.py` 是唯一装配位置。
-
-不以机械行数驱动拆文件。超过 500 行提示人工审查；Ruff 圈复杂度上限 12；禁止只改名、格式化路径或转发参数的薄包装。
-
-## 当前模块所有权
+## 唯一生产模型
 
 ```text
-domain/
-  contracts.py      DayBrief、EpisodeScript、EpisodePlan
-  continuity.py     SceneContinuity轻量起终态与引用检查
-  rendering.py      VideoInputPlan 与素材顺序
-  prompts.py        导演、图片、视频和审核 Prompt
-  rules.py          规划准入硬门
-  snapshots.py      Director/Image/Video 类型化输入快照
-  workflow.py       Run/Episode/Step 状态转换
-
-application/
-  planning.py             四次导演调用与局部重规划
-  visual_preparation.py   日内定妆、精确参考选择、故事板组图和整组语义审核
-  video_execution.py      Seedance、下载和技术 QC
-  production.py           状态编排
-  retry.py                显式 attempt 与防重复收费
-  assets.py/reviews.py    Canon、参考和人工审核
-  delivery.py/queries.py  交付与统一只读投影
+RunCreativeControls
+→ DayBrief
+→ EpisodeScript × 3
+→ RenderPlan（确定性推导）
 ```
 
-`application/ports.py` 提供 `PlanningStore`、`ProductionStore`、`QueryStore` 三种能力协议。Application Service 只依赖其真正使用的能力；基础设施可由同一 Repository 实现它们。
+`EpisodeScript`只保存一个主事件、猫咪/人物活动关系、动作、镜头、声音、时长和
+少量关键道具起终描述。不保存世界状态模拟、故事板面板、供应商输入模式或数据库
+资产ID。默认关系为猫咪推动主要可见信息、人物完成副活动或回应、两条线汇合回报。
 
-## 单一事实模型
+`RenderPlan`按精确时长确定性生成：8～15秒一个初始任务；16～30秒增加一次官方
+延展；31～45秒增加两次延展。首段只用批准开场锚点，延展只用上一版视频。模型
+不支持延展时在收费前失败，不自动换模型。供应商延展返回新增尾段，因此媒体边界
+只负责区段级QC与FFmpeg `stream copy`顺序封装；不重新编码，也不引入逐镜或
+`multi_clip`创作路径。
+
+## 模块所有权
 
 ```text
-EpisodePlan
-├─ slot
-└─ script: EpisodeScript
-   ├─ mainEvent / scene / appearance / ending
-   ├─ actions[]
-   ├─ shots[]
-   ├─ durationSeconds
-   └─ continuity
+domain/contracts.py    DayBrief、EpisodeScript、创作控制与关系弧
+domain/rendering.py    RenderPlan、VideoInputPlan与延展能力
+domain/prompts.py      导演、定妆、开场锚点、视频和审核Prompt
+domain/rules.py        少量身份、时长与跨时段硬门
+domain/workflow.py     Run/Episode/Step合法状态转换
+
+application/planning.py            四次顺序导演调用与局部重规划
+application/visual_preparation.py  定妆图、开场锚点和图片审核
+application/video_execution.py     初始生成、官方延展、恢复、下载和QC
+application/production.py          流程编排
+application/retry.py               显式attempt、恢复和对账
 ```
 
-`SceneContinuity`只保存真正参与交互的锚点，以及关键实体的起点、终点、生命周期和稳定类别。普通背景不进入账本；动作姿态不做物理状态建模，也不执行逐动作重放。未知引用、关键实体缺失、无原因消失或变类会阻断；座位、服饰和道具的实际画面连续性由故事板语义审核把关，渲染难度只形成诊断。
+## PostgreSQL与不变量
 
-`VideoInputPlan` 只保存输入模式、分辨率、时长和有序素材绑定。模型位于 WorkflowStep；素材别名由模态和序号确定性生成；原生音频和 Prompt 方言属于产品配置与 Step 快照。
+八张核心表保持为`production_runs / episodes / workflow_steps / prompt_records /
+assets / reviews / delivery_packages / delivery_items`。
 
-## PostgreSQL
-
-八张核心表：
-
-```text
-production_runs
-episodes
-workflow_steps
-prompt_records
-assets
-reviews
-delivery_packages
-delivery_items
-```
-
-- `production_runs.planning_json` 保存 DayBrief、导演选择和恢复信息。
-- `episodes.script_json` 只保存 EpisodeScript；slot、排序和状态使用关系字段。
-- `workflow_steps` 只允许 director、image、video，保存正式 operation_key、attempt、幂等键、Task ID、模型、输入哈希和类型化输入快照。
-- Prompt 正文使用 TEXT；视频二进制不进入 PostgreSQL。
-- 旧运行数据已按用户要求从运行库清除；新Schema只接受故事板优先的新Run。
-
-## 不变量
-
-1. Prompt 和收费意图先落库，再调用 Ark。
-2. 幂等键包含 Episode、StepKind、operationKey、attempt 和规范化输入哈希。
-3. `submission_unknown` 禁止自动重复 POST。
-4. 终态失败只能通过显式 `retry-step` 产生递增 attempt；`run-day` 不隐式收费重试。
-5. Ark 轮询、下载和 ffprobe 期间不保持事务。
-6. 媒体先写 `.part`，完整下载并校验 SHA-256 后原子改名。
-7. 资产审核锁定 Asset、Step 和 Episode 并在一个事务中提交。
-8. 新Run只选择精确`semantic_key`的最新已批准Canon；人物使用大头照与全身照，日内外观先资产化，相同外观复用定妆图；每条只有一个故事板组图Step。
-9. Seedance只接收批准故事板并走single-pass；视频完成后进入人工`content_review`。
-10. JobRegistry 只管理 HTTP 异步执行，不成为工作流事实来源。
-11. Ark返回可解析脚本但语义审核失败时进入`planning_review`；只有结构解析失败允许一次自动导演修复。
+1. 收费意图和实际Prompt先在同一短事务落库，再调用Ark。
+2. PostgreSQL是唯一工作流状态源；JobRegistry只展示本进程异步任务。
+3. 幂等键包含操作、attempt和规范化输入哈希。
+4. `submission_unknown`冻结；已有Seedance Task ID只查询，不重复POST。
+5. 终态失败只能显式创建新attempt，`run-day`不暗中重试收费任务。
+6. 媒体通过`.part`下载、哈希校验和原子改名落盘。
+7. 图片和视频人工决定不可覆盖；相反决定必须产生新attempt。
+8. 最终视频停在`content_review`，三条人工批准后才能交付。

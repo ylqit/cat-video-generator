@@ -1,8 +1,4 @@
-"""WorkflowStep三类输入快照的严格契约。
-
-快照只保存幂等恢复所需事实，不承载任意业务JSON。Prompt正文另存于prompt_records，
-模型和operation_key使用关系列，避免同一字段重复。
-"""
+"""WorkflowStep三类输入快照的严格契约。"""
 
 from __future__ import annotations
 
@@ -30,8 +26,7 @@ class DirectorInputSnapshot(StrictModel):
 
 class ImageInputSnapshot(StrictModel):
     type: Literal["image"] = "image"
-    target: Literal["look", "storyboard"]
-    expected_panel_count: Annotated[int, Field(ge=1, le=4)]
+    target: Literal["look", "opening_anchor"]
     prompt_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     reference_asset_ids: tuple[UUID, ...]
     reference_sha256: tuple[Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")], ...]
@@ -48,6 +43,7 @@ class VideoInputSnapshot(StrictModel):
     prompt_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     input_plan: VideoInputPlan
     input_asset_ids: tuple[UUID, ...]
+    render_section_order: Annotated[int, Field(ge=1, le=3)]
     retry_of_step_id: UUID | None = None
     retry_reason: str | None = None
     api_request_timeout_seconds: float | None = None
@@ -59,6 +55,8 @@ class VideoInputSnapshot(StrictModel):
     reconciliation_queried_at: datetime | None = None
     reconciled_provider_task_id: str | None = None
     reconciled_at: datetime | None = None
+    local_recovery_started_at: datetime | None = None
+    media_qc: dict[str, object] | None = None
 
 
 StepInputSnapshot = Annotated[
@@ -69,6 +67,4 @@ _ADAPTER = TypeAdapter(StepInputSnapshot)
 
 
 def validate_input_snapshot(value: object) -> StepInputSnapshot:
-    """在Repository写入前拒绝任意键堆积。"""
-
     return _ADAPTER.validate_python(value)

@@ -1,7 +1,7 @@
-"""全天导演、时段导演、故事板、视频与媒体审核Prompt编译。
+"""导演、视觉锚点、视频生成与媒体审核Prompt编译。
 
-导演上下文可以完整；Seedream负责把脚本视觉化为有序独立面板；Seedance只接收
-当前Episode、已批准故事板和少量关键连续性。字符数仅用于展示，不作为本地准入门。
+导演Prompt拥有完整创作上下文；Seedream只接收定妆或开场画面所需信息；
+Seedance只接收当前渲染区段的镜头执行信息。三者不得互相承载数据库状态。
 """
 
 from __future__ import annotations
@@ -10,17 +10,17 @@ import json
 from dataclasses import dataclass
 from datetime import date
 
-from .continuity import EntityKind, EntityState, PlacementKind, validate_continuity
 from .contracts import (
-    ActionStage,
+    ActivityFocus,
     DayBrief,
     EpisodePlan,
     RecentContentSummary,
+    RunCreativeControls,
     ShotPlan,
     Slot,
     SlotBrief,
 )
-from .rendering import VideoInputPlan
+from .rendering import RenderOperation, RenderSection, VideoInputPlan, build_render_plan
 from .story_patterns import StoryPattern
 from .user_story import UserStory
 from .visual_profiles import (
@@ -37,8 +37,6 @@ class PromptCompilationError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class CompiledPrompt:
-    """Prompt正文和只读统计；统计值不会阻断生成。"""
-
     text: str
     char_count: int
     utf8_bytes: int
@@ -52,44 +50,71 @@ def compile_day_director_prompt(
     recent_summaries: tuple[RecentContentSummary, ...] = (),
     event_seeds: tuple[str, ...] = (),
     story_patterns: dict[Slot, StoryPattern] | None = None,
+    creative_controls: RunCreativeControls | None = None,
     series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
 ) -> str:
-    """生成只输出DayBrief的总导演Prompt。"""
+    """总导演只输出全天关系、时段方向和自适应配置解析。"""
 
+    controls = creative_controls or RunCreativeControls()
     recent = "；".join(item.summary_text for item in recent_summaries[-6:]) or "无"
     seeds = "；".join(event_seeds[:3]) or "无适用事件种子，可原创"
-    patterns = "；".join(
-        f"{slot.value}={pattern.name}，情绪={pattern.mood}，节拍="
-        f"{'→'.join(pattern.structure)}，可选反差="
-        f"{'、'.join(pattern.humor_mechanisms) or '自然反应'}，方向示例="
-        f"{'、'.join(pattern.example_themes)}"
-        for slot, pattern in (story_patterns or {}).items()
-    ) or "未分配模式，各时段可自由选择不同叙事结构"
+    patterns = _pattern_summary(story_patterns or {})
     return "\n".join(
         (
-            "你是持续角色生活流短视频的总导演。只输出一个符合JSON Schema的"
-            "DayBrief，不输出Episode、分镜、解释或候选数组。",
-            f"内容日期：{target_date.isoformat()}。当天输入：{planning_context}。",
-            f"近期已批准内容：{recent}。适用事件种子：{seeds}。",
-            f"本日创意模式分配：{patterns}。模式只约束叙事方向，必须按当天环境改编，"
-            "不得照抄示例或为了匹配模式增加第二个任务。",
-            "固定主体为同一个中性儿童和同一只灰白猫。只规划全天主题、天气、"
-            "地点范围、真正跨时段复用的元素及早中晚边界，不替时段导演写动作。",
-            f"人物长期身份：{series_profile.person_identity}；{series_profile.person_hair}；"
-            f"{series_profile.person_body}。",
-            f"人物性格：{series_profile.person_personality}。猫咪性格："
-            f"{series_profile.cat_personality}。幽默表达：{series_profile.humor_style}。",
-            f"全日唯一视觉风格：{style_profile.prompt_positive()}；排除"
-            f"{style_profile.prompt_negative()}。早中晚只允许随天气、地点和光线自然变化，"
-            "不得切换成其它插画、摄影或三维渲染体系。",
-            "共享元素只使用逻辑entity_key，不要写数据库semantic_key，不要把固定人物、"
-            "固定猫咪或普通场景重复声明为共享元素；没有跨时段关键道具就保持空数组。"
-            "服装、鞋帽、背包和配饰服从场景，变化时给出天气、地点或事件原因。",
-            "早中晚可以独立或局部承接，不强制准备—完成—归家。slots必须严格按"
-            "morning、noon、evening排序，自然语言字段全部使用中文。每个带编号的事件"
-            "种子一天最多分配给一个时段；三个时段必须采用不同的观察、探索、共同活动"
-            "或环境回应方式，不能全部重复“听声—寻找—发现”的同一种关系结构。",
+            "你是持续角色生活流视频的总导演。只输出一个符合JSON Schema的DayBrief，"
+            "不得输出具体动作、镜头、精确秒数、视频Prompt或候选数组。",
+            f"内容日期：{target_date.isoformat()}。用户主题输入：{planning_context}。",
+            "用户已冻结的活动焦点与时长意图："
+            + json.dumps(controls.model_dump(mode="json"), ensure_ascii=False),
+            f"近期已批准内容：{recent}。事件方向种子：{seeds}。模式建议：{patterns}。",
+            "全天默认关系是猫咪主活动、人物副活动或回应、两线汇合形成回报。"
+            "猫咪通过探索、发现、追逐、等待、误触或自然反应推动观众注意力，"
+            "不代替人物完成复杂工具劳动。",
+            "每个slotBrief必须原样保留用户固定选择。activity_focus为adaptive时才可"
+            "在cat_lead、person_lead、balanced中解析；duration_mode为adaptive时才可"
+            "在short、medium、long中解析，并在resolution_reason说明全天节奏理由。",
+            "short承载8至15秒轻量事件；medium承载16至30秒的变化、受阻或协作恢复；"
+            "long承载31至45秒连续过程。长时段仍只有一个主事件，不得用第二个任务填时长。",
+            "早间建立当天活动，中午推进变化或主要事件，傍晚回收前文并兑现关系与情绪。"
+            "总导演只给eventDirection、relationshipDirection和narrativeRole，"
+            "具体事件、精确秒数与镜头由时段导演决定。",
+            f"固定人物：{series_profile.person_identity}；{series_profile.person_hair}；"
+            f"{series_profile.person_body}。固定猫咪：{series_profile.cat_identity}。",
+            f"猫咪行为边界：{series_profile.cat_motion_rules}。全日画风："
+            f"{style_profile.prompt_positive()}；排除{style_profile.prompt_negative()}。",
+            "handoffs只登记真正跨时段延续的同一关键道具或结果；人物、猫咪和普通背景"
+            "不得登记为handoff。slotBriefs严格按morning、noon、evening排序。",
+        )
+    )
+
+
+def compile_day_structuring_prompt(
+    *,
+    user_story: UserStory,
+    target_date: date,
+    creative_controls: RunCreativeControls | None = None,
+    series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
+    style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
+) -> str:
+    """把用户完整三集剧情映射为DayBrief，不改写情节。"""
+
+    controls = creative_controls or RunCreativeControls()
+    episodes = "\n".join(
+        f"剧本{index}（{slot.value}）：{text}"
+        for index, (slot, text) in enumerate(zip(Slot, user_story.episodes, strict=True), 1)
+    )
+    return "\n".join(
+        (
+            "你是全天结构导演。只输出符合JSON Schema的DayBrief，不增删用户剧情。",
+            f"日期：{target_date.isoformat()}。主题：{user_story.theme}。\n{episodes}",
+            "创作控制：" + json.dumps(controls.model_dump(mode="json"), ensure_ascii=False),
+            "提炼全天目标、上下文、共享意象、三个时段作用、关系方向和跨时段handoff。"
+            "固定选择不得改写；adaptive活动焦点与时长档按原剧情容量解析。",
+            "默认以猫咪推动可见信息、人物承担工具活动或回应、最终关系汇合的方式整理，"
+            "但不得改变用户原文的实际主次。",
+            f"固定主体：{series_profile.person_identity}；{series_profile.cat_identity}。",
+            f"唯一画风：{style_profile.prompt_positive()}；排除{style_profile.prompt_negative()}。",
         )
     )
 
@@ -106,129 +131,19 @@ def compile_episode_director_prompt(
     series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
 ) -> str:
-    """生成只输出一个故事板友好EpisodeScript的时段导演Prompt。"""
+    """时段导演在总导演边界内生成精确事件、时长和镜头。"""
 
-    previous = "；".join(previous_state_summaries) or "当天第一条，无前序状态"
-    repair = ""
-    if rejected_candidate is not None:
-        repair = (
-            "上次候选存在确定性矛盾，必须重新输出完整EpisodeScript而不是局部补丁。"
-            f"错误：{'；'.join(validation_errors)}。上次候选："
-            f"{json.dumps(rejected_candidate, ensure_ascii=False, separators=(',', ':'))}"
-        )
-    retry = f"局部重规划原因：{retry_reason}。" if retry_reason else ""
-    pattern = (
-        f"本时段采用“{story_pattern.name}”创意模式，整体情绪为{story_pattern.mood}。"
-        f"节拍骨架：{'→'.join(story_pattern.structure)}。可选幽默机制："
-        f"{'、'.join(story_pattern.humor_mechanisms) or '自然反差'}。可借鉴但不可照抄的"
-        f"方向：{'、'.join(story_pattern.example_themes)}；可能需要的道具方向："
-        f"{'、'.join(story_pattern.prop_hints) or '由剧情决定'}。"
-        "按DayBrief改编，不照抄示例；模式不是校验字段，不要把pattern_id写进JSON。"
-        if story_pattern is not None
-        else "本时段没有预分配模式，请选择与其他时段不同的自然生活叙事结构。"
-    )
-    return "\n".join(
-        (
-            f"你是{slot_brief.slot.value}时段导演。只输出符合JSON Schema的一个"
-            "EpisodeScript，不输出slot、全天方案、解释或Markdown。",
-            "DayBrief：" + json.dumps(day_brief.model_dump(mode="json"), ensure_ascii=False),
-            "本时段边界：" + json.dumps(slot_brief.model_dump(mode="json"), ensure_ascii=False),
-            f"前序真实终态摘要：{previous}。{retry}{repair}",
-            pattern,
-            "设计一条8至15秒生活流视频：一个主事件、2至4个连续动作阶段，默认使用"
-            "2至3个镜头和一个可见收束。动作阶段服务于镜头叙事，不要求每个动作机械"
-            "对应一张故事板图；结尾不得靠静止互看填时长。",
-            "一个主事件可以有3至5次可见信息变化，但不得加入第二个独立任务。猫咪"
-            "产生独立反应、探索或关系作用，不要求它每次都负责解决问题。实际"
-            "操作的关键道具优先控制在0至2个，复杂度更高时先保证主事件可读。",
-            "每个Shot必须明确景别、主体位置与画面方向、唯一一种camera_move、进入"
-            "状态、主要变化和动作稳定后的切点。高风险拿取、落下或交接过程应在同一"
-            "镜头内完成，不把物理变化藏在切镜中。",
-            "动作主体使用SceneContinuity实体ID（固定人物person、灰白猫cat）；"
-            "ActionStage只保存order、actor_id、action和visible_result。停步、转头、"
-            "蹲下、嗅闻、走动等姿态只写入动作文本。每个action必须由实际执行主体出发，"
-            "说明肢体动作、自然速度、移动路径、接触对象及动作停止位置；visible_result"
-            "只写镜头中能直接看到的动作后结果，不用抽象情绪代替画面。",
-            "SceneContinuity只登记人物、猫咪、被操作或跨镜头延续的关键道具，以及"
-            "真正参与承重的桌面、座椅等锚点。普通植物、屋檐、远山和装饰不要建账。",
-            "每个实体声明kind、逻辑entity_key、start_state、end_state、lifecycle和稳定"
-            "form_key。**entity_key在账本内必须唯一**：每个实体一个独立键（如fishing_rod、"
-            "fish_bucket、cat_hat_big），禁止把同一类别词（如fishing_gear）复用给多个实体。"
-            "form_key只表示类别或固定外观，禁止加入crouch、sniffing、walking等"
-            "姿势。人物和猫咪固定persist；其他实体按persist、enter、exit、consume或"
-            "transform声明起终态，变化时说明原因。",
-            "首个动作里提到的人物、猫咪和关键道具起点必须逐项等于对应实体的start_state；"
-            "不得同时写成位于窗台和来自地面等互相冲突的位置。后续动作与end_state也必须"
-            "保持同一空间语义。",
-            "关键实体不得无原因出现、消失、复制或改变类别；承担发现或结尾回报的实体"
-            "必须登记，并在ending.key_entity_ids中引用。跨时段道具使用DayBrief中的同一"
-            "entity_key。导演不得生成数据库资产semantic_key。",
-            f"人物保持{series_profile.person_identity}；{series_profile.person_hair}；"
-            f"{series_profile.person_body}。猫保持{series_profile.cat_identity}。"
-            f"{series_profile.cat_motion_rules}。"
-            f"人物行为符合{series_profile.person_personality}；猫咪行为符合"
-            f"{series_profile.cat_personality}；{series_profile.humor_style}。"
-            "猫咪动作必须四足可执行：剧情需要拟人效果时做生物力学适配——抱物改为"
-            "用嘴叼住或前爪在四足姿态下轻扶，递物改为用鼻子顶过去，不得写猫咪直立、"
-            "双足行走或人手式抓握；这属于执行方式适配，visible_result的剧情意图保持不变。"
-            "服装、鞋帽和背包按剧情自然变化。appearance直接描述本时段外观；"
-            "若相对前一时段有变化，列入changes_from_previous并给出change_reason，"
-            "没有变化时两者保持空值。",
-            f"本集必须服从全日定稿画风：{style_profile.prompt_positive()}；排除"
-            f"{style_profile.prompt_negative()}。style_context只选择indoor或outdoor场景参考，"
-            "不得重新定义画风、媒介或角色造型体系。",
-            "ending必须给出result和key_entity_ids；key_entity_ids可引用continuity中已登记的"
-            "实体或场景锚点；只有结尾物体状态或构图必须精确锁定"
-            "时，才将visual_critical设为true。脚本不选择Seedance输入模式，也不声明"
-            "参考素材。",
-            "sound_design必须结合本集场景和动作，明确环境底声、关键动作声和结尾声音回报；"
-            "不使用对白、旁白或歌词，也不要只写笼统的“自然环境声”。",
-        )
-    )
-
-
-def storyboard_panel_count(episode: EpisodePlan) -> int:
-    """按镜头结构确定组图数量；一次Episode永远只产生一个组图任务。"""
-
-    return 4 if len(episode.script.shots) == 3 else 3
-
-
-def compile_day_structuring_prompt(
-    *,
-    user_story: UserStory,
-    target_date: date,
-    series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
-    style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
-) -> str:
-    """扩写模式：把用户写好的完整三集剧情结构化为DayBrief，不做任何创作。"""
-
-    episodes = "\n".join(
-        f"剧本{index}（{slot.value}）：\n{text}"
-        for index, (slot, text) in enumerate(
-            zip((Slot.MORNING, Slot.NOON, Slot.EVENING), user_story.episodes),
-            1,
-        )
-    )
-    return "\n".join(
-        (
-            "你是持续角色生活流短视频的总导演。用户已经写好全天三集完整剧情，"
-            "你的任务是把它们结构化为一个符合JSON Schema的DayBrief，"
-            "**不得增删情节、道具、幽默点或角色行为**，不输出Episode、解释或Markdown。",
-            f"内容日期：{target_date.isoformat()}。全天主题：{user_story.theme}。",
-            f"用户剧情原文：\n{episodes}",
-            "从原文提炼：全天主题与氛围、天气与光线随早中晚的自然推进、地点范围、"
-            "真正跨时段复用的关键道具（shared_elements使用逻辑entity_key，"
-            "如钓鱼装备、风筝；没有就保持空数组），以及每个时段的叙事目的、"
-            "场景方向、事件方向与服饰意图（slots严格按morning、noon、evening排序，"
-            "自然语言字段全部使用中文）。**每个shared_element的slots必须覆盖该道具在"
-            "用户原文中出现的全部时段**——例如水桶在准备、垂钓、返程三集都出现，"
-            "slots就必须是morning、noon、evening三个，漏掉的时段导演将无法合法使用它。",
-            f"固定主体为同一个中性儿童和同一只灰白猫：{series_profile.person_identity}；"
-            f"{series_profile.cat_identity}。人物性格：{series_profile.person_personality}。"
-            f"猫咪性格：{series_profile.cat_personality}。",
-            f"全日唯一视觉风格：{style_profile.prompt_positive()}；排除"
-            f"{style_profile.prompt_negative()}。",
-        )
+    return _episode_director_body(
+        day_brief=day_brief,
+        slot_brief=slot_brief,
+        previous_state_summaries=previous_state_summaries,
+        retry_reason=retry_reason,
+        rejected_candidate=rejected_candidate,
+        validation_errors=validation_errors,
+        story_pattern=story_pattern,
+        series_profile=series_profile,
+        style_profile=style_profile,
+        user_episode_text=None,
     )
 
 
@@ -244,66 +159,89 @@ def compile_episode_adaptation_prompt(
     series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
 ) -> str:
-    """扩写模式：把用户写好的本集剧情逐拍改编为EpisodeScript契约。
+    """把用户本集原文映射为同一EpisodeScript，不增删情节。"""
 
-    契约规则段落与创作模式完全一致；任务从"创作"换成"改编"——情节、道具、
-    幽默节拍与温情收束一律以用户原文为准，模型只负责结构化映射。
-    """
+    return _episode_director_body(
+        day_brief=day_brief,
+        slot_brief=slot_brief,
+        previous_state_summaries=previous_state_summaries,
+        retry_reason=retry_reason,
+        rejected_candidate=rejected_candidate,
+        validation_errors=validation_errors,
+        story_pattern=None,
+        series_profile=series_profile,
+        style_profile=style_profile,
+        user_episode_text=user_episode_text,
+    )
 
-    previous = "；".join(previous_state_summaries) or "当天第一条，无前序状态"
+
+def _episode_director_body(
+    *,
+    day_brief: DayBrief,
+    slot_brief: SlotBrief,
+    previous_state_summaries: tuple[str, ...],
+    retry_reason: str | None,
+    rejected_candidate: dict[str, object] | None,
+    validation_errors: tuple[str, ...],
+    story_pattern: StoryPattern | None,
+    series_profile: SeriesVisualProfile,
+    style_profile: StyleProfile,
+    user_episode_text: str | None,
+) -> str:
+    previous = "；".join(previous_state_summaries) or "当天第一条，无前序结果"
+    requested = slot_brief.duration_intent.resolved_band.range
+    source = (
+        "用户本集原文（不得增删情节）：" + user_episode_text
+        if user_episode_text is not None
+        else "根据DayBrief原创一个具体生活事件。"
+    )
+    pattern = (
+        f"建议叙事模式：{story_pattern.name}；节拍：{'→'.join(story_pattern.structure)}。"
+        if story_pattern is not None
+        else "选择最适合本时段的叙事模式。"
+    )
     repair = ""
     if rejected_candidate is not None:
         repair = (
-            "上次候选存在确定性矛盾，必须重新输出完整EpisodeScript而不是局部补丁，"
-            "剧情内容仍以用户原文为准。错误："
-            f"{'；'.join(validation_errors)}。上次候选："
+            "上次结构不合格，重新输出完整对象，不做局部补丁。错误："
+            f"{'；'.join(validation_errors)}。上次对象："
             f"{json.dumps(rejected_candidate, ensure_ascii=False, separators=(',', ':'))}"
         )
-    retry = f"局部重规划原因：{retry_reason}。" if retry_reason else ""
     return "\n".join(
         (
-            f"你是{slot_brief.slot.value}时段导演。用户已经写好本集剧情，你的任务是"
-            "把它**逐拍改编**为一个符合JSON Schema的EpisodeScript，"
-            "不输出slot、解释或Markdown。",
-            f"用户本集剧情原文（改编的唯一依据）：\n{user_episode_text}",
-            "**情节、道具、幽默节拍、角色行为与温情收束一律不得增删改动**；"
-            "你只负责把原文映射为动作阶段、镜头、连续性账本与声音设计。"
-            "原文没有明写的动作不要新增；原文写到的道具必须出现在连续性账本或画面中。",
+            f"你是{slot_brief.slot.value}时段导演。只输出一个符合JSON Schema的"
+            "EpisodeScript，不输出slot、解释或Markdown。",
+            source,
             "DayBrief：" + json.dumps(day_brief.model_dump(mode="json"), ensure_ascii=False),
             "本时段边界：" + json.dumps(slot_brief.model_dump(mode="json"), ensure_ascii=False),
-            f"前序真实终态摘要：{previous}。{retry}{repair}",
-            "输出8至15秒生活流视频脚本：一个主事件、2至4个连续动作阶段，默认使用"
-            "2至3个镜头和一个可见收束。结尾不得靠静止互看填时长。",
-            "每个Shot必须明确景别、主体位置与画面方向、唯一一种camera_move、进入"
-            "状态、主要变化和动作稳定后的切点。高风险拿取、落下或交接过程应在同一"
-            "镜头内完成，不把物理变化藏在切镜中。",
-            "动作主体使用SceneContinuity实体ID（固定人物person、灰白猫cat）；"
-            "ActionStage只保存order、actor_id、action和visible_result。停步、转头、"
-            "蹲下、嗅闻、走动等姿态只写入动作文本。每个action必须由实际执行主体出发，"
-            "说明肢体动作、自然速度、移动路径、接触对象及动作停止位置；visible_result"
-            "只写镜头中能直接看到的动作后结果，不用抽象情绪代替画面。",
-            "SceneContinuity只登记人物、猫咪、被操作或跨镜头延续的关键道具，以及"
-            "真正参与承重的桌面、座椅等锚点。普通植物、屋檐、远山和装饰不要建账。",
-            "每个实体声明kind、逻辑entity_key、start_state、end_state、lifecycle和稳定"
-            "form_key。**entity_key在账本内必须唯一**：每个实体一个独立键（如fishing_rod、"
-            "fish_bucket），禁止把同一类别词复用给多个实体。form_key只表示类别或固定外观，"
-            "禁止加入crouch、sniffing、walking等姿势。人物和猫咪固定persist；其他实体按"
-            "persist、enter、exit、consume或transform声明起终态，变化时说明原因。",
-            "首个动作里提到的人物、猫咪和关键道具起点必须逐项等于对应实体的start_state；"
-            "后续动作与end_state也必须保持同一空间语义。",
-            "关键实体不得无原因出现、消失、复制或改变类别；承担发现或结尾回报的实体"
-            "必须登记，并在ending.key_entity_ids中引用。跨时段道具使用DayBrief中的同一"
-            "entity_key。导演不得生成数据库资产semantic_key。",
-            f"人物保持{series_profile.person_identity}；{series_profile.person_hair}；"
-            f"{series_profile.person_body}。猫保持{series_profile.cat_identity}。"
-            "appearance直接描述本时段外观；若相对前一时段有变化，列入"
-            "changes_from_previous并给出change_reason，没有变化时两者保持空值。",
-            f"本集必须服从全日定稿画风：{style_profile.prompt_positive()}；排除"
-            f"{style_profile.prompt_negative()}。style_context只选择indoor或outdoor场景参考。",
-            "ending必须给出result和key_entity_ids；只有结尾物体状态或构图必须精确锁定"
-            "时，才将visual_critical设为true。脚本不选择Seedance输入模式，也不声明参考素材。",
-            "sound_design必须结合本集场景和动作，明确环境底声、关键动作声和结尾声音回报；"
-            "不使用对白、旁白或歌词；必须是一句话字符串，不要输出列表。",
+            f"前序时段结果：{previous}。{pattern}",
+            f"精确时长必须在{requested[0]}至{requested[1]}秒之间；根据可见动作需要选择"
+            "整数秒，不用停顿填时长。8至15秒使用1至3镜头；16至30秒至少2镜头；"
+            "31至45秒至少3镜头并可使用process_montage。全程只有一个主事件。",
+            f"本时段活动焦点固定为{slot_brief.resolved_activity_focus.value}。"
+            "relationshipArc分别写主活动、副活动和两线如何汇合。cat_lead时猫咪必须"
+            "通过探索、发现、追逐、等待、误触或自然反应推动新信息，人物只承担工具"
+            "操作、辅助或回应；不能把猫写成画面边缘装饰。",
+            "猫咪保持四足自然行为：可追逐、嗅闻、拨弄、轻拍、蹭、跳上低矮物或叼"
+            "轻小物；不得直立、双足行走、人手式抓握或操作复杂工具。",
+            "actions为2至4个连续阶段。actor_id只允许person、cat、environment，"
+            "若存在guest则还允许本集guest.id；中性儿童必须写person，灰白猫必须写cat。"
+            "每个阶段写具体肢体路径、自然速度、"
+            "接触对象与可见结果。shots为1至3个，每镜只使用一种运镜，并明确景别、"
+            "人物与猫咪位置关系、主要变化和稳定切点。",
+            "criticalProps只登记被拿取、包含、消耗或跨镜头/跨时段延续的关键道具，"
+            "使用自然语言start和end；不登记人物、猫咪、普通植物、远山或光影。",
+            "appearance只描述人物本时段的完整定妆，不得混入猫咪、场景或道具状态。"
+            "必须明确上装、下装、鞋袜，以及外套、帽子、包或配饰是穿戴还是明确没有；"
+            "描述必须足以生成一张从头顶到鞋底均完整可见的单人全身定妆图。"
+            "猫咪配饰如草帽应写入mainEvent、actions和必要的criticalProps，不写入appearance。",
+            "结尾必须兑现relationshipArc.convergence，不能用原地互看或完全静止填时长。"
+            "soundDesign明确环境底声、动作声和结尾声音回报，无对白、旁白或歌词。",
+            f"人物身份：{series_profile.person_identity}；{series_profile.person_hair}；"
+            f"{series_profile.person_body}。猫咪：{series_profile.cat_identity}；"
+            f"{series_profile.cat_motion_rules}。",
+            f"画风：{style_profile.prompt_positive()}；排除{style_profile.prompt_negative()}。",
+            (f"人工重规划原因：{retry_reason}。" if retry_reason else "") + repair,
         )
     )
 
@@ -316,151 +254,228 @@ def compile_look_prompt(
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
     retry_feedback: str | None = None,
 ) -> CompiledPrompt:
-    """生成本时段的一张日内定妆图，不把临时服装写回长期Canon。"""
-
     references = "；".join(
-        f"图{index}只负责{_reference_role_description(role)}"
+        f"图{index}只负责{_reference_description(role)}"
         for index, role in enumerate(reference_roles, 1)
     )
     text = "\n".join(
         (
-            "【任务】生成一张独立的9:16竖屏全身定妆图，用于同一天后续故事板保持人物外观。",
-            f"【参考职责】{references}。",
-            f"【人物身份】保持{series_profile.person_identity}；{series_profile.person_hair}；"
-            f"{series_profile.person_body}。人物主要面貌必须与大头照是同一个人，全身比例参考全身照。",
-            f"【本时段外观】{episode.script.appearance.description}。服装、鞋帽、雨具、背包和配饰完整可见，"
-            "只表现本集剧情需要的装扮，不擅自增加性别化妆容或无关饰品。",
+            "【任务】生成一张独立无字的9:16全身定妆图，作为本集人物外观唯一基准。",
+            f"【参考职责】{references}。参考画风不得改写人物身份。",
+            f"【人物】{series_profile.person_identity}；{series_profile.person_hair}；"
+            f"{series_profile.person_body}。本集外观：{episode.script.appearance.description}。",
             f"【画风】{style_profile.prompt_positive()}；排除{style_profile.prompt_negative()}。",
-            "【构图】自然站姿，正面或轻微四分之三侧身，头顶到脚部完整入画，背景简化且不抢主体，"
-            "面部清楚、四肢自然、衣物层次和颜色稳定。",
-            "【禁止】文字、编号、角色卡边框、多视图拼图、额外人物、身体重复、衣物断裂、明显3D/PBR质感。",
+            "【构图】人物自然站姿并位于画面中央，占画面高度约75%，头顶上方和鞋底下方"
+            "都保留明确留白；必须完整显示头顶、双手、下装、双腿、鞋袜和脚底落地阴影。"
+            "面貌、短发、身体比例与全部服装层清楚，简洁纯净背景，不包含猫咪、场景道具"
+            "或其他人物。",
+            "【禁止】文字、角色卡网格、多视图、身体重复、服装断裂、明显3D/PBR质感。",
         )
     )
     if retry_feedback:
-        text += f"\n【重试修正】保留旧图审计，本次必须修正：{retry_feedback}。"
+        text += f"\n【重试修正】{retry_feedback}。"
     return _compiled(text)
 
 
-def compile_look_review_prompt(
+def compile_opening_anchor_prompt(
     episode: EpisodePlan,
     *,
     reference_roles: tuple[str, ...],
     series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
-) -> str:
-    """审核单张日内定妆图的身份、画风与剧情装扮。"""
-
-    references = "；".join(
-        f"参考图{index}={_reference_role_description(role)}"
-        for index, role in enumerate(reference_roles, 1)
-    )
-    return "\n".join(
-        (
-            "你是日内定妆图审核器，只返回给定JSON。",
-            f"输入顺序：{references}；最后一张图片是待审核定妆图。",
-            f"身份：{series_profile.person_identity}；{series_profile.person_hair}；{series_profile.person_body}。",
-            f"本时段外观：{episode.script.appearance.description}。",
-            f"画风：{style_profile.prompt_positive()}；不得出现{style_profile.prompt_negative()}。",
-            "identityOk只检查是否明显为同一个人物及合理身体比例；styleOk检查批准的日系二维治愈插画画风；"
-            "appearanceOk检查服装、鞋帽和随身物品是否符合本时段描述且完整可见。"
-            "轻微姿势、表情和构图差异写入warnings，不作为硬失败。",
-        )
-    )
-
-
-def compile_storyboard_prompt(
-    episode: EpisodePlan,
-    *,
-    reference_roles: tuple[str, ...] = (),
-    style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
-    series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
     retry_feedback: str | None = None,
 ) -> CompiledPrompt:
-    """生成一次Seedream多图序列Prompt，返回3至4张独立无字竖图。"""
-
-    references = (
-        "；".join(
-            _storyboard_reference_instruction(index, role)
-            for index, role in enumerate(reference_roles, 1)
-        )
-        or "没有额外参考图"
+    first_shot = episode.script.shots[0]
+    first_actions = _actions_for_shot(episode, first_shot)
+    references = "；".join(
+        f"图{index}只负责{_reference_description(role)}"
+        for index, role in enumerate(reference_roles, 1)
     )
-    panels = _storyboard_panels(episode)
-    look_reference_index = next(
-        (
-            index
-            for index, role in enumerate(reference_roles, 1)
-            if role.startswith("look:")
-        ),
-        None,
-    )
-    person_source = (
-        f"图{look_reference_index}定妆人物"
-        if look_reference_index is not None
-        else "已批准人物Canon"
-    )
-    identity_invariant = (
-        f"本面板继承{person_source}的主要面貌、固定短发、儿童头身比例和完整服装，"
-        "并继承同一只灰白猫的脸型、主要斑纹、体型及正常尾巴比例"
-    )
-    panel_lines = "\n".join(
-        f"面板{index}：{description}；{identity_invariant}；"
-        f"{_storyboard_prop_invariants(episode)}。"
-        for index, description in enumerate(panels, 1)
-    )
-    script = episode.script
+    focus = _focus_instruction(episode.script.activity_focus)
     text = "\n".join(
         (
-            f"【任务】一次生成{len(panels)}张相互连贯但彼此独立的9:16竖屏故事板图；"
-            "每张都是完整画面，不要拼成网格。",
-            f"【参考职责】{references}。",
-            f"【固定主体】{series_profile.person_identity}；{series_profile.person_hair}；"
-            f"{series_profile.cat_identity}。{series_profile.cat_motion_rules}。"
-            "整组叙事世界始终只有这一人一猫；特写可以让"
-            "非焦点主体局部可见或暂时画外，但不得生成第二个人物或第二只猫。",
+            "【任务】生成一张独立无字9:16开场视觉锚点，用于Seedance第一帧。",
+            f"【参考职责】{references}。定妆图负责人物外观，猫咪图负责斑纹体型和正常尾巴，"
+            "画风图只负责视觉媒介，道具图只负责对应道具。",
+            f"【固定身份】{series_profile.person_identity}；{series_profile.person_hair}；"
+            f"{series_profile.cat_identity}。全画面准确一人一猫。",
+            f"【场景与外观】{episode.script.scene}；{episode.script.appearance.description}。",
+            f"【活动焦点】{focus}。猫咪必须处于能推动下一步事件的位置，不是边缘装饰。",
+            f"【开场镜头】{first_shot.framing}，{first_shot.direction}；机位体现"
+            f"{first_shot.camera_move.value}运镜开始前的稳定姿态。可见动作起点："
+            f"{'；'.join(item.action for item in first_actions)}。",
+            f"【开场关键道具】{_opening_prop_requirements(episode)}。第一动作可以已经开始，"
+            "不要为了还原文字起点而重建与镜头方向冲突的静物陈列。",
             f"【画风】{style_profile.prompt_positive()}；排除{style_profile.prompt_negative()}。",
-            f"【场景与服饰】{script.scene}；{script.appearance.description}。",
-            f"【有序面板】\n{panel_lines}",
-            f"【连续性】{_describe_character_boundaries(episode)}；{_describe_continuity(episode)}。"
-            "跨面板保持同一人物、同一灰白猫、人与猫的相对体型、"
-            "同场景服装和关键道具类别、颜色、形状与数量。同一镜头内保持空间轴线、"
-            "角色左右关系和相对尺度；只有明确切镜时才允许重新取景。容器的把手、开口、"
-            "材质与结构不得在面板间改变；食物和小物件不得复制。",
-            "【禁止】不得包含文字、序号、对白框、边框、九宫格、UI、Logo、水印、"
-            "角色分身、明显3D/PBR质感或与面板顺序冲突的状态；猫咪不得直立、双足站立"
-            "或拟人抱物；不得新增脚本未声明的"
-            "杯子、食物、书本或其他可搬运道具。",
+            "【禁止】文字、边框、UI、角色分身、额外动物、尾巴脱离身体、服装断裂、"
+            "不可能肢体、明显3D/PBR质感。",
         )
     )
-    text += (
-        "\n【表情与肢体】用视线、耳朵、尾巴、手势、重心和步态把好奇、犹豫、得意或意外外化；"
-        "动作低缓连贯，避免只有站立互看，也避免夸张到改变角色身份。"
-        "\n【画质稳定】面部和四肢结构清楚，手绘线条稳定，色彩均匀，衣物与关键道具细节跨面板保持。"
-    )
     if retry_feedback:
-        text += f"\n【重试修正】保留旧组图审计，本次必须修正：{retry_feedback}。"
+        text += f"\n【重试修正】{retry_feedback}。"
     return _compiled(text)
+
+
+def compile_image_review_prompt(
+    episode: EpisodePlan,
+    *,
+    target: str,
+    reference_roles: tuple[str, ...],
+    series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
+    style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
+) -> str:
+    if target not in {"look", "opening_anchor"}:
+        raise PromptCompilationError(f"未知图片审核目标：{target}")
+    common = (
+        "你是生产图片审核器，只返回给定JSON。最后一张是待审核图，其余是参考图。",
+        "参考职责：" + "；".join(reference_roles),
+        f"画风：{style_profile.prompt_positive()}；不得出现{style_profile.prompt_negative()}。",
+    )
+    if target == "look":
+        return "\n".join(
+            (
+                *common,
+                f"人物身份：{series_profile.person_identity}；{series_profile.person_hair}；"
+                f"{series_profile.person_body}。人物本集完整定妆："
+                f"{episode.script.appearance.description}。",
+                "待审核图只是一张单人全身定妆图，不是剧情开场图：不得要求猫咪、场景、"
+                "活动焦点或剧情道具出现。人物须从头顶到鞋底完整可见，双手、下装、双腿、"
+                "鞋袜和全部服装层清楚，身体比例自然，无裁断、重复或严重结构失衡。",
+                "identityOk只检查人物身份；styleOk检查定稿二维画风；appearanceOk检查"
+                "人物完整服装；compositionOk检查单人全身与四肢完整。criticalPropsOk在"
+                "定妆任务中不适用，必须返回true。轻微表情差异只写warnings。",
+            )
+        )
+    focus = _focus_instruction(episode.script.activity_focus)
+    return "\n".join(
+        (
+            *common,
+            f"人物身份：{series_profile.person_identity}；{series_profile.person_hair}。"
+            f"猫咪身份：{series_profile.cat_identity}。",
+            f"人物本集定妆：{episode.script.appearance.description}。场景："
+            f"{episode.script.scene}。开场关键道具：{_opening_prop_requirements(episode)}。",
+            f"待审核图必须准确一人一猫，活动焦点可读：{focus}。开场画面允许第一动作"
+            "刚刚开始；cat_lead只要求猫咪清楚可见、处于即将推动事件的位置，不要求"
+            "静态第一帧已经完成猫咪主动作。人物可以在前景持工具或尺寸较大，这只是"
+            "必要副活动，不能据此判成person_lead；猫咪正在追逐、观察、探索或触发"
+            "下一步信息时即满足cat_lead。",
+            "identityOk检查同一人物与同一猫咪；styleOk检查定稿二维画风；"
+            "appearanceOk检查可见服装层和猫咪Canon；坐姿、蹲姿或家具遮挡导致鞋脚局部"
+            "不可见是合法构图，不得按定妆图标准要求全身展示。compositionOk检查开场"
+            "构图与后续活动起点；criticalPropsOk只检查开场中视觉显著关键道具的类别、"
+            "数量和不可替换外观。胶带小段等微小耗材允许被手、物体或视角自然遮挡；"
+            "不得把第一动作已经出现少量进展误判为道具错误。"
+            "轻微表情或合理构图差异只写warnings。",
+        )
+    )
 
 
 def compile_video_prompt(
     episode: EpisodePlan,
     *,
     input_plan: VideoInputPlan,
-    style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
+    section: RenderSection,
     series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
-    **_: object,
+    style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
 ) -> CompiledPrompt:
-    """根据最终有序故事板输入生成三段式Seedance执行Prompt。"""
+    """为一个初始或延展区段编译实际Seedance Prompt。"""
 
-    if input_plan.duration_seconds != episode.script.duration_seconds:
-        raise ValueError("VideoInputPlan时长与EpisodeScript不一致")
-    return _compile_video_body(
-        episode,
-        resolution=input_plan.resolution,
-        duration_seconds=input_plan.duration_seconds,
-        bindings=_describe_bindings(input_plan),
-        style_profile=style_profile,
-        series_profile=series_profile,
+    shots = [shot for shot in episode.script.shots if shot.order in section.shot_orders]
+    if not shots:
+        raise PromptCompilationError("渲染区段没有镜头")
+    # 视频延展是独立的供应商生命周期：输入已经包含前一段的身份、画风和空间。
+    # 若继续重复整集设定和完整关系弧，模型容易重演触发动作而不兑现本段结果。
+    if input_plan.operation is RenderOperation.EXTEND:
+        return _compile_extension_video_prompt(
+            episode,
+            input_plan=input_plan,
+            section=section,
+            shots=shots,
+        )
+    binding = input_plan.bindings[0].prompt_alias
+    binding_text = f"{binding}是严格开场画面，保持其人物、猫咪、服装和空间轴线"
+    shot_lines = [_video_shot_line(episode, shot) for shot in shots]
+    final_section = section.order == len(build_render_plan(episode).sections)
+    continuity = _section_continuity(episode, final_section=final_section)
+    ending = (
+        f"最终可见回报：{episode.script.ending.result}"
+        if final_section
+        else "区段末尾停在动作稳定完成后的自然切点，保留下一段继续发展的方向"
+    )
+    section_boundary = (
+        "本区段完成上述关系汇合与关键道具结果。"
+        if final_section
+        else "本区段只推进当前镜头，不提前完成后续镜头或最终道具状态。"
+    )
+    text = "\n".join(
+        (
+            "【整体设定与素材绑定】"
+            f"{binding_text}。输出{input_plan.resolution}、9:16竖屏、"
+            f"本区段{input_plan.duration_seconds}秒，原生音频。全程只有同一个中性儿童"
+            "和同一只灰白猫。"
+            f"人物保持{series_profile.person_identity}、{series_profile.person_hair}；"
+            f"猫保持{series_profile.cat_identity}。外观：{episode.script.appearance.description}。"
+            f"场景：{episode.script.scene}。画风：{style_profile.prompt_positive()}；排除"
+            f"{style_profile.prompt_negative()}。活动关系：{_focus_instruction(episode.script.activity_focus)}。",
+            "【镜头与动作推进】\n"
+            "严格按镜头顺序推进，前序动作不得占满全片；必须完整进入最后一个镜头并"
+            "兑现结尾，最后一段持续展示已经完成的可见回报，不保留未完成的关键道具状态。\n"
+            + "\n".join(shot_lines),
+            "【连续性、声音与结尾回报】"
+            f"关系弧：主活动为{episode.script.relationship_arc.lead_activity}；副活动为"
+            f"{episode.script.relationship_arc.secondary_activity}；两线汇合为"
+            f"{episode.script.relationship_arc.convergence}。全片关键道具闭环：{continuity}。"
+            f"{section_boundary}"
+            f"声音：{episode.script.sound_design}。{ending}。"
+            "人物和猫咪数量固定；禁止角色复制、瞬移、无原因换装、关键道具变类或悬空、"
+            "猫咪双足直立或人手式操作、字幕、水印、Logo和供应商UI；不得用原地互看或"
+            "完全静止填充时长。",
+        )
+    )
+    return _compiled(text)
+
+
+def _compile_extension_video_prompt(
+    episode: EpisodePlan,
+    *,
+    input_plan: VideoInputPlan,
+    section: RenderSection,
+    shots: list[ShotPlan],
+) -> CompiledPrompt:
+    """为官方视频续写编译只关注“承接与兑现”的紧凑执行Prompt。"""
+
+    binding = input_plan.bindings[0].prompt_alias
+    actions = tuple(action for shot in shots for action in _actions_for_shot(episode, shot))
+    visible_results = "；".join(action.visible_result for action in actions)
+    final_section = section.order == len(build_render_plan(episode).sections)
+    final_requirement = (
+        f"最终可见回报必须清楚兑现：{episode.script.ending.result}。"
+        "后半段持续展示已解决的结果，"
+        "最后不得退回未解决状态。"
+        if final_section
+        else "区段末尾停在动作已完成的稳定状态，为下一段保留明确发展方向。"
+    )
+    continuity = _section_continuity(episode, final_section=final_section)
+    return _compiled(
+        "\n".join(
+            (
+                "【续写起点与固定要素】"
+                f"向后延长 {binding}。第一帧直接继承上一版视频末帧的人物、猫咪、服装、"
+                "关键道具和空间状态；上一段内容已经发生，不重新建立场景、不回放触发过程。"
+                f"输出{input_plan.resolution}、9:16竖屏、本区段{input_plan.duration_seconds}秒，"
+                "原生音频。始终只有同一个中性短发儿童和同一只灰白猫，身份、画风和关键"
+                "道具外观沿用输入视频。",
+                "【本区段唯一推进】"
+                "本区段前半完成当前关键变化，后半明确展示结果与人猫关系汇合。"
+                + "\n".join(_video_shot_line(episode, shot) for shot in shots)
+                + f"必须出现的可见结果：{visible_results}。",
+                "【连续性、声音与结束】"
+                f"关键道具闭环：{continuity}。{final_requirement}"
+                f"声音：{episode.script.sound_design}。禁止重演前文、重复触发意外、以未解决"
+                "状态收尾、角色复制、瞬移、无原因换装、道具变类或悬空、猫咪人手式操作、"
+                "字幕、水印、Logo和供应商UI。",
+            )
+        )
     )
 
 
@@ -468,587 +483,203 @@ def compile_video_prompt_preview(
     episode: EpisodePlan,
     *,
     resolution: str,
+    section_order: int = 1,
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
     series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
 ) -> CompiledPrompt:
-    """不绑定真实资产的执行Prompt预览；长度仅用于Web展示。"""
+    """不依赖数据库资产的实际执行Prompt预览。"""
 
-    if resolution not in {"480p", "720p"}:
-        raise ValueError("视频分辨率只允许480p或720p")
-    count = storyboard_panel_count(episode)
-    bindings = _storyboard_binding_text(count)
-    return _compile_video_body(
-        episode,
+    from uuid import UUID
+
+    from .rendering import MediaBinding, MediaModality, ProviderMediaRole, VideoInputPlan
+
+    render_plan = build_render_plan(episode)
+    try:
+        section = next(item for item in render_plan.sections if item.order == section_order)
+    except StopIteration as exc:
+        raise PromptCompilationError(f"不存在渲染区段{section_order}") from exc
+    operation = RenderOperation.INITIAL if section_order == 1 else RenderOperation.EXTEND
+    plan = VideoInputPlan(
+        operation=operation,
         resolution=resolution,
-        duration_seconds=episode.script.duration_seconds,
-        bindings=bindings,
-        style_profile=style_profile,
+        duration_seconds=section.duration_seconds,
+        bindings=[
+            MediaBinding(
+                asset_id=UUID(int=section_order),
+                semantic_key="opening:preview" if section_order == 1 else "video:preview",
+                modality=MediaModality.IMAGE if section_order == 1 else MediaModality.VIDEO,
+                provider_role=(
+                    ProviderMediaRole.FIRST_FRAME
+                    if section_order == 1
+                    else ProviderMediaRole.REFERENCE_VIDEO
+                ),
+                ordinal=1,
+                sha256="0" * 64,
+            )
+        ],
+    )
+    return compile_video_prompt(
+        episode,
+        input_plan=plan,
+        section=section,
         series_profile=series_profile,
-    )
-
-
-def compile_storyboard_review_prompt(
-    episode: EpisodePlan,
-    *,
-    panel_count: int,
-    reference_roles: tuple[str, ...] = (),
-    series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
-    style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
-) -> str:
-    """一次审核整组面板，结果必须对全部面板原子生效。"""
-
-    if panel_count != storyboard_panel_count(episode):
-        raise ValueError("故事板审核数量与Episode镜头结构不一致")
-    shots = _describe_shot_sequence(episode)
-    continuity = _describe_continuity(episode)
-    reference_note = (
-        "；".join(
-            f"参考图{index}={_reference_role_description(role)}"
-            for index, role in enumerate(reference_roles, 1)
-        )
-        or "无额外身份参考"
-    )
-    return "\n".join(
-        (
-            f"你是故事板组图审核器。先输入{len(reference_roles)}张基准参考（{reference_note}），"
-            f"随后输入{panel_count}张待审核面板并按面板顺序排列，只返回给定JSON。",
-            f"身份：{series_profile.person_identity}；{series_profile.person_hair}；"
-            f"{series_profile.cat_identity}。",
-            f"画风：{style_profile.prompt_positive()}；不得出现{style_profile.prompt_negative()}。",
-            f"镜头链：{shots}。关键连续性：{continuity}。"
-            f"本集地点与空间语义：{episode.script.scene}。每张面板都必须属于这个地点类型；"
-            "参考图中若带有与本集不同的茶园、山坡、室内房间、海滨等背景，只能参考画法，"
-            "不得把这些背景迁移到待审核故事板。地点类型错误必须令spatialContinuityOk=false。"
-            f"结尾：{episode.script.ending.result}。",
-            "布尔字段按轻量关系弧判定：identityOk检查每个可见面板中的人物主要面貌、固定短发、"
-            "猫咪脸型与灰白斑纹及角色数量；bodyProportionOk检查头身比例、四肢结构、猫咪体型与"
-            "尾巴是否从后躯自然连接；poseNaturalnessOk检查动物姿态是否符合真实猫科生物力学——"
-            "猫咪必须四足行走、坐卧或跳跃，出现直立、双足站立、拟人行走或人手式抱物抓握即判false，"
-            "前爪只能在四足姿态下拨按扶；actionSequenceOk检查建立、反应或探索、关系回报的顺序；"
-            "spatialContinuityOk检查每张面板的地点类型、同一镜头内空间轴线、左右关系和相对尺度；"
-            "明确切镜后的合理重新取景不算漂移，但切镜不能把本集地点替换为参考图背景；"
-            "propContinuityOk检查关键道具类别、数量、服装层和必要座位；"
-            "endingOk检查最后一张是否兑现本集回报。不要因左右手切换、轻微姿势、眼睛画法或"
-            "道具朝向变化判失败。硬失败只包括明显换人、角色复制、严重身体失衡、猫尾连接异常、"
-            "明显3D画风、同镜头无原因位置或尺度跳变、关键道具复制消失或变类、整层服装断裂、"
-            "最终回报不可见。其他差异写入warnings。violations和evidence必须逐项指出面板序号，"
-            "禁止只返回“身份不一致”这类无法指导重试的笼统描述。",
-        )
+        style_profile=style_profile,
     )
 
 
 def compile_video_diagnostic_prompt(
     episode: EpisodePlan,
     *,
+    series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
-    shot_order: int | None = None,
 ) -> str:
-    """生成视频抽帧诊断Prompt；诊断不自动批准成片。
-
-    ``shot_order``非空时只诊断该镜头片段：动作范围限定到该镜头覆盖的动作，
-    结尾兑现按镜头切点或全集结尾判定。
-    """
-
-    if shot_order is None:
-        scoped_actions = tuple(episode.script.actions)
-        ending = episode.script.ending.result
-    else:
-        scoped_actions = _actions_for_shot(episode, shot_order)
-        ending = (
-            episode.script.ending.result
-            if shot_order == len(episode.script.shots)
-            else "本镜头以稳定切点结束，姿态与空间状态可衔接下一镜头"
-        )
-    actions = "；".join(
-        f"{item.order}.{_actor_name(item.actor_id)}{item.action}" for item in scoped_actions
-    )
-    entities = _describe_continuity(episode)
     return "\n".join(
         (
-            "你是生活流短视频抽帧诊断器，图片按时间顺序排列，只返回给定JSON。",
-            f"关键实体：{entities}。动作：{actions}。结尾：{ending}。"
-            f"声音设计：{episode.script.sound_design}。",
-            f"检查同一人物和灰白猫、定稿画风（{style_profile.prompt_positive()}；排除"
-            f"{style_profile.prompt_negative()}）、关键实体与服装连续性、动作先后和"
-            "结尾兑现。对每个已登记关键道具逐帧核对数量、位置和持有者；任何一帧中"
-            "同一道具同时留在原位置又出现在手中，均属于复制并使worldContinuityOk=false。"
-            "猫咪必须保持四足姿态，出现直立、双足站立或拟人抱物使narrativeOrderOk=false。"
-            "单帧遮挡不等于消失；证据必须包含帧序号。",
+            "你是视频语义诊断器，只返回给定JSON；诊断不自动批准或重新生成。",
+            f"人物：{series_profile.person_identity}；{series_profile.person_hair}。猫咪："
+            f"{series_profile.cat_identity}。画风：{style_profile.prompt_positive()}。",
+            f"活动焦点：{episode.script.activity_focus.value}。主活动："
+            f"{episode.script.relationship_arc.lead_activity}；副活动："
+            f"{episode.script.relationship_arc.secondary_activity}；汇合："
+            f"{episode.script.relationship_arc.convergence}。",
+            "按抽帧顺序检查身份、二维画风、猫咪四足动作、关键道具连续性、镜头顺序"
+            "和结尾回报。轻微表情和合理切镜变化不得误判为硬失败。",
         )
     )
 
 
 def summarize_episode_state(episode: EpisodePlan) -> str:
-    """把关键实体真实终态压缩给下一个时段导演。"""
-
-    result = validate_continuity(episode.script.continuity)
-    if result.issues:
-        raise PromptCompilationError("不一致场景连续性不能生成前序摘要")
-    states = "、".join(
-        f"{entity_id}@{_placement_text(episode, state)}"
-        for entity_id, state in sorted(result.final_states.items())
+    props = (
+        "；".join(f"{item.name}最终为{item.end}" for item in episode.script.critical_props)
+        or "无跨时段关键道具"
     )
     return (
-        f"{episode.slot.value}结尾={episode.script.ending.result}，"
-        f"外观={episode.script.appearance.description}，关键实体={states}"
+        f"{episode.slot.value}已完成：{episode.script.main_event}；活动焦点"
+        f"{episode.script.activity_focus.value}；汇合{episode.script.relationship_arc.convergence}；"
+        f"结尾{episode.script.ending.result}；{props}"
     )
 
 
-def _storyboard_panels(episode: EpisodePlan) -> tuple[str, ...]:
-    """把动态镜头投影成可审核的静态状态，避免单张面板提前演完整段动作。"""
-
-    script = episode.script
-    shots = script.shots
-    if len(shots) == 1:
-        shot = shots[0]
-        actions = _actions_for_shot(episode, shot.order)
-        return (
-            f"镜头1开场状态；{_describe_storyboard_entry(shot, actions[0])}。",
-            f"镜头1动作进展；保持同一机位、空间轴线、角色左右关系和相对尺度；"
-            f"{_describe_storyboard_result(shot, actions)}。",
-            f"镜头1结束状态；保持同一机位和角色位置连续，在动作稳定后呈现"
-            f"{script.ending.result}；关键结束画面为{_describe_end_states(episode)}。",
-        )
-    if len(shots) == 2:
-        first, second = shots
-        return (
-            "镜头1关键状态；"
-            f"{_describe_storyboard_result(first, _actions_for_shot(episode, first.order))}；"
-            "动作稳定后形成可切换姿态。",
-            f"镜头2进入状态；从镜头1稳定切点进入；"
-            f"{_describe_storyboard_entry(second, _actions_for_shot(episode, second.order)[0])}。",
-            f"镜头2结束状态；沿用镜头2的机位、空间轴线、角色左右关系和相对尺度，"
-            f"不重新设计人物、猫咪或场景；呈现{script.ending.result}；关键结束画面为"
-            f"{_describe_end_states(episode)}。",
-        )
-    first, second, third = shots
-    return (
-        "镜头1关键状态；"
-        f"{_describe_storyboard_result(first, _actions_for_shot(episode, first.order))}；"
-        "动作稳定后形成可切换姿态。",
-        f"镜头2关键状态；从镜头1稳定切点进入；"
-        f"{_describe_storyboard_result(second, _actions_for_shot(episode, second.order))}；"
-        "动作稳定后形成可切换姿态。",
-        f"镜头3进入状态；从镜头2稳定切点进入；"
-        f"{_describe_storyboard_entry(third, _actions_for_shot(episode, third.order)[0])}。",
-        f"镜头3结束状态；沿用镜头3的机位、空间轴线、角色左右关系和相对尺度，"
-        f"不重新设计人物、猫咪或场景；呈现{script.ending.result}；关键结束画面为"
-        f"{_describe_end_states(episode)}。",
+def _video_shot_line(episode: EpisodePlan, shot: ShotPlan) -> str:
+    actors = {"person": "人物", "cat": "灰白猫", "environment": "环境"}
+    if episode.script.guest is not None:
+        actors[episode.script.guest.id] = episode.script.guest.name
+    actions = _actions_for_shot(episode, shot)
+    action_text = "；随后".join(
+        f"{actors.get(item.actor_id, item.actor_id)}{item.action}，动作结果为{item.visible_result}"
+        for item in actions
     )
-
-
-def _compile_video_body(
-    episode: EpisodePlan,
-    *,
-    resolution: str,
-    duration_seconds: int,
-    bindings: str,
-    style_profile: StyleProfile,
-    series_profile: SeriesVisualProfile,
-    shot_order: int | None = None,
-) -> CompiledPrompt:
-    """编译视频Prompt；``shot_order``非空时只编译单镜头片段（逐镜头生成）。"""
-
-    script = episode.script
-    shot_lines: list[str] = []
-    for shot in script.shots:
-        if shot_order is not None and shot.order != shot_order:
-            continue
-        transition = (
-            "；动作与道具稳定后再切入下一镜头"
-            if shot.order < len(script.shots)
-            else f"；动作稳定后呈现最终可见回报：{script.ending.result}"
-        )
-        if shot_order is not None and shot.order < len(script.shots):
-            # 逐镜头模式下非末镜头以稳定切点收尾，由下一镜首帧自然衔接。
-            # 边界纪律：单镜头片段只演绎分配到本镜头的动作，提前演绎后续动作
-            # 会让尾帧携带超前状态，下一镜继承后造成道具复制或状态矛盾。
-            transition = (
-                "；动作稳定后保持本镜头结束的姿态与空间状态，"
-                "形成可衔接下一镜头的稳定切点；本片段只演绎本镜头分配的动作，"
-                "禁止提前演绎后续镜头的动作，禁止提前改变关键道具的持有者或位置"
-            )
-        shot_lines.append(
-            f"镜头{shot.order}：{_shot_directing_text(shot)}；"
-            f"{_action_sequence_text(_actions_for_shot(episode, shot.order))}{transition}。"
-        )
-    shots = "\n".join(shot_lines)
-    continuity = _describe_continuity(episode)
-    lighting = _lighting_direction(script.scene, script.style_context)
-    segment = "完整视频" if shot_order is None else f"单镜头片段（镜头{shot_order}）"
-    return _compiled(
-        "\n".join(
-            (
-                "【整体设定与素材绑定】"
-                f"{bindings}生成{resolution}、9:16、{duration_seconds}秒{segment}。"
-                f"人物身份：{series_profile.person_identity}；{series_profile.person_hair}；"
-                f"{series_profile.person_body}。猫咪身份：{series_profile.cat_identity}。"
-                f"猫咪动作约束：{series_profile.cat_motion_rules}。"
-                f"本集外观：{script.appearance.description}。场景：{script.scene}。"
-                f"画风：{style_profile.prompt_positive()}；排除{style_profile.prompt_negative()}；"
-                f"光影：{lighting}。",
-                f"【镜头顺序】\n{shots}",
-                f"【质量、连续性与声音】关键实体闭环：{continuity}。声音：{script.sound_design}。"
-                "人物主要面貌、固定短发、儿童头身比例和完整服装层保持稳定；猫咪脸型、灰白"
-                "斑纹、体型及从后躯自然连接的尾巴保持稳定。动作惯性自然，面部与四肢结构清楚，"
-                "同一镜头内空间轴线、角色左右关系和相对尺度连续。猫咪全程保持四足姿态，禁止"
-                "直立、双足站立、拟人行走或人手式抓握抱物。禁止角色分身、关键道具无原因"
-                "出现或消失、物体穿透悬空、服装断裂、字幕、水印、Logo和供应商UI；结尾不得以"
-                "原地互看或完全静止填充时长。",
-            )
-        )
-    )
-
-
-def compile_shot_video_prompt(
-    episode: EpisodePlan,
-    *,
-    shot_order: int,
-    input_plan: VideoInputPlan,
-    style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
-    series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
-) -> CompiledPrompt:
-    """逐镜头生成的单镜头片段Prompt；只含该镜头的动作与首帧锚定。"""
-
-    if not any(item.order == shot_order for item in episode.script.shots):
-        raise PromptCompilationError(f"Episode没有镜头{shot_order}")
-    return _compile_video_body(
-        episode,
-        resolution=input_plan.resolution,
-        duration_seconds=input_plan.duration_seconds,
-        bindings=_describe_bindings(input_plan),
-        style_profile=style_profile,
-        series_profile=series_profile,
-        shot_order=shot_order,
-    )
-
-
-def _lighting_direction(scene: str, style_context: str) -> str:
-    """从真实场景语义提炼光影，不按早中晚写死模板。"""
-
-    scene_text = scene.lower()
-    if any(word in scene_text for word in ("雨", "阴", "雾", "潮湿")):
-        return "使用雨后或阴天的柔和散射光、低反差与湿润环境反光"
-    if any(word in scene_text for word in ("夜", "灯", "傍晚", "黄昏", "夕阳")):
-        return "使用环境中已有灯光或低角度暖光形成自然层次，不添加舞台式高光"
-    if style_context == "indoor":
-        return "使用场景中窗户或室内灯具提供的柔和方向光，阴影克制"
-    return "使用符合天气与地点的柔和自然环境光，保持日系二维插画的哑光水彩质感和克制景深"
-
-
-def _reference_role_description(semantic_key: str) -> str:
-    """把资产语义键翻译成供应商可理解的职责，不向Prompt泄露内部哈希。"""
-
-    if semantic_key == "person:headshot":
-        return "人物主要面貌与短发身份"
-    if semantic_key == "person:fullbody":
-        return "人物全身比例与体型"
-    if semantic_key in {"person:front", "person:side", "person:back"}:
-        view = semantic_key.split(":", 1)[1]
-        view_name = {"front": "正面", "side": "侧面", "back": "背面"}[view]
-        return f"人物{view_name}轮廓、短发形状与身体朝向"
-    if semantic_key.startswith("look:"):
-        return "本时段已批准的人物面貌、全身服饰与最终二维画风"
-    if semantic_key.startswith("cat:"):
-        return "同一只灰白猫的体型与主要斑纹"
-    if semantic_key == "style:line_texture":
-        return "定稿日系二维治愈插画的细线、水彩质感与哑光色彩"
-    if semantic_key in {"style:indoor", "style:outdoor"}:
-        return "与本集场景匹配的定稿自然色彩、光线与环境氛围"
-    if semantic_key.startswith("element:"):
-        return "本集关键道具的颜色、形状与材质"
-    if semantic_key.startswith("scene:"):
-        return "本集场景的空间与环境元素"
-    return "本集必要视觉参考"
-
-
-def _storyboard_reference_instruction(index: int, semantic_key: str) -> str:
-    """为Seedream建立互斥参考职责，避免角色来源彼此竞争。"""
-
-    prefix = f"图{index}"
-    if semantic_key == "style_chain:previous_panel":
-        return (
-            f"{prefix}是上一时段已批准故事板的画风基准：只提取线条、水彩质感、"
-            "哑光色彩与光影处理，使全天三集画面风格统一；禁止带入其中的场景、"
-            "人物动作、道具与构图内容"
-        )
-    if semantic_key.startswith("look:"):
-        return (
-            f"{prefix}是全组唯一人物与最终画风基准，人物面貌、固定短发、体型、本集服装、"
-            "线条、水彩质感和哑光色彩均以此图为准；只继承画法，不继承其简化背景"
-        )
-    if semantic_key.startswith("cat:"):
-        return f"{prefix}中的灰白猫是全组唯一猫咪基准，脸型、斑纹、体型和尾巴比例均以此图为准"
-    if semantic_key.startswith("style:"):
-        return f"{prefix}只提供线条、色彩、光影和环境画风，不提供人物或猫咪造型"
-    if semantic_key.startswith("element:"):
-        return f"{prefix}只提供关键道具的颜色、形状与材质，不改变角色或场景"
-    if semantic_key.startswith("scene:"):
-        return f"{prefix}只提供场景空间和环境元素，不改变人物、猫咪或服装"
-    return f"{prefix}只负责{_reference_role_description(semantic_key)}"
-
-
-def _storyboard_binding_text(count: int) -> str:
-    """把有序面板翻译为Seedance可理解的镜头职责。"""
-
-    return _panel_role_text(tuple(f"@图片{index}" for index in range(1, count + 1)), count)
-
-
-def _panel_role_text(aliases: tuple[str, ...], count: int) -> str:
-    """按面板数量分配镜头职责；别名来自真实绑定序号。"""
-
-    roles = {
-        1: ("本镜头严格开场画面",),
-        2: ("严格开场画面", "严格结尾画面"),
-        3: ("开场与镜头1构图", "中段反应或进展", "最后镜头的结果与回报"),
-        4: ("镜头1构图", "镜头2进展", "镜头3进入状态", "镜头3结果与最终回报"),
-    }
-    if count not in roles:
-        raise PromptCompilationError("Seedance故事板输入只允许1至4张")
-    return "；".join(f"{alias}作为{role}" for alias, role in zip(aliases, roles[count])) + "。"
-
-
-def _describe_bindings(input_plan: VideoInputPlan) -> str:
-    """描述素材绑定：身份参考锚定本体，面板承担镜头构图职责。"""
-
-    if not input_plan.bindings:
-        raise PromptCompilationError("Seedance故事板输入不能为空")
-    identity = tuple(
-        item
-        for item in input_plan.bindings
-        if item.semantic_key.startswith(("person:", "cat:"))
-    )
-    # 帧素材=故事板面板或上一镜头真实尾帧（逐镜头生成）。
-    panels = tuple(
-        item
-        for item in input_plan.bindings
-        if item.semantic_key.startswith(("storyboard:panel-", "shot_tail:"))
-    )
-    parts: list[str] = []
-    for binding in identity:
-        if binding.semantic_key.startswith("person:"):
-            parts.append(
-                f"{binding.prompt_alias}是人物的本体身份基准：面容、发型、"
-                "头身比例严格以此为准；其服装不作为约束，人物衣着以下文"
-                "本集外观描述为准"
-            )
-        else:
-            parts.append(
-                f"{binding.prompt_alias}是猫咪的本体身份基准：脸型、灰白斑纹、"
-                "体型与尾巴严格以此为准；佩戴的帽饰背包按本集剧情需要呈现"
-            )
-    if panels:
-        parts.append(
-            _panel_role_text(
-                tuple(item.prompt_alias for item in panels),
-                len(panels),
-            )
-        )
-    return "".join(f"{item}。" if not item.endswith("。") else item for item in parts)
-
-
-def _describe_continuity(episode: EpisodePlan) -> str:
-    """用自然语言描述必要道具关系，不暴露数据库ID或生命周期术语。"""
-
-    continuity = episode.script.continuity
-    props = [item for item in continuity.entities if item.kind is EntityKind.PROP]
-    if not props:
-        return "同一个中性儿童和同一只灰白猫始终在场，服饰与数量保持一致"
-    rendered: list[str] = []
-    for item in props:
-        start = _placement_text(episode, item.start_state)
-        end = _placement_text(episode, item.end_state)
-        description = f"{item.name}开场{start}，结尾{end}"
-        if item.change_reason:
-            description += f"，变化原因是{item.change_reason}"
-        if item.start_state.present and item.end_state.present and start != end:
-            description += "；移动完成后原位置为空，不得保留同一物体的副本"
-        rendered.append(description)
-    return "；".join(rendered)
-
-
-def _describe_character_boundaries(episode: EpisodePlan) -> str:
-    """把人物与猫咪的承重范围写成自然语言，避免无动作跳上其他家具。"""
-
-    characters = [
-        item
-        for item in episode.script.continuity.entities
-        if item.kind in {EntityKind.PERSON, EntityKind.CAT}
-    ]
-    rendered: list[str] = []
-    for item in characters:
-        start = _placement_text(episode, item.start_state)
-        end = _placement_text(episode, item.end_state)
-        if start == end:
-            rendered.append(
-                f"{item.name}全组只在{start.removeprefix('位于')}所代表的地面、座面或活动范围内，"
-                "不得无动作跳到桌面、柜面或其他家具表面"
-            )
-        else:
-            rendered.append(f"{item.name}开场{start}，只按动作路径移动，结尾{end}")
-    return "；".join(rendered) or "人物与猫咪只在镜头声明的合法承重表面活动"
-
-
-def _storyboard_prop_invariants(episode: EpisodePlan) -> str:
-    """把关键道具的唯一性写入每张面板，防止组图在中间帧复制物体。"""
-
-    props = [
-        item
-        for item in episode.script.continuity.entities
-        if item.kind is EntityKind.PROP
-    ]
-    if not props:
-        return "本面板不新增可搬运道具"
-    names = "、".join(item.name for item in props)
-    return (
-        f"本面板中的关键道具只有{names}，每种全画面最多一个实例；"
-        "道具被手持时原位置必须为空，道具落在地面或家具上时人物手中不得保留副本"
-    )
-
-
-def _describe_end_states(episode: EpisodePlan) -> str:
-    continuity = episode.script.continuity
-    selected = [
-        item
-        for item in continuity.entities
-        if item.id in episode.script.ending.key_entity_ids
-    ]
-    if not selected:
-        selected = [item for item in continuity.entities if item.kind is EntityKind.PROP]
-    return "；".join(
-        f"{item.name}{_placement_text(episode, item.end_state)}" for item in selected
-    ) or episode.script.ending.result
-
-
-def _describe_shot_sequence(episode: EpisodePlan) -> str:
-    return "；".join(_describe_shot(episode, shot.order) for shot in episode.script.shots)
-
-
-def _describe_shot(episode: EpisodePlan, shot_order: int) -> str:
-    shot = next((item for item in episode.script.shots if item.order == shot_order), None)
-    if shot is None:
-        raise PromptCompilationError(f"镜头{shot_order}不存在")
-    actions = _actions_for_shot(episode, shot_order)
-    return f"{_shot_directing_text(shot)}；{_action_sequence_text(actions)}"
-
-
-def _describe_storyboard_result(
-    shot: ShotPlan,
-    actions: tuple[ActionStage, ...],
-) -> str:
-    """生成单张故事板能稳定表达的镜头结果，不重复动态动作全文。"""
-
-    results = "；".join(
-        f"{_actor_name(action.actor_id)}的动作结果为{action.visible_result}"
-        for action in actions
-    )
-    return f"{_shot_directing_text(shot)}；本面板冻结在动作完成后的清晰状态：{results}"
-
-
-def _describe_storyboard_entry(shot: ShotPlan, action: ActionStage) -> str:
-    """描述新镜头刚进入的稳定瞬间，防止故事板提前呈现本镜头回报。"""
-
-    direction_start = _first_visual_clause(shot.direction)
-    action_start = _first_visual_clause(action.action)
-    return (
-        f"{_shot_camera_text(shot)}；画面方向与主体位置起点为{direction_start}；"
-        f"执行主体为{_actor_name(action.actor_id)}，动作只进行到“{action_start}”这一进入瞬间；"
-        f"尚未出现后续动作结果“{action.visible_result}”，并继承上一面板的服装、道具和空间状态"
-    )
-
-
-def _first_visual_clause(text: str) -> str:
-    """提取导演动作的首个可见瞬间，供进入面板使用。"""
-
-    stripped = text.strip()
-    indexes = [stripped.find(mark) for mark in ("，", "；", "。", "\n")]
-    boundaries = [index for index in indexes if index > 0]
-    return stripped[: min(boundaries)].strip() if boundaries else stripped
-
-
-def _actions_for_shot(episode: EpisodePlan, shot_order: int) -> tuple[ActionStage, ...]:
-    shot = next((item for item in episode.script.shots if item.order == shot_order), None)
-    if shot is None:
-        raise PromptCompilationError(f"镜头{shot_order}不存在")
-    actions_by_order = {item.order: item for item in episode.script.actions}
-    try:
-        return tuple(actions_by_order[order] for order in shot.action_orders)
-    except KeyError as exc:
-        raise PromptCompilationError(f"镜头{shot_order}引用不存在的动作{exc.args[0]}") from exc
-
-
-def _shot_directing_text(shot: ShotPlan) -> str:
-    return f"{_shot_camera_text(shot)}，画面方向与主体位置：{shot.direction}"
-
-
-def _shot_camera_text(shot: ShotPlan) -> str:
-    """输出镜头的稳定摄影参数；进入面板可复用而不携带完整动作结果。"""
-
-    moves = {
-        "fixed": "固定机位",
-        "follow": "平稳跟随",
+    camera_move = {
+        "fixed": "固定镜头",
+        "follow": "平稳跟拍",
         "push": "缓慢推近",
         "pull": "缓慢拉远",
-        "pan": "单向摇摄",
+        "pan": "平稳摇摄",
         "track": "平稳横移",
-    }
+    }[shot.camera_move.value]
     return (
-        f"镜头{shot.order}，景别为{shot.framing}，主体视角{shot.dominant_view.value}，"
-        f"唯一运镜为{moves[shot.camera_move.value]}"
+        f"镜头{shot.order}：{camera_move}，{shot.framing}；{shot.direction}；"
+        f"{action_text}。动作稳定后再切镜。"
     )
 
 
-def _action_sequence_text(actions: tuple[ActionStage, ...]) -> str:
-    rendered: list[str] = []
-    actor_prefixes = {
-        "person": ("人物", "孩子", "儿童", "中性儿童"),
-        "cat": ("灰白猫", "猫咪", "猫"),
-        "environment": ("环境", "风", "雨", "光线", "水滴"),
-    }
-    for item in actions:
-        action = item.action.strip()
-        prefixes = actor_prefixes.get(item.actor_id, (item.actor_id,))
-        # 导演经常已经在动作正文中写明执行主体。只在正文缺少主体时补前缀，
-        # 避免“人物孩子”“灰白猫灰白猫”这类重复文本分散图像模型注意力。
-        if not action.startswith(prefixes):
-            action = f"{_actor_name(item.actor_id)}{action}"
-        rendered.append(
-            f"执行主体为{_actor_name(item.actor_id)}：{action}；动作后画面清楚形成"
-            f"{item.visible_result}"
+def _section_continuity(episode: EpisodePlan, *, final_section: bool) -> str:
+    """只向当前渲染区段暴露必要的道具连续性。
+
+    非最终延展段若收到整集终态，模型容易提前收纳、离场或完成回报。前段因此
+    只锁定同一物体和当前起点，最终段才声明完整闭环。
+    """
+
+    if not episode.script.critical_props:
+        return "本集没有需要额外追踪的关键道具"
+    if final_section:
+        return "；".join(
+            f"{prop.name}：{prop.start} → {prop.end}" for prop in episode.script.critical_props
         )
-    return "；随后".join(rendered)
+    return "；".join(
+        f"{prop.name}沿用同一个物体，当前从{prop.start}继续推进，暂不进入最终结果"
+        for prop in episode.script.critical_props
+    )
 
 
-def _placement_text(episode: EpisodePlan, state: EntityState) -> str:
-    if not state.present:
-        return "离屏"
-    continuity = episode.script.continuity
-    names = {item.id: item.name for item in continuity.anchors}
-    names.update({item.id: item.name for item in continuity.entities})
-    target = names.get(state.placement.target_id or "", state.placement.target_id or "")
-    labels = {
-        PlacementKind.ANCHOR: "位于",
-        PlacementKind.HELD_BY: "由",
-        PlacementKind.INSIDE: "位于",
-        PlacementKind.OFFSCREEN: "离屏",
-    }
-    suffix = {
-        PlacementKind.HELD_BY: "持有",
-        PlacementKind.INSIDE: "内部",
-    }.get(state.placement.kind, "")
-    return f"{labels[state.placement.kind]}{target}{suffix}"
+def _opening_prop_requirements(episode: EpisodePlan) -> str:
+    """声明开场需要维持的道具身份，不把完整状态账本塞给图片模型。"""
+
+    if not episode.script.critical_props:
+        return "没有必须入镜的关键道具"
+    first_shot = episode.script.shots[0]
+    first_actions = _actions_for_shot(episode, first_shot)
+    visible_text = "；".join(
+        (
+            first_shot.direction,
+            *(item.action for item in first_actions),
+            *(item.visible_result for item in first_actions),
+        )
+    )
+    visible_props = tuple(
+        prop
+        for prop in episode.script.critical_props
+        if prop.name in visible_text
+        or prop.entity_key in visible_text
+        or (len(prop.name) >= 2 and prop.name[-2:] in visible_text)
+    )
+    if not visible_props:
+        return "没有必须在开场清楚出现的关键道具"
+    return "；".join(
+        f"同一个{prop.name}，开场状态为：{prop.start}" for prop in visible_props
+    )
 
 
-def _actor_name(actor_id: str) -> str:
-    return {"person": "人物", "cat": "灰白猫", "environment": "环境"}.get(actor_id, actor_id)
+def _actions_for_shot(episode: EpisodePlan, shot: ShotPlan):
+    indexed = {item.order: item for item in episode.script.actions}
+    try:
+        return tuple(indexed[order] for order in shot.action_orders)
+    except KeyError as exc:
+        raise PromptCompilationError(f"镜头{shot.order}引用未知动作") from exc
+
+
+def _focus_instruction(focus: ActivityFocus) -> str:
+    return {
+        ActivityFocus.CAT_LEAD: (
+            "灰白猫推动主要可见信息，人物进行自然副活动或回应，最后两条活动线汇合"
+        ),
+        ActivityFocus.PERSON_LEAD: ("人物推动主要事件，灰白猫产生独立反应并在结尾回到人物关系中"),
+        ActivityFocus.BALANCED: "人物与灰白猫共同推动同一事件，最后形成共同回报",
+    }[focus]
+
+
+def _reference_description(role: str) -> str:
+    if role.startswith("person:"):
+        return "人物面貌、短发与身体比例"
+    if role.startswith("cat:"):
+        return "灰白猫脸型、斑纹、体型与正常尾巴比例"
+    if role.startswith("style:"):
+        return "定稿二维画风、线条、色彩和材质"
+    if role.startswith("look:"):
+        return "本集人物定妆与完整服装"
+    if role.startswith("element:"):
+        return "本集关键道具的颜色、形状和材质"
+    if role.startswith("handoff:"):
+        names = role.removeprefix("handoff:").replace(",", "、")
+        return f"上一时段画面中的共享道具（{names}），只继承道具造型，不复制人物、猫咪或场景"
+    return role
+
+
+def _pattern_summary(patterns: dict[Slot, StoryPattern]) -> str:
+    if not patterns:
+        return "由时段导演选择不同结构"
+    return "；".join(
+        f"{slot.value}={pattern.name}（{'→'.join(pattern.structure)}）"
+        for slot, pattern in patterns.items()
+    )
 
 
 def _compiled(text: str) -> CompiledPrompt:
-    stripped = text.strip()
-    if not stripped:
+    normalized = text.strip()
+    if not normalized:
         raise PromptCompilationError("Prompt不能为空")
     return CompiledPrompt(
-        text=stripped,
-        char_count=len(stripped),
-        utf8_bytes=len(stripped.encode("utf-8")),
+        text=normalized,
+        char_count=len(normalized),
+        utf8_bytes=len(normalized.encode("utf-8")),
     )

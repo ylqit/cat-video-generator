@@ -29,8 +29,8 @@ class DatabaseOperation(StrEnum):
     TEST = "test"
 
 
-class StoryboardReviewMode(StrEnum):
-    """故事板整组语义审核是否阻断后续收费视频任务。"""
+class ImageReviewMode(StrEnum):
+    """定妆图和开场锚点的语义审核模式。"""
 
     SEMANTIC_AUTO = "semantic_auto"
     MANUAL = "manual"
@@ -60,9 +60,7 @@ def load_local_env(path: Path | None = None) -> bool:
     """加载本地秘密文件，但不覆盖调用者当前会话。"""
 
     env_path = _config_root() / ".env" if path is None else path
-    return bool(
-        env_path.is_file() and load_dotenv(dotenv_path=env_path, override=False)
-    )
+    return bool(env_path.is_file() and load_dotenv(dotenv_path=env_path, override=False))
 
 
 def _bool(value: str | None, *, default: bool = False) -> bool:
@@ -121,10 +119,8 @@ class RuntimeSettings:
     ark_image_timeout_auto_retries: int
     ark_image_retry_delay_seconds: float
     candidate_count: int
-    storyboard_review_mode: StoryboardReviewMode
+    image_review_mode: ImageReviewMode
     video_semantic_review_mode: str
-    ark_video_generation_mode: str
-    ark_shot_minimum_seconds: int
     configuration_warnings: tuple[str, ...]
     ffmpeg_path: Path | None
     ffprobe_path: Path | None
@@ -147,9 +143,7 @@ class RuntimeSettings:
         review_request_timeout = float(
             _number(values, "ARK_REVIEW_REQUEST_TIMEOUT_SECONDS", "240", float)
         )
-        video_api_timeout = float(
-            _number(values, "ARK_VIDEO_API_TIMEOUT_SECONDS", "120", float)
-        )
+        video_api_timeout = float(_number(values, "ARK_VIDEO_API_TIMEOUT_SECONDS", "120", float))
         poll_interval = float(_number(values, "ARK_POLL_INTERVAL_SECONDS", "10", float))
         timeout = float(_number(values, "ARK_TASK_TIMEOUT_SECONDS", "1800", float))
         image_request_timeout = float(
@@ -158,9 +152,7 @@ class RuntimeSettings:
         image_timeout_auto_retries = int(
             _number(values, "ARK_IMAGE_TIMEOUT_AUTO_RETRIES", "1", int)
         )
-        image_retry_delay = float(
-            _number(values, "ARK_IMAGE_RETRY_DELAY_SECONDS", "15", float)
-        )
+        image_retry_delay = float(_number(values, "ARK_IMAGE_RETRY_DELAY_SECONDS", "15", float))
         candidate_count = int(_number(values, "DAILY_PLAN_CANDIDATE_COUNT", "1", int))
         if any(
             value <= 0
@@ -181,7 +173,7 @@ class RuntimeSettings:
             raise ConfigurationError("分层导演模式下DAILY_PLAN_CANDIDATE_COUNT必须为1")
         review_mode_value = (
             values.get(
-                "STORYBOARD_REVIEW_MODE",
+                "IMAGE_REVIEW_MODE",
                 "semantic_auto",
             )
             .strip()
@@ -189,35 +181,19 @@ class RuntimeSettings:
         )
         configuration_warnings: list[str] = []
         try:
-            storyboard_review_mode = StoryboardReviewMode(review_mode_value)
+            image_review_mode = ImageReviewMode(review_mode_value)
         except ValueError as exc:
-            raise ConfigurationError(
-                "STORYBOARD_REVIEW_MODE必须是semantic_auto或manual"
-            ) from exc
-        video_review_mode = values.get(
-            "VIDEO_SEMANTIC_REVIEW_MODE",
-            "diagnostic",
-        ).strip().lower()
+            raise ConfigurationError("IMAGE_REVIEW_MODE必须是semantic_auto或manual") from exc
+        video_review_mode = (
+            values.get(
+                "VIDEO_SEMANTIC_REVIEW_MODE",
+                "diagnostic",
+            )
+            .strip()
+            .lower()
+        )
         if video_review_mode not in {"off", "diagnostic"}:
-            raise ConfigurationError(
-                "VIDEO_SEMANTIC_REVIEW_MODE必须是off或diagnostic"
-            )
-        video_generation_mode = values.get(
-            "ARK_VIDEO_GENERATION_MODE",
-            "per_shot",
-        ).strip().lower()
-        if video_generation_mode not in {"per_shot", "single_pass"}:
-            raise ConfigurationError(
-                "ARK_VIDEO_GENERATION_MODE必须是per_shot或single_pass"
-            )
-        try:
-            shot_minimum_seconds = int(
-                values.get("ARK_SHOT_MINIMUM_SECONDS", "4").strip()
-            )
-        except ValueError as exc:
-            raise ConfigurationError(
-                "ARK_SHOT_MINIMUM_SECONDS必须是整数"
-            ) from exc
+            raise ConfigurationError("VIDEO_SEMANTIC_REVIEW_MODE必须是off或diagnostic")
         structured_mode = values.get(
             "ARK_RESPONSES_STRUCTURED_OUTPUT_MODE",
             "json_object_schema_prompt",
@@ -225,9 +201,7 @@ class RuntimeSettings:
         if structured_mode not in {"json_schema", "json_object_schema_prompt"}:
             raise ConfigurationError("无效Ark结构化输出模式")
         resolved_config_root = (
-            _config_root()
-            if config_root is None
-            else config_root.expanduser().resolve()
+            _config_root() if config_root is None else config_root.expanduser().resolve()
         )
         configured_seed_root = Path(
             values.get("CAT_VIDEO_EVENT_SEED_ROOT", "content/events")
@@ -276,10 +250,8 @@ class RuntimeSettings:
             ark_image_timeout_auto_retries=image_timeout_auto_retries,
             ark_image_retry_delay_seconds=image_retry_delay,
             candidate_count=candidate_count,
-            storyboard_review_mode=storyboard_review_mode,
+            image_review_mode=image_review_mode,
             video_semantic_review_mode=video_review_mode,
-            ark_video_generation_mode=video_generation_mode,
-            ark_shot_minimum_seconds=shot_minimum_seconds,
             configuration_warnings=tuple(configuration_warnings),
             ffmpeg_path=_executable(
                 values.get("FFMPEG_PATH"),
@@ -322,13 +294,10 @@ class RuntimeSettings:
             issues.append(f"当前生产只允许图片模型{_IMAGE_MODEL}")
         if self.ark_video_model not in _VIDEO_MODELS:
             issues.append(
-                "ARK_VIDEO_MODEL必须使用已登记能力档案："
-                + "、".join(sorted(_VIDEO_MODELS))
+                "ARK_VIDEO_MODEL必须使用已登记能力档案：" + "、".join(sorted(_VIDEO_MODELS))
             )
         if self.ark_video_resolution not in {"480p", "720p"}:
             issues.append("ARK_VIDEO_RESOLUTION必须是480p或720p")
-        if not 3 <= self.ark_shot_minimum_seconds <= 8:
-            issues.append("ARK_SHOT_MINIMUM_SECONDS必须在3至8秒之间")
         if issues:
             raise ConfigurationError("; ".join(issues))
 
@@ -350,13 +319,10 @@ class RuntimeSettings:
         return {
             "provider": self.provider_profile,
             "arkApiKeyConfigured": bool(self.ark_api_key),
-            "arkBaseUrlProfile": (
-                "standard"
-                if self.ark_base_url == _STANDARD_URL
-                else "unknown"
-            ),
+            "arkBaseUrlProfile": ("standard" if self.ark_base_url == _STANDARD_URL else "unknown"),
             "arkImageModel": self.ark_image_model,
             "arkVideoModel": self.ark_video_model,
+            "supportsVideoExtension": self.ark_video_model == "doubao-seedance-2-0-260128",
             "arkPlanningModel": self.ark_planning_model,
             "arkReviewModel": self.ark_review_model,
             "arkVideoResolution": self.ark_video_resolution,
@@ -368,10 +334,8 @@ class RuntimeSettings:
             "arkImageRequestTimeoutSeconds": self.ark_image_request_timeout_seconds,
             "arkImageTimeoutAutoRetries": self.ark_image_timeout_auto_retries,
             "arkImageRetryDelaySeconds": self.ark_image_retry_delay_seconds,
-            "storyboardReviewMode": self.storyboard_review_mode.value,
+            "imageReviewMode": self.image_review_mode.value,
             "videoSemanticReviewMode": self.video_semantic_review_mode,
-            "arkVideoGenerationMode": self.ark_video_generation_mode,
-            "arkShotMinimumSeconds": self.ark_shot_minimum_seconds,
             "configurationWarnings": list(self.configuration_warnings),
             "eventSeedRoot": str(self.event_seed_root),
             "eventSeedRootAvailable": self.event_seed_root.is_dir(),
@@ -429,9 +393,7 @@ class DatabaseSettings:
             password=values["CAT_VIDEO_DB_PASSWORD"],
             sslmode=sslmode,
             schema=values.get("CAT_VIDEO_DB_SCHEMA", "cat_video").strip(),
-            allow_insecure_runtime=_bool(
-                values.get("CAT_VIDEO_ALLOW_INSECURE_RUNTIME")
-            ),
+            allow_insecure_runtime=_bool(values.get("CAT_VIDEO_ALLOW_INSECURE_RUNTIME")),
             allow_insecure_readonly_smoke=_bool(
                 values.get("CAT_VIDEO_ALLOW_INSECURE_READONLY_SMOKE")
             ),
@@ -485,6 +447,4 @@ class DatabaseSettings:
             and self.schema == "cat_video"
         ):
             return
-        raise ConfigurationError(
-            "明文PostgreSQL只允许显式授权的vedio-appdb.cat_video运行"
-        )
+        raise ConfigurationError("明文PostgreSQL只允许显式授权的vedio-appdb.cat_video运行")

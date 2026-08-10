@@ -1,4 +1,4 @@
-"""CLI和HTTP共用的只读查询服务。"""
+"""CLI 与 HTTP 共用的只读查询服务。"""
 
 from __future__ import annotations
 
@@ -7,8 +7,12 @@ from typing import Any
 
 from ..domain.contracts import EpisodePlan
 from ..domain.pipeline import PipelineSettings
-from ..domain.prompts import compile_storyboard_prompt, compile_video_prompt_preview
-from ..domain.rendering import storyboard_reference_keys
+from ..domain.prompts import (
+    compile_look_prompt,
+    compile_opening_anchor_prompt,
+    compile_video_prompt_preview,
+)
+from ..domain.rendering import build_render_plan
 from ..domain.visual_profiles import (
     DEFAULT_SERIES_VISUAL_PROFILE,
     DEFAULT_STYLE_PROFILE,
@@ -18,132 +22,103 @@ from .ports import QueryStore, StoredAsset
 
 
 class QueryService:
-    """稳定工作流读模型，避免不同接口各自猜测状态。"""
+    """稳定工作流读模型，避免 CLI 与 Web 各自推测节点状态。"""
 
-    def __init__(self, repository: QueryStore) -> None:
-        self._repository = repository
-
-    def list_runs(
+    def __init__(
         self,
+        repository: QueryStore,
         *,
-        limit: int = 50,
-        offset: int = 0,
-    ) -> list[dict[str, Any]]:
-        """分页返回 Run 摘要，供 CLI 与 HTTP 使用同一排序。"""
+        video_resolution: str = "720p",
+    ) -> None:
+        self._repository = repository
+        if video_resolution not in {"480p", "720p"}:
+            raise ValueError("视频预览分辨率必须是480p或720p")
+        self._video_resolution = video_resolution
 
+    def list_runs(self, *, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         if not 1 <= limit <= 200 or offset < 0:
-            raise ValueError("limit必须在1至200之间且offset不能为负数")
+            raise ValueError("limit 必须在 1 至 200 之间且 offset 不能为负数")
         return self._repository.list_run_summaries(limit, offset)
 
     def run_graph(self, run_id: uuid.UUID) -> dict[str, Any]:
-        """返回一个 Run 的 Episode、Step、Prompt、资产和审核关系图。"""
-
         return self._repository.workflow_graph(run_id)
 
     def prompt(self, prompt_id: uuid.UUID) -> dict[str, Any]:
-        """返回实际持久化且可审计的完整 Prompt。"""
-
         return self._repository.prompt_detail(prompt_id)
 
     def asset(self, asset_id: uuid.UUID) -> StoredAsset:
-        """返回资产元数据；文件路径安全仍由接口层校验。"""
-
         return self._repository.asset_detail(asset_id)
 
     def episode(self, episode_id: uuid.UUID) -> dict[str, Any]:
-        """返回单个 Episode 只读投影。"""
-
         return self._repository.episode_detail(episode_id)
 
     def prompt_preview(
         self,
         episode_id: uuid.UUID,
-        *,
-        resolution: str = "480p",
     ) -> dict[str, Any]:
-        """实时编译故事板与视频Prompt；纯函数预览，不创建Step或收费任务。
-
-        参考素材顺序与VisualPreparationService.select_references保持一致，
-        页面编辑后的覆盖文本原样附回，便于对照。
-        """
+        """编译定妆图、开场锚点和全部视频区段 Prompt，不创建 Step。"""
 
         detail = self._repository.episode_detail(episode_id)
         episode = EpisodePlan(slot=detail["slot"], script=detail["script"])
-        style_profile = DEFAULT_STYLE_PROFILE
-        planning_context = self._repository.get_planning_context(
-            uuid.UUID(detail["runId"])
-        )
-        planning_metadata = planning_context.get("planningMetadata", {})
-        raw_series_profile = (
-            planning_metadata.get("seriesProfile")
-            if isinstance(planning_metadata, dict)
-            else None
-        )
-        series_profile = (
-            SeriesVisualProfile.model_validate(raw_series_profile)
-            if isinstance(raw_series_profile, dict)
+        run_id = uuid.UUID(detail["runId"])
+        context = self._repository.get_planning_context(run_id)
+        metadata = context.get("planningMetadata", {})
+        raw_profile = metadata.get("seriesProfile") if isinstance(metadata, dict) else None
+        series = (
+            SeriesVisualProfile.model_validate(raw_profile)
+            if isinstance(raw_profile, dict)
             else DEFAULT_SERIES_VISUAL_PROFILE
         )
-        explicit_episode_assets = tuple(
-            item
-            for item in self._repository.list_assets(
-                run_id=uuid.UUID(detail["runId"]),
-                episode_id=episode_id,
-                statuses=("approved", "ready"),
-            )
-            if item.episode_id == episode_id
-            and item.scope == "episode"
-            and item.role == "element"
-            and item.media_type == "image"
-            and item.semantic_key is not None
-            and not item.semantic_key.startswith("legacy:")
+        style = DEFAULT_STYLE_PROFILE
+        look_roles = ("person:front", style.line_reference_key)
+        scene_style = (
+            style.indoor_reference_key
+            if any(word in episode.script.scene for word in ("室内", "房间", "家中", "店内"))
+            else style.outdoor_reference_key
         )
-        reference_keys = storyboard_reference_keys(
-            episode,
-            style_profile,
-            series_profile,
-            # 故事板生产固定先完成日内定妆。预览使用稳定占位键，确保人物、猫咪、
-            # 场景画风三个互斥职责与实际输入顺序一致，不依赖尚未生成的哈希。
-            look_key="look:current-appearance",
-            explicit_episode_keys=tuple(
-                item.semantic_key
-                for item in explicit_episode_assets
-                if item.semantic_key is not None
-            ),
-        )
-        storyboard = compile_storyboard_prompt(
-            episode,
-            reference_roles=reference_keys,
-            style_profile=style_profile,
-            series_profile=series_profile,
-        )
-        video = compile_video_prompt_preview(
-            episode,
-            resolution=resolution,
-            style_profile=style_profile,
-            series_profile=series_profile,
-        )
+        anchor_roles = ("look:current-appearance", "cat:front", scene_style)
+        render_plan = build_render_plan(episode)
         return {
             "episodeId": str(episode_id),
             "slot": detail["slot"],
-            "storyboard": storyboard.text,
-            "video": video.text,
+            "look": compile_look_prompt(
+                episode,
+                reference_roles=look_roles,
+                series_profile=series,
+                style_profile=style,
+            ).text,
+            "openingAnchor": compile_opening_anchor_prompt(
+                episode,
+                reference_roles=anchor_roles,
+                series_profile=series,
+                style_profile=style,
+            ).text,
+            "videoSections": [
+                {
+                    "order": section.order,
+                    "durationSeconds": section.duration_seconds,
+                    "prompt": compile_video_prompt_preview(
+                        episode,
+                        resolution=self._video_resolution,
+                        section_order=section.order,
+                        style_profile=style,
+                        series_profile=series,
+                    ).text,
+                }
+                for section in render_plan.sections
+            ],
+            "renderPlan": render_plan.model_dump(mode="json"),
+            "resolution": self._video_resolution,
             "overrides": self._repository.get_prompt_overrides(episode_id),
         }
 
     def step(self, step_id: uuid.UUID) -> dict[str, Any]:
-        """返回收费意图、Ark task ID 与恢复状态。"""
-
         return self._repository.step_detail(step_id)
 
     def pipeline_settings(self, run_id: uuid.UUID) -> PipelineSettings:
-        """返回Run持久化的流水线开关。"""
-
         return self._repository.get_pipeline_settings(run_id)
 
     def episode_assets(self, episode_id: uuid.UUID) -> tuple[StoredAsset, ...]:
-        """精确返回属于该Episode的资产（仓储查询会混入run级NULL行）。"""
-
         return tuple(
             asset
             for asset in self._repository.list_assets(episode_id=episode_id)
@@ -151,8 +126,6 @@ class QueryService:
         )
 
     def list_canon(self) -> list[dict[str, Any]]:
-        """返回人物、猫咪和画风三类已批准Canon资产。"""
-
         assets = self._repository.list_assets(
             run_id=None,
             roles=("person", "cat", "style"),
@@ -172,16 +145,10 @@ class QueryService:
         ]
 
     def list_deliveries(self, run_id: uuid.UUID) -> list[dict[str, Any]]:
-        """返回一个 Run 的全部交付包及其条目。"""
-
         return self._repository.list_delivery_packages(run_id)
 
     def delivery_detail(self, package_id: uuid.UUID) -> dict[str, Any]:
-        """返回单个交付包及其条目。"""
-
         return self._repository.delivery_package_detail(package_id)
 
     def health(self) -> dict[str, Any]:
-        """返回数据库身份、版本、SSL 与迁移状态。"""
-
         return self._repository.health()

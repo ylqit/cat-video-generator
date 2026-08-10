@@ -1,4 +1,4 @@
-"""四次独立导演调用与Slot本地注入。"""
+"""总导演、三个顺序时段导演与一次结构修复。"""
 
 from __future__ import annotations
 
@@ -9,9 +9,20 @@ from datetime import date
 
 import pytest
 
-from cat_video_generator.application.planning import PlanningReviewRequired, PlanningService
+from cat_video_generator.application.planning import (
+    DayBriefPause,
+    PlanningReviewRequired,
+    PlanningService,
+)
 from cat_video_generator.application.ports import DirectorResult, StoredRun, StoredStep
-from cat_video_generator.domain.contracts import DayBrief, Slot
+from cat_video_generator.domain.contracts import (
+    ActivityFocusMode,
+    DayBrief,
+    RunCreativeControls,
+    Slot,
+    SlotCreativeControl,
+)
+from cat_video_generator.domain.pipeline import PipelineSettings
 from cat_video_generator.domain.visual_profiles import (
     DEFAULT_SERIES_VISUAL_PROFILE,
     DEFAULT_STYLE_PROFILE,
@@ -23,7 +34,7 @@ class Director:
     model = "planning-model"
 
     def __init__(self, payloads: list[dict]) -> None:
-        self.payloads = payloads
+        self.payloads = list(payloads)
         self.prompts: list[str] = []
 
     def generate_structured(self, *, prompt, schema, output_name):
@@ -44,12 +55,17 @@ class PlanningRepository:
         self.context: dict = {}
         self.plan = None
         self.run_status = RunStatus.DRAFT.value
+        self.pipeline_settings = PipelineSettings()
 
     def create_draft_run(self, content_date: date) -> uuid.UUID:
+        self.content_date = content_date
         return self.run_id
 
     def save_pipeline_settings(self, **kwargs):
         self.pipeline_settings = kwargs["settings"]
+
+    def get_pipeline_settings(self, run_id):
+        return self.pipeline_settings
 
     def list_recent_completed_summaries(self, *, limit: int):
         assert limit == 6
@@ -71,29 +87,20 @@ class PlanningRepository:
         self.steps[step.id] = step
         return step, uuid.uuid4()
 
-    def save_prompt(self, **kwargs):
-        return uuid.uuid4()
-
     def set_step_status(self, step_id, target, **kwargs):
         self.steps[step_id] = replace(self.steps[step_id], status=target)
 
     def finish_director_step(self, **kwargs):
         step = self.steps[kwargs["step_id"]]
-        snapshot = {**step.input_snapshot, "output": kwargs["output"]}
         self.steps[step.id] = replace(
             step,
             status=StepStatus.SUCCEEDED,
-            input_snapshot=snapshot,
+            input_snapshot={**step.input_snapshot, "output": kwargs["output"]},
         )
 
     def fail_director_step(self, **kwargs):
         step = self.steps[kwargs["step_id"]]
-        snapshot = {**step.input_snapshot, "output": kwargs["output"]}
-        self.steps[step.id] = replace(
-            step,
-            status=StepStatus.FAILED,
-            input_snapshot=snapshot,
-        )
+        self.steps[step.id] = replace(step, status=StepStatus.FAILED)
 
     def fail_step(self, step_id, **kwargs):
         self.steps[step_id] = replace(self.steps[step_id], status=StepStatus.FAILED)
@@ -102,7 +109,11 @@ class PlanningRepository:
         return self.steps[step_id]
 
     def next_director_attempt(self, **kwargs):
-        return 1
+        phase = kwargs["phase"]
+        slot = kwargs["slot"]
+        prefix = f"director:{phase}" + (f":{slot.value}" if slot is not None else "")
+        attempts = [step.attempt for step in self.steps.values() if step.operation_key == prefix]
+        return max(attempts, default=0) + 1
 
     def save_planning_context(self, **kwargs):
         self.context = {
@@ -121,12 +132,7 @@ class PlanningRepository:
         self.run_status = RunStatus.PLANNED.value
 
     def get_run(self, run_id):
-        return StoredRun(
-            id=self.run_id,
-            content_date=date(2026, 8, 2),
-            status=self.run_status,
-            plan=self.plan,
-        )
+        return StoredRun(self.run_id, self.content_date, self.run_status, self.plan)
 
     def set_run_status(self, run_id, target):
         self.run_status = target.value
@@ -135,7 +141,7 @@ class PlanningRepository:
         return uuid.uuid4()
 
     def replace_episode_plan(self, **kwargs):
-        raise AssertionError("初始规划不应调用局部替换")
+        raise AssertionError("初始规划不应局部替换Episode")
 
 
 class EmptySeeds:
@@ -146,50 +152,8 @@ class EmptySeeds:
         return {}
 
 
-def test_planning_calls_day_and_three_episode_directors(daily_plan) -> None:
-    payloads = [
-        daily_plan.day_brief.model_dump(mode="json"),
-        *(item.script.model_dump(mode="json") for item in daily_plan.episodes),
-    ]
-    director = Director(payloads)
-    repository = PlanningRepository()
-    service = PlanningService(
-        repository=repository,
-        director=director,
-        provider_name="volcengine-ark-standard",
-        series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
-        style_profile=DEFAULT_STYLE_PROFILE,
-        event_seed_catalog=EmptySeeds(),
-    )
-    result = service.plan_day(
-        target_date=daily_plan.content_date,
-        planning_context="设计普通生活中的小发现",
-        candidate_count=1,
-        allow_paid_generation=True,
-    )
-    assert len(director.prompts) == 4
-    assert isinstance(result.plan.day_brief, DayBrief)
-    assert [item.slot for item in result.plan.episodes] == list(Slot)
-    assert all("slot" not in item.script.model_dump() for item in result.plan.episodes)
-    assert [item.kind for item in repository.steps.values()] == [
-        StepKind.DIRECTOR,
-        StepKind.DIRECTOR,
-        StepKind.DIRECTOR,
-        StepKind.DIRECTOR,
-    ]
-
-
-def test_structural_director_failure_repairs_once(daily_plan) -> None:
-    invalid = daily_plan.episodes[0].script.model_dump(mode="json")
-    invalid.pop("title")
-    payloads = [
-        daily_plan.day_brief.model_dump(mode="json"),
-        invalid,
-        *(item.script.model_dump(mode="json") for item in daily_plan.episodes),
-    ]
-    director = Director(payloads)
-    repository = PlanningRepository()
-    service = PlanningService(
+def service(repository, director) -> PlanningService:
+    return PlanningService(
         repository=repository,
         director=director,
         provider_name="volcengine-ark-standard",
@@ -198,48 +162,114 @@ def test_structural_director_failure_repairs_once(daily_plan) -> None:
         event_seed_catalog=EmptySeeds(),
     )
 
-    result = service.plan_day(
-        target_date=daily_plan.content_date,
-        planning_context="设计普通生活中的小发现",
-        candidate_count=1,
-        allow_paid_generation=True,
-    )
 
-    assert result.plan.episodes[0].script.title == daily_plan.episodes[0].script.title
-    assert len(director.prompts) == 5
-
-
-def test_semantic_director_failure_requires_explicit_replan(daily_plan) -> None:
-    gendered = daily_plan.episodes[0].script.model_copy(
-        update={"main_event": "固定女孩在阳台发现风吹动纸风车并拿起来观察"}
-    )
-    # 语义失败会带反馈自动修复（原始+两次修复共三次尝试），
-    # 三次都不合格才进入人工规划审核。
+def test_planning_calls_day_then_morning_noon_evening(daily_plan) -> None:
     director = Director(
         [
             daily_plan.day_brief.model_dump(mode="json"),
-            gendered.model_dump(mode="json"),
-            gendered.model_dump(mode="json"),
-            gendered.model_dump(mode="json"),
+            *(item.script.model_dump(mode="json") for item in daily_plan.episodes),
         ]
     )
     repository = PlanningRepository()
-    service = PlanningService(
-        repository=repository,
-        director=director,
-        provider_name="volcengine-ark-standard",
-        series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
-        style_profile=DEFAULT_STYLE_PROFILE,
-        event_seed_catalog=EmptySeeds(),
+
+    result = service(repository, director).plan_day(
+        target_date=daily_plan.content_date,
+        planning_context="完整放风筝生活弧",
+        candidate_count=1,
+        allow_paid_generation=True,
     )
 
-    with pytest.raises(PlanningReviewRequired, match="需要人工规划审核"):
-        service.plan_day(
+    assert len(director.prompts) == 4
+    assert isinstance(result.plan.day_brief, DayBrief)
+    assert [item.slot for item in result.plan.episodes] == list(Slot)
+    assert [item.operation_key for item in repository.steps.values()] == [
+        "director:day",
+        "director:episode:morning",
+        "director:episode:noon",
+        "director:episode:evening",
+    ]
+    assert all(item.kind is StepKind.DIRECTOR for item in repository.steps.values())
+
+
+def test_day_brief_manual_mode_pauses_before_slot_directors(daily_plan) -> None:
+    director = Director([daily_plan.day_brief.model_dump(mode="json")])
+    repository = PlanningRepository()
+
+    result = service(repository, director).plan_day(
+        target_date=daily_plan.content_date,
+        planning_context="先确认全天主次和时长",
+        candidate_count=1,
+        allow_paid_generation=True,
+        stop_after_day_brief=True,
+    )
+
+    assert isinstance(result, DayBriefPause)
+    assert len(director.prompts) == 1
+    assert repository.plan is None
+    assert repository.context["episodeDrafts"] == {}
+
+
+def test_fixed_slot_focus_cannot_be_changed_by_day_director(daily_plan) -> None:
+    payload = daily_plan.day_brief.model_dump(mode="json")
+    payload["slot_briefs"][1]["resolved_activity_focus"] = "person_lead"
+    director = Director([payload])
+    repository = PlanningRepository()
+    controls = RunCreativeControls(
+        slot_controls=[
+            SlotCreativeControl(slot=Slot.MORNING),
+            SlotCreativeControl(slot=Slot.NOON, activity_focus=ActivityFocusMode.CAT_LEAD),
+            SlotCreativeControl(slot=Slot.EVENING),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="改写了noon固定活动焦点"):
+        service(repository, director).plan_day(
             target_date=daily_plan.content_date,
-            planning_context="设计普通生活中的小发现",
+            planning_context="放风筝",
+            candidate_count=1,
+            allow_paid_generation=True,
+            creative_controls=controls,
+        )
+
+
+def test_invalid_episode_contract_gets_exactly_one_repair(daily_plan) -> None:
+    invalid = daily_plan.episodes[0].script.model_dump(mode="json")
+    invalid.pop("relationship_arc")
+    director = Director(
+        [
+            daily_plan.day_brief.model_dump(mode="json"),
+            invalid,
+            daily_plan.episodes[0].script.model_dump(mode="json"),
+            daily_plan.episodes[1].script.model_dump(mode="json"),
+            daily_plan.episodes[2].script.model_dump(mode="json"),
+        ]
+    )
+    repository = PlanningRepository()
+
+    result = service(repository, director).plan_day(
+        target_date=daily_plan.content_date,
+        planning_context="放风筝",
+        candidate_count=1,
+        allow_paid_generation=True,
+    )
+
+    assert result.plan.episodes[0].script.relationship_arc.convergence
+    assert len(director.prompts) == 5
+
+
+def test_second_invalid_episode_enters_planning_review(daily_plan) -> None:
+    invalid = daily_plan.episodes[0].script.model_dump(mode="json")
+    invalid["actions"][0]["actor_id"] = "unknown_actor"
+    director = Director([daily_plan.day_brief.model_dump(mode="json"), invalid, invalid])
+    repository = PlanningRepository()
+
+    with pytest.raises(PlanningReviewRequired, match="需要人工规划审核"):
+        service(repository, director).plan_day(
+            target_date=daily_plan.content_date,
+            planning_context="放风筝",
             candidate_count=1,
             allow_paid_generation=True,
         )
 
-    assert len(director.prompts) == 4
+    assert len(director.prompts) == 3
     assert repository.run_status == RunStatus.PLANNING_REVIEW.value

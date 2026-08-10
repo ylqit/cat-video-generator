@@ -52,7 +52,7 @@ const technicalPassed = computed(() => {
   );
 });
 
-/** Ark 视觉语义审核证据（身份/画风/世界连续性/叙事）。 */
+/** Ark 视觉语义审核证据（身份、画风、关键道具和叙事）。 */
 const visualReview = computed(() =>
   [...props.reviews]
     .filter(
@@ -73,7 +73,7 @@ const visualEvidence = computed(() => {
 const VISUAL_FLAG_LABEL: Record<string, string> = {
   identityOk: "身份一致",
   styleOk: "画风一致",
-  worldContinuityOk: "世界连续",
+  criticalPropsOk: "关键道具",
   narrativeOrderOk: "叙事顺序",
 };
 

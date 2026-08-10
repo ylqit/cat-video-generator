@@ -10,6 +10,7 @@ __pycache__/
 htmlcov/
 var/
 output/
+tmp/
 *.part
 docs/设计脚本教程/
 docs/公众号文章解析

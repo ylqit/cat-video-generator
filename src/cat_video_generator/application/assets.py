@@ -1,4 +1,4 @@
-"""Canon导入和人工媒体审核用例。"""
+"""Canon、Episode 参考素材导入与人工媒体审核。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from .ports import AssetStore, MediaProbe, ProductionStore
 
 
 class AssetService:
-    """本地Canon资产与人工审核的业务所有者。"""
+    """本地不可变资产及人工审核的业务所有者。"""
 
     def __init__(
         self,
@@ -34,21 +34,10 @@ class AssetService:
         semantic_key: str,
         view: str | None,
     ) -> dict[str, Any]:
-        """导入长期人物、猫咪或画风Canon。"""
-
         if role not in {"person", "cat", "style"}:
-            raise ValueError("Canon role必须是person、cat或style")
+            raise ValueError("Canon role 必须是 person、cat 或 style")
         _validate_semantic_key(role, semantic_key, scope="canon")
-        if role in {"person", "cat"}:
-            allowed = _canon_views(role)
-            if view not in allowed:
-                raise ValueError(f"{role} Canon视角必须是{', '.join(sorted(allowed))}")
-            if semantic_key != f"{role}:{view}":
-                raise ValueError("人物和猫咪semantic_key必须与role和view一致")
-        elif view is not None:
-            raise ValueError("style Canon不能声明人物视角")
-        elif semantic_key not in DEFAULT_STYLE_PROFILE.reference_keys:
-            raise ValueError("画风Canon只能使用当前定稿的line_texture、indoor或outdoor语义键")
+        _validate_canon_view(role, semantic_key, view)
         landed = self._asset_store.import_local(path)
         metadata = {
             **self._probe.inspect_image(landed.path),
@@ -70,7 +59,7 @@ class AssetService:
         return {
             "assetId": str(asset.id),
             "role": role,
-            "semanticKey": semantic_key,
+            "semanticKey": asset.semantic_key,
             "localPath": str(asset.path),
             "sha256": asset.sha256,
         }
@@ -85,28 +74,17 @@ class AssetService:
         semantic_key: str,
         view: str | None,
     ) -> dict[str, Any]:
-        """从已批准Canon确定性裁出单视图或无主体画风参考。"""
-
         source = self._repository.asset_detail(source_asset_id)
         if source.scope != "canon" or source.status not in {"approved", "ready"}:
-            raise ValueError("派生裁剪的来源必须是已批准Canon")
+            raise ValueError("派生裁剪来源必须是已批准 Canon")
         if source.role != role or role not in {"person", "cat", "style"}:
-            raise ValueError("派生角色必须与来源Canon角色一致")
+            raise ValueError("派生角色必须与来源 Canon 一致")
         _validate_semantic_key(role, semantic_key, scope="canon")
-        if role in {"person", "cat"}:
-            allowed = _canon_views(role)
-            if view not in allowed:
-                raise ValueError(f"{role}裁片视角必须是{', '.join(sorted(allowed))}")
-            if semantic_key != f"{role}:{view}":
-                raise ValueError("裁片semantic_key必须与role和view一致")
-        elif view is not None:
-            raise ValueError("style裁片不能声明人物视角")
-        elif semantic_key not in DEFAULT_STYLE_PROFILE.reference_keys:
-            raise ValueError("画风裁片只能写入当前定稿画风语义键")
+        _validate_canon_view(role, semantic_key, view)
         source_meta = self._probe.inspect_image(source.path)
         if box is None:
             if role in {"style", "person"}:
-                raise ValueError("人物新参考和style必须显式提供裁剪框")
+                raise ValueError("人物新参考和 style 必须显式提供裁剪框")
             box = (0, 0, int(source_meta["width"]) // 3, int(source_meta["height"]))
         landed = self._asset_store.crop_local(source.path, box=box)
         metadata = {
@@ -132,7 +110,7 @@ class AssetService:
         return {
             "assetId": str(asset.id),
             "role": role,
-            "semanticKey": semantic_key,
+            "semanticKey": asset.semantic_key,
             "localPath": str(asset.path),
             "sha256": asset.sha256,
             "metadata": metadata,
@@ -146,14 +124,11 @@ class AssetService:
         path: Path,
         semantic_key: str,
     ) -> dict[str, Any]:
-        """导入仅供一个Episode使用的场景或元素参考图。"""
-
         if role not in {"element", "scene"}:
-            raise ValueError("Episode参考role必须是element或scene")
+            raise ValueError("Episode 参考 role 必须是 element 或 scene")
         _validate_semantic_key(role, semantic_key, scope="episode")
         episode = self._repository.episode_detail(episode_id)
         landed = self._asset_store.import_local(path)
-        media_type = "image"
         metadata = self._probe.inspect_image(landed.path)
         asset = self._repository.save_asset(
             run_id=uuid.UUID(episode["runId"]),
@@ -163,18 +138,18 @@ class AssetService:
             semantic_key=semantic_key,
             scope="episode",
             status="approved",
-            media_type=media_type,
+            media_type="image",
             landed=landed,
             metadata=metadata,
         )
         return {
             "assetId": str(asset.id),
-            "episodeId": str(episode_id),
             "role": role,
-            "semanticKey": semantic_key,
-            "mediaType": media_type,
+            "semanticKey": asset.semantic_key,
             "localPath": str(asset.path),
             "sha256": asset.sha256,
+            "episodeId": str(episode_id),
+            "mediaType": "image",
             "metadata": metadata,
         }
 
@@ -185,40 +160,18 @@ class AssetService:
         approve: bool,
         reason: str,
     ) -> dict[str, Any]:
-        """记录人工决定；拒绝后只保留审计，不自动再次付费。"""
+        """原子提交单个定妆、开场锚点或最终视频的人工决定。"""
 
         decision = "approved" if approve else "rejected"
         asset = self._repository.asset_detail(asset_id)
-        if asset.role == "storyboard_panel":
-            if asset.step_id is None or asset.episode_id is None:
-                raise ValueError("故事板面板缺少生产步骤或Episode")
-            panels = tuple(
-                item
-                for item in self._repository.list_assets(
-                    run_id=asset.run_id,
-                    episode_id=asset.episode_id,
-                    roles=("storyboard_panel",),
-                )
-                if item.step_id == asset.step_id
-            )
-            result = self._repository.commit_storyboard_review(
-                step_id=asset.step_id,
-                asset_ids=tuple(item.id for item in panels),
-                source="human",
-                decision=decision,
-                reason=reason,
-                warnings=[],
-                evidence={"reviewedFromPanelId": str(asset_id)},
-            )
-        else:
-            result = self._repository.commit_asset_review(
-                asset_id=asset_id,
-                source="human",
-                decision=decision,
-                reason=reason,
-                warnings=[],
-                evidence={},
-            )
+        result = self._repository.commit_asset_review(
+            asset_id=asset_id,
+            source="human",
+            decision=decision,
+            reason=reason,
+            warnings=[],
+            evidence={},
+        )
         if (
             approve
             and asset.role == "video"
@@ -248,11 +201,23 @@ def _canon_views(role: str) -> frozenset[str]:
     return frozenset()
 
 
-def _validate_semantic_key(role: str, semantic_key: str, *, scope: str) -> None:
-    """阻止模糊role重新成为资产选择条件。"""
+def _validate_canon_view(role: str, semantic_key: str, view: str | None) -> None:
+    if role in {"person", "cat"}:
+        allowed = _canon_views(role)
+        if view not in allowed:
+            raise ValueError(f"{role} Canon 视角必须是 {', '.join(sorted(allowed))}")
+        if semantic_key != f"{role}:{view}":
+            raise ValueError("人物和猫咪 semantic_key 必须与 role、view 一致")
+        return
+    if view is not None:
+        raise ValueError("style Canon 不能声明人物视角")
+    if semantic_key not in DEFAULT_STYLE_PROFILE.reference_keys:
+        raise ValueError("style Canon 必须使用当前定稿画风语义键")
 
+
+def _validate_semantic_key(role: str, semantic_key: str, *, scope: str) -> None:
     if not _SEMANTIC_KEY.fullmatch(semantic_key):
-        raise ValueError("semantic_key必须使用type:value格式")
+        raise ValueError("semantic_key 必须使用 type:value 格式")
     prefix = semantic_key.split(":", 1)[0]
     allowed = {
         "person": {"person"},
@@ -262,6 +227,6 @@ def _validate_semantic_key(role: str, semantic_key: str, *, scope: str) -> None:
         "scene": {"scene"},
     }[role]
     if prefix not in allowed:
-        raise ValueError(f"{role}资产不能使用{semantic_key}")
+        raise ValueError(f"{role} 资产不能使用 {semantic_key}")
     if scope == "canon" and semantic_key.startswith("legacy:"):
-        raise ValueError("新Canon不能使用legacy语义键")
+        raise ValueError("新 Canon 不能使用 legacy 语义键")
