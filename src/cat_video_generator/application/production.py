@@ -68,6 +68,7 @@ class ProductionService:
         episode_id: uuid.UUID,
         *,
         overrides: dict[str, str] | None,
+        enabled: bool,
     ) -> None:
         """保存尚未提交的定妆、开场锚点和视频 Prompt 覆盖。"""
 
@@ -79,6 +80,7 @@ class ProductionService:
         self._repository.save_prompt_overrides(
             episode_id=episode_id,
             overrides=cleaned or None,
+            enabled=enabled,
         )
 
     def run_day(

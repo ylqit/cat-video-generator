@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 
-import type { RunGraph, StepDto, WorkflowNodeDto } from "../api/types";
+import { api, ApiError } from "../api/client";
+import type { RunGraph, StepDto, StepTraceDto, WorkflowNodeDto } from "../api/types";
 import AssetThumb from "./AssetThumb.vue";
-import PromptCollapse from "./PromptCollapse.vue";
 import StatusBadge from "./StatusBadge.vue";
 import StepList from "./StepList.vue";
 
@@ -19,10 +19,35 @@ const emit = defineEmits<{
 }>();
 
 const activePanel = ref("content");
+const trace = ref<StepTraceDto | null>(null);
+const traceLoading = ref(false);
+const traceError = ref("");
+
+async function loadTrace() {
+  const stepId = props.node?.stepId;
+  trace.value = null;
+  traceError.value = "";
+  if (!props.modelValue || !stepId) return;
+  traceLoading.value = true;
+  try {
+    trace.value = await api.stepTrace(stepId);
+  } catch (error) {
+    traceError.value = error instanceof ApiError ? error.message : String(error);
+  } finally {
+    traceLoading.value = false;
+  }
+}
+
 watch(
-  [() => props.node?.id, () => props.modelValue],
-  ([, visible]) => {
-    if (!visible) {
+  [
+    () => props.node?.id,
+    () => props.node?.stepId,
+    () => props.node?.status,
+    () => props.node?.attempts.length,
+    () => props.modelValue,
+  ],
+  () => {
+    if (!props.modelValue) {
       return;
     }
     // 失败节点优先展示可执行的恢复操作，避免用户只看到错误却找不到重试入口。
@@ -30,25 +55,31 @@ watch(
     activePanel.value = props.node?.status === "failed" || props.node?.error
       ? "provider"
       : "content";
+    void loadTrace();
   },
 );
 
-const prompts = computed(() => {
-  const ids = new Set(props.node?.promptIds ?? []);
-  return props.graph.prompts.filter((item) => ids.has(item.id));
-});
 const assets = computed(() => {
   const ids = new Set(props.node?.assetIds ?? []);
   return props.graph.assets.filter((item) => ids.has(item.id));
 });
 const reviews = computed(() => {
+  if (trace.value) return trace.value.reviews;
   const ids = new Set(props.node?.reviewIds ?? []);
   return props.graph.reviews.filter((item) => ids.has(item.id));
 });
+const outputAssets = computed(() => trace.value?.assets ?? assets.value);
+const attempts = computed(() => trace.value?.attempts ?? props.node?.attempts ?? []);
 const episode = computed(() =>
   props.graph.episodes.find((item) => item.slot === props.node?.slot),
 );
 const materialIds = computed(() => {
+  if (trace.value) {
+    const ids = trace.value.inputBindings
+      .map((item) => item.assetId)
+      .filter((value): value is string => typeof value === "string");
+    return [...new Set(ids)];
+  }
   const result: string[] = [];
   for (const attempt of props.node?.attempts ?? []) {
     for (const key of ["reference_asset_ids", "input_asset_ids"]) {
@@ -60,6 +91,10 @@ const materialIds = computed(() => {
   }
   return [...new Set(result)];
 });
+
+function promptAttempt(stepId: string) {
+  return attempts.value.find((item) => item.id === stepId)?.attempt ?? "?";
+}
 
 function close() {
   emit("update:modelValue", false);
@@ -118,19 +153,18 @@ function close() {
           </template>
           <template v-else-if="node.type === 'director' && episode">
             <h4>{{ episode.title }}</h4>
-            <p>{{ episode.script.main_event }}</p>
-            <div class="muted">{{ episode.script.scene }}</div>
+            <p>{{ episode.script.story_text }}</p>
+            <div class="muted">{{ episode.script.visual_context }} · {{ episode.script.appearance }}</div>
             <el-descriptions :column="1" border size="small" style="margin-top: 12px">
               <el-descriptions-item label="活动焦点">{{ episode.activityFocus }}</el-descriptions-item>
-              <el-descriptions-item label="主活动">{{ episode.relationshipArc.lead_activity }}</el-descriptions-item>
-              <el-descriptions-item label="副活动">{{ episode.relationshipArc.secondary_activity }}</el-descriptions-item>
-              <el-descriptions-item label="关系汇合">{{ episode.relationshipArc.convergence }}</el-descriptions-item>
+              <el-descriptions-item label="关系弧">{{ episode.relationshipArc }}</el-descriptions-item>
               <el-descriptions-item label="精确时长">{{ episode.script.duration_seconds }}秒</el-descriptions-item>
+              <el-descriptions-item label="结尾回报">{{ episode.script.ending }}</el-descriptions-item>
             </el-descriptions>
           </template>
-          <div v-if="assets.length" class="asset-grid">
+          <div v-if="outputAssets.length" class="asset-grid">
             <AssetThumb
-              v-for="asset in assets"
+              v-for="asset in outputAssets"
               :key="asset.id"
               :asset-id="asset.id"
               :label="`${asset.role} · ${asset.status}`"
@@ -138,18 +172,72 @@ function close() {
             />
           </div>
           <el-empty
-            v-if="!assets.length && node.type !== 'director'"
+            v-if="!outputAssets.length && node.type !== 'director'"
             description="该节点尚未产生媒体资产"
           />
         </el-tab-pane>
 
-        <el-tab-pane label="实际Prompt" name="prompt">
-          <PromptCollapse
-            v-if="prompts.length"
-            :prompts="prompts"
-            title="该attempt实际调用Prompt"
-          />
-          <el-empty v-else description="该节点尚未持久化实际Prompt" />
+        <el-tab-pane label="Prompt链路" name="prompt">
+          <el-alert v-if="traceError" type="error" :closable="false" :title="traceError" />
+          <div v-loading="traceLoading">
+            <template v-if="trace">
+              <h4>上游输入摘要</h4>
+              <pre class="json-view">{{ JSON.stringify(trace.inputSummary, null, 2) }}</pre>
+
+              <el-descriptions :column="3" border size="small" style="margin: 12px 0">
+                <el-descriptions-item label="Provider">{{ node.providerStatus }}</el-descriptions-item>
+                <el-descriptions-item label="契约校验">{{ node.contractStatus }}</el-descriptions-item>
+                <el-descriptions-item label="语义审核">{{ node.semanticReviewStatus }}</el-descriptions-item>
+              </el-descriptions>
+
+              <h4>当前结构化结果</h4>
+              <pre class="json-view">{{ JSON.stringify(trace.currentStructuredOutput, null, 2) }}</pre>
+
+              <h4>当前编译Prompt</h4>
+              <el-collapse v-if="trace.currentCompiledPrompts.length">
+                <el-collapse-item
+                  v-for="prompt in trace.currentCompiledPrompts"
+                  :key="prompt.label"
+                  :title="`${prompt.label} · ${prompt.text.length}字`"
+                  :name="prompt.label"
+                >
+                  <pre class="prompt-text">{{ prompt.text }}</pre>
+                </el-collapse-item>
+              </el-collapse>
+              <el-empty v-else description="导演节点的当前编译Prompt就是已持久化的调用Prompt" />
+
+              <h4>本节点各attempt实际调用Prompt</h4>
+              <el-collapse v-if="trace.actualPrompts.length">
+                <el-collapse-item
+                  v-for="prompt in trace.actualPrompts"
+                  :key="prompt.id"
+                  :title="`attempt ${promptAttempt(prompt.stepId)} · ${prompt.purpose} · ${prompt.charCount}字`"
+                  :name="prompt.id"
+                >
+                  <pre class="prompt-text">{{ prompt.text }}</pre>
+                </el-collapse-item>
+              </el-collapse>
+              <el-empty v-else description="该节点尚未持久化实际Prompt" />
+
+              <el-collapse style="margin-top: 12px">
+                <el-collapse-item title="Ark原始结构化JSON" name="provider-output">
+                  <pre class="json-view">{{ JSON.stringify(trace.providerOutput, null, 2) }}</pre>
+                </el-collapse-item>
+                <el-collapse-item v-if="trace.normalizedOutput" title="标准化业务对象" name="normalized-output">
+                  <pre class="json-view">{{ JSON.stringify(trace.normalizedOutput, null, 2) }}</pre>
+                </el-collapse-item>
+              </el-collapse>
+              <el-alert
+                v-if="trace.normalizationWarnings.length"
+                type="warning"
+                :closable="false"
+                title="归一化警告"
+                style="margin-top: 12px"
+              >
+                <div v-for="warning in trace.normalizationWarnings" :key="warning">{{ warning }}</div>
+              </el-alert>
+            </template>
+          </div>
           <el-alert
             type="info"
             :closable="false"
@@ -169,21 +257,37 @@ function close() {
             />
           </div>
           <el-empty v-else description="该节点没有媒体输入素材" />
-          <el-collapse v-if="node.attempts.length" style="margin-top: 12px">
+          <el-collapse v-if="attempts.length" style="margin-top: 12px">
             <el-collapse-item title="类型化输入快照" name="snapshot">
               <pre class="json-view">{{
-                JSON.stringify(node.attempts.at(-1)?.inputSnapshot, null, 2)
+                JSON.stringify(attempts.at(-1)?.inputSnapshot, null, 2)
               }}</pre>
+            </el-collapse-item>
+            <el-collapse-item v-if="trace?.inputBindings.length" title="有序素材绑定" name="bindings">
+              <pre class="json-view">{{ JSON.stringify(trace.inputBindings, null, 2) }}</pre>
             </el-collapse-item>
           </el-collapse>
         </el-tab-pane>
 
         <el-tab-pane label="Provider任务" name="provider">
           <StepList
-            :steps="node.attempts"
+            :steps="attempts"
             @changed="emit('changed')"
             @review="emit('review', $event)"
           />
+        </el-tab-pane>
+
+        <el-tab-pane label="媒体输出" name="media">
+          <div v-if="outputAssets.length" class="asset-grid">
+            <AssetThumb
+              v-for="asset in outputAssets"
+              :key="asset.id"
+              :asset-id="asset.id"
+              :label="`${asset.role} · ${asset.status}`"
+              :size="180"
+            />
+          </div>
+          <el-empty v-else description="该节点尚未产生媒体输出" />
         </el-tab-pane>
 
         <el-tab-pane label="审核证据" name="reviews">
@@ -204,7 +308,7 @@ function close() {
 
         <el-tab-pane label="尝试历史" name="attempts">
           <StepList
-            :steps="node.attempts"
+            :steps="attempts"
             @changed="emit('changed')"
             @review="emit('review', $event)"
           />
@@ -243,6 +347,19 @@ function close() {
   padding: 10px;
   color: #cbd5e1;
   font-size: 12px;
+}
+.prompt-text {
+  margin: 0;
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #17191f;
+  border-radius: 6px;
+  padding: 10px;
+  color: #cbd5e1;
+  font-size: 12px;
+  line-height: 1.6;
 }
 .asset-grid {
   display: flex;

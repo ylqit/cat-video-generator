@@ -157,6 +157,17 @@ def create_studio_router(
             lambda: studio_editing.update_episode_script(episode_id, payload)
         )
 
+    @router.post("/episodes/{episode_id}/prompt-preview")
+    async def preview_episode_prompt(
+        episode_id: uuid.UUID,
+        payload: dict[str, Any] = Body(...),  # noqa: B008
+    ) -> dict[str, Any]:
+        """用尚未保存的结构化脚本编译实时Prompt；不落库、不调用Ark。"""
+
+        return await _run_validated(
+            lambda: queries.prompt_preview(episode_id, script_override=payload)
+        )
+
     @router.put("/runs/{run_id}/day-brief")
     async def update_day_brief(
         run_id: uuid.UUID,

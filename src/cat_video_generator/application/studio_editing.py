@@ -17,8 +17,6 @@ from ..domain.contracts import (
     DailyProductionPlan,
     DayBrief,
     DurationBand,
-    DurationIntent,
-    DurationMode,
     EpisodePlan,
     EpisodeScript,
     Slot,
@@ -133,7 +131,9 @@ class StudioEditingService:
             "episodeId": str(episode_id),
             "slot": slot.value,
             "saved": True,
-            "promptOverridesKept": bool(detail.get("promptOverrides")),
+            "promptOverrideStale": bool(
+                detail.get("promptOverrideState", {}).get("values")
+            ),
             "normalizations": list(normalizations),
         }
 
@@ -154,6 +154,8 @@ class StudioEditingService:
         }:
             raise ValueError(f"Run状态{stored_run.status}不允许编辑日导演输出")
         day_brief = DayBrief.model_validate(payload)
+        if day_brief.content_date != stored_run.content_date:
+            raise ValueError("DayBrief内容日期不能改写Run的固定日期")
         self._repository.update_day_brief(run_id=run_id, day_brief=day_brief)
         return {
             "runId": str(run_id),
@@ -192,16 +194,12 @@ def _apply_episode_controls(
         if script.duration_seconds <= 30
         else DurationBand.LONG
     )
-    mode = DurationMode(band.value)
     briefs = [
         item.model_copy(
             update={
-                "resolved_activity_focus": script.activity_focus,
-                "duration_intent": DurationIntent(
-                    requested_mode=mode,
-                    resolved_band=band,
-                    resolution_reason="用户在时段剧本阶段固定活动焦点与时长档",
-                ),
+                "activity_focus": script.activity_focus,
+                "duration_band": band,
+                "decision_reason": "用户在时段剧本阶段固定活动焦点与时长档",
             }
         )
         if item.slot is slot

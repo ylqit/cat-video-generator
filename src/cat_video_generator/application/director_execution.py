@@ -12,7 +12,8 @@ from typing import Any, TypeVar
 
 from pydantic import ValidationError
 
-from ..domain.contracts import EpisodeScript, Slot, StrictModel
+from ..domain.contract_base import StrictModel
+from ..domain.contracts import EpisodeScript, Slot
 from ..domain.normalization import normalize_episode_payload
 from ..domain.workflow import PromptPurpose, StepKind, StepStatus
 from .ports import DirectorGateway, GatewayError, PlanningStore, StoredStep
@@ -99,10 +100,17 @@ class DirectorInvoker:
             parent_prompt_id=parent_prompt_id,
         )
         if step.status is StepStatus.SUCCEEDED:
-            saved = step.input_snapshot.get("output")
+            snapshot = step.input_snapshot
+            saved = snapshot.get("normalized_output") or snapshot.get("provider_output")
             if not isinstance(saved, dict):
                 raise RuntimeError("导演步骤已成功但缺少持久化输出")
-            return contract.model_validate(saved), step, prompt_id, ()
+            warnings = snapshot.get("normalization_warnings")
+            return (
+                contract.model_validate(saved),
+                step,
+                prompt_id,
+                tuple(str(item) for item in warnings) if isinstance(warnings, list) else (),
+            )
 
         # 先提交收费意图，再调用Ark。进程即使在响应前中断，恢复流程也能通过
         # submission_unknown阻止第二次POST。
@@ -135,7 +143,9 @@ class DirectorInvoker:
                 step_id=step.id,
                 response_id=result.response_id,
                 request_hash=result.request_hash,
-                output=result.payload,
+                provider_output=result.payload,
+                normalized_output=(output if output != result.payload else None),
+                normalization_warnings=normalizations,
                 code="invalid_director_output",
                 message=errors[0],
             )
@@ -149,7 +159,9 @@ class DirectorInvoker:
             step_id=step.id,
             response_id=result.response_id,
             request_hash=result.request_hash,
-            output=output,
+            provider_output=result.payload,
+            normalized_output=(output if output != result.payload else None),
+            normalization_warnings=normalizations,
         )
         return parsed, self._repository.get_step(step.id), prompt_id, normalizations
 

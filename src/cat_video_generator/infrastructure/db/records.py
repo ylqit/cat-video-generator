@@ -6,7 +6,13 @@ from pathlib import Path
 from typing import Any
 
 from ...application.ports import StoredAsset, StoredEpisode, StoredPrompt, StoredStep
-from ...domain.contracts import EpisodePlan, EpisodeScript, Slot
+from ...domain.contracts import (
+    CURRENT_CONTRACT_VERSION,
+    ContractVersionError,
+    EpisodePlan,
+    EpisodeScript,
+    Slot,
+)
 from ...domain.pipeline import PipelineSettings
 from ...domain.rendering import build_render_plan
 from ...domain.workflow import EpisodeStatus, PromptPurpose, StepKind, StepStatus
@@ -39,6 +45,16 @@ def stored_step(row: WorkflowStep) -> StoredStep:
         error_code=(row.error_json or {}).get("code"),
         error_message=(row.error_json or {}).get("message"),
     )
+
+
+def ensure_current_contract(row: ProductionRun) -> None:
+    """拒绝读取未知导演契约，不在运行时猜测或补齐旧JSON。"""
+
+    if row.contract_version != CURRENT_CONTRACT_VERSION:
+        raise ContractVersionError(
+            f"Run {row.id}使用契约版本{row.contract_version}，"
+            f"当前仅支持版本{CURRENT_CONTRACT_VERSION}"
+        )
 
 
 def stored_prompt(row: PromptRecord) -> StoredPrompt:
@@ -84,6 +100,7 @@ def stored_asset(row: Asset) -> StoredAsset:
 
 
 def run_dict(row: ProductionRun) -> dict[str, Any]:
+    ensure_current_contract(row)
     settings = PipelineSettings.model_validate(row.pipeline_settings_json)
     available_actions = (
         [{"type": "deliver", "label": "构建交付包", "paid": False}] if row.status == "ready" else []
@@ -91,6 +108,7 @@ def run_dict(row: ProductionRun) -> dict[str, Any]:
     return {
         "id": str(row.id),
         "contentDate": row.content_date.isoformat(),
+        "contractVersion": row.contract_version,
         "theme": row.planning_json.get("dayBrief", {}).get("theme"),
         "status": row.status,
         "pipelineSettings": settings.model_dump(mode="json", by_alias=True),
@@ -117,6 +135,16 @@ def episode_dict(row: Episode) -> dict[str, Any]:
         script=EpisodeScript.model_validate(row.script_json),
     )
     render_plan = build_render_plan(plan)
+    raw_override = row.prompt_overrides_json or {}
+    override_values = (
+        raw_override.get("values") if isinstance(raw_override.get("values"), dict) else {}
+    )
+    override_state = {
+        "enabled": bool(raw_override.get("enabled", False)),
+        "stale": bool(raw_override.get("stale", False)),
+        "sourceScriptSha256": raw_override.get("sourceScriptSha256"),
+        "values": override_values,
+    }
     return {
         "id": str(row.id),
         "runId": str(row.production_run_id),
@@ -125,7 +153,7 @@ def episode_dict(row: Episode) -> dict[str, Any]:
         "title": plan.script.title,
         "status": row.status,
         "activityFocus": plan.script.activity_focus.value,
-        "relationshipArc": plan.script.relationship_arc.model_dump(mode="json"),
+        "relationshipArc": plan.script.relationship_arc,
         "renderPlan": render_plan.model_dump(mode="json"),
         "nextAction": {
             "planned": "生成定妆图与开场锚点",
@@ -140,7 +168,12 @@ def episode_dict(row: Episode) -> dict[str, Any]:
         "selectedVideoAssetId": (
             None if row.selected_video_asset_id is None else str(row.selected_video_asset_id)
         ),
-        "promptOverrides": row.prompt_overrides_json or {},
+        "promptOverrides": (
+            override_values
+            if override_state["enabled"] and not override_state["stale"]
+            else {}
+        ),
+        "promptOverrideState": override_state,
         "script": plan.script.model_dump(mode="json"),
     }
 

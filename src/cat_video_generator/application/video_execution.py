@@ -155,6 +155,8 @@ class VideoExecutionService:
         step: StoredStep,
         *,
         reason: str,
+        prompt_override: str | None = None,
+        restart_from_beginning: bool = False,
     ) -> dict[str, Any]:
         """为终止的视频节点显式创建 attempt+1，并保留原任务证据。"""
 
@@ -164,12 +166,37 @@ class VideoExecutionService:
             StepStatus.CANCELLED,
         }:
             raise ValueError("只允许重试 failed、expired 或 cancelled 视频步骤")
+        render_plan = build_render_plan(episode.plan)
+        self._require_extension_capability(render_plan)
+        if restart_from_beginning:
+            if step.operation_key not in {"video:extend:2", "video:extend:3"}:
+                raise ValueError("只有延展视频节点可以选择从开场重新生成")
+            anchors = self._repository.list_assets(
+                run_id=episode.run_id,
+                episode_id=episode.id,
+                roles=("opening_anchor",),
+                statuses=("approved", "ready"),
+            )
+            if not anchors:
+                raise ValueError("Episode尚无批准的开场锚点，无法重新生成整条视频")
+            # 最终视频暴露的问题可能已经存在于较早区段。此时只重做尾段无法
+            # 改变已写入源视频的事实，因此从同一开场锚点创建一条全新的attempt链。
+            # 旧区段、Prompt和Task ID继续保留，便于追踪重复计费和成片差异。
+            return self._execute_sections(
+                episode,
+                render_plan,
+                source=anchors[-1],
+                start_order=1,
+                prompt_override=prompt_override,
+                fresh_attempts=True,
+                retry_of_step_id=step.id,
+                retry_reason=reason,
+            )
+
         snapshot = VideoInputSnapshot.model_validate(step.input_snapshot)
         if len(snapshot.input_asset_ids) != 1:
             raise ValueError("视频步骤必须只有一个开场锚点或上一版视频输入")
         source = self._repository.asset_detail(snapshot.input_asset_ids[0])
-        render_plan = build_render_plan(episode.plan)
-        self._require_extension_capability(render_plan)
         section = _section(render_plan, snapshot.render_section_order)
         result = self._run_section(
             episode,
@@ -183,6 +210,7 @@ class VideoExecutionService:
             ),
             retry_of_step_id=step.id,
             retry_reason=reason,
+            prompt_override=(prompt_override if section.order == 1 else None),
         )
         if result["status"] != "succeeded":
             return result
@@ -271,19 +299,37 @@ class VideoExecutionService:
         source: StoredAsset,
         start_order: int,
         prompt_override: str | None,
+        fresh_attempts: bool = False,
+        retry_of_step_id: uuid.UUID | None = None,
+        retry_reason: str | None = None,
     ) -> dict[str, Any]:
         current_source = source
         last_result: dict[str, Any] | None = None
         for section in render_plan.sections:
             if section.order < start_order:
                 continue
+            operation_key = (
+                "video:single_pass"
+                if section.order == 1
+                else f"video:extend:{section.order}"
+            )
             last_result = self._run_section(
                 episode,
                 render_plan,
                 section,
                 current_source,
-                attempt=1,
+                attempt=(
+                    self._repository.next_step_attempt(
+                        episode_id=episode.id,
+                        kind=StepKind.VIDEO,
+                        operation_key=operation_key,
+                    )
+                    if fresh_attempts
+                    else 1
+                ),
                 prompt_override=prompt_override if section.order == 1 else None,
+                retry_of_step_id=retry_of_step_id if fresh_attempts else None,
+                retry_reason=retry_reason if fresh_attempts else None,
             )
             if last_result["status"] != "succeeded":
                 return last_result
@@ -662,7 +708,7 @@ class VideoExecutionService:
                 "reviewerModel": result.model,
                 "identityOk": result.identity_ok,
                 "styleOk": result.style_ok,
-                "criticalPropsOk": result.critical_props_ok,
+                "constraintsOk": result.constraints_ok,
                 "narrativeOrderOk": result.narrative_order_ok,
                 "confidence": result.confidence,
                 "violations": result.violations,

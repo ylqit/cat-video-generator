@@ -27,6 +27,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from ...domain.contracts import CURRENT_CONTRACT_VERSION
 from ...domain.workflow import (
     EpisodeStatus,
     PromptPurpose,
@@ -59,6 +60,10 @@ class ProductionRun(Base):
             _check("status", _values(RunStatus)),
             name="ck_production_runs_status",
         ),
+        CheckConstraint(
+            f"contract_version = {CURRENT_CONTRACT_VERSION}",
+            name="ck_production_runs_contract_version",
+        ),
         Index("ix_production_runs_queue", "status", "content_date", "created_at"),
         {"schema": SCHEMA_NAME},
     )
@@ -69,6 +74,10 @@ class ProductionRun(Base):
         default=uuid.uuid4,
     )
     content_date: Mapped[date] = mapped_column(Date, nullable=False)
+    contract_version: Mapped[int] = mapped_column(
+        SmallInteger,
+        nullable=False,
+    )
     planning_json: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
         nullable=False,

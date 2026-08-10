@@ -46,12 +46,6 @@ def validate_plan_gate(
         issues.append(_hard("plan", "content_date_mismatch", "内容日期与规划目标不一致"))
     for episode in plan.episodes:
         issues.extend(_identity_issues(episode, series_profile))
-    if len({item.script.story_pattern for item in plan.episodes}) == 1:
-        issues.append(
-            _warning(
-                "planning", "repeated_story_pattern", "早中晚使用了相同关系弧，建议增加信息组织差异"
-            )
-        )
     return tuple(issues)
 
 
@@ -65,9 +59,9 @@ def validate_episode_against_brief(
     issues = list(_identity_issues(episode, series_profile))
     if episode.slot is not slot_brief.slot:
         issues.append(_hard("plan", "slot_mismatch", "时段导演返回了错误的slot"))
-    if episode.script.activity_focus is not slot_brief.resolved_activity_focus:
+    if episode.script.activity_focus is not slot_brief.activity_focus:
         issues.append(_hard("plan", "activity_focus_mismatch", "时段导演改写了固定活动焦点"))
-    minimum, maximum = slot_brief.duration_intent.resolved_band.range
+    minimum, maximum = slot_brief.duration_band.range
     if not minimum <= episode.duration_seconds <= maximum:
         issues.append(_hard("plan", "duration_band_mismatch", "精确时长超出总导演解析档位"))
     try:
@@ -75,24 +69,9 @@ def validate_episode_against_brief(
     except ValueError as exc:
         issues.append(_hard("rendering", "invalid_render_sections", str(exc)))
 
-    handoff_keys = {
-        item.entity_key
-        for item in day_brief.handoffs
-        if episode.slot in {item.from_slot, item.to_slot}
-    }
-    prop_keys = {item.entity_key for item in episode.script.critical_props}
-    missing = handoff_keys - prop_keys
-    if missing:
+    if len(episode.script.hard_constraints) > 4:
         issues.append(
-            _warning(
-                "continuity",
-                "handoff_not_visible_in_slot",
-                "本时段未显式展示交接元素：" + ", ".join(sorted(missing)),
-            )
-        )
-    if len(episode.script.critical_props) > 4:
-        issues.append(
-            _warning("rendering", "many_critical_props", "关键道具较多，可能降低画面聚焦度")
+            _warning("rendering", "many_hard_constraints", "硬约束较多，可能降低画面聚焦度")
         )
     return tuple(issues)
 
@@ -117,15 +96,11 @@ def validate_episode_cooldown(
     recent = tuple(recent_summaries)
     event_keys = {key for item in recent for key in item.event_keys}
     location_keys = {key for item in recent for key in item.location_keys}
-    element_keys = {key for item in recent for key in item.element_keys}
-    current_elements = {item.entity_key for item in episode.script.critical_props}
     issues: list[GateIssue] = []
     if episode.script.event_key in event_keys:
         issues.append(_warning("planning", "recent_event_repeat", "事件仍在近期冷却期"))
     if episode.script.location_key in location_keys:
         issues.append(_warning("planning", "recent_location_repeat", "地点仍在近期冷却期"))
-    if current_elements and current_elements.issubset(element_keys):
-        issues.append(_warning("planning", "recent_element_repeat", "关键元素组合仍在近期冷却期"))
     return tuple(issues)
 
 
@@ -154,20 +129,12 @@ def _episode_text(episode: EpisodePlan) -> str:
     script = episode.script
     return " ".join(
         (
-            script.episode_question,
-            script.main_event,
-            script.scene,
-            script.appearance.description,
-            script.appearance.change_reason or "",
-            script.relationship_arc.lead_activity,
-            script.relationship_arc.secondary_activity,
-            script.relationship_arc.convergence,
-            script.ending.result,
-            *(item.action for item in script.actions),
-            *(item.visible_result for item in script.actions),
-            *(item.framing for item in script.shots),
+            script.story_text,
+            script.appearance,
+            script.relationship_arc,
+            script.ending,
             *(item.direction for item in script.shots),
-            *(item.name for item in script.critical_props),
+            *(item.text for item in script.hard_constraints),
         )
     ).casefold()
 

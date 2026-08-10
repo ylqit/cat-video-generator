@@ -76,8 +76,8 @@ def test_episode_editor_synchronizes_focus_and_duration_to_day_brief(daily_plan)
 
     assert result["saved"] is True
     saved_brief = repository.replacement["day_brief"].slot_briefs[0]
-    assert saved_brief.resolved_activity_focus is ActivityFocus.BALANCED
-    assert saved_brief.duration_intent.resolved_band.value == "medium"
+    assert saved_brief.activity_focus is ActivityFocus.BALANCED
+    assert saved_brief.duration_band.value == "medium"
     assert repository.replacement["episode"].duration_seconds == 20
 
 

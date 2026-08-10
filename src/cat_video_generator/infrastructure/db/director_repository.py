@@ -29,7 +29,9 @@ class DirectorStepPersistenceMixin:
         step_id: uuid.UUID,
         response_id: str,
         request_hash: str,
-        output: dict[str, Any],
+        provider_output: dict[str, Any],
+        normalized_output: dict[str, Any] | None,
+        normalization_warnings: tuple[str, ...],
     ) -> None:
         with self._sessions.begin() as session:
             row = required_record(session, WorkflowStep, step_id)
@@ -42,7 +44,9 @@ class DirectorStepPersistenceMixin:
                 update={
                     "response_id": response_id,
                     "request_hash": request_hash,
-                    "output": output,
+                    "provider_output": provider_output,
+                    "normalized_output": normalized_output,
+                    "normalization_warnings": normalization_warnings,
                 }
             ).model_dump(mode="json")
             row.completed_at = datetime.now(timezone.utc)
@@ -53,7 +57,9 @@ class DirectorStepPersistenceMixin:
         step_id: uuid.UUID,
         response_id: str,
         request_hash: str,
-        output: dict[str, Any],
+        provider_output: dict[str, Any],
+        normalized_output: dict[str, Any] | None,
+        normalization_warnings: tuple[str, ...],
         code: str,
         message: str,
     ) -> None:
@@ -70,7 +76,9 @@ class DirectorStepPersistenceMixin:
                 update={
                     "response_id": response_id,
                     "request_hash": request_hash,
-                    "output": output,
+                    "provider_output": provider_output,
+                    "normalized_output": normalized_output,
+                    "normalization_warnings": normalization_warnings,
                 }
             ).model_dump(mode="json")
             row.error_json = {"code": code, "message": message}

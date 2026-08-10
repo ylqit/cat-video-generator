@@ -294,6 +294,11 @@ def retry_step(
         False,
         "--allow-paid-generation",
     ),
+    restart_from_beginning: bool = typer.Option(
+        False,
+        "--restart-from-beginning",
+        help="延展成片的错误已存在于前段时，从批准的开场锚点重建全部区段。",
+    ),
 ) -> None:
     """显式重试一个终态步骤；run-day永远不会替代本命令自动重试。"""
 
@@ -307,6 +312,7 @@ def retry_step(
                 step_id,
                 reason=reason,
                 allow_paid_generation=allow_paid_generation,
+                restart_from_beginning=restart_from_beginning,
             )
         )
     finally:

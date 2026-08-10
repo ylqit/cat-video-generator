@@ -1,4 +1,4 @@
-"""为0011生产内核生成清理清单，并显式删除全部非Canon历史。
+"""为0012极简导演契约生成清理清单，并显式删除全部非Canon历史。
 
 默认只输出诊断Manifest。只有传入与当前Run数量匹配的``--confirm``口令时，
 才在单一数据库事务中删除业务记录；事务提交后再删除Manifest已记录且位于媒体
@@ -284,7 +284,7 @@ def _write_manifest(manifest: dict[str, Any]) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     body = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True)
     digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    path = root / f"narrative-core-cleanup-{timestamp}-{digest[:12]}.json"
+    path = root / f"minimal-contract-cleanup-{timestamp}-{digest[:12]}.json"
     path.write_text(body + "\n", encoding="utf-8")
     return path
 

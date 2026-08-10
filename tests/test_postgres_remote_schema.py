@@ -27,7 +27,7 @@ from cat_video_generator.infrastructure.db.session import (
 
 
 @pytest.mark.postgres
-def test_remote_0011_migration_atomic_intent_and_review(monkeypatch) -> None:
+def test_remote_0012_migration_atomic_intent_and_review(monkeypatch) -> None:
     if os.environ.get("CAT_VIDEO_POSTGRES_TEST_MODE") != "remote-schema":
         pytest.skip("需要显式CAT_VIDEO_POSTGRES_TEST_MODE=remote-schema")
     load_local_env()
@@ -69,7 +69,7 @@ def test_remote_0011_migration_atomic_intent_and_review(monkeypatch) -> None:
             revision = connection.execute(
                 text(f"SELECT version_num FROM {quoted}.alembic_version")
             ).scalar_one()
-            assert revision == "0011_narrative_render_core"
+            assert revision == "0012_minimal_director_contract"
 
         repository = SqlAlchemyWorkflowRepository(create_session_factory(engine))
         run_id = repository.create_draft_run(date(2026, 8, 10))
@@ -113,6 +113,23 @@ def test_remote_0011_migration_atomic_intent_and_review(monkeypatch) -> None:
         assert repeated.id == first.id
         assert repeated_prompt == first_prompt
 
+        repository.set_step_status(first.id, StepStatus.SUBMITTING)
+        repository.finish_director_step(
+            step_id=first.id,
+            response_id="resp-day-1",
+            request_hash="c" * 64,
+            provider_output={"theme": "原始导演对象", "slot_briefs": []},
+            normalized_output={"theme": "标准化导演对象", "slot_briefs": []},
+            normalization_warnings=("机械归一化示例",),
+        )
+        trace = repository.step_trace(first.id)
+        assert trace["inputSummary"]["output_contract"] == "DayBrief"
+        assert "provider_output" not in trace["inputSummary"]
+        assert trace["providerOutput"]["theme"] == "原始导演对象"
+        assert trace["normalizedOutput"]["theme"] == "标准化导演对象"
+        assert trace["normalizationWarnings"] == ["机械归一化示例"]
+        assert trace["actualPrompts"][0]["text"] == "全天总导演实际Prompt"
+
         with pytest.raises(ValueError, match="director步骤不允许purpose=review"):
             repository.create_step_with_prompt_intent(
                 run_id=run_id,
@@ -149,6 +166,17 @@ def test_remote_0011_migration_atomic_intent_and_review(monkeypatch) -> None:
                     "script": episode.script.model_dump_json(),
                 },
             )
+        repository.save_prompt_overrides(
+            episode_id=episode_id,
+            overrides={"video": "人工确认的视频Prompt"},
+            enabled=True,
+        )
+        override_state = repository.get_prompt_override_state(episode_id)
+        assert override_state["enabled"] is True
+        assert override_state["stale"] is False
+        assert repository.get_prompt_overrides(episode_id) == {
+            "video": "人工确认的视频Prompt"
+        }
         image_step, _ = repository.create_step_with_prompt_intent(
             run_id=run_id,
             episode_id=episode_id,

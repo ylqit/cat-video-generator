@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from ..domain.contracts import EpisodePlan
+from ..domain.contracts import EpisodePlan, EpisodeScript
 from ..domain.pipeline import PipelineSettings
 from ..domain.prompts import (
     compile_look_prompt,
@@ -55,11 +55,24 @@ class QueryService:
     def prompt_preview(
         self,
         episode_id: uuid.UUID,
+        *,
+        script_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """编译定妆图、开场锚点和全部视频区段 Prompt，不创建 Step。"""
+        """编译定妆图、开场锚点和全部视频区段 Prompt，不创建 Step。
+
+        创作台可传入尚未保存的结构化脚本以获得实时预览；该对象只在内存中
+        通过同一领域编译器处理，不写数据库，也不会触发任何供应商调用。
+        """
 
         detail = self._repository.episode_detail(episode_id)
-        episode = EpisodePlan(slot=detail["slot"], script=detail["script"])
+        episode = EpisodePlan(
+            slot=detail["slot"],
+            script=(
+                EpisodeScript.model_validate(script_override)
+                if script_override is not None
+                else detail["script"]
+            ),
+        )
         run_id = uuid.UUID(detail["runId"])
         context = self._repository.get_planning_context(run_id)
         metadata = context.get("planningMetadata", {})
@@ -73,7 +86,7 @@ class QueryService:
         look_roles = ("person:front", style.line_reference_key)
         scene_style = (
             style.indoor_reference_key
-            if any(word in episode.script.scene for word in ("室内", "房间", "家中", "店内"))
+            if episode.script.visual_context == "indoor"
             else style.outdoor_reference_key
         )
         anchor_roles = ("look:current-appearance", "cat:front", scene_style)
@@ -110,10 +123,60 @@ class QueryService:
             "renderPlan": render_plan.model_dump(mode="json"),
             "resolution": self._video_resolution,
             "overrides": self._repository.get_prompt_overrides(episode_id),
+            "overrideState": self._repository.get_prompt_override_state(episode_id),
         }
 
     def step(self, step_id: uuid.UUID) -> dict[str, Any]:
         return self._repository.step_detail(step_id)
+
+    def step_trace(self, step_id: uuid.UUID) -> dict[str, Any]:
+        """按需返回一个工作流节点的完整输入、Prompt、输出和审核血缘。"""
+
+        trace = self._repository.step_trace(step_id)
+        step = trace["step"]
+        episode_id = step.get("episodeId")
+        trace["currentCompiledPrompts"] = []
+        trace["currentStructuredOutput"] = trace.get("effectiveOutput")
+        if episode_id is None:
+            return trace
+
+        episode_uuid = uuid.UUID(episode_id)
+        detail = self._repository.episode_detail(episode_uuid)
+        trace["currentStructuredOutput"] = detail["script"]
+        operation_key = str(step.get("operationKey") or "")
+        if operation_key.startswith("director:"):
+            return trace
+
+        preview = self.prompt_preview(episode_uuid)
+        if operation_key == "image:look":
+            trace["currentCompiledPrompts"] = [
+                {"purpose": "image", "label": "当前定妆图Prompt", "text": preview["look"]}
+            ]
+        elif operation_key == "image:opening_anchor":
+            trace["currentCompiledPrompts"] = [
+                {
+                    "purpose": "image",
+                    "label": "当前开场锚点Prompt",
+                    "text": preview["openingAnchor"],
+                }
+            ]
+        elif operation_key.startswith("video:"):
+            try:
+                section_order = 1 if operation_key == "video:single_pass" else int(
+                    operation_key.rsplit(":", 1)[1]
+                )
+            except ValueError:
+                section_order = 1
+            trace["currentCompiledPrompts"] = [
+                {
+                    "purpose": "video",
+                    "label": f"当前视频区段{section_order} Prompt",
+                    "text": item["prompt"],
+                }
+                for item in preview["videoSections"]
+                if item["order"] == section_order
+            ]
+        return trace
 
     def pipeline_settings(self, run_id: uuid.UUID) -> PipelineSettings:
         return self._repository.get_pipeline_settings(run_id)

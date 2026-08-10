@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from ...config import DatabaseOperation, DatabaseSettings
 from .models import SCHEMA_NAME
 
-ALEMBIC_HEAD = "0011_narrative_render_core"
+ALEMBIC_HEAD = "0012_minimal_director_contract"
 
 
 def create_database_engine(

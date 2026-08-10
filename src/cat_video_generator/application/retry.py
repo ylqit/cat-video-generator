@@ -32,6 +32,7 @@ class RetryService:
         reason: str,
         allow_paid_generation: bool,
         acknowledge_duplicate_billing: bool = False,
+        restart_from_beginning: bool = False,
     ) -> dict[str, Any]:
         """验证状态和费用许可后创建 attempt+1。"""
 
@@ -71,10 +72,13 @@ class RetryService:
         )
         if self._repository.get_run(step.run_id).status == RunStatus.FAILED.value:
             self._repository.set_run_status(step.run_id, RunStatus.GENERATING)
+        overrides = self._repository.get_prompt_overrides(episode.id)
         if step.kind is StepKind.IMAGE:
+            target = step.operation_key.removeprefix("image:")
             asset = self._visual_preparation.retry_image(
                 step.id,
                 reason=reason,
+                prompt_override=overrides.get(target),
                 duplicate_billing_risk_accepted=acknowledge_duplicate_billing,
             )
             return {
@@ -83,7 +87,13 @@ class RetryService:
                 "assetIds": [str(asset.id)],
                 "status": asset.status,
             }
-        return self._video_execution.retry_video(episode, step, reason=reason)
+        return self._video_execution.retry_video(
+            episode,
+            step,
+            reason=reason,
+            prompt_override=overrides.get("video"),
+            restart_from_beginning=restart_from_beginning,
+        )
 
     def resume_step(self, step_id: uuid.UUID) -> dict[str, Any]:
         step = self._repository.get_step(step_id)

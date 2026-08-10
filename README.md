@@ -20,6 +20,9 @@ Web创作配置
 - Python、Pydantic、SQLAlchemy、Alembic与显式状态机。
 - PostgreSQL是工作流、Prompt和媒体元数据的唯一事实来源。
 - Ark Responses负责导演与视觉审核，Seedream生成单张视觉锚点，Seedance生成视频。
+- `EpisodeScript`以完整长剧情为创作主体，用1～3段完整镜头描述和少量关键硬约束
+  承担自动化控制；图片、视频和审核Prompt由它确定性编译，已提交attempt的实际Prompt
+  不可覆盖。
 - 8～15秒单次成片；16～45秒使用完整模型的官方视频延展。
 - 媒体以SHA-256不可变落盘，不写入数据库。
 - FastAPI与Vue提供统一生产工作台；Typer保留运维CLI。
@@ -43,7 +46,9 @@ npm --prefix web run dev
 
 访问`http://localhost:5173/studio`。新建Run时可配置全天默认活动焦点，以及早中晚
 各自的活动焦点和时长档：short 8～15秒、medium 16～30秒、long 31～45秒或
-adaptive。总导演只解析全天方向和容量，时段导演在档位内生成精确事件、镜头和秒数。
+adaptive。总导演只解析全天方向和容量，时段导演在档位内生成完整剧情、1～3段镜头
+和精确秒数。Web默认编辑完整剧情、镜头段落及少量连接、承重、容器、穿戴或交接硬
+约束；高级Prompt覆盖默认关闭，脚本变化后会自动失效并要求重新确认。
 
 ## 恢复与付费安全
 

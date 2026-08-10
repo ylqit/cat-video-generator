@@ -14,4 +14,4 @@
 - [Seedance 工程化 Prompt 规则](SKILL.md)
 
 `docs/research/`和`docs/real-tests/`是历史决策证据，不代表当前运行接口。新内核
-不读取或恢复旧Run；迁移0011前会生成诊断清单并清理全部非Canon业务记录。
+不读取或恢复旧Run；迁移0012前会生成诊断清单并清理全部非Canon业务记录。

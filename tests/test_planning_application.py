@@ -95,7 +95,14 @@ class PlanningRepository:
         self.steps[step.id] = replace(
             step,
             status=StepStatus.SUCCEEDED,
-            input_snapshot={**step.input_snapshot, "output": kwargs["output"]},
+            input_snapshot={
+                **step.input_snapshot,
+                "provider_output": kwargs["provider_output"],
+                "normalized_output": kwargs["normalized_output"],
+                "normalization_warnings": kwargs["normalization_warnings"],
+                "response_id": kwargs["response_id"],
+                "request_hash": kwargs["request_hash"],
+            },
         )
 
     def fail_director_step(self, **kwargs):
@@ -189,6 +196,14 @@ def test_planning_calls_day_then_morning_noon_evening(daily_plan) -> None:
         "director:episode:evening",
     ]
     assert all(item.kind is StepKind.DIRECTOR for item in repository.steps.values())
+    noon_step = next(
+        item for item in repository.steps.values() if item.operation_key == "director:episode:noon"
+    )
+    assert noon_step.input_snapshot["provider_output"]["hard_constraints"]
+    assert noon_step.input_snapshot["normalized_output"] is None
+    assert noon_step.input_snapshot["normalization_warnings"] == ()
+    assert "storyText" in director.prompts[2]
+    assert "hardConstraints" in director.prompts[2]
 
 
 def test_day_brief_manual_mode_pauses_before_slot_directors(daily_plan) -> None:
@@ -211,7 +226,7 @@ def test_day_brief_manual_mode_pauses_before_slot_directors(daily_plan) -> None:
 
 def test_fixed_slot_focus_cannot_be_changed_by_day_director(daily_plan) -> None:
     payload = daily_plan.day_brief.model_dump(mode="json")
-    payload["slot_briefs"][1]["resolved_activity_focus"] = "person_lead"
+    payload["slot_briefs"][1]["activity_focus"] = "person_lead"
     director = Director([payload])
     repository = PlanningRepository()
     controls = RunCreativeControls(
@@ -253,13 +268,13 @@ def test_invalid_episode_contract_gets_exactly_one_repair(daily_plan) -> None:
         allow_paid_generation=True,
     )
 
-    assert result.plan.episodes[0].script.relationship_arc.convergence
+    assert result.plan.episodes[0].script.relationship_arc
     assert len(director.prompts) == 5
 
 
 def test_second_invalid_episode_enters_planning_review(daily_plan) -> None:
     invalid = daily_plan.episodes[0].script.model_dump(mode="json")
-    invalid["actions"][0]["actor_id"] = "unknown_actor"
+    invalid["shots"][0]["order"] = 2
     director = Director([daily_plan.day_brief.model_dump(mode="json"), invalid, invalid])
     repository = PlanningRepository()
 

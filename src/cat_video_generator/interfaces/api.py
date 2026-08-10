@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..application.queries import QueryService
+from ..domain.contracts import ContractVersionError
 from .api_studio import create_studio_router
 from .api_write import create_write_router
 from .jobs import JobRegistry
@@ -57,6 +58,10 @@ def create_app(
     )
     roots = tuple(root.expanduser().resolve() for root in allowed_media_roots)
 
+    @app.exception_handler(ContractVersionError)
+    async def incompatible_contract(_request: Request, exc: ContractVersionError) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
     @app.get("/api/v1/health")
     def health() -> dict:
         # 运行超时属于只读运维事实。与数据库健康状态合并返回，前端无需读取
@@ -89,6 +94,10 @@ def create_app(
     @app.get("/api/v1/steps/{step_id}")
     def step_detail(step_id: uuid.UUID) -> dict:
         return _not_found(lambda: query_service.step(step_id))
+
+    @app.get("/api/v1/steps/{step_id}/trace")
+    def step_trace(step_id: uuid.UUID) -> dict:
+        return _not_found(lambda: query_service.step_trace(step_id))
 
     @app.get("/api/v1/prompts/{prompt_id}")
     def prompt_detail(prompt_id: uuid.UUID) -> dict:

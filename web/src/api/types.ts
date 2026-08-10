@@ -26,40 +26,32 @@ export interface RunCreativeControlsDto {
   slot_controls: SlotCreativeControlDto[];
 }
 
-export interface DurationIntentDto {
-  requested_mode: DurationMode;
-  resolved_band: "short" | "medium" | "long";
-  resolution_reason: string;
-}
-
 export interface SlotBriefDto {
   slot: Slot;
   narrative_role: string;
-  scene_direction: string;
   event_direction: string;
   appearance_intent: string;
-  resolved_activity_focus: ActivityFocus;
-  relationship_direction: string;
-  duration_intent: DurationIntentDto;
+  activity_focus: ActivityFocus;
+  duration_band: Exclude<DurationMode, "adaptive">;
+  decision_reason: string;
 }
 
 export interface DayBriefDto {
   content_date: string;
   theme: string;
-  day_objective: string;
-  day_context: string;
-  shared_motif: string;
+  day_arc: string;
   slot_briefs: SlotBriefDto[];
   handoffs: Array<{
-    entity_key: string;
+    name: string;
     from_slot: Slot;
     to_slot: Slot;
-    state: string;
+    continuity: string;
   }>;
 }
 
 export interface RunSummary {
   id: string;
+  contractVersion: number;
   contentDate: string;
   theme: string | null;
   status: string;
@@ -77,62 +69,37 @@ export interface RunSummary {
   currentStage?: string;
 }
 
-export interface AppearancePlanDto {
-  description: string;
-  change_reason: string | null;
-}
-
-export interface RelationshipArcDto {
-  lead_activity: string;
-  secondary_activity: string;
-  convergence: string;
-}
-
-export interface ActionStageDto {
+export interface ShotDirectionDto {
   order: number;
-  actor_id: string;
-  action: string;
-  visible_result: string;
-}
-
-export interface ShotPlanDto {
-  order: number;
-  action_orders: number[];
-  framing: string;
-  camera_move: "fixed" | "follow" | "push" | "pull" | "pan" | "track";
   direction: string;
+}
+
+export interface HardConstraintDto {
+  shot_orders: number[];
+  text: string;
 }
 
 export interface EpisodeScript {
   title: string;
   event_key: string;
   location_key: string;
-  story_pattern:
-    | "parallel_convergence"
-    | "watch_trigger_payoff"
-    | "setup_mishap_recovery"
-    | "choice_reveal"
-    | "routine_tag"
-    | "process_montage";
-  episode_question: string;
-  main_event: string;
-  scene: string;
-  style_context: "indoor" | "outdoor";
-  appearance: AppearancePlanDto;
+  visual_context: "indoor" | "outdoor";
   activity_focus: ActivityFocus;
-  relationship_arc: RelationshipArcDto;
-  guest: { id: string; name: string; role: string } | null;
-  actions: ActionStageDto[];
-  shots: ShotPlanDto[];
-  ending: { result: string };
-  sound_design: string;
   duration_seconds: number;
-  critical_props: Array<{
-    entity_key: string;
-    name: string;
-    start: string;
-    end: string;
-  }>;
+  appearance: string;
+  story_text: string;
+  relationship_arc: string;
+  shots: ShotDirectionDto[];
+  hard_constraints: HardConstraintDto[];
+  sound_design: string;
+  ending: string;
+}
+
+export interface PromptOverrideState {
+  enabled: boolean;
+  stale: boolean;
+  sourceScriptSha256: string | null;
+  values: PromptOverrides;
 }
 
 export interface RenderPlanDto {
@@ -153,11 +120,12 @@ export interface EpisodeDto {
   title: string;
   status: string;
   activityFocus: ActivityFocus;
-  relationshipArc: RelationshipArcDto;
+  relationshipArc: string;
   renderPlan: RenderPlanDto;
   nextAction: string | null;
   selectedVideoAssetId: string | null;
   promptOverrides: Record<string, string>;
+  promptOverrideState: PromptOverrideState;
   script: EpisodeScript;
 }
 
@@ -219,6 +187,22 @@ export interface PromptDto {
 export interface PromptFull extends PromptDto {
   text: string;
   inputSnapshot?: Record<string, unknown>;
+}
+
+export interface StepTraceDto {
+  step: StepDto;
+  inputSummary: Record<string, unknown>;
+  actualPrompts: PromptFull[];
+  currentCompiledPrompts: Array<{ purpose: string; label: string; text: string }>;
+  currentStructuredOutput: Record<string, unknown> | null;
+  providerOutput: Record<string, unknown> | null;
+  normalizedOutput: Record<string, unknown> | null;
+  effectiveOutput: Record<string, unknown> | null;
+  normalizationWarnings: string[];
+  inputBindings: Array<Record<string, unknown>>;
+  assets: AssetDto[];
+  reviews: ReviewDto[];
+  attempts: StepDto[];
 }
 
 export interface AssetDto {
@@ -383,4 +367,5 @@ export interface EpisodePromptPreview {
   renderPlan: RenderPlanDto;
   resolution: "480p" | "720p";
   overrides: PromptOverrides;
+  overrideState: PromptOverrideState;
 }

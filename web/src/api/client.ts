@@ -1,7 +1,9 @@
 import type {
   CanonAsset,
   DeliveryPackageDto,
+  DayBriefDto,
   EpisodePromptPreview,
+  EpisodeScript,
   HealthStatus,
   Job,
   JobAccepted,
@@ -12,6 +14,7 @@ import type {
   RunCreativeControlsDto,
   RunGraph,
   RunSummary,
+  StepTraceDto,
 } from "./types";
 
 const BASE = "/api/v1";
@@ -88,6 +91,8 @@ export const api = {
   runGraph: (runId: string) => request<RunGraph>(`/runs/${runId}/graph`),
   prompt: (promptId: string) =>
     request<PromptFull>(`/prompts/${promptId}`),
+  stepTrace: (stepId: string) =>
+    request<StepTraceDto>(`/steps/${stepId}/trace`),
   createPlan: (payload: PlanPayload) => post<JobAccepted>("/plans", payload),
   generate: (runId: string, payload: GeneratePayload) =>
     post<JobAccepted>(`/runs/${runId}/generate`, payload),
@@ -140,11 +145,13 @@ export const api = {
     reason: string,
     allowPaidGeneration: boolean,
     acknowledgeDuplicateBilling = false,
+    restartFromBeginning = false,
   ) =>
     post<JobAccepted>(`/steps/${stepId}/retry`, {
       reason,
       allowPaidGeneration,
       acknowledgeDuplicateBilling,
+      restartFromBeginning,
     }),
   resumeStep: (stepId: string) =>
     post<JobAccepted>(`/steps/${stepId}/resume`),
@@ -199,12 +206,18 @@ export const api = {
   ) => post<{ assetId: string }>(`/canon/${assetId}/derive-crop`, payload),
   getPromptPreview: (episodeId: string) =>
     request<EpisodePromptPreview>(`/episodes/${episodeId}/prompt-preview`),
-  savePromptOverrides: (episodeId: string, overrides: PromptOverrides) =>
+  previewScriptPrompts: (episodeId: string, script: unknown) =>
+    post<EpisodePromptPreview>(`/episodes/${episodeId}/prompt-preview`, script),
+  savePromptOverrides: (
+    episodeId: string,
+    overrides: PromptOverrides,
+    enabled: boolean,
+  ) =>
     request<{ episodeId: string; saved: boolean }>(
       `/episodes/${episodeId}/prompt-overrides`,
       {
         method: "PUT",
-        body: JSON.stringify({ overrides }),
+        body: JSON.stringify({ overrides, enabled }),
       },
     ),
   generateVisuals: (
@@ -216,16 +229,16 @@ export const api = {
     }),
   continueRun: (runId: string) =>
     post<JobAccepted>(`/runs/${runId}/continue`),
-  updateScript: (episodeId: string, script: Record<string, unknown>) =>
+  updateScript: (episodeId: string, script: EpisodeScript) =>
     request<{
       episodeId: string;
       saved: boolean;
-      promptOverridesKept: boolean;
+      promptOverrideStale: boolean;
     }>(`/episodes/${episodeId}/script`, {
       method: "PUT",
       body: JSON.stringify(script),
     }),
-  updateDayBrief: (runId: string, brief: Record<string, unknown>) =>
+  updateDayBrief: (runId: string, brief: DayBriefDto) =>
     request<{ runId: string; saved: boolean; episodeDraftsCleared: boolean }>(
       `/runs/${runId}/day-brief`,
       { method: "PUT", body: JSON.stringify(brief) },

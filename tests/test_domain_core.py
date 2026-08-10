@@ -1,4 +1,4 @@
-"""猫咪主活动、分层时长与全天交接的领域契约。"""
+"""极简导演契约、分层时长与全天边界的领域测试。"""
 
 from __future__ import annotations
 
@@ -12,9 +12,6 @@ from cat_video_generator.domain.contracts import (
     ActivityFocus,
     ActivityFocusMode,
     DailyProductionPlan,
-    DurationBand,
-    DurationIntent,
-    DurationMode,
     EpisodePlan,
     EpisodeScript,
     RunCreativeControls,
@@ -44,15 +41,6 @@ def test_slot_focus_override_does_not_change_other_slots() -> None:
     assert controls.requested_focus(Slot.MORNING) is ActivityFocusMode.CAT_LEAD
 
 
-def test_fixed_duration_intent_cannot_be_rewritten() -> None:
-    with pytest.raises(ValidationError, match="固定时长档不得被总导演改写"):
-        DurationIntent(
-            requested_mode=DurationMode.SHORT,
-            resolved_band=DurationBand.MEDIUM,
-            resolution_reason="错误地把用户固定短片改成了中片",
-        )
-
-
 @pytest.mark.parametrize(
     ("seconds", "expected_shots"),
     [(12, 2), (22, 2), (36, 3)],
@@ -73,27 +61,32 @@ def test_long_episode_requires_three_shots() -> None:
         EpisodeScript.model_validate(payload)
 
 
-def test_each_action_may_belong_to_only_one_shot() -> None:
-    payload = episode_for(Slot.MORNING).script.model_dump(mode="json")
-    payload["shots"][1]["action_orders"] = [2, 3]
+def test_shots_are_complete_text_instead_of_repeated_action_fields() -> None:
+    script = episode_for(Slot.NOON, duration=22).script
 
-    with pytest.raises(ValidationError, match="每个动作只能属于一个镜头"):
+    assert all(shot.direction for shot in script.shots)
+    fields = type(script).model_fields
+    assert "story_text" in fields
+    assert "actions" not in fields
+    assert "critical_props" not in fields
+    assert "interaction_constraints" not in fields
+
+
+def test_hard_constraint_must_reference_existing_shots() -> None:
+    payload = episode_for(Slot.NOON, duration=22).script.model_dump(mode="json")
+    payload["hard_constraints"][0]["shot_orders"] = [1, 3]
+
+    with pytest.raises(ValidationError, match="硬约束引用不存在的镜头"):
         EpisodeScript.model_validate(payload)
 
 
-def test_unknown_actor_is_rejected_without_keyword_story_policing() -> None:
-    payload = episode_for(Slot.MORNING).script.model_dump(mode="json")
-    payload["actions"][0]["actor_id"] = "vendor"
-
-    with pytest.raises(ValidationError, match="动作引用未知主体"):
-        EpisodeScript.model_validate(payload)
-
-
-def test_handoff_requires_same_prop_key_in_source_and_target(daily_plan) -> None:
+def test_duplicate_handoff_is_rejected(daily_plan) -> None:
     payload = daily_plan.model_dump(mode="json")
-    payload["episodes"][1]["script"]["critical_props"][0]["entity_key"] = "different_kite"
+    payload["day_brief"]["handoffs"].append(
+        deepcopy(payload["day_brief"]["handoffs"][0])
+    )
 
-    with pytest.raises(ValidationError, match="没有在noon时段使用同一entityKey"):
+    with pytest.raises(ValidationError, match="同一时段交接不能重复"):
         DailyProductionPlan.model_validate(payload)
 
 

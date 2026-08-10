@@ -124,6 +124,7 @@ class VisualPreparationService:
         step_id: uuid.UUID,
         *,
         reason: str,
+        prompt_override: str | None = None,
         duplicate_billing_risk_accepted: bool = False,
     ) -> StoredAsset:
         step = self._repository.get_step(step_id)
@@ -170,6 +171,7 @@ class VisualPreparationService:
             retry_of_step_id=step.id,
             retry_reason=reason,
             retry_feedback=reason,
+            prompt_override=prompt_override,
             duplicate_billing_risk_accepted=duplicate_billing_risk_accepted,
         )
 
@@ -321,7 +323,7 @@ class VisualPreparationService:
             metadata = {
                 **metadata,
                 "appearanceSignature": signature,
-                "appearanceDescription": episode.plan.script.appearance.description,
+                "appearanceDescription": episode.plan.script.appearance,
                 "inputHash": input_hash,
             }
             asset = self._repository.save_asset(
@@ -405,7 +407,7 @@ class VisualPreparationService:
                 result.style_ok,
                 result.appearance_ok,
                 result.composition_ok,
-                *((result.critical_props_ok,) if target == "opening_anchor" else ()),
+                *((result.constraints_ok,) if target == "opening_anchor" else ()),
             )
         )
         evidence = {
@@ -413,7 +415,7 @@ class VisualPreparationService:
             "styleOk": result.style_ok,
             "appearanceOk": result.appearance_ok,
             "compositionOk": result.composition_ok,
-            "criticalPropsOk": result.critical_props_ok,
+            "constraintsOk": result.constraints_ok,
             "confidence": result.confidence,
             "violations": list(result.violations),
             "observations": list(result.evidence),
@@ -444,7 +446,7 @@ class VisualPreparationService:
     def _look_references(self, episode: StoredEpisode) -> ReferenceSelectionPlan:
         contextual = (
             self._style_profile.indoor_reference_key
-            if episode.plan.script.style_context == "indoor"
+            if episode.plan.script.visual_context == "indoor"
             else self._style_profile.outdoor_reference_key
         )
         keys = (
@@ -457,57 +459,14 @@ class VisualPreparationService:
     def _anchor_references(
         self, episode: StoredEpisode, look: StoredAsset
     ) -> ReferenceSelectionPlan:
-        contextual = (
-            self._style_profile.indoor_reference_key
-            if episode.plan.script.style_context == "indoor"
-            else self._style_profile.outdoor_reference_key
-        )
-        keys = [str(look.semantic_key), "cat:front", contextual]
-        optional = [f"element:{item.entity_key}" for item in episode.plan.script.critical_props[:1]]
+        # 定妆图已经同时固定人物和项目画风。场景化画风图往往还携带茶园、房间等
+        # 具体语义，继续发送会让 Seedream 把参考场景错误复制到新的开场画面。
+        # 因此开场锚点只保留定妆图和猫咪身份图；画风由定妆图与文字档案共同约束。
+        keys = [str(look.semantic_key), "cat:front"]
         assets = [look]
-        selected = self._select_assets(episode, tuple(keys[1:]), allow_missing=tuple(optional))
+        selected = self._select_assets(episode, tuple(keys[1:]))
         assets.extend(selected.assets)
         reference_roles = [str(look.semantic_key), *selected.semantic_keys]
-        optional_assets = self._select_assets(episode, tuple(optional), all_optional=True)
-        assets.extend(optional_assets.assets)
-        reference_roles.extend(optional_assets.semantic_keys)
-
-        # 跨时段共享道具不能只靠 entityKey 文本维持造型。若上一时段已有批准
-        # 开场锚点且两集声明了同一关键道具，就把该画面作为“只继承道具”的限定
-        # 参考；人物、猫咪和场景仍分别由本集定妆、Canon 与风格图负责。
-        current_keys = {item.entity_key for item in episode.plan.script.critical_props}
-        slot_order = {item: index for index, item in enumerate(Slot)}
-        prior_episodes = sorted(
-            (
-                item
-                for item in self._repository.list_episodes(episode.run_id)
-                if slot_order[item.plan.slot] < slot_order[episode.plan.slot]
-            ),
-            key=lambda item: slot_order[item.plan.slot],
-            reverse=True,
-        )
-        handoff_role: str | None = None
-        handoff_asset: StoredAsset | None = None
-        for prior in prior_episodes:
-            shared = current_keys & {
-                item.entity_key for item in prior.plan.script.critical_props
-            }
-            if not shared:
-                continue
-            candidates = self._repository.list_assets(
-                run_id=episode.run_id,
-                episode_id=prior.id,
-                roles=("opening_anchor",),
-                statuses=("approved", "ready"),
-            )
-            exact = [item for item in candidates if item.episode_id == prior.id]
-            if exact:
-                handoff_asset = exact[-1]
-                handoff_role = "handoff:" + ",".join(sorted(shared))
-                break
-        if handoff_asset is not None and handoff_role is not None:
-            assets.append(handoff_asset)
-            reference_roles.append(handoff_role)
         return ReferenceSelectionPlan(
             semantic_keys=tuple(reference_roles),
             assets=tuple(assets),
@@ -517,9 +476,6 @@ class VisualPreparationService:
         self,
         episode: StoredEpisode,
         keys: tuple[str, ...],
-        *,
-        allow_missing: tuple[str, ...] = (),
-        all_optional: bool = False,
     ) -> ReferenceSelectionPlan:
         candidates = self._repository.list_assets(
             run_id=episode.run_id,
@@ -532,8 +488,7 @@ class VisualPreparationService:
             for item in candidates
             if item.media_type == "image" and item.semantic_key is not None
         }
-        required = set() if all_optional else set(keys) - set(allow_missing)
-        missing = [key for key in keys if key in required and key not in latest]
+        missing = [key for key in keys if key not in latest]
         if missing:
             raise ValueError("缺少视觉参考：" + ", ".join(missing))
         selected = tuple(latest[key] for key in keys if key in latest)
@@ -568,7 +523,7 @@ class VisualPreparationService:
 
 
 def _appearance_signature(episode: StoredEpisode) -> str:
-    source = f"{episode.plan.script.appearance.description}|{episode.plan.script.style_context}"
+    source = f"{episode.plan.script.appearance}|{episode.plan.script.visual_context}"
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 

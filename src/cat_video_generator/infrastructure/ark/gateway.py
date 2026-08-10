@@ -265,7 +265,7 @@ class ArkGateway:
                 style_ok=bool(payload["styleOk"]),
                 appearance_ok=bool(payload["appearanceOk"]),
                 composition_ok=bool(payload["compositionOk"]),
-                critical_props_ok=bool(payload["criticalPropsOk"]),
+                constraints_ok=bool(payload["constraintsOk"]),
                 confidence=float(payload["confidence"]),
                 violations=tuple(str(item) for item in payload["violations"]),
                 warnings=tuple(str(item) for item in payload["warnings"]),
@@ -348,11 +348,23 @@ class ArkGateway:
             return VideoDiagnosticResult(
                 identity_ok=bool(payload["identityOk"]),
                 style_ok=bool(payload["styleOk"]),
-                critical_props_ok=bool(payload["criticalPropsOk"]),
+                constraints_ok=bool(payload["constraintsOk"]),
                 narrative_order_ok=bool(payload["narrativeOrderOk"]),
                 confidence=float(payload["confidence"]),
                 violations=tuple(str(item) for item in payload["violations"]),
-                evidence=tuple(str(item) for item in payload["evidence"]),
+                evidence=tuple(
+                    {
+                        "timestamp": str(item["timestamp"]),
+                        "object": str(item["object"]),
+                        "observation": str(item["observation"]),
+                        "relationError": (
+                            None
+                            if item["relationError"] is None
+                            else str(item["relationError"])
+                        ),
+                    }
+                    for item in payload["evidence"]
+                ),
                 response_id=response.id,
                 model=response.model,
                 request_hash=request_hash,

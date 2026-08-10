@@ -273,6 +273,7 @@ def create_write_router(
                 reason=request.reason,
                 allow_paid_generation=True,
                 acknowledge_duplicate_billing=request.acknowledge_duplicate_billing,
+                restart_from_beginning=request.restart_from_beginning,
             )
             return _jsonable(result)
 
@@ -502,6 +503,7 @@ def create_write_router(
             lambda: production.save_prompt_overrides(
                 episode_id,
                 overrides=request.overrides,
+                enabled=request.enabled,
             )
         )
         return {"episodeId": str(episode_id), "saved": True}

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ElMessage } from "element-plus";
-import { reactive, ref, watch } from "vue";
+import { reactive, ref, toRaw, watch } from "vue";
 
 import { api, ApiError } from "../api/client";
 import type { DayBriefDto } from "../api/types";
@@ -14,26 +14,19 @@ const SLOT_LABEL: Record<string, string> = {
   evening: "傍晚",
 };
 
-const draft = reactive<DayBriefDto>(structuredClone(props.dayBrief));
+const draft = reactive<DayBriefDto>(structuredClone(toRaw(props.dayBrief)));
 watch(
   () => props.dayBrief,
-  (brief) => Object.assign(draft, structuredClone(brief)),
+  (brief) => Object.assign(draft, structuredClone(toRaw(brief))),
   { deep: true },
 );
 const saving = ref(false);
 
-function durationChanged(brief: DayBriefDto["slot_briefs"][number]) {
-  if (brief.duration_intent.requested_mode !== "adaptive") {
-    brief.duration_intent.resolved_band = brief.duration_intent.requested_mode;
-    brief.duration_intent.resolution_reason = "用户在DayBrief确认阶段固定时长档";
-  }
-}
-
 async function save() {
   saving.value = true;
   try {
-    await api.updateDayBrief(props.runId, structuredClone(draft));
-    ElMessage.success("总导演方向已保存；未生成的时段导演将读取新设置");
+    await api.updateDayBrief(props.runId, structuredClone(toRaw(draft)));
+    ElMessage.success("总导演方向已保存；尚未定稿的时段脚本会读取新设置");
     emit("saved");
   } catch (error) {
     ElMessage.error(error instanceof ApiError ? error.message : String(error));
@@ -46,14 +39,8 @@ async function save() {
 <template>
   <el-form label-width="104px" :disabled="!editable" size="small">
     <el-form-item label="日主题"><el-input v-model="draft.theme" /></el-form-item>
-    <el-form-item label="全天目标">
-      <el-input v-model="draft.day_objective" type="textarea" :rows="2" />
-    </el-form-item>
-    <el-form-item label="全天环境">
-      <el-input v-model="draft.day_context" type="textarea" :rows="2" />
-    </el-form-item>
-    <el-form-item label="共享视觉母题">
-      <el-input v-model="draft.shared_motif" type="textarea" :rows="1" />
+    <el-form-item label="全天生活弧">
+      <el-input v-model="draft.day_arc" type="textarea" :rows="4" />
     </el-form-item>
 
     <el-card
@@ -66,50 +53,44 @@ async function save() {
       <el-form-item label="时段作用" label-width="86px">
         <el-input v-model="brief.narrative_role" type="textarea" :rows="1" />
       </el-form-item>
-      <el-form-item label="场景方向" label-width="86px">
-        <el-input v-model="brief.scene_direction" type="textarea" :rows="1" />
-      </el-form-item>
       <el-form-item label="事件方向" label-width="86px">
-        <el-input v-model="brief.event_direction" type="textarea" :rows="1" />
+        <el-input v-model="brief.event_direction" type="textarea" :rows="2" />
       </el-form-item>
       <el-form-item label="外观意图" label-width="86px">
         <el-input v-model="brief.appearance_intent" type="textarea" :rows="1" />
       </el-form-item>
       <el-form-item label="活动焦点" label-width="86px">
-        <el-select v-model="brief.resolved_activity_focus" style="width: 180px">
+        <el-select v-model="brief.activity_focus" style="width: 180px">
           <el-option label="猫咪主活动" value="cat_lead" />
           <el-option label="人物主活动" value="person_lead" />
           <el-option label="人猫平衡" value="balanced" />
         </el-select>
       </el-form-item>
-      <el-form-item label="关系方向" label-width="86px">
-        <el-input v-model="brief.relationship_direction" type="textarea" :rows="1" />
+      <el-form-item label="时长档" label-width="86px">
+        <el-select v-model="brief.duration_band" style="width: 180px">
+          <el-option label="短片 8～15秒" value="short" />
+          <el-option label="中片 16～30秒" value="medium" />
+          <el-option label="长片 31～45秒" value="long" />
+        </el-select>
       </el-form-item>
-      <el-form-item label="时长意图" label-width="86px">
-        <el-select
-          v-model="brief.duration_intent.requested_mode"
-          style="width: 160px"
-          @change="durationChanged(brief)"
-        >
-          <el-option label="自适应" value="adaptive" />
-          <el-option label="短 8–15秒" value="short" />
-          <el-option label="中 16–30秒" value="medium" />
-          <el-option label="长 31–45秒" value="long" />
-        </el-select>
-        <el-select
-          v-if="brief.duration_intent.requested_mode === 'adaptive'"
-          v-model="brief.duration_intent.resolved_band"
-          style="width: 160px; margin-left: 8px"
-        >
-          <el-option label="解析为短" value="short" />
-          <el-option label="解析为中" value="medium" />
-          <el-option label="解析为长" value="long" />
-        </el-select>
-        <span class="muted" style="margin-left: 8px">
-          {{ brief.duration_intent.resolution_reason }}
-        </span>
+      <el-form-item label="决策理由" label-width="86px">
+        <el-input v-model="brief.decision_reason" type="textarea" :rows="1" />
       </el-form-item>
     </el-card>
+
+    <el-divider content-position="left">跨时段交接</el-divider>
+    <el-descriptions
+      v-for="(handoff, index) in draft.handoffs"
+      :key="`${handoff.name}-${index}`"
+      :column="1"
+      border
+      size="small"
+      class="handoff"
+    >
+      <el-descriptions-item label="交接对象">{{ handoff.name }}</el-descriptions-item>
+      <el-descriptions-item label="时段">{{ handoff.from_slot }} → {{ handoff.to_slot }}</el-descriptions-item>
+      <el-descriptions-item label="连续性">{{ handoff.continuity }}</el-descriptions-item>
+    </el-descriptions>
 
     <el-form-item v-if="editable">
       <el-button type="primary" :loading="saving" @click="save">保存总导演编辑</el-button>
@@ -120,5 +101,6 @@ async function save() {
 
 <style scoped>
 .slot-card { margin-bottom: 10px; background: #16181d; border-color: #2b2d33; }
+.handoff { margin-bottom: 10px; }
 .muted { color: #8a8f99; font-size: 12px; }
 </style>

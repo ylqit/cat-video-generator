@@ -17,7 +17,7 @@ from ...application.ports import (
     StoredRun,
     StoredStep,
 )
-from ...domain.contracts import DailyProductionPlan, Slot
+from ...domain.contracts import CURRENT_CONTRACT_VERSION, DailyProductionPlan, Slot
 from ...domain.snapshots import validate_input_snapshot
 from ...domain.workflow import (
     EpisodeStatus,
@@ -46,6 +46,7 @@ from .query_repository import (
     required_record,
 )
 from .records import (
+    ensure_current_contract,
     stored_asset,
     stored_episode,
     stored_step,
@@ -74,6 +75,7 @@ class SqlAlchemyWorkflowRepository(
         with self._sessions.begin() as session:
             row = ProductionRun(
                 content_date=content_date,
+                contract_version=CURRENT_CONTRACT_VERSION,
                 status=RunStatus.DRAFT.value,
             )
             session.add(row)
@@ -329,6 +331,7 @@ class SqlAlchemyWorkflowRepository(
     def get_run(self, run_id: uuid.UUID) -> StoredRun:
         with self._sessions() as session:
             row = required_record(session, ProductionRun, run_id)
+            ensure_current_contract(row)
             episode_rows = tuple(
                 session.execute(
                     select(Episode)
@@ -347,6 +350,7 @@ class SqlAlchemyWorkflowRepository(
 
     def get_episode(self, run_id: uuid.UUID, slot: Slot) -> StoredEpisode:
         with self._sessions() as session:
+            ensure_current_contract(required_record(session, ProductionRun, run_id))
             row = session.execute(
                 select(Episode).where(
                     Episode.production_run_id == run_id,
@@ -359,6 +363,7 @@ class SqlAlchemyWorkflowRepository(
 
     def list_episodes(self, run_id: uuid.UUID) -> tuple[StoredEpisode, ...]:
         with self._sessions() as session:
+            ensure_current_contract(required_record(session, ProductionRun, run_id))
             rows = session.execute(
                 select(Episode)
                 .where(Episode.production_run_id == run_id)

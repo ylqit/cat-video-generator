@@ -73,7 +73,7 @@ const visualEvidence = computed(() => {
 const VISUAL_FLAG_LABEL: Record<string, string> = {
   identityOk: "身份一致",
   styleOk: "画风一致",
-  criticalPropsOk: "关键道具",
+  constraintsOk: "关键约束",
   narrativeOrderOk: "叙事顺序",
 };
 

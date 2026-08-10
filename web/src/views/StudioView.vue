@@ -50,6 +50,7 @@ const drawerOpen = ref(false);
 const selectedNode = ref<WorkflowNodeDto | null>(null);
 const previews = reactive<Record<string, EpisodePromptPreview>>({});
 const drafts = reactive<Record<string, PromptOverrides>>({});
+const overrideEnabled = reactive<Record<string, boolean>>({});
 let poller: number | undefined;
 
 const runId = computed(() => String(route.query.run ?? ""));
@@ -109,6 +110,7 @@ async function refreshAll() {
 watch(runId, () => {
   Object.keys(previews).forEach((key) => delete previews[key]);
   Object.keys(drafts).forEach((key) => delete drafts[key]);
+  Object.keys(overrideEnabled).forEach((key) => delete overrideEnabled[key]);
   void refresh();
 });
 
@@ -159,10 +161,12 @@ async function loadPreview(episode: EpisodeDto) {
   if (previews[episode.id]) return;
   const preview = await api.getPromptPreview(episode.id);
   previews[episode.id] = preview;
+  const saved = preview.overrideState.values;
+  overrideEnabled[episode.id] = preview.overrideState.enabled;
   drafts[episode.id] = {
-    look: preview.overrides.look ?? preview.look,
-    opening_anchor: preview.overrides.opening_anchor ?? preview.openingAnchor,
-    video: preview.overrides.video ?? preview.videoSections[0]?.prompt ?? "",
+    look: saved.look ?? preview.look,
+    opening_anchor: saved.opening_anchor ?? preview.openingAnchor,
+    video: saved.video ?? preview.videoSections[0]?.prompt ?? "",
   };
 }
 
@@ -176,8 +180,23 @@ async function saveOverrides(episode: EpisodeDto) {
     overrides.opening_anchor = draft.opening_anchor.trim();
   }
   if (draft.video?.trim() && draft.video !== preview.videoSections[0]?.prompt) overrides.video = draft.video.trim();
-  await api.savePromptOverrides(episode.id, overrides);
-  ElMessage.success("Prompt覆盖已保存；只有尚未提交的节点会使用它");
+  await api.savePromptOverrides(episode.id, overrides, overrideEnabled[episode.id] ?? false);
+  ElMessage.success(
+    overrideEnabled[episode.id]
+      ? "高级Prompt覆盖已重新确认；只有尚未提交的节点会使用它"
+      : "已关闭高级Prompt覆盖，后续节点将使用结构化脚本编译结果",
+  );
+  delete previews[episode.id];
+  delete drafts[episode.id];
+  delete overrideEnabled[episode.id];
+  await refresh();
+  await loadPreview(episode);
+}
+
+async function onScriptSaved(episodeId: string) {
+  delete previews[episodeId];
+  delete drafts[episodeId];
+  delete overrideEnabled[episodeId];
   await refresh();
 }
 
@@ -327,11 +346,9 @@ onBeforeUnmount(() => window.clearInterval(poller));
             <div class="row"><strong>{{ SLOT_LABEL[episode.slot] }} · {{ episode.title }}</strong><el-tag>{{ FOCUS_LABEL[episode.activityFocus] }}</el-tag><el-tag type="info">{{ episode.script.duration_seconds }}秒 · {{ episode.renderPlan.sections.length }}个任务</el-tag><el-button text type="primary" @click="openNode(nodeFor(`director:${episode.slot}`))">导演节点</el-button></div>
           </template>
           <el-descriptions :column="1" border size="small" style="margin-bottom: 12px">
-            <el-descriptions-item label="主活动">{{ episode.relationshipArc.lead_activity }}</el-descriptions-item>
-            <el-descriptions-item label="副活动">{{ episode.relationshipArc.secondary_activity }}</el-descriptions-item>
-            <el-descriptions-item label="关系汇合">{{ episode.relationshipArc.convergence }}</el-descriptions-item>
+            <el-descriptions-item label="关系弧">{{ episode.relationshipArc }}</el-descriptions-item>
           </el-descriptions>
-          <ScriptEditorPanel :episode="episode" :editable="['planned', 'video_pending', 'failed'].includes(episode.status)" @saved="refresh" />
+          <ScriptEditorPanel :episode="episode" :editable="['planned', 'video_pending', 'failed'].includes(episode.status)" @saved="onScriptSaved(episode.id)" />
         </el-card>
       </section>
 
@@ -340,10 +357,22 @@ onBeforeUnmount(() => window.clearInterval(poller));
         <el-card v-for="episode in episodes" :key="episode.id" class="episode-card" shadow="never">
           <template #header><div class="row"><strong>{{ SLOT_LABEL[episode.slot] }} · {{ episode.title }}</strong><el-button @click="loadPreview(episode)">查看/编辑编译Prompt</el-button><el-button type="primary" @click="generateVisuals(episode)">生成视觉锚点</el-button></div></template>
           <el-collapse v-if="previews[episode.id]">
-            <el-collapse-item title="收费前Prompt覆盖" name="prompt">
-              <div class="prompt-label">定妆图Prompt</div><el-input v-model="drafts[episode.id].look" type="textarea" :rows="7" />
-              <div class="prompt-label">开场锚点Prompt</div><el-input v-model="drafts[episode.id].opening_anchor" type="textarea" :rows="7" />
-              <el-button style="margin-top: 8px" @click="saveOverrides(episode)">保存覆盖</el-button>
+            <el-collapse-item title="编译Prompt与高级覆盖" name="prompt">
+              <el-alert
+                v-if="previews[episode.id].overrideState.stale"
+                type="warning"
+                :closable="false"
+                title="上游结构化脚本已经变化，旧Prompt覆盖已过期"
+                description="只有重新检查并保存后，覆盖才允许用于下一次收费调用。"
+                style="margin-bottom: 10px"
+              />
+              <div class="advanced-toggle">
+                <span>高级Prompt覆盖</span>
+                <el-switch v-model="overrideEnabled[episode.id]" active-text="启用" inactive-text="关闭" />
+              </div>
+              <div class="prompt-label">定妆图Prompt</div><el-input v-model="drafts[episode.id].look" type="textarea" :rows="7" :readonly="!overrideEnabled[episode.id]" />
+              <div class="prompt-label">开场锚点Prompt</div><el-input v-model="drafts[episode.id].opening_anchor" type="textarea" :rows="7" :readonly="!overrideEnabled[episode.id]" />
+              <el-button style="margin-top: 8px" @click="saveOverrides(episode)">{{ overrideEnabled[episode.id] ? '确认并启用覆盖' : '确认使用编译Prompt' }}</el-button>
             </el-collapse-item>
           </el-collapse>
           <div class="media-grid">
@@ -362,9 +391,21 @@ onBeforeUnmount(() => window.clearInterval(poller));
           <el-collapse v-if="previews[episode.id]">
             <el-collapse-item title="RenderPlan与视频Prompt" name="video-prompt">
               <pre class="json-view">{{ JSON.stringify(previews[episode.id].renderPlan, null, 2) }}</pre>
-              <el-input v-model="drafts[episode.id].video" type="textarea" :rows="12" />
+              <el-alert
+                v-if="previews[episode.id].overrideState.stale"
+                type="warning"
+                :closable="false"
+                title="上游结构化脚本已经变化，旧Prompt覆盖已过期"
+                description="请重新检查后再显式确认；未经确认的覆盖不会进入收费请求。"
+                style="margin-bottom: 10px"
+              />
+              <div class="advanced-toggle">
+                <span>高级Prompt覆盖</span>
+                <el-switch v-model="overrideEnabled[episode.id]" active-text="启用" inactive-text="关闭" />
+              </div>
+              <el-input v-model="drafts[episode.id].video" type="textarea" :rows="12" :readonly="!overrideEnabled[episode.id]" />
               <div class="muted">覆盖只作用于初始区段；延展区段根据对应镜头重新编译。</div>
-              <el-button style="margin-top: 8px" @click="saveOverrides(episode)">保存覆盖</el-button>
+              <el-button style="margin-top: 8px" @click="saveOverrides(episode)">{{ overrideEnabled[episode.id] ? '确认并启用覆盖' : '确认使用编译Prompt' }}</el-button>
               <div v-for="section in previews[episode.id].videoSections.slice(1)" :key="section.order" class="extension-prompt">
                 <strong>延展{{ section.order }} · {{ section.durationSeconds }}秒</strong><pre>{{ section.prompt }}</pre>
               </div>
@@ -413,6 +454,7 @@ onBeforeUnmount(() => window.clearInterval(poller));
 .media-grid { display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start; }
 .node-links { margin-top: 12px; }
 .prompt-label { margin: 8px 0 4px; color: #9ca3af; font-size: 12px; }
+.advanced-toggle { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
 .json-view, .extension-prompt pre { white-space: pre-wrap; word-break: break-word; background: #111318; padding: 10px; border-radius: 6px; max-height: 320px; overflow: auto; font-size: 12px; }
 .extension-prompt { margin-top: 12px; }
 </style>

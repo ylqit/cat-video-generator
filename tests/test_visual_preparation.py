@@ -194,7 +194,7 @@ class ReviewGateway:
             style_ok=True,
             appearance_ok=True,
             composition_ok=True,
-            critical_props_ok=True,
+            constraints_ok=True,
             confidence=0.96,
             violations=(),
             warnings=(),

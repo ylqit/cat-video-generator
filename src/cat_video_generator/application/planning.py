@@ -16,6 +16,7 @@ from ..domain.contracts import (
     ActivityFocusMode,
     DailyProductionPlan,
     DayBrief,
+    DurationMode,
     EpisodePlan,
     EpisodeScript,
     RecentContentSummary,
@@ -164,14 +165,11 @@ class PlanningService:
             planning_revision=1,
             planning_context=planning_context,
         )
-        recent_pattern_ids = tuple(
-            pattern_id for summary in recent_summaries for pattern_id in summary.pattern_ids
-        )
         story_patterns = self._event_seed_catalog.select_patterns(
             series_profile_hash=series_profile.fingerprint(),
             content_date=target_date,
             planning_revision=1,
-            recent_pattern_ids=recent_pattern_ids,
+            recent_pattern_ids=(),
         )
         planning_metadata = {
             "planningRevision": 1,
@@ -750,11 +748,14 @@ def _validate_day_brief_controls(
         requested_focus = controls.requested_focus(brief.slot)
         if (
             requested_focus is not ActivityFocusMode.ADAPTIVE
-            and brief.resolved_activity_focus.value != requested_focus.value
+            and brief.activity_focus.value != requested_focus.value
         ):
             raise ValueError(f"总导演改写了{brief.slot.value}固定活动焦点")
-        if brief.duration_intent.requested_mode is not control.duration_mode:
-            raise ValueError(f"总导演改写了{brief.slot.value}时长意图")
+        if (
+            control.duration_mode is not DurationMode.ADAPTIVE
+            and brief.duration_band.value != control.duration_mode.value
+        ):
+            raise ValueError(f"总导演改写了{brief.slot.value}固定时长档")
 
 
 def _user_episode_text(user_story: UserStory | None, slot: Slot) -> str | None:

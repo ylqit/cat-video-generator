@@ -14,6 +14,7 @@ from cat_video_generator.domain.prompts import (
     compile_episode_director_prompt,
     compile_look_prompt,
     compile_opening_anchor_prompt,
+    compile_video_diagnostic_prompt,
     compile_video_prompt,
     compile_video_prompt_preview,
 )
@@ -118,11 +119,45 @@ def test_short_video_prompt_keeps_director_execution_depth() -> None:
     assert "肢体" not in prompt  # 动作本身已具体，不输出抽象字段名。
     assert "灰白猫" in prompt and "人物" in prompt
     assert "关系弧" in prompt
-    assert "同一只彩色风筝" in prompt
+    assert "同一只风筝" in prompt
     assert "原生音频" in prompt
     assert "绝对时间" not in prompt
     assert "数据库" not in prompt
     assert "storyboard" not in prompt.lower()
+
+
+def test_connector_constraint_has_one_source_across_anchor_video_and_review() -> None:
+    episode = episode_for(Slot.NOON, duration=22)
+    statement = episode.script.hard_constraints[0].text
+    anchor = compile_opening_anchor_prompt(
+        episode,
+        reference_roles=("look:noon", "cat:front", "style:outdoor"),
+    ).text
+    video = compile_video_prompt_preview(
+        episode,
+        resolution="720p",
+        section_order=1,
+    ).text
+    diagnostic = compile_video_diagnostic_prompt(episode)
+
+    assert statement in anchor
+    assert statement in video
+    assert statement in diagnostic
+    assert video.count(statement) == 1
+    assert "不得经过、缠绕或连接猫咪身体" in video
+    assert "人物与猫咪共同执行" not in video
+    assert "motion_path" not in video
+    assert "hard_constraints" not in video
+
+
+def test_low_risk_shot_does_not_emit_empty_interaction_placeholder() -> None:
+    episode = episode_for(Slot.MORNING).model_copy(deep=True)
+    episode.script.hard_constraints.clear()
+
+    prompt = compile_video_prompt_preview(episode, resolution="720p").text
+
+    assert "没有额外关键交互约束" not in prompt
+    assert "本镜关键交互" not in prompt
 
 
 def test_extension_prompt_does_not_reveal_final_prop_state_early() -> None:
@@ -142,7 +177,7 @@ def test_extension_prompt_does_not_reveal_final_prop_state_early() -> None:
     ).text
 
     assert "向后延长 @视频1" in prompt
-    assert episode.script.critical_props[0].end in prompt
+    assert episode.script.ending in prompt
     assert "最终可见回报" in prompt
 
 
@@ -153,6 +188,8 @@ def test_first_medium_section_defers_final_payoff() -> None:
     assert "暂不进入最终结果" in prompt
     assert "不提前完成" in prompt
     assert "最终可见回报" not in prompt
+    assert "不提前演出后续镜头或最终回报" in prompt
+    assert "必须完整进入最后一个镜头并兑现结尾" not in prompt
 
 
 def test_invalid_preview_section_raises_business_error() -> None:

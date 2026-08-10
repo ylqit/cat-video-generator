@@ -1,7 +1,8 @@
 """全天导演、时段脚本与镜头设计的唯一业务契约。
 
 本模块只表达观众能理解的剧情事实，不保存数据库字段、供应商参数或逐动作物理状态。
-人物与猫咪身份由 Canon 和视觉锚点保证；这里只追踪跨镜头、跨时段真正重要的道具。
+人物与猫咪身份由 Canon 和视觉锚点保证；真正重要的物体关系只用少量自然语言硬约束
+表达，不再建立重复道具状态表。
 """
 
 from __future__ import annotations
@@ -14,6 +15,12 @@ from pydantic import Field, model_validator
 
 from .contract_base import StrictModel
 
+CURRENT_CONTRACT_VERSION = 2
+
+
+class ContractVersionError(ValueError):
+    """数据库Run与当前导演契约不兼容，禁止猜测补齐旧字段。"""
+
 
 class Slot(StrEnum):
     """全天固定观察顺序。"""
@@ -25,26 +32,6 @@ class Slot(StrEnum):
     @property
     def sort_order(self) -> int:
         return {Slot.MORNING: 1, Slot.NOON: 2, Slot.EVENING: 3}[self]
-
-
-class CameraMove(StrEnum):
-    FIXED = "fixed"
-    FOLLOW = "follow"
-    PUSH = "push"
-    PULL = "pull"
-    PAN = "pan"
-    TRACK = "track"
-
-
-class StoryPatternId(StrEnum):
-    """短片叙事骨架；它约束信息组织，不是固定剧情模板。"""
-
-    PARALLEL_CONVERGENCE = "parallel_convergence"
-    WATCH_TRIGGER_PAYOFF = "watch_trigger_payoff"
-    SETUP_MISHAP_RECOVERY = "setup_mishap_recovery"
-    CHOICE_REVEAL = "choice_reveal"
-    ROUTINE_TAG = "routine_tag"
-    PROCESS_MONTAGE = "process_montage"
 
 
 class ActivityFocus(StrEnum):
@@ -117,107 +104,51 @@ class RunCreativeControls(StrictModel):
         )
 
 
-class DurationIntent(StrictModel):
-    requested_mode: DurationMode
-    resolved_band: DurationBand
-    resolution_reason: Annotated[str, Field(min_length=4, max_length=220)]
-
-    @model_validator(mode="after")
-    def validate_resolution(self) -> DurationIntent:
-        if (
-            self.requested_mode is not DurationMode.ADAPTIVE
-            and self.requested_mode.value != self.resolved_band.value
-        ):
-            raise ValueError("固定时长档不得被总导演改写")
-        return self
-
-
-class RelationshipArc(StrictModel):
-    """主活动、副活动和最终汇合的最小叙事合同。"""
-
-    lead_activity: Annotated[str, Field(min_length=6, max_length=260)]
-    secondary_activity: Annotated[str, Field(min_length=6, max_length=260)]
-    convergence: Annotated[str, Field(min_length=6, max_length=260)]
-
-
-class AppearancePlan(StrictModel):
-    """本时段人物的完整定妆；猫咪外观由Canon和剧情道具表达。"""
-
-    description: Annotated[str, Field(min_length=4, max_length=360)]
-    change_reason: Annotated[str, Field(min_length=4, max_length=220)] | None = None
-
-
-class GuestActor(StrictModel):
-    """仅在剧情确实需要时出现的一名临时配角。"""
-
-    id: Annotated[str, Field(pattern=r"^guest_[a-z0-9][a-z0-9_-]{0,63}$")]
-    name: Annotated[str, Field(min_length=2, max_length=40)]
-    role: Annotated[str, Field(min_length=3, max_length=120)]
-
-
-class ActionStage(StrictModel):
-    """同一主事件内连续发生的一次可见动作变化。"""
-
-    order: Annotated[int, Field(ge=1, le=4)]
-    actor_id: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{1,79}$")]
-    action: Annotated[str, Field(min_length=6, max_length=320)]
-    visible_result: Annotated[str, Field(min_length=4, max_length=220)]
-
-
-class ShotPlan(StrictModel):
-    """镜头只负责视觉表达；每个动作只属于一个镜头。"""
+class ShotDirection(StrictModel):
+    """一段完整镜头导演文字，不再把同一动作拆成重复字段。"""
 
     order: Annotated[int, Field(ge=1, le=3)]
-    action_orders: list[Annotated[int, Field(ge=1, le=4)]] = Field(
-        min_length=1,
-        max_length=4,
+    direction: Annotated[str, Field(min_length=12)]
+
+
+class HardConstraint(StrictModel):
+    """仅保留会直接影响生成正确性的自然语言关系事实。
+
+    ``shot_orders``为空表示全片适用；否则只投影到指定镜头。
+    """
+
+    shot_orders: list[Annotated[int, Field(ge=1, le=3)]] = Field(
+        default_factory=list,
+        max_length=3,
     )
-    framing: Annotated[str, Field(min_length=2, max_length=100)]
-    camera_move: CameraMove
-    direction: Annotated[str, Field(min_length=6, max_length=260)]
+    text: Annotated[str, Field(min_length=8)]
 
     @model_validator(mode="after")
-    def validate_unique_actions(self) -> ShotPlan:
-        if len(self.action_orders) != len(set(self.action_orders)):
-            raise ValueError("同一镜头不能重复引用动作")
+    def validate_shot_orders(self) -> HardConstraint:
+        if self.shot_orders != sorted(set(self.shot_orders)):
+            raise ValueError("硬约束的shotOrders必须唯一且递增")
         return self
-
-
-class CriticalProp(StrictModel):
-    """需要在Prompt中明确起点和结果的关键道具。"""
-
-    entity_key: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{1,79}$")]
-    name: Annotated[str, Field(min_length=2, max_length=60)]
-    start: Annotated[str, Field(min_length=4, max_length=180)]
-    end: Annotated[str, Field(min_length=4, max_length=180)]
-
-
-class EpisodeEnding(StrictModel):
-    """必须在画面中兑现的最终回报。"""
-
-    result: Annotated[str, Field(min_length=6, max_length=260)]
 
 
 class SlotBrief(StrictModel):
     """总导演交给单个时段导演的创作边界。"""
 
     slot: Slot
-    narrative_role: Annotated[str, Field(min_length=6, max_length=220)]
-    scene_direction: Annotated[str, Field(min_length=6, max_length=280)]
-    event_direction: Annotated[str, Field(min_length=6, max_length=280)]
-    appearance_intent: Annotated[str, Field(min_length=4, max_length=240)]
-    resolved_activity_focus: ActivityFocus
-    relationship_direction: Annotated[str, Field(min_length=6, max_length=280)]
-    duration_intent: DurationIntent
+    narrative_role: Annotated[str, Field(min_length=4)]
+    event_direction: Annotated[str, Field(min_length=8)]
+    appearance_intent: Annotated[str, Field(min_length=4)]
+    activity_focus: ActivityFocus
+    duration_band: DurationBand
+    decision_reason: Annotated[str, Field(min_length=4)]
 
 
 class Handoff(StrictModel):
     """上一时段明确交给下一时段的同一逻辑道具或结果。"""
 
-    entity_key: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{1,79}$")]
+    name: Annotated[str, Field(min_length=2, max_length=80)]
     from_slot: Slot
     to_slot: Slot
-    state: Annotated[str, Field(min_length=4, max_length=220)]
+    continuity: Annotated[str, Field(min_length=4)]
 
     @model_validator(mode="after")
     def validate_order(self) -> Handoff:
@@ -231,9 +162,7 @@ class DayBrief(StrictModel):
 
     content_date: date
     theme: Annotated[str, Field(min_length=2, max_length=160)]
-    day_objective: Annotated[str, Field(min_length=8, max_length=320)]
-    day_context: Annotated[str, Field(min_length=8, max_length=520)]
-    shared_motif: Annotated[str, Field(min_length=4, max_length=240)]
+    day_arc: Annotated[str, Field(min_length=12)]
     slot_briefs: list[SlotBrief] = Field(min_length=3, max_length=3)
     handoffs: list[Handoff] = Field(default_factory=list, max_length=12)
 
@@ -241,60 +170,46 @@ class DayBrief(StrictModel):
     def validate_day(self) -> DayBrief:
         if [item.slot for item in self.slot_briefs] != list(Slot):
             raise ValueError("DayBrief时段必须按morning、noon、evening排序")
-        handoff_keys = [(item.entity_key, item.from_slot, item.to_slot) for item in self.handoffs]
+        handoff_keys = [(item.name, item.from_slot, item.to_slot) for item in self.handoffs]
         if len(handoff_keys) != len(set(handoff_keys)):
             raise ValueError("同一时段交接不能重复")
         return self
 
 
 class EpisodeScript(StrictModel):
-    """单个时段导演直接输出的8至45秒可执行脚本。"""
+    """长剧情正文加极小自动化控制壳的时段导演契约。"""
 
     title: Annotated[str, Field(min_length=2, max_length=80)]
     event_key: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{1,79}$")]
     location_key: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{1,79}$")]
-    story_pattern: StoryPatternId
-    episode_question: Annotated[str, Field(min_length=6, max_length=220)]
-    main_event: Annotated[str, Field(min_length=6, max_length=320)]
-    scene: Annotated[str, Field(min_length=6, max_length=380)]
-    style_context: Literal["indoor", "outdoor"]
-    appearance: AppearancePlan
+    visual_context: Literal["indoor", "outdoor"]
     activity_focus: ActivityFocus
-    relationship_arc: RelationshipArc
-    guest: GuestActor | None = None
-    actions: list[ActionStage] = Field(min_length=2, max_length=4)
-    shots: list[ShotPlan] = Field(min_length=1, max_length=3)
-    ending: EpisodeEnding
-    sound_design: Annotated[str, Field(min_length=8, max_length=360)]
     duration_seconds: Annotated[int, Field(ge=8, le=45)]
-    critical_props: list[CriticalProp] = Field(default_factory=list, max_length=8)
+    appearance: Annotated[str, Field(min_length=6)]
+    story_text: Annotated[str, Field(min_length=24)]
+    relationship_arc: Annotated[str, Field(min_length=12)]
+    shots: list[ShotDirection] = Field(min_length=1, max_length=3)
+    hard_constraints: list[HardConstraint] = Field(default_factory=list, max_length=8)
+    sound_design: Annotated[str, Field(min_length=8)]
+    ending: Annotated[str, Field(min_length=6)]
 
     @model_validator(mode="after")
     def validate_execution(self) -> EpisodeScript:
-        action_orders = [item.order for item in self.actions]
-        if action_orders != list(range(1, len(self.actions) + 1)):
-            raise ValueError("动作order必须从1连续递增")
         shot_orders = [item.order for item in self.shots]
         if shot_orders != list(range(1, len(self.shots) + 1)):
             raise ValueError("镜头order必须从1连续递增")
-        referenced = [order for shot in self.shots for order in shot.action_orders]
-        if referenced != sorted(referenced) or set(referenced) != set(action_orders):
-            raise ValueError("镜头必须按顺序完整覆盖全部动作")
-        if len(referenced) != len(set(referenced)):
-            raise ValueError("每个动作只能属于一个镜头")
-
-        allowed_actors = {"person", "cat", "environment"}
-        if self.guest is not None:
-            allowed_actors.add(self.guest.id)
-        unknown = {item.actor_id for item in self.actions} - allowed_actors
-        if unknown:
-            raise ValueError("动作引用未知主体：" + ", ".join(sorted(unknown)))
-
-        prop_keys = [item.entity_key for item in self.critical_props]
-        if len(prop_keys) != len(set(prop_keys)):
-            raise ValueError("关键道具entityKey不能重复")
-        if self.story_pattern is StoryPatternId.PROCESS_MONTAGE and self.duration_seconds <= 15:
-            raise ValueError("process_montage只适用于16秒以上内容")
+        shot_order_set = set(shot_orders)
+        unknown_constraint_shots = {
+            order
+            for constraint in self.hard_constraints
+            for order in constraint.shot_orders
+            if order not in shot_order_set
+        }
+        if unknown_constraint_shots:
+            raise ValueError(
+                "硬约束引用不存在的镜头："
+                + ", ".join(str(item) for item in sorted(unknown_constraint_shots))
+            )
         required_shots = (
             1 if self.duration_seconds <= 15 else 2 if self.duration_seconds <= 30 else 3
         )
@@ -332,10 +247,6 @@ class DailyProductionPlan(StrictModel):
     def theme(self) -> str:
         return self.day_brief.theme
 
-    @property
-    def day_context(self) -> str:
-        return self.day_brief.day_context
-
     @model_validator(mode="after")
     def validate_day(self) -> DailyProductionPlan:
         if [item.slot for item in self.episodes] != list(Slot):
@@ -344,30 +255,15 @@ class DailyProductionPlan(StrictModel):
             raise ValueError("早中晚标题必须互不重复")
         if len({item.script.event_key for item in self.episodes}) != 3:
             raise ValueError("早中晚必须使用不同的时段事件键")
-        props_by_slot = {
-            item.slot: {prop.entity_key for prop in item.script.critical_props}
-            for item in self.episodes
-        }
         briefs = {item.slot: item for item in self.day_brief.slot_briefs}
         for episode in self.episodes:
             brief = briefs[episode.slot]
-            if episode.script.activity_focus is not brief.resolved_activity_focus:
+            if episode.script.activity_focus is not brief.activity_focus:
                 raise ValueError(f"{episode.slot.value}活动焦点与DayBrief不一致")
-            minimum, maximum = brief.duration_intent.resolved_band.range
+            minimum, maximum = brief.duration_band.range
             if not minimum <= episode.duration_seconds <= maximum:
                 raise ValueError(
-                    f"{episode.slot.value}精确时长不在{brief.duration_intent.resolved_band.value}档"
-                )
-        for handoff in self.day_brief.handoffs:
-            missing_slots = [
-                slot.value
-                for slot in (handoff.from_slot, handoff.to_slot)
-                if handoff.entity_key not in props_by_slot[slot]
-            ]
-            if missing_slots:
-                raise ValueError(
-                    f"交接元素{handoff.entity_key}没有在"
-                    f"{','.join(missing_slots)}时段使用同一entityKey登记"
+                    f"{episode.slot.value}精确时长不在{brief.duration_band.value}档"
                 )
         return self
 
@@ -378,6 +274,4 @@ class RecentContentSummary(StrictModel):
     content_date: date
     event_keys: tuple[str, ...] = ()
     location_keys: tuple[str, ...] = ()
-    element_keys: tuple[str, ...] = ()
-    pattern_ids: tuple[str, ...] = ()
     summary_text: Annotated[str, Field(min_length=1, max_length=2000)]

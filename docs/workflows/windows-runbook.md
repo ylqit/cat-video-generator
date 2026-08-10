@@ -32,9 +32,10 @@ IMAGE_REVIEW_MODE=semantic_auto|manual
 MEDIA_WORK_ROOT / MEDIA_ASSET_ROOT / DELIVERY_OUTPUT_ROOT
 ```
 
-## 2. 迁移到0011
+## 2. 迁移到0012
 
-0011要求旧生产Run为空。先预览并保存诊断清单：
+0012启用极简混合导演契约版本2，且不转换旧Episode JSON，因此要求旧生产Run为空。
+先预览并保存诊断清单：
 
 ```powershell
 uv run python scripts/clear_production_history.py
@@ -50,7 +51,7 @@ uv run cvg doctor
 
 清理删除带Run外键的业务记录和已验证位于媒体根下的历史文件，同时只保留当前正式
 语义键的最新批准Canon；仍被保留Canon引用的文件路径永远不会被删除。
-Doctor最终必须报告`0011_narrative_render_core`。
+Doctor最终必须报告`0012_minimal_director_contract`。
 
 ## 3. Canon
 
@@ -92,6 +93,12 @@ uv run cvg api --static-dir web/dist
 Web新建Run时配置全天默认活动焦点和早中晚覆盖；每个时段选择short、medium、long
 或adaptive。总导演只解析全天容量，时段导演在档位内确定精确秒数。
 
+“三集导演”默认编辑极简混合脚本：完整长剧情、关系弧、1～3段完整镜头描述和少量
+关键硬约束。每个镜头段落自然表达镜头目的、机位、运镜、人物与猫咪站位、动作路径、
+接触结果和稳定切点。页面实时编译定妆图、开场锚点及视频Prompt；预览不会保存数据
+或调用Ark。高级Prompt覆盖必须显式开启，脚本变化后会标记为过期，重新确认前不会
+进入下一次收费请求。
+
 CLI核心入口仍可使用：
 
 ```powershell
@@ -103,6 +110,10 @@ uv run cvg run-day <runId> --slot morning --allow-paid-generation
 `run-day`依次确保定妆图、开场锚点和RenderPlan视频任务。8～15秒一个任务；中长
 视频按模型能力使用官方延展。延展返回的新增尾段会在各自QC通过后，通过FFmpeg
 `stream copy`与前序区段顺序封装；不会生成故事板组图、逐镜视频，也不会转码。
+
+点击任一工作流节点会按需读取Trace。Prompt链路依次展示输入摘要、当前结构化结果、
+当前编译Prompt、各attempt实际调用Prompt、Ark原始结构化JSON、可选归一化结果和警告；
+Provider、媒体、审核与尝试历史分别展示，页面轮询不会改变当前stage、slot或node。
 
 ## 6. 恢复、审核和交付
 

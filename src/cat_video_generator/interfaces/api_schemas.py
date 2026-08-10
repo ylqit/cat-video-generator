@@ -117,6 +117,7 @@ class RetryStepRequest(BaseModel):
         False,
         alias="acknowledgeDuplicateBilling",
     )
+    restart_from_beginning: bool = Field(False, alias="restartFromBeginning")
 
 
 class ReconcileStepRequest(BaseModel):
@@ -154,3 +155,4 @@ class PromptOverridesRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     overrides: dict[str, str] = Field(default_factory=dict)
+    enabled: bool = False

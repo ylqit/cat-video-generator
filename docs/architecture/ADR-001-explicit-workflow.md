@@ -31,9 +31,14 @@ RunCreativeControls
 → RenderPlan（确定性推导）
 ```
 
-`EpisodeScript`只保存一个主事件、猫咪/人物活动关系、动作、镜头、声音、时长和
-少量关键道具起终描述。不保存世界状态模拟、故事板面板、供应商输入模式或数据库
-资产ID。默认关系为猫咪推动主要可见信息、人物完成副活动或回应、两条线汇合回报。
+`EpisodeScript`采用极简混合契约：完整长剧情是创作事实主体，活动焦点、时长、外观、
+关系弧、1～3段完整镜头描述和少量`hardConstraints`构成机器可读控制壳。镜头段落一次
+说明景别、机位、唯一运镜、站位、动作路径、接触结果和稳定切点；不会把同一剧情再
+拆成动作表和重复镜头字段。连接、承重、容器、接触、交接和穿戴等真正影响出片正确性
+的关系才进入硬约束，并由同一来源投影到图片、视频和审核Prompt。
+
+系统不保存世界状态模拟、故事板面板、供应商输入模式、重复道具起终表或数据库资产ID。
+默认关系为猫咪推动主要可见信息、人物完成副活动或回应、两条线汇合回报。
 
 `RenderPlan`按精确时长确定性生成：8～15秒一个初始任务；16～30秒增加一次官方
 延展；31～45秒增加两次延展。首段只用批准开场锚点，延展只用上一版视频。模型
@@ -44,7 +49,7 @@ RunCreativeControls
 ## 模块所有权
 
 ```text
-domain/contracts.py    DayBrief、EpisodeScript、创作控制与关系弧
+domain/contracts.py    DayBriefV2、EpisodeScriptV2、创作控制与极简导演壳
 domain/rendering.py    RenderPlan、VideoInputPlan与延展能力
 domain/prompts.py      导演、定妆、开场锚点、视频和审核Prompt
 domain/rules.py        少量身份、时长与跨时段硬门
@@ -70,3 +75,6 @@ assets / reviews / delivery_packages / delivery_items`。
 6. 媒体通过`.part`下载、哈希校验和原子改名落盘。
 7. 图片和视频人工决定不可覆盖；相反决定必须产生新attempt。
 8. 最终视频停在`content_review`，三条人工批准后才能交付。
+9. 导演原始结构化JSON、可选归一化结果和警告保存在Step快照；查询层只在打开节点时
+   投影完整Trace，禁止把Key、Base64、签名URL或SDK对象写入数据库。
+10. 高级Prompt覆盖绑定当前脚本哈希；上游脚本变化后自动失效，旧attempt Prompt永久保留。

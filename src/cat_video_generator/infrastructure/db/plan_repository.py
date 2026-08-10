@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from typing import Any
 
@@ -20,6 +22,14 @@ from ...domain.workflow import (
 )
 from .models import Episode, ProductionRun
 from .query_repository import required_record as _required
+
+
+def _script_sha256(value: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
 
 
 class PlanPersistenceMixin:
@@ -121,10 +131,13 @@ class PlanPersistenceMixin:
                     EpisodeStatus.PLANNED,
                 ).value
             row.script_json = episode.script.model_dump(mode="json")
-            # Prompt覆盖只对创建它时的剧本有效。局部重规划已经替换了剧情、镜头和连续性，
-            # 若继续保留旧覆盖，后续Seedream/Seedance会在新Episode上误用旧Prompt和旧输入哈希。
-            # 历史Prompt、Step与资产仍作为审计记录保留；这里只清除活动Episode的编辑覆盖。
-            row.prompt_overrides_json = None
+            # 覆盖正文仍作为创作草稿保留，但脚本变化后必须显式重新确认；生产读取只会返回
+            # enabled且非stale的覆盖，因此不会把旧Prompt误用到新Episode。
+            if row.prompt_overrides_json:
+                row.prompt_overrides_json = {
+                    **row.prompt_overrides_json,
+                    "stale": True,
+                }
             drafts = dict(run.planning_json.get("episodeDrafts", {}))
             drafts[episode.slot.value] = episode.script.model_dump(mode="json")
             planning_json = {**run.planning_json, "episodeDrafts": drafts}
@@ -133,15 +146,41 @@ class PlanPersistenceMixin:
             run.planning_json = planning_json
 
     def get_prompt_overrides(self, episode_id: uuid.UUID) -> dict[str, str]:
-        """读取页面编辑后的Prompt覆盖；缺省为空字典。"""
+        """只返回已显式启用、已确认且与当前脚本匹配的Prompt覆盖。"""
 
         with self._sessions() as session:  # type: ignore[attr-defined]
             row = _required(session, Episode, episode_id)
             raw = row.prompt_overrides_json or {}
+            stale = bool(raw.get("stale")) or raw.get("sourceScriptSha256") != _script_sha256(
+                row.script_json
+            )
+            if not raw.get("enabled") or stale:
+                return {}
+            values = raw.get("values")
+            if not isinstance(values, dict):
+                return {}
             return {
                 str(key): str(value)
-                for key, value in raw.items()
+                for key, value in values.items()
                 if isinstance(value, str) and value.strip()
+            }
+
+    def get_prompt_override_state(self, episode_id: uuid.UUID) -> dict[str, Any]:
+        with self._sessions() as session:  # type: ignore[attr-defined]
+            row = _required(session, Episode, episode_id)
+            raw = row.prompt_overrides_json or {}
+            values = raw.get("values") if isinstance(raw.get("values"), dict) else {}
+            source_hash = raw.get("sourceScriptSha256")
+            return {
+                "enabled": bool(raw.get("enabled", False)),
+                "stale": bool(raw.get("stale", False))
+                or (source_hash is not None and source_hash != _script_sha256(row.script_json)),
+                "sourceScriptSha256": source_hash,
+                "values": {
+                    str(key): str(value)
+                    for key, value in values.items()
+                    if isinstance(value, str)
+                },
             }
 
     def save_prompt_overrides(
@@ -149,12 +188,18 @@ class PlanPersistenceMixin:
         *,
         episode_id: uuid.UUID,
         overrides: dict[str, str] | None,
+        enabled: bool,
     ) -> None:
-        """持久化页面编辑的Prompt覆盖；``None``或空字典表示清除。"""
+        """保存高级Prompt覆盖，并绑定保存时的结构化脚本哈希。"""
 
         with self._sessions.begin() as session:  # type: ignore[attr-defined]
             row = _required(session, Episode, episode_id)
-            row.prompt_overrides_json = overrides or None
+            row.prompt_overrides_json = {
+                "enabled": enabled,
+                "stale": False,
+                "sourceScriptSha256": _script_sha256(row.script_json),
+                "values": overrides or {},
+            }
 
     def update_day_brief(
         self,

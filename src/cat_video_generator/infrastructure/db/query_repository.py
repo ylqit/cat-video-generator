@@ -13,7 +13,13 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from ...application.ports import StoredAsset, StoredPrompt
-from ...domain.contracts import EpisodePlan, EpisodeScript, RecentContentSummary, Slot
+from ...domain.contracts import (
+    CURRENT_CONTRACT_VERSION,
+    EpisodePlan,
+    EpisodeScript,
+    RecentContentSummary,
+    Slot,
+)
 from ...domain.rendering import build_render_plan
 from ...domain.workflow import PromptPurpose, RunStatus
 from .models import (
@@ -29,6 +35,7 @@ from .models import (
 from .records import (
     asset_dict,
     delivery_package_dict,
+    ensure_current_contract,
     episode_dict,
     prompt_dict,
     review_dict,
@@ -42,6 +49,38 @@ from .session import ALEMBIC_HEAD
 
 class RecordNotFoundError(LookupError):
     """请求的工作流记录不存在。"""
+
+
+def _trace_input_bindings(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    """把三种Step快照投影为统一素材顺序，不在查询层猜测业务用途。"""
+
+    input_plan = snapshot.get("input_plan")
+    if isinstance(input_plan, dict) and isinstance(input_plan.get("bindings"), list):
+        return [
+            {
+                "assetId": str(item.get("asset_id")),
+                "semanticKey": item.get("semantic_key"),
+                "modality": item.get("modality"),
+                "providerRole": item.get("provider_role"),
+                "ordinal": item.get("ordinal"),
+                "sha256": item.get("sha256"),
+            }
+            for item in input_plan["bindings"]
+            if isinstance(item, dict) and item.get("asset_id") is not None
+        ]
+    asset_ids = snapshot.get("reference_asset_ids")
+    hashes = snapshot.get("reference_sha256")
+    if not isinstance(asset_ids, list | tuple):
+        return []
+    hash_values = hashes if isinstance(hashes, list | tuple) else ()
+    return [
+        {
+            "assetId": str(asset_id),
+            "ordinal": index,
+            "sha256": str(hash_values[index - 1]) if index <= len(hash_values) else None,
+        }
+        for index, asset_id in enumerate(asset_ids, 1)
+    ]
 
 
 def _current_stage(
@@ -387,7 +426,9 @@ class SqlAlchemyReadRepository:
 
     def get_planning_context(self, run_id: uuid.UUID) -> dict[str, Any]:
         with self._sessions() as session:
-            return dict(required_record(session, ProductionRun, run_id).planning_json or {})
+            run = required_record(session, ProductionRun, run_id)
+            ensure_current_contract(run)
+            return dict(run.planning_json or {})
 
     @staticmethod
     def _rows_for_steps(
@@ -407,6 +448,7 @@ class SqlAlchemyReadRepository:
         with self._sessions() as session:
             rows = session.execute(
                 select(ProductionRun)
+                .where(ProductionRun.contract_version == CURRENT_CONTRACT_VERSION)
                 .order_by(ProductionRun.content_date.desc(), ProductionRun.created_at.desc())
                 .limit(limit)
                 .offset(offset)
@@ -425,6 +467,7 @@ class SqlAlchemyReadRepository:
                 session.execute(
                     select(ProductionRun)
                     .where(
+                        ProductionRun.contract_version == CURRENT_CONTRACT_VERSION,
                         ProductionRun.status.in_((RunStatus.READY.value, RunStatus.DELIVERED.value))
                     )
                     .order_by(ProductionRun.content_date.desc(), ProductionRun.created_at.desc())
@@ -443,22 +486,15 @@ class SqlAlchemyReadRepository:
                 if len(rows) != 3:
                     continue
                 scripts = [EpisodeScript.model_validate(row.script_json) for row in rows]
-                elements = tuple(
-                    dict.fromkeys(
-                        prop.entity_key for script in scripts for prop in script.critical_props
-                    )
-                )
                 result.append(
                     RecentContentSummary(
                         content_date=run.content_date,
                         event_keys=tuple(item.event_key for item in scripts),
                         location_keys=tuple(item.location_key for item in scripts),
-                        element_keys=elements,
-                        pattern_ids=tuple(item.story_pattern.value for item in scripts),
                         summary_text=(
                             f"{run.content_date.isoformat()}主题="
                             f"{run.planning_json.get('dayBrief', {}).get('theme', '')}；"
-                            f"事件={'、'.join(item.main_event for item in scripts)}"
+                            f"剧情={'、'.join(item.story_text for item in scripts)}"
                         ),
                     )
                 )
@@ -468,6 +504,9 @@ class SqlAlchemyReadRepository:
         with self._sessions() as session:
             prompt = required_record(session, PromptRecord, prompt_id)
             step = required_record(session, WorkflowStep, prompt.step_id)
+            ensure_current_contract(
+                required_record(session, ProductionRun, step.production_run_id)
+            )
             result = prompt_dict(prompt, full=True)
             result["inputSnapshot"] = step.input_snapshot_json
             return result
@@ -479,6 +518,10 @@ class SqlAlchemyReadRepository:
         purpose: PromptPurpose,
     ) -> StoredPrompt:
         with self._sessions() as session:
+            step = required_record(session, WorkflowStep, step_id)
+            ensure_current_contract(
+                required_record(session, ProductionRun, step.production_run_id)
+            )
             row = session.execute(
                 select(PromptRecord)
                 .where(PromptRecord.step_id == step_id, PromptRecord.purpose == purpose.value)
@@ -492,15 +535,90 @@ class SqlAlchemyReadRepository:
 
     def asset_detail(self, asset_id: uuid.UUID) -> StoredAsset:
         with self._sessions() as session:
-            return stored_asset(required_record(session, Asset, asset_id))
+            asset = required_record(session, Asset, asset_id)
+            if asset.production_run_id is not None:
+                ensure_current_contract(
+                    required_record(session, ProductionRun, asset.production_run_id)
+                )
+            return stored_asset(asset)
 
     def episode_detail(self, episode_id: uuid.UUID) -> dict[str, Any]:
         with self._sessions() as session:
-            return episode_dict(required_record(session, Episode, episode_id))
+            episode = required_record(session, Episode, episode_id)
+            ensure_current_contract(
+                required_record(session, ProductionRun, episode.production_run_id)
+            )
+            return episode_dict(episode)
 
     def step_detail(self, step_id: uuid.UUID) -> dict[str, Any]:
         with self._sessions() as session:
-            return step_dict(required_record(session, WorkflowStep, step_id))
+            step = required_record(session, WorkflowStep, step_id)
+            ensure_current_contract(
+                required_record(session, ProductionRun, step.production_run_id)
+            )
+            return step_dict(step)
+
+    def step_trace(self, step_id: uuid.UUID) -> dict[str, Any]:
+        """返回节点追踪投影；大正文只在打开抽屉时读取，不膨胀Run Graph。"""
+
+        with self._sessions() as session:
+            current = required_record(session, WorkflowStep, step_id)
+            ensure_current_contract(
+                required_record(session, ProductionRun, current.production_run_id)
+            )
+            attempt_query = select(WorkflowStep).where(
+                WorkflowStep.production_run_id == current.production_run_id,
+                WorkflowStep.operation_key == current.operation_key,
+            )
+            if current.episode_id is None:
+                attempt_query = attempt_query.where(WorkflowStep.episode_id.is_(None))
+            else:
+                attempt_query = attempt_query.where(WorkflowStep.episode_id == current.episode_id)
+            attempts = tuple(
+                session.execute(attempt_query.order_by(WorkflowStep.attempt)).scalars()
+            )
+            attempt_ids = tuple(item.id for item in attempts)
+            prompts = self._rows_for_steps(session, PromptRecord, attempt_ids)
+            reviews = self._rows_for_steps(session, Review, attempt_ids)
+            assets = (
+                ()
+                if not attempt_ids
+                else tuple(
+                    session.execute(
+                        select(Asset)
+                        .where(Asset.producing_step_id.in_(attempt_ids))
+                        .order_by(Asset.created_at)
+                    ).scalars()
+                )
+            )
+            snapshot = dict(current.input_snapshot_json or {})
+            provider_output = snapshot.get("provider_output")
+            normalized_output = snapshot.get("normalized_output")
+            input_summary = {
+                key: value
+                for key, value in snapshot.items()
+                if key
+                not in {
+                    "provider_output",
+                    "normalized_output",
+                    "normalization_warnings",
+                    "response_id",
+                    "request_hash",
+                }
+            }
+            return {
+                "step": step_dict(current),
+                "inputSummary": input_summary,
+                "actualPrompts": [prompt_dict(item, full=True) for item in prompts],
+                "providerOutput": provider_output,
+                "normalizedOutput": normalized_output,
+                "effectiveOutput": normalized_output or provider_output,
+                "normalizationWarnings": snapshot.get("normalization_warnings", []),
+                "inputBindings": _trace_input_bindings(snapshot),
+                "assets": [asset_dict(item) for item in assets],
+                "reviews": [review_dict(item) for item in reviews],
+                "attempts": [step_dict(item) for item in attempts],
+            }
 
     def list_delivery_packages(self, run_id: uuid.UUID) -> list[dict[str, Any]]:
         with self._sessions() as session:

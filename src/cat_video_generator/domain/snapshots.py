@@ -21,7 +21,15 @@ class DirectorInputSnapshot(StrictModel):
     repair_of_step_id: UUID | None = None
     response_id: str | None = None
     request_hash: str | None = None
-    output: dict[str, object] | None = None
+    provider_output: dict[str, object] | None = None
+    normalized_output: dict[str, object] | None = None
+    normalization_warnings: tuple[str, ...] = ()
+
+    @property
+    def effective_output(self) -> dict[str, object] | None:
+        """业务层始终读取归一化结果；没有改写时直接使用供应商原始对象。"""
+
+        return self.normalized_output or self.provider_output
 
 
 class ImageInputSnapshot(StrictModel):

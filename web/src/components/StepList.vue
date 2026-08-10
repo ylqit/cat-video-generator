@@ -28,6 +28,7 @@ const retryAction = ref<StepActionDto | null>(null);
 const reason = ref("");
 const paidConfirmed = ref(false);
 const duplicateBillingConfirmed = ref(false);
+const restartFromBeginning = ref(false);
 const reconcileTarget = ref<StepDto | null>(null);
 const candidates = ref<ReconciliationCandidateDto[]>([]);
 const selectedTaskId = ref("");
@@ -45,6 +46,7 @@ function askRetry(step: StepDto, action: StepActionDto) {
   reason.value = "";
   paidConfirmed.value = false;
   duplicateBillingConfirmed.value = false;
+  restartFromBeginning.value = false;
 }
 
 function closeRetry() {
@@ -66,6 +68,7 @@ async function confirmRetry() {
       reason.value.trim(),
       action.paid,
       duplicateBillingConfirmed.value,
+      restartFromBeginning.value,
     );
     ElMessage.success("新attempt已提交；旧任务和错误记录保持不变");
     closeRetry();
@@ -220,6 +223,17 @@ function runAction(step: StepDto, action: StepActionDto) {
       <el-checkbox v-model="duplicateBillingConfirmed">
         我接受原未知请求可能已计费，本次可能重复计费
       </el-checkbox>
+    </div>
+    <div
+      v-if="retryTarget?.kind === 'video' && retryTarget.operationKey.startsWith('video:extend:')"
+      style="margin-top: 6px"
+    >
+      <el-checkbox v-model="restartFromBeginning">
+        错误已存在于前段：从开场锚点重新生成全部区段
+      </el-checkbox>
+      <div v-if="restartFromBeginning" class="error-text">
+        将为首段和全部延展分别创建新attempt，产生多次新的Ark视频费用。
+      </div>
     </div>
     <template #footer>
       <el-button @click="closeRetry">取消</el-button>
