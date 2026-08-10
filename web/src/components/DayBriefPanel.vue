@@ -26,7 +26,7 @@ async function save() {
   saving.value = true;
   try {
     await api.updateDayBrief(props.runId, structuredClone(toRaw(draft)));
-    ElMessage.success("总导演方向已保存；尚未定稿的时段脚本会读取新设置");
+    ElMessage.success("总导演边界已保存并确认；当前已解锁时段可以开始规划");
     emit("saved");
   } catch (error) {
     ElMessage.error(error instanceof ApiError ? error.message : String(error));
@@ -93,7 +93,7 @@ async function save() {
     </el-descriptions>
 
     <el-form-item v-if="editable">
-      <el-button type="primary" :loading="saving" @click="save">保存总导演编辑</el-button>
+      <el-button type="primary" :loading="saving" @click="save">保存并确认总导演边界</el-button>
       <span class="muted" style="margin-left: 10px">保存会清空尚未定稿的三时段草稿。</span>
     </el-form-item>
   </el-form>

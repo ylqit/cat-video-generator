@@ -234,6 +234,10 @@ def _episode_director_body(
             "机位、唯一运镜、人物与猫咪站位、实际动作主体、肢体路径和速度、接触对象、"
             "可见结果及稳定切点。每个镜头最多安排一个关键接触关系变化；猫咪与人物不得"
             "同时操作同一工具或连接物。不要把这些信息再拆成其他字段。",
+            "开场立即呈现一个尚未完成的小事件或可感知信号，不用空镜等待进入剧情。"
+            "全片安排3至5次彼此不同的可见信息更新，通常每2至3秒通过动作、发现、声音"
+            "或关系变化刷新一次；同一动作、景别和情绪功能不得重复填充时长。结尾必须"
+            "回应开场期待。镜头切换只能发生在动作已经落稳、接触关系清楚的状态。",
             "hardConstraints只登记会直接影响画面正确性的自然语言关系事实，并用"
             "shotOrders限定适用镜头；空shotOrders表示全片。普通走动、视线、背景和轻微"
             "表情不要登记。连接类必须写清两端归属及不得接触的角色，例如风筝线只能连接"
@@ -457,12 +461,10 @@ def compile_video_prompt(
             f"视觉环境：{episode.script.visual_context}。画风：{style_profile.prompt_positive()}；排除"
             f"{style_profile.prompt_negative()}。活动关系：{_focus_instruction(episode.script.activity_focus)}。",
             "【镜头与动作推进】\n"
-            f"完整剧情：{episode.script.story_text}\n"
             f"{progression_instruction}\n"
             + "\n".join(shot_lines),
             "【连续性、声音与结尾回报】"
-            f"关系弧：{episode.script.relationship_arc}。本区段硬约束：{constraints}。"
-            f"{section_boundary}"
+            f"本区段硬约束：{constraints}。{section_boundary}"
             f"声音：{episode.script.sound_design}。{ending}。"
             "人物和猫咪数量固定；禁止角色复制、瞬移、无原因换装、关键道具变类或悬空、"
             "猫咪双足直立或人手式操作、字幕、水印、Logo和供应商UI；不得用原地互看或"
@@ -503,10 +505,9 @@ def _compile_extension_video_prompt(
                 f"输出{input_plan.resolution}、9:16竖屏、本区段{input_plan.duration_seconds}秒，"
                 "原生音频。始终只有同一个中性短发儿童和同一只灰白猫，身份、画风和关键"
                 "道具外观沿用输入视频。",
-                "【本区段唯一推进】"
-                "本区段前半完成当前关键变化，后半明确展示结果与人猫关系汇合。"
+                "【本区段唯一推进】\n"
                 + "\n".join(_video_shot_line(episode, shot) for shot in shots)
-                + "只执行上述当前区段镜头。前序剧情已经由输入视频承载，不在本Prompt中"
+                + "\n只执行上述当前区段镜头。前序剧情已经由输入视频承载，不在本Prompt中"
                 "复述，也不得重新演出前序触发、意外或人物和猫咪已经完成的动作。",
                 "【连续性、声音与结束】"
                 f"本区段硬约束：{constraints}。关系目标：沿用输入视频末帧的既有关系，"
@@ -588,6 +589,10 @@ def compile_video_diagnostic_prompt(
             "relationError；没有关系错误时relationError为null。"
             "连接线、承重物、容器、交接物或穿戴物归属错误必须判为constraintsOk=false。"
             "轻微表情和合理切镜变化不得误判为硬失败。",
+            "actualOutcome只总结抽帧中确实可见的最终事实，不用原剧本补写未实现内容。"
+            "carryForward只列出后续剧情可以安全继承的实际人物、关系、道具或环境结果；"
+            "doNotCarryForward列出分身、错误配饰、错误道具连接、空间突变等偶发生成错误，"
+            "后续导演必须明确忽略这些错误。三个字段都使用简短自然语言。",
         )
     )
 

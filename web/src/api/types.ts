@@ -2,11 +2,13 @@
 
 export type Slot = "morning" | "noon" | "evening";
 export type StageMode = "auto" | "manual";
+export type PlanningMode = "guided_sequential" | "auto_day";
 export type ActivityFocus = "cat_lead" | "person_lead" | "balanced";
 export type ActivityFocusMode = ActivityFocus | "inherit" | "adaptive";
 export type DurationMode = "short" | "medium" | "long" | "adaptive";
 
 export interface PipelineSettings {
+  planningMode: PlanningMode;
   allowPaidGeneration: boolean;
   dayBrief: StageMode;
   script: StageMode;
@@ -67,6 +69,32 @@ export interface RunSummary {
     storyPatterns?: Record<string, Record<string, unknown>>;
   };
   currentStage?: string;
+  dayBriefConfirmed?: boolean;
+  planningMode?: PlanningMode;
+  acceptedOutcomes?: Partial<Record<Slot, AcceptedOutcomeDto>>;
+  slotPlanning?: SlotPlanningStateDto[];
+}
+
+export interface AcceptedOutcomeDto {
+  summary: string;
+  carryForward: string[];
+  doNotCarryForward: string[];
+  confirmedAt?: string;
+}
+
+export interface OutcomeDraftDto extends AcceptedOutcomeDto {
+  slot: Slot;
+  confirmed: boolean;
+  source?: "video_diagnostic" | "script_ending";
+  episodeStatus?: string;
+}
+
+export interface SlotPlanningStateDto {
+  slot: Slot;
+  planned: boolean;
+  unlocked: boolean;
+  blockReason: string | null;
+  outcomeConfirmed: boolean;
 }
 
 export interface ShotDirectionDto {
@@ -237,8 +265,9 @@ export interface WorkflowNodeDto {
     | "look"
     | "opening_anchor"
     | "video"
-    | "video_extension"
-    | "content_review";
+     | "video_extension"
+     | "content_review"
+     | "accepted_outcome";
   slot: Slot | null;
   label: string;
   status: string;

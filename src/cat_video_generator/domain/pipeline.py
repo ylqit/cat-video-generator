@@ -15,10 +15,21 @@ class StageMode(StrEnum):
     MANUAL = "manual"
 
 
+class PlanningMode(StrEnum):
+    """全天脚本的推进方式；顺序模式是Web创作台的默认质量路径。"""
+
+    GUIDED_SEQUENTIAL = "guided_sequential"
+    AUTO_DAY = "auto_day"
+
+
 PIPELINE_STAGES = ("dayBrief", "script", "visual", "video", "review")
 
 
 class PipelineSettings(StrictModel):
+    planning_mode: Annotated[
+        PlanningMode,
+        Field(alias="planningMode"),
+    ] = PlanningMode.GUIDED_SEQUENTIAL
     allow_paid_generation: Annotated[bool, Field(alias="allowPaidGeneration")] = False
     day_brief: Annotated[StageMode, Field(alias="dayBrief")] = StageMode.AUTO
     script: StageMode = StageMode.AUTO

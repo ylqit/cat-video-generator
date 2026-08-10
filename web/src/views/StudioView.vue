@@ -38,6 +38,7 @@ const AUTO_STAGE_KEYS: Array<"dayBrief" | "script" | "visual" | "video"> = [
   "video",
 ];
 const SLOT_LABEL: Record<Slot, string> = { morning: "上午", noon: "中午", evening: "傍晚" };
+const SLOT_ORDER: Slot[] = ["morning", "noon", "evening"];
 const FOCUS_LABEL = { cat_lead: "猫咪主活动", person_lead: "人物主活动", balanced: "人猫平衡" };
 
 const route = useRoute();
@@ -51,6 +52,22 @@ const selectedNode = ref<WorkflowNodeDto | null>(null);
 const previews = reactive<Record<string, EpisodePromptPreview>>({});
 const drafts = reactive<Record<string, PromptOverrides>>({});
 const overrideEnabled = reactive<Record<string, boolean>>({});
+type OutcomeForm = { summary: string; carryForwardText: string; doNotCarryForwardText: string };
+const emptyOutcomeForm = (): OutcomeForm => ({
+  summary: "",
+  carryForwardText: "",
+  doNotCarryForwardText: "",
+});
+const outcomeForms = reactive<Record<Slot, OutcomeForm>>({
+  morning: emptyOutcomeForm(),
+  noon: emptyOutcomeForm(),
+  evening: emptyOutcomeForm(),
+});
+const outcomeLoaded = reactive<Record<Slot, boolean>>({
+  morning: false,
+  noon: false,
+  evening: false,
+});
 let poller: number | undefined;
 
 const runId = computed(() => String(route.query.run ?? ""));
@@ -69,6 +86,15 @@ const failedNodes = computed(() =>
 );
 const settings = computed<PipelineSettings | null>(() => graph.value?.run.pipelineSettings ?? null);
 const canDeliver = computed(() => graph.value?.run.status === "ready");
+const guided = computed(() => settings.value?.planningMode === "guided_sequential");
+const slotCards = computed(() =>
+  SLOT_ORDER.map((slot) => ({
+    slot,
+    episode: episodes.value.find((item) => item.slot === slot),
+    state: graph.value?.run.slotPlanning?.find((item) => item.slot === slot),
+    directorNode: graph.value?.workflowNodes?.find((item) => item.id === `director:${slot}`),
+  })),
+);
 
 function setLocation(stage: Stage, slot: Slot | null = selectedSlot.value, node?: string) {
   router.replace({
@@ -111,6 +137,10 @@ watch(runId, () => {
   Object.keys(previews).forEach((key) => delete previews[key]);
   Object.keys(drafts).forEach((key) => delete drafts[key]);
   Object.keys(overrideEnabled).forEach((key) => delete overrideEnabled[key]);
+  SLOT_ORDER.forEach((slot) => {
+    outcomeForms[slot] = emptyOutcomeForm();
+    outcomeLoaded[slot] = false;
+  });
   void refresh();
 });
 
@@ -155,6 +185,94 @@ function assetsFor(episode: EpisodeDto, roles: string[]): AssetDto[] {
 
 function reviewsFor(asset: AssetDto) {
   return (graph.value?.reviews ?? []).filter((review) => review.assetId === asset.id);
+}
+
+function planningStateFor(slot: Slot) {
+  return graph.value?.run.slotPlanning?.find((item) => item.slot === slot);
+}
+
+async function planSlot(slot: Slot) {
+  try {
+    await confirmPaid(`调用${SLOT_LABEL[slot]}时段导演？该导演会读取所有前序已确认结果卡。`);
+    const accepted = await api.planSlot(runId.value, slot, true);
+    jobs.track(accepted);
+    ElMessage.info(`${SLOT_LABEL[slot]}导演任务已提交`);
+  } catch (error) {
+    if (!isDialogCancellation(error)) {
+      ElMessage.error(error instanceof ApiError ? error.message : String(error));
+    }
+  }
+}
+
+async function replanSlot(slot: Slot) {
+  try {
+    const { value } = await ElMessageBox.prompt(
+      "请说明上一候选的具体问题；新导演会读取该原因并重新输出完整时段脚本。",
+      `重规划${SLOT_LABEL[slot]}`,
+      {
+        inputPlaceholder: "例如：关系汇合不清楚，或镜头没有稳定切点",
+        inputValidator: (text) => text.trim().length >= 4 || "请至少填写4个字符",
+        confirmButtonText: "继续",
+        cancelButtonText: "取消",
+      },
+    );
+    await confirmPaid(`重新调用${SLOT_LABEL[slot]}时段导演？原失败attempt会永久保留。`);
+    const accepted = await api.replanEpisode(runId.value, slot, value.trim(), true);
+    jobs.track(accepted);
+    ElMessage.info(`${SLOT_LABEL[slot]}重规划任务已提交`);
+  } catch (error) {
+    if (!isDialogCancellation(error)) {
+      ElMessage.error(error instanceof ApiError ? error.message : String(error));
+    }
+  }
+}
+
+async function loadOutcome(slot: Slot) {
+  const result = await api.outcome(runId.value, slot);
+  outcomeForms[slot] = {
+    summary: result.summary,
+    carryForwardText: result.carryForward.join("\n"),
+    doNotCarryForwardText: result.doNotCarryForward.join("\n"),
+  };
+  outcomeLoaded[slot] = true;
+}
+
+function outcomeLines(value: string) {
+  return value
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+async function confirmOutcome(slot: Slot) {
+  const form = outcomeForms[slot];
+  try {
+    await ElMessageBox.confirm(
+      `确认${SLOT_LABEL[slot]}实际结果？后续时段导演将把这些内容视为当天事实。`,
+      "锁定结果卡",
+      { confirmButtonText: "确认并解锁下一时段", cancelButtonText: "继续编辑", type: "warning" },
+    );
+    await api.confirmOutcome(runId.value, slot, {
+      summary: form.summary.trim(),
+      carryForward: outcomeLines(form.carryForwardText),
+      doNotCarryForward: outcomeLines(form.doNotCarryForwardText),
+    });
+    ElMessage.success(`${SLOT_LABEL[slot]}结果卡已确认`);
+    await refresh();
+    if (slot !== "evening") {
+      const nextSlot = SLOT_ORDER[SLOT_ORDER.indexOf(slot) + 1];
+      setLocation("script", nextSlot);
+    }
+  } catch (error) {
+    if (!isDialogCancellation(error)) {
+      ElMessage.error(error instanceof ApiError ? error.message : String(error));
+    }
+  }
+}
+
+async function onDayBriefConfirmed() {
+  await refresh();
+  setLocation("script", "morning");
 }
 
 async function loadPreview(episode: EpisodeDto) {
@@ -292,7 +410,11 @@ onBeforeUnmount(() => window.clearInterval(poller));
           <div class="row"><h2>{{ graph.run.contentDate }} · {{ graph.run.theme ?? "全天计划" }}</h2><StatusBadge :status="graph.run.status" /></div>
           <p class="muted">{{ graph.run.nextAction }}</p>
         </div>
-        <div class="row"><el-button @click="router.push('/studio')">切换Run</el-button><el-button type="primary" @click="continuePipeline">继续流程</el-button></div>
+        <div class="row">
+          <el-tag v-if="guided" type="success">顺序人工确认</el-tag>
+          <el-button @click="router.push('/studio')">切换Run</el-button>
+          <el-button v-if="!guided" type="primary" @click="continuePipeline">继续流程</el-button>
+        </div>
       </div>
 
       <el-alert
@@ -321,12 +443,19 @@ onBeforeUnmount(() => window.clearInterval(poller));
           :run-id="runId"
           :day-brief="graph.run.dayBrief"
           :editable="graph.run.status === 'draft' || graph.run.status === 'planning_review'"
-          @saved="refresh"
+          @saved="onDayBriefConfirmed"
         />
         <el-empty v-else description="总导演尚未生成DayBrief" />
         <el-card v-if="settings" shadow="never" class="settings-card">
           <template #header><strong>自动推进设置</strong></template>
-          <div class="row wrap">
+          <el-alert
+            v-if="guided"
+            type="info"
+            :closable="false"
+            title="顺序人工确认模式"
+            description="确认DayBrief后只规划上午；上午成片批准并确认结果卡后才解锁中午，傍晚同理。"
+          />
+          <div v-else class="row wrap">
             <span v-for="key in AUTO_STAGE_KEYS" :key="key">
               {{ STAGES.find((item) => item.key === key)?.label }}
               <el-switch
@@ -340,15 +469,51 @@ onBeforeUnmount(() => window.clearInterval(poller));
       </section>
 
       <section v-else-if="activeStage === 'script'" class="stage-panel">
-        <div class="section-title"><h3>早中晚时段导演</h3><span class="muted">猫咪默认推动主要信息；每集精确时长决定是否使用官方延展。</span></div>
-        <el-card v-for="episode in episodes" :key="episode.id" class="episode-card" shadow="never">
+        <div class="section-title"><h3>早中晚时段导演</h3><span class="muted">顺序模式以下一时段实际读取前序已确认成片结果；未解锁时不会调用导演。</span></div>
+        <el-card v-for="card in slotCards" :key="card.slot" class="episode-card" shadow="never">
           <template #header>
-            <div class="row"><strong>{{ SLOT_LABEL[episode.slot] }} · {{ episode.title }}</strong><el-tag>{{ FOCUS_LABEL[episode.activityFocus] }}</el-tag><el-tag type="info">{{ episode.script.duration_seconds }}秒 · {{ episode.renderPlan.sections.length }}个任务</el-tag><el-button text type="primary" @click="openNode(nodeFor(`director:${episode.slot}`))">导演节点</el-button></div>
+            <div class="row">
+              <strong>{{ SLOT_LABEL[card.slot] }} · {{ card.episode?.title ?? "尚未规划" }}</strong>
+              <template v-if="card.episode">
+                <el-tag>{{ FOCUS_LABEL[card.episode.activityFocus] }}</el-tag>
+                <el-tag type="info">{{ card.episode.script.duration_seconds }}秒 · {{ card.episode.renderPlan.sections.length }}个任务</el-tag>
+              </template>
+              <el-tag v-else :type="card.state?.unlocked ? 'warning' : 'info'">
+                {{ card.state?.unlocked ? "已解锁" : "锁定" }}
+              </el-tag>
+              <el-button text type="primary" @click="openNode(nodeFor(`director:${card.slot}`))">导演节点</el-button>
+            </div>
           </template>
-          <el-descriptions :column="1" border size="small" style="margin-bottom: 12px">
-            <el-descriptions-item label="关系弧">{{ episode.relationshipArc }}</el-descriptions-item>
-          </el-descriptions>
-          <ScriptEditorPanel :episode="episode" :editable="['planned', 'video_pending', 'failed'].includes(episode.status)" @saved="onScriptSaved(episode.id)" />
+          <template v-if="card.episode">
+            <el-descriptions :column="1" border size="small" style="margin-bottom: 12px">
+              <el-descriptions-item label="关系弧">{{ card.episode.relationshipArc }}</el-descriptions-item>
+            </el-descriptions>
+            <ScriptEditorPanel :episode="card.episode" :editable="['planned', 'video_pending', 'failed'].includes(card.episode.status)" @saved="onScriptSaved(card.episode.id)" />
+          </template>
+          <el-result
+            v-else
+            :icon="card.state?.unlocked ? 'warning' : 'info'"
+            :title="card.state?.unlocked ? `${SLOT_LABEL[card.slot]}导演已解锁` : `${SLOT_LABEL[card.slot]}导演尚未解锁`"
+            :sub-title="card.state?.blockReason ?? '可以调用当前时段导演'"
+          >
+            <template #extra>
+              <el-button
+                v-if="card.state?.unlocked && card.directorNode?.status === 'planning_rejected'"
+                type="warning"
+                @click="replanSlot(card.slot)"
+              >按原因重规划{{ SLOT_LABEL[card.slot] }}</el-button>
+              <el-button
+                v-else-if="card.state?.unlocked && ['failed', 'submission_unknown'].includes(card.directorNode?.status ?? '')"
+                type="danger"
+                @click="openNode(card.directorNode)"
+              >查看失败与恢复操作</el-button>
+              <el-button
+                v-else-if="card.state?.unlocked"
+                type="primary"
+                @click="planSlot(card.slot)"
+              >规划{{ SLOT_LABEL[card.slot] }}</el-button>
+            </template>
+          </el-result>
         </el-card>
       </section>
 
@@ -423,6 +588,31 @@ onBeforeUnmount(() => window.clearInterval(poller));
         <el-card v-for="episode in episodes" :key="episode.id" class="episode-card" shadow="never">
           <template #header><div class="row"><strong>{{ SLOT_LABEL[episode.slot] }} · {{ episode.title }}</strong><StatusBadge :status="episode.status" /><el-button text @click="openNode(nodeFor(`content-review:${episode.slot}`))">审核节点</el-button></div></template>
           <AssetReviewPanel v-for="asset in assetsFor(episode, ['video'])" :key="asset.id" :asset="asset" :reviews="reviewsFor(asset)" :max-width="360" @reviewed="refresh" />
+          <el-divider />
+          <div class="section-title">
+            <h4>实际结果卡</h4>
+            <el-tag v-if="planningStateFor(episode.slot)?.outcomeConfirmed" type="success">已确认</el-tag>
+          </div>
+          <template v-if="planningStateFor(episode.slot)?.outcomeConfirmed">
+            <el-descriptions :column="1" border size="small">
+              <el-descriptions-item label="实际结果">{{ graph.run.acceptedOutcomes?.[episode.slot]?.summary }}</el-descriptions-item>
+              <el-descriptions-item label="继续继承">{{ graph.run.acceptedOutcomes?.[episode.slot]?.carryForward.join('；') || '无' }}</el-descriptions-item>
+              <el-descriptions-item label="禁止继承">{{ graph.run.acceptedOutcomes?.[episode.slot]?.doNotCarryForward.join('；') || '无' }}</el-descriptions-item>
+            </el-descriptions>
+          </template>
+          <template v-else-if="outcomeLoaded[episode.slot]">
+            <el-form label-position="top">
+              <el-form-item label="实际成片结果"><el-input v-model="outcomeForms[episode.slot].summary" type="textarea" :rows="3" /></el-form-item>
+              <el-form-item label="后续可以继承（每行一项）"><el-input v-model="outcomeForms[episode.slot].carryForwardText" type="textarea" :rows="3" /></el-form-item>
+              <el-form-item label="后续禁止继承的偶发错误（每行一项）"><el-input v-model="outcomeForms[episode.slot].doNotCarryForwardText" type="textarea" :rows="3" /></el-form-item>
+              <el-button type="primary" @click="confirmOutcome(episode.slot)">确认结果卡</el-button>
+            </el-form>
+          </template>
+          <el-button
+            v-else
+            :disabled="episode.status !== 'ready'"
+            @click="loadOutcome(episode.slot)"
+          >{{ episode.status === 'ready' ? '读取诊断并编辑结果卡' : '批准视频后才能确认结果卡' }}</el-button>
         </el-card>
         <DeliveryPanel :run-id="runId" :can-deliver="canDeliver" />
       </section>

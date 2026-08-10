@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 PAID_KINDS = frozenset(
     {
         "plan_day",
+        "plan_slot",
         "run_day",
         "resume_planning",
         "replan_episode",

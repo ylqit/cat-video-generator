@@ -10,6 +10,7 @@ import uuid
 from typing import Any
 
 from ..domain.contracts import Slot
+from ..domain.pipeline import PlanningMode
 from ..domain.workflow import EpisodeStatus, RunStatus, StepKind, StepStatus
 from .ports import ProductionStore, StoredEpisode
 from .video_execution import VideoExecutionService
@@ -42,7 +43,7 @@ class ProductionService:
 
         if not allow_paid_generation:
             raise ValueError("视觉生成需要显式付费许可")
-        self._require_plan(run_id)
+        self._require_plan(run_id, slot=slot)
         results: list[dict[str, Any]] = []
         for episode in self._episodes(run_id, slot):
             overrides = dict(self._repository.get_prompt_overrides(episode.id))
@@ -94,16 +95,26 @@ class ProductionService:
 
         if not allow_paid_generation:
             raise ValueError("媒体生成需要显式付费许可")
-        stored_run = self._require_plan(run_id)
+        stored_run = self._require_plan(run_id, slot=slot)
         if stored_run.status == RunStatus.DELIVERED.value:
             raise ValueError("已交付 Run 不允许继续生成")
         episodes = self._episodes(run_id, slot)
-        if stored_run.status in {RunStatus.PLANNED.value, RunStatus.FAILED.value}:
+        if stored_run.status in {
+            RunStatus.PLANNED.value,
+            RunStatus.FAILED.value,
+            RunStatus.REVIEWING.value,
+        }:
             self._repository.set_run_status(run_id, RunStatus.GENERATING)
         results = [self._run_episode(episode) for episode in episodes]
         current = self._repository.list_episodes(run_id)
-        if all(item.status is EpisodeStatus.READY for item in current):
-            self._repository.set_run_status(run_id, RunStatus.READY)
+        if len(current) == 3 and all(item.status is EpisodeStatus.READY for item in current):
+            target = (
+                RunStatus.READY
+                if self._repository.get_pipeline_settings(run_id).planning_mode
+                is PlanningMode.AUTO_DAY
+                else RunStatus.REVIEWING
+            )
+            self._repository.set_run_status(run_id, target)
         elif any(item.status is EpisodeStatus.CONTENT_REVIEW for item in current):
             self._repository.set_run_status(run_id, RunStatus.REVIEWING)
         return {"runId": str(run_id), "episodes": results}
@@ -177,9 +188,11 @@ class ProductionService:
             prompt_override=overrides.get("video"),
         )
 
-    def _require_plan(self, run_id: uuid.UUID):
+    def _require_plan(self, run_id: uuid.UUID, *, slot: Slot | None):
         stored_run = self._repository.get_run(run_id)
-        if stored_run.plan is None:
+        if slot is not None:
+            self._repository.get_episode(run_id, slot)
+        elif stored_run.plan is None:
             raise ValueError("Run 尚未形成可执行方案")
         return stored_run
 

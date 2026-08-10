@@ -352,6 +352,11 @@ class ArkGateway:
                 narrative_order_ok=bool(payload["narrativeOrderOk"]),
                 confidence=float(payload["confidence"]),
                 violations=tuple(str(item) for item in payload["violations"]),
+                actual_outcome=str(payload["actualOutcome"]),
+                carry_forward=tuple(str(item) for item in payload["carryForward"]),
+                do_not_carry_forward=tuple(
+                    str(item) for item in payload["doNotCarryForward"]
+                ),
                 evidence=tuple(
                     {
                         "timestamp": str(item["timestamp"]),

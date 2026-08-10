@@ -73,6 +73,10 @@ const attempts = computed(() => trace.value?.attempts ?? props.node?.attempts ??
 const episode = computed(() =>
   props.graph.episodes.find((item) => item.slot === props.node?.slot),
 );
+const acceptedOutcome = computed(() => {
+  const slot = props.node?.slot;
+  return slot ? props.graph.run.acceptedOutcomes?.[slot] : undefined;
+});
 const materialIds = computed(() => {
   if (trace.value) {
     const ids = trace.value.inputBindings
@@ -161,6 +165,16 @@ function close() {
               <el-descriptions-item label="精确时长">{{ episode.script.duration_seconds }}秒</el-descriptions-item>
               <el-descriptions-item label="结尾回报">{{ episode.script.ending }}</el-descriptions-item>
             </el-descriptions>
+          </template>
+          <template v-else-if="node.type === 'accepted_outcome'">
+            <h4>人工确认的实际成片结果</h4>
+            <el-descriptions v-if="acceptedOutcome" :column="1" border size="small">
+              <el-descriptions-item label="实际结果">{{ acceptedOutcome.summary }}</el-descriptions-item>
+              <el-descriptions-item label="继续继承">{{ acceptedOutcome.carryForward.join('；') || '无' }}</el-descriptions-item>
+              <el-descriptions-item label="禁止继承">{{ acceptedOutcome.doNotCarryForward.join('；') || '无' }}</el-descriptions-item>
+              <el-descriptions-item label="确认时间">{{ acceptedOutcome.confirmedAt ?? '—' }}</el-descriptions-item>
+            </el-descriptions>
+            <el-empty v-else description="视频批准后可在审核交付页编辑并确认结果卡" />
           </template>
           <div v-if="outputAssets.length" class="asset-grid">
             <AssetThumb

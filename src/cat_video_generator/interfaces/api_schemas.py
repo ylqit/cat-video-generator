@@ -106,6 +106,24 @@ class PaidRequest(BaseModel):
     allow_paid_generation: bool = Field(False, alias="allowPaidGeneration")
 
 
+class AcceptedOutcomeRequest(BaseModel):
+    """人工确认的实际成片结果；确认后才允许后续时段导演读取。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    summary: str = Field(min_length=8, max_length=1000)
+    carry_forward: list[str] = Field(
+        default_factory=list,
+        alias="carryForward",
+        max_length=8,
+    )
+    do_not_carry_forward: list[str] = Field(
+        default_factory=list,
+        alias="doNotCarryForward",
+        max_length=8,
+    )
+
+
 class RetryStepRequest(BaseModel):
     """从失败步骤显式创建新attempt；理由必填以保留来源记录。"""
 

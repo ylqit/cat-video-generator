@@ -14,20 +14,26 @@ from cat_video_generator.application.planning import (
     PlanningReviewRequired,
     PlanningService,
 )
-from cat_video_generator.application.ports import DirectorResult, StoredRun, StoredStep
+from cat_video_generator.application.ports import (
+    DirectorResult,
+    StoredEpisode,
+    StoredRun,
+    StoredStep,
+)
 from cat_video_generator.domain.contracts import (
+    AcceptedOutcome,
     ActivityFocusMode,
     DayBrief,
     RunCreativeControls,
     Slot,
     SlotCreativeControl,
 )
-from cat_video_generator.domain.pipeline import PipelineSettings
+from cat_video_generator.domain.pipeline import PipelineSettings, PlanningMode
 from cat_video_generator.domain.visual_profiles import (
     DEFAULT_SERIES_VISUAL_PROFILE,
     DEFAULT_STYLE_PROFILE,
 )
-from cat_video_generator.domain.workflow import RunStatus, StepKind, StepStatus
+from cat_video_generator.domain.workflow import EpisodeStatus, RunStatus, StepKind, StepStatus
 
 
 class Director:
@@ -56,6 +62,7 @@ class PlanningRepository:
         self.plan = None
         self.run_status = RunStatus.DRAFT.value
         self.pipeline_settings = PipelineSettings()
+        self.episodes: list[StoredEpisode] = []
 
     def create_draft_run(self, content_date: date) -> uuid.UUID:
         self.content_date = content_date
@@ -138,6 +145,22 @@ class PlanningRepository:
         self.plan = kwargs["plan"]
         self.run_status = RunStatus.PLANNED.value
 
+    def save_planned_episode(self, **kwargs):
+        episode = kwargs["episode"]
+        stored = StoredEpisode(
+            id=uuid.uuid4(),
+            run_id=self.run_id,
+            plan=episode,
+            status=EpisodeStatus.PLANNED,
+            selected_video_asset_id=None,
+        )
+        self.episodes.append(stored)
+        self.run_status = RunStatus.PLANNED.value
+        return stored
+
+    def list_episodes(self, run_id):
+        return tuple(self.episodes)
+
     def get_run(self, run_id):
         return StoredRun(self.run_id, self.content_date, self.run_status, self.plan)
 
@@ -184,6 +207,7 @@ def test_planning_calls_day_then_morning_noon_evening(daily_plan) -> None:
         planning_context="完整放风筝生活弧",
         candidate_count=1,
         allow_paid_generation=True,
+        pipeline_settings=PipelineSettings(planningMode=PlanningMode.AUTO_DAY),
     )
 
     assert len(director.prompts) == 4
@@ -215,6 +239,7 @@ def test_day_brief_manual_mode_pauses_before_slot_directors(daily_plan) -> None:
         planning_context="先确认全天主次和时长",
         candidate_count=1,
         allow_paid_generation=True,
+        pipeline_settings=PipelineSettings(planningMode=PlanningMode.AUTO_DAY),
         stop_after_day_brief=True,
     )
 
@@ -266,6 +291,7 @@ def test_invalid_episode_contract_gets_exactly_one_repair(daily_plan) -> None:
         planning_context="放风筝",
         candidate_count=1,
         allow_paid_generation=True,
+        pipeline_settings=PipelineSettings(planningMode=PlanningMode.AUTO_DAY),
     )
 
     assert result.plan.episodes[0].script.relationship_arc
@@ -284,7 +310,60 @@ def test_second_invalid_episode_enters_planning_review(daily_plan) -> None:
             planning_context="放风筝",
             candidate_count=1,
             allow_paid_generation=True,
+            pipeline_settings=PipelineSettings(planningMode=PlanningMode.AUTO_DAY),
         )
 
     assert len(director.prompts) == 3
     assert repository.run_status == RunStatus.PLANNING_REVIEW.value
+
+
+def test_guided_mode_plans_one_slot_and_uses_confirmed_outcome(daily_plan) -> None:
+    director = Director(
+        [
+            daily_plan.day_brief.model_dump(mode="json"),
+            daily_plan.episodes[0].script.model_dump(mode="json"),
+            daily_plan.episodes[1].script.model_dump(mode="json"),
+        ]
+    )
+    repository = PlanningRepository()
+    planner = service(repository, director)
+
+    paused = planner.plan_day(
+        target_date=daily_plan.content_date,
+        planning_context="放风筝",
+        candidate_count=1,
+        allow_paid_generation=True,
+        pipeline_settings=PipelineSettings(planningMode=PlanningMode.GUIDED_SEQUENTIAL),
+    )
+    assert isinstance(paused, DayBriefPause)
+    repository.context["dayBriefConfirmedAt"] = "2026-08-10T09:00:00+08:00"
+
+    planner.plan_slot(
+        repository.run_id,
+        slot=Slot.MORNING,
+        allow_paid_generation=True,
+    )
+    with pytest.raises(ValueError, match="结果卡"):
+        planner.plan_slot(
+            repository.run_id,
+            slot=Slot.NOON,
+            allow_paid_generation=True,
+        )
+
+    repository.context["acceptedOutcomes"] = {
+        "morning": AcceptedOutcome(
+            summary="上午实际完成同一只风筝，猫咪最后回到桌边。",
+            carryForward=["同一只完整风筝"],
+            doNotCarryForward=["画面中偶发出现的第二卷胶带"],
+            confirmedAt="2026-08-10T10:00:00+08:00",
+        ).model_dump(mode="json", by_alias=True)
+    }
+    planner.plan_slot(
+        repository.run_id,
+        slot=Slot.NOON,
+        allow_paid_generation=True,
+    )
+
+    assert len(director.prompts) == 3
+    assert "上午实际完成同一只风筝" in director.prompts[-1]
+    assert "偶发出现的第二卷胶带" in director.prompts[-1]

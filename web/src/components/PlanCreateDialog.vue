@@ -4,7 +4,13 @@ import { reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 
 import { api, ApiError } from "../api/client";
-import type { ActivityFocusMode, DurationMode, HealthStatus, Slot } from "../api/types";
+import type {
+  ActivityFocusMode,
+  DurationMode,
+  HealthStatus,
+  PlanningMode,
+  Slot,
+} from "../api/types";
 import { useJobsStore } from "../stores/jobs";
 
 const emit = defineEmits<{ created: [] }>();
@@ -21,7 +27,7 @@ const form = reactive({
   catPersonality: "",
   humorStyle: "",
   allowPaidGeneration: false,
-  pauseAfterDayBrief: true,
+  planningMode: "guided_sequential" as PlanningMode,
   autoVisual: false,
   autoVideo: false,
   defaultActivityFocus: "cat_lead" as Exclude<ActivityFocusMode, "inherit">,
@@ -59,11 +65,22 @@ async function submit() {
       },
       allowPaidGeneration: true,
       pipelineSettings: {
+        planningMode: form.planningMode,
         allowPaidGeneration: true,
-        dayBrief: form.pauseAfterDayBrief ? "manual" : "auto",
-        script: "auto",
-        visual: form.autoVisual ? "auto" : "manual",
-        video: form.autoVisual && form.autoVideo ? "auto" : "manual",
+        dayBrief: form.planningMode === "guided_sequential" ? "manual" : "auto",
+        script: form.planningMode === "guided_sequential" ? "manual" : "auto",
+        visual:
+          form.planningMode === "guided_sequential"
+            ? "manual"
+            : form.autoVisual
+              ? "auto"
+              : "manual",
+        video:
+          form.planningMode === "guided_sequential"
+            ? "manual"
+            : form.autoVisual && form.autoVideo
+              ? "auto"
+              : "manual",
         review: "manual",
       },
       creativeControls: {
@@ -82,7 +99,7 @@ async function submit() {
     if (final.status === "succeeded" && final.result?.runId) {
       ElMessage.success("全天方案已生成");
       emit("created");
-      router.push(`/runs/${final.result.runId}`);
+      router.push(`/studio?run=${final.result.runId}&stage=dayBrief`);
     } else {
       ElMessage.error(final.error?.message ?? "规划任务失败");
     }
@@ -143,6 +160,15 @@ defineExpose({ open });
           <el-option label="总导演自适应" value="adaptive" />
         </el-select>
       </el-form-item>
+      <el-form-item label="规划方式">
+        <el-radio-group v-model="form.planningMode">
+          <el-radio-button value="guided_sequential">顺序人工确认</el-radio-button>
+          <el-radio-button value="auto_day">全自动全天</el-radio-button>
+        </el-radio-group>
+        <div class="muted" style="width: 100%; margin-top: 6px">
+          顺序模式会在每个时段成片批准并确认实际结果后，才解锁下一时段导演。
+        </div>
+      </el-form-item>
       <el-form-item label="时段覆盖">
         <div style="width: 100%">
           <div
@@ -179,10 +205,18 @@ defineExpose({ open });
       </el-form-item>
       <el-form-item label="推进方式">
         <div style="width: 100%">
-          <el-checkbox v-model="form.pauseAfterDayBrief">总导演后暂停，先确认主次关系与时长档</el-checkbox>
-          <el-checkbox v-model="form.autoVisual">三集导演完成后自动生成视觉锚点</el-checkbox>
-          <el-checkbox v-model="form.autoVideo" :disabled="!form.autoVisual">视觉锚点通过后自动生成视频</el-checkbox>
-          <div class="muted">关闭自动项后，可在统一工作台逐节点确认并付费生成。</div>
+          <template v-if="form.planningMode === 'guided_sequential'">
+            <el-alert
+              type="info"
+              :closable="false"
+              title="总导演后暂停；上午→结果卡→中午→结果卡→傍晚按顺序人工推进。"
+            />
+          </template>
+          <template v-else>
+            <el-checkbox v-model="form.autoVisual">三集导演完成后自动生成视觉锚点</el-checkbox>
+            <el-checkbox v-model="form.autoVideo" :disabled="!form.autoVisual">视觉锚点通过后自动生成视频</el-checkbox>
+            <div class="muted">关闭自动项后，可在统一工作台逐节点确认并付费生成。</div>
+          </template>
         </div>
       </el-form-item>
       <el-form-item>

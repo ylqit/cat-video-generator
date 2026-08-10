@@ -36,6 +36,9 @@ VIDEO_DIAGNOSTIC_SCHEMA = {
         "narrativeOrderOk": {"type": "boolean"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "violations": {"type": "array", "items": {"type": "string"}},
+        "actualOutcome": {"type": "string", "minLength": 8},
+        "carryForward": {"type": "array", "items": {"type": "string"}},
+        "doNotCarryForward": {"type": "array", "items": {"type": "string"}},
         "evidence": {
             "type": "array",
             "items": {
@@ -58,6 +61,9 @@ VIDEO_DIAGNOSTIC_SCHEMA = {
         "narrativeOrderOk",
         "confidence",
         "violations",
+        "actualOutcome",
+        "carryForward",
+        "doNotCarryForward",
         "evidence",
     ],
     "additionalProperties": False,

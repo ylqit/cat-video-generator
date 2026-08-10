@@ -150,6 +150,42 @@ def create_write_router(
         )
         return _accepted(record)
 
+    @router.post("/runs/{run_id}/slots/{slot}/plan", status_code=202)
+    def plan_slot(
+        run_id: uuid.UUID,
+        slot: Slot,
+        request: PaidRequest,
+    ) -> dict[str, Any]:
+        """顺序人工模式只调用当前已解锁时段的导演。"""
+
+        if not request.allow_paid_generation:
+            raise HTTPException(
+                status_code=422,
+                detail="时段导演调用付费模型，必须显式确认allowPaidGeneration",
+            )
+
+        def task() -> dict[str, Any]:
+            return _jsonable(
+                planning.plan_slot(
+                    run_id,
+                    slot=slot,
+                    allow_paid_generation=True,
+                )
+            )
+
+        record = _submit(
+            job_registry,
+            kind="plan_slot",
+            dedup_key=f"plan-slot:{run_id}:{slot.value}",
+            fn=task,
+            context={
+                "runId": run_id,
+                "slot": slot.value,
+                "operationKey": f"director:episode:{slot.value}",
+            },
+        )
+        return _accepted(record)
+
     @router.post("/runs/{run_id}/resume", status_code=202)
     def resume(run_id: uuid.UUID) -> dict[str, Any]:
         def task() -> list[dict[str, Any]]:

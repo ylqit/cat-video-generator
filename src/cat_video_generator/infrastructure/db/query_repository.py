@@ -20,8 +20,9 @@ from ...domain.contracts import (
     RecentContentSummary,
     Slot,
 )
+from ...domain.pipeline import PipelineSettings
 from ...domain.rendering import build_render_plan
-from ...domain.workflow import PromptPurpose, RunStatus
+from ...domain.workflow import EpisodeStatus, PromptPurpose, RunStatus
 from .models import (
     Asset,
     DeliveryItem,
@@ -49,6 +50,50 @@ from .session import ALEMBIC_HEAD
 
 class RecordNotFoundError(LookupError):
     """请求的工作流记录不存在。"""
+
+
+def _slot_planning_state(
+    episodes: tuple[Episode, ...],
+    accepted_outcomes: object,
+    *,
+    guided: bool,
+    day_brief_confirmed: bool = True,
+) -> list[dict[str, Any]]:
+    """投影逐时段解锁状态；只依据已落库Episode和人工确认结果。"""
+
+    planned = {item.slot for item in episodes}
+    outcomes = accepted_outcomes if isinstance(accepted_outcomes, dict) else {}
+    result: list[dict[str, Any]] = []
+    for slot in Slot:
+        previous = [item.value for item in Slot if item.sort_order < slot.sort_order]
+        missing_outcomes = [item for item in previous if item not in outcomes]
+        is_planned = slot.value in planned
+        if not guided:
+            unlocked, reason = not is_planned, None
+        elif is_planned:
+            unlocked, reason = False, "该时段已经规划"
+        elif not day_brief_confirmed:
+            unlocked, reason = False, "请先保存并确认全天总导演边界"
+        elif any(
+            item.value not in planned
+            for item in Slot
+            if item.sort_order < slot.sort_order
+        ):
+            unlocked, reason = False, "前序时段尚未规划"
+        elif missing_outcomes:
+            unlocked, reason = False, "请先批准并确认" + "、".join(missing_outcomes) + "结果卡"
+        else:
+            unlocked, reason = True, None
+        result.append(
+            {
+                "slot": slot.value,
+                "planned": is_planned,
+                "unlocked": unlocked,
+                "blockReason": reason,
+                "outcomeConfirmed": slot.value in outcomes,
+            }
+        )
+    return result
 
 
 def _trace_input_bindings(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
@@ -90,6 +135,32 @@ def _current_stage(
 ) -> str:
     if "dayBrief" not in run.planning_json:
         return "dayBrief"
+    settings = PipelineSettings.model_validate(run.pipeline_settings_json or {})
+    if settings.planning_mode.value == "guided_sequential":
+        if "dayBriefConfirmedAt" not in run.planning_json:
+            return "dayBrief"
+        outcomes = run.planning_json.get("acceptedOutcomes", {}) or {}
+        by_slot = {item.slot: item for item in episodes}
+        for slot in Slot:
+            episode = by_slot.get(slot.value)
+            if episode is None:
+                return "script"
+            status = EpisodeStatus(episode.status)
+            if status in {EpisodeStatus.PLANNED, EpisodeStatus.PREPARING_VISUALS}:
+                return "visual"
+            if status in {
+                EpisodeStatus.VIDEO_PENDING,
+                EpisodeStatus.VIDEO_GENERATING,
+                EpisodeStatus.MEDIA_QC,
+            }:
+                return "video"
+            if status in {EpisodeStatus.CONTENT_REVIEW, EpisodeStatus.READY} and (
+                status is not EpisodeStatus.READY or slot.value not in outcomes
+            ):
+                return "review"
+            if status is EpisodeStatus.FAILED:
+                return "script"
+        return "review"
     if run.status == RunStatus.DRAFT.value:
         return "dayBrief"
     if run.status == RunStatus.PLANNING_REVIEW.value:
@@ -106,13 +177,52 @@ def _current_stage(
     return "script"
 
 
+def _guided_next_action(
+    episodes: tuple[Episode, ...],
+    accepted_outcomes: object,
+    *,
+    day_brief_confirmed: bool,
+) -> str:
+    """返回顺序工作台唯一应执行的下一步，不用Run粗粒度状态猜测。"""
+
+    if not day_brief_confirmed:
+        return "保存并确认全天总导演边界"
+    outcomes = accepted_outcomes if isinstance(accepted_outcomes, dict) else {}
+    by_slot = {item.slot: item for item in episodes}
+    for slot in Slot:
+        episode = by_slot.get(slot.value)
+        if episode is None:
+            return f"规划{slot.value}时段导演"
+        status = EpisodeStatus(episode.status)
+        if status is EpisodeStatus.PLANNED:
+            return f"生成并审核{slot.value}视觉锚点"
+        if status is EpisodeStatus.PREPARING_VISUALS:
+            return f"完成{slot.value}视觉锚点审核"
+        if status is EpisodeStatus.VIDEO_PENDING:
+            return f"生成{slot.value}视频"
+        if status in {
+            EpisodeStatus.VIDEO_GENERATING,
+            EpisodeStatus.MEDIA_QC,
+        }:
+            return f"等待或恢复{slot.value}视频任务"
+        if status is EpisodeStatus.CONTENT_REVIEW:
+            return f"人工观看并审核{slot.value}视频"
+        if status is EpisodeStatus.FAILED:
+            return f"查看{slot.value}失败节点并选择重试或重规划"
+        if slot.value not in outcomes:
+            return f"编辑并确认{slot.value}实际结果卡"
+    return "构建本地1/2/3交付包"
+
+
 def _workflow_nodes(
     episodes: tuple[Episode, ...],
     steps: tuple[WorkflowStep, ...],
     prompts: tuple[PromptRecord, ...],
     assets: tuple[Asset, ...],
     reviews: tuple[Review, ...],
+    accepted_outcomes: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    accepted_outcomes = accepted_outcomes or {}
     prompt_ids: dict[uuid.UUID, list[str]] = {}
     review_ids: dict[uuid.UUID, list[str]] = {}
     for prompt in prompts:
@@ -177,15 +287,29 @@ def _workflow_nodes(
             "attempts": attempts,
         }
 
-    def director_state(step: WorkflowStep | None) -> tuple[str, str]:
+    def director_state(step: WorkflowStep | None) -> tuple[str, str, str]:
         if step is None:
-            return "pending", "pending"
+            return "pending", "pending", "pending"
         if (step.error_json or {}).get("code") == "invalid_director_output":
-            return "succeeded", "rejected"
-        return step.status, "parsed" if step.status == "succeeded" else "not_available"
+            return "succeeded", "rejected", "rejected"
+        semantic_rejected = any(
+            item.step_id == step.id
+            and item.decision == "rejected"
+            and (item.evidence_json or {}).get("phase") == "episode_contract"
+            for item in reviews
+        )
+        return (
+            step.status,
+            "parsed" if step.status == "succeeded" else "not_available",
+            "rejected"
+            if semantic_rejected
+            else "approved"
+            if step.status == "succeeded"
+            else "pending",
+        )
 
     day_step = latest("director:day")
-    provider, contract = director_state(day_step)
+    provider, contract, semantic = director_state(day_step)
     nodes = [
         {
             **node(
@@ -196,6 +320,7 @@ def _workflow_nodes(
                 contract_status=contract,
             ),
             "providerStatus": provider,
+            "semanticReviewStatus": semantic,
         }
     ]
     episodes_by_slot = {item.slot: item for item in episodes}
@@ -207,7 +332,7 @@ def _workflow_nodes(
             item for item in assets if episode_id is not None and item.episode_id == episode_id
         )
         director = latest(f"director:episode:{slot}")
-        provider, contract = director_state(director)
+        provider, contract, semantic = director_state(director)
         director_node = node(
             node_id=f"director:{slot}",
             node_type="director",
@@ -215,12 +340,12 @@ def _workflow_nodes(
             label=f"{slot}导演",
             step=director,
             contract_status=contract,
-            semantic_status=("approved" if contract == "parsed" and episode else "pending"),
+            semantic_status=("approved" if semantic == "approved" and episode else semantic),
         )
         director_node["providerStatus"] = provider
-        if contract == "rejected":
+        if contract == "rejected" or semantic == "rejected":
             director_node["status"] = "planning_rejected"
-            director_node["nextAction"] = "查看契约原因后显式重规划本时段"
+            director_node["nextAction"] = "查看拒绝原因后显式重规划本时段"
         nodes.append(director_node)
         if episode is None:
             nodes.extend(
@@ -253,6 +378,18 @@ def _workflow_nodes(
                         label=f"{slot}内容审核",
                         step=None,
                     ),
+                    {
+                        **node(
+                            node_id=f"outcome:{slot}",
+                            node_type="accepted_outcome",
+                            slot=slot,
+                            label=f"{slot}结果卡",
+                            step=None,
+                            status="locked",
+                            semantic_status="pending",
+                        ),
+                        "providerStatus": "not_applicable",
+                    },
                 )
             )
             continue
@@ -362,6 +499,34 @@ def _workflow_nodes(
                 semantic_status=content_status,
             )
         )
+        outcome = accepted_outcomes.get(slot)
+        nodes.append(
+            {
+                **node(
+                    node_id=f"outcome:{slot}",
+                    node_type="accepted_outcome",
+                    slot=slot,
+                    label=f"{slot}结果卡",
+                    step=None,
+                    status=(
+                        "confirmed"
+                        if isinstance(outcome, dict)
+                        else "pending"
+                        if content_status == "approved"
+                        else "locked"
+                    ),
+                    semantic_status=(
+                        "approved" if isinstance(outcome, dict) else "pending"
+                    ),
+                ),
+                "providerStatus": "not_applicable",
+                "nextAction": (
+                    None
+                    if isinstance(outcome, dict)
+                    else "人工批准视频后编辑并确认实际结果"
+                ),
+            }
+        )
     return nodes
 
 
@@ -411,9 +576,25 @@ class SqlAlchemyReadRepository:
                     "dayBrief": run.planning_json.get("dayBrief"),
                     "episodeDrafts": run.planning_json.get("episodeDrafts", {}),
                     "planningMetadata": run.planning_json.get("planningMetadata", {}),
+                    "acceptedOutcomes": run.planning_json.get("acceptedOutcomes", {}),
+                    "dayBriefConfirmed": "dayBriefConfirmedAt" in run.planning_json,
                     "currentStage": _current_stage(run, episodes, steps),
                 }
             )
+            settings = PipelineSettings.model_validate(run.pipeline_settings_json or {})
+            payload["planningMode"] = settings.planning_mode.value
+            payload["slotPlanning"] = _slot_planning_state(
+                episodes,
+                run.planning_json.get("acceptedOutcomes", {}),
+                guided=settings.planning_mode.value == "guided_sequential",
+                day_brief_confirmed="dayBriefConfirmedAt" in run.planning_json,
+            )
+            if settings.planning_mode.value == "guided_sequential":
+                payload["nextAction"] = _guided_next_action(
+                    episodes,
+                    run.planning_json.get("acceptedOutcomes", {}),
+                    day_brief_confirmed="dayBriefConfirmedAt" in run.planning_json,
+                )
             return {
                 "run": payload,
                 "episodes": [episode_dict(item) for item in episodes],
@@ -421,7 +602,51 @@ class SqlAlchemyReadRepository:
                 "prompts": [prompt_dict(item) for item in prompts],
                 "assets": [asset_dict(item) for item in assets],
                 "reviews": [review_dict(item) for item in reviews],
-                "workflowNodes": _workflow_nodes(episodes, steps, prompts, assets, reviews),
+                "workflowNodes": _workflow_nodes(
+                    episodes,
+                    steps,
+                    prompts,
+                    assets,
+                    reviews,
+                    run.planning_json.get("acceptedOutcomes", {}) or {},
+                ),
+            }
+
+    def get_outcome_source(self, run_id: uuid.UUID, slot: Slot) -> dict[str, Any]:
+        """读取结果卡草稿所需的已批准视频及最新诊断，不解释剧情。"""
+
+        with self._sessions() as session:
+            run = required_record(session, ProductionRun, run_id)
+            ensure_current_contract(run)
+            episode = session.execute(
+                select(Episode).where(
+                    Episode.production_run_id == run_id,
+                    Episode.slot == slot.value,
+                )
+            ).scalar_one_or_none()
+            if episode is None:
+                raise RecordNotFoundError(f"Run {run_id}没有{slot.value} Episode")
+            diagnostic: dict[str, Any] = {}
+            if episode.selected_video_asset_id is not None:
+                review = session.execute(
+                    select(Review)
+                    .where(
+                        Review.asset_id == episode.selected_video_asset_id,
+                        Review.source == "ark_visual",
+                    )
+                    .order_by(Review.created_at.desc())
+                ).scalars().first()
+                if review is not None:
+                    diagnostic = dict(review.evidence_json or {})
+            return {
+                "episodeStatus": episode.status,
+                "script": EpisodeScript.model_validate(episode.script_json).model_dump(
+                    mode="json"
+                ),
+                "diagnostic": diagnostic,
+                "acceptedOutcome": (run.planning_json.get("acceptedOutcomes", {}) or {}).get(
+                    slot.value
+                ),
             }
 
     def get_planning_context(self, run_id: uuid.UUID) -> dict[str, Any]:

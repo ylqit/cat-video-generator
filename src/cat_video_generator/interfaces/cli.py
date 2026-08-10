@@ -14,7 +14,7 @@ from typing import Any
 
 import typer
 
-from ..application.planning import PlanningReviewRequired
+from ..application.planning import DayBriefPause, PlanningReviewRequired
 from ..bootstrap import (
     build_diagnostic_container,
     build_local_container,
@@ -23,6 +23,7 @@ from ..bootstrap import (
 )
 from ..config import RuntimeSettings, load_local_env
 from ..domain.contracts import Slot
+from ..domain.pipeline import PipelineSettings, PlanningMode
 from .api import create_app, create_full_app
 from .jobs import JobRegistry
 
@@ -146,6 +147,10 @@ def plan_day(
         False,
         "--allow-paid-generation",
     ),
+    planning_mode: PlanningMode = typer.Option(
+        PlanningMode.AUTO_DAY,
+        "--planning-mode",
+    ),
 ) -> None:
     """调用Ark导演并保存一份可执行全天方案。"""
 
@@ -165,17 +170,30 @@ def plan_day(
                     else container.runtime_settings.candidate_count
                 ),
                 allow_paid_generation=allow_paid_generation,
+                pipeline_settings=PipelineSettings(
+                    planningMode=planning_mode,
+                    allowPaidGeneration=allow_paid_generation,
+                ),
             )
         except PlanningReviewRequired as exc:
             _emit_planning_review(exc)
-        _echo(
-            {
-                "runId": str(result.run_id),
-                "selectedCandidate": result.selected_candidate,
-                "candidateCount": result.candidate_count,
-                "plan": result.plan.model_dump(mode="json"),
-            }
-        )
+        if isinstance(result, DayBriefPause):
+            _echo(
+                {
+                    "runId": str(result.run_id),
+                    "pausedAt": "dayBrief",
+                    "dayBrief": result.day_brief.model_dump(mode="json"),
+                }
+            )
+        else:
+            _echo(
+                {
+                    "runId": str(result.run_id),
+                    "selectedCandidate": result.selected_candidate,
+                    "candidateCount": result.candidate_count,
+                    "plan": result.plan.model_dump(mode="json"),
+                }
+            )
     finally:
         container.close()
 

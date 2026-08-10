@@ -8,11 +8,12 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
 
-from ...domain.contracts import DailyProductionPlan, DayBrief, EpisodePlan
+from ...domain.contracts import AcceptedOutcome, DailyProductionPlan, DayBrief, EpisodePlan, Slot
 from ...domain.pipeline import PipelineSettings
 from ...domain.workflow import (
     EpisodeStatus,
@@ -68,6 +69,47 @@ class PlanPersistenceMixin:
                 )
                 for episode in plan.episodes
             )
+
+    def save_planned_episode(
+        self,
+        *,
+        run_id: uuid.UUID,
+        episode: EpisodePlan,
+    ):
+        """顺序模式原子落库单个时段；已存在时段不会被静默覆盖。"""
+
+        from .records import stored_episode
+
+        with self._sessions.begin() as session:  # type: ignore[attr-defined]
+            run = _required(session, ProductionRun, run_id)
+            existing = session.execute(
+                select(Episode).where(
+                    Episode.production_run_id == run_id,
+                    Episode.slot == episode.slot.value,
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                raise ValueError(f"{episode.slot.value}时段已经规划，不能重复创建")
+            row = Episode(
+                production_run_id=run_id,
+                slot=episode.slot.value,
+                sort_order=episode.slot.sort_order,
+                script_json=episode.script.model_dump(mode="json"),
+                status=EpisodeStatus.PLANNED.value,
+            )
+            session.add(row)
+            drafts = dict(run.planning_json.get("episodeDrafts", {}))
+            drafts[episode.slot.value] = episode.script.model_dump(mode="json")
+            run.planning_json = {**run.planning_json, "episodeDrafts": drafts}
+            current = RunStatus(run.status)
+            if current in {
+                RunStatus.DRAFT,
+                RunStatus.PLANNING_REVIEW,
+                RunStatus.FAILED,
+            }:
+                run.status = transition_run(current, RunStatus.PLANNED).value
+            session.flush()
+            return stored_episode(row)
 
     def save_planning_context(
         self,
@@ -215,7 +257,54 @@ class PlanPersistenceMixin:
                 **run.planning_json,
                 "dayBrief": day_brief.model_dump(mode="json"),
                 "episodeDrafts": {},
+                "dayBriefConfirmedAt": datetime.now(timezone.utc).isoformat(),
             }
+
+    def save_accepted_outcome(
+        self,
+        *,
+        run_id: uuid.UUID,
+        slot: Slot,
+        outcome: AcceptedOutcome,
+    ) -> None:
+        """原子保存用户确认结果；较晚时段存在后禁止改写历史事实。"""
+
+        with self._sessions.begin() as session:  # type: ignore[attr-defined]
+            run = _required(session, ProductionRun, run_id)
+            episode = session.execute(
+                select(Episode).where(
+                    Episode.production_run_id == run_id,
+                    Episode.slot == slot.value,
+                )
+            ).scalar_one_or_none()
+            if episode is None or EpisodeStatus(episode.status) is not EpisodeStatus.READY:
+                raise ValueError("只有人工批准的最终视频才能确认时段结果")
+            later = session.execute(
+                select(Episode.id).where(
+                    Episode.production_run_id == run_id,
+                    Episode.sort_order > slot.sort_order,
+                )
+            ).first()
+            if later is not None:
+                raise ValueError("后续时段已经规划，不能改写其依赖的已确认结果")
+            outcomes = dict(run.planning_json.get("acceptedOutcomes", {}))
+            if slot.value in outcomes:
+                raise ValueError("结果卡已经确认；如成片事实错误，请重做该时段而不是覆盖历史")
+            outcomes[slot.value] = outcome.model_dump(mode="json", by_alias=True)
+            run.planning_json = {**run.planning_json, "acceptedOutcomes": outcomes}
+            if len(outcomes) == len(Slot):
+                episodes = tuple(
+                    session.execute(
+                        select(Episode).where(Episode.production_run_id == run_id)
+                    ).scalars()
+                )
+                if len(episodes) == len(Slot) and all(
+                    EpisodeStatus(item.status) is EpisodeStatus.READY for item in episodes
+                ):
+                    run.status = transition_run(
+                        RunStatus(run.status),
+                        RunStatus.READY,
+                    ).value
 
     def save_pipeline_settings(
         self,

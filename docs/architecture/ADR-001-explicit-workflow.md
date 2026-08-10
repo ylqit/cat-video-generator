@@ -22,7 +22,7 @@ Domain不依赖框架或I/O；Application只依赖Domain和所需Port；Infrastr
 决定业务状态；接口层不直接写数据库或调用Ark。禁止只改名、转发参数或格式化
 路径的薄包装。
 
-## 唯一生产模型
+## 两种规划模式与唯一生产模型
 
 ```text
 RunCreativeControls
@@ -31,11 +31,30 @@ RunCreativeControls
 → RenderPlan（确定性推导）
 ```
 
+Web默认使用`guided_sequential`：DayBrief人工确认后只规划Morning；Morning最终视频
+人工批准并确认`AcceptedOutcome`后才解锁Noon，Evening同理。结果卡只保存实际成片
+摘要、可安全继承事实和禁止继承的偶发错误，位于`production_runs.planning_json`，
+不增加第二套状态源。`auto_day`保留为无人值守批量模式，仍一次顺序生成三个脚本。
+
+轻量总导演只定义全天边界、时段职责、活动焦点、时长档和交接意图，不设计手部动作、
+道具机制或镜头。顺序模式的后续时段导演读取人工确认后的实际成片结果，而不是把上一
+时段原始脚本或视觉诊断自动当成事实。
+
 `EpisodeScript`采用极简混合契约：完整长剧情是创作事实主体，活动焦点、时长、外观、
 关系弧、1～3段完整镜头描述和少量`hardConstraints`构成机器可读控制壳。镜头段落一次
 说明景别、机位、唯一运镜、站位、动作路径、接触结果和稳定切点；不会把同一剧情再
 拆成动作表和重复镜头字段。连接、承重、容器、接触、交接和穿戴等真正影响出片正确性
 的关系才进入硬约束，并由同一来源投影到图片、视频和审核Prompt。
+
+`storyText`服务于规划、人工阅读和媒体诊断；Seedance初始请求只接收当前RenderSection
+的镜头段落、相关硬约束、外观、声音和区段结尾。延展请求只承接输入视频末帧并执行
+下一RenderSection，不复述完整前文，避免触发动作重演。
+
+导演方法吸收`docs/healing-life-director`的“开场存在未完成小事件、猫咪先触发、每
+2～3秒刷新可见信息、结尾回应开场”和`docs/director`的“一镜一种运镜、路径/速度/
+接触/结果、稳定切点、必要素材、根因修复”。两份Docs只作为设计来源，不成为运行时
+依赖；固定女孩/服装/眼睛、九宫格、固定五镜、逐镜收费、FFmpeg创作拼接和重型世界
+状态均明确排除。
 
 系统不保存世界状态模拟、故事板面板、供应商输入模式、重复道具起终表或数据库资产ID。
 默认关系为猫咪推动主要可见信息、人物完成副活动或回应、两条线汇合回报。
@@ -55,7 +74,7 @@ domain/prompts.py      导演、定妆、开场锚点、视频和审核Prompt
 domain/rules.py        少量身份、时长与跨时段硬门
 domain/workflow.py     Run/Episode/Step合法状态转换
 
-application/planning.py            四次顺序导演调用与局部重规划
+application/planning.py            auto_day四次调用或guided逐时段导演与局部重规划
 application/visual_preparation.py  定妆图、开场锚点和图片审核
 application/video_execution.py     初始生成、官方延展、恢复、下载和QC
 application/production.py          流程编排
@@ -78,3 +97,4 @@ assets / reviews / delivery_packages / delivery_items`。
 9. 导演原始结构化JSON、可选归一化结果和警告保存在Step快照；查询层只在打开节点时
    投影完整Trace，禁止把Key、Base64、签名URL或SDK对象写入数据库。
 10. 高级Prompt覆盖绑定当前脚本哈希；上游脚本变化后自动失效，旧attempt Prompt永久保留。
+11. 视频语义诊断只能生成结果卡草稿；只有人工批准视频并确认结果卡，后续导演才可读取。

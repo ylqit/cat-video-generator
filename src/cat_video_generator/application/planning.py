@@ -1,7 +1,8 @@
 """总导演与三个时段导演的顺序规划用例。
 
-一次全天规划固定产生四个独立 Ark 调用：DayBrief、morning、noon、evening。
-每个 Prompt 和结构化输出都先落入工作流，单个时段失败不会要求重做全天方向。
+auto_day一次产生DayBrief、morning、noon、evening四个独立Ark调用；
+guided_sequential先生成DayBrief，后续只在前一时段成片结果被人工确认后调用当前导演。
+每个Prompt和结构化输出都先落入工作流，单个时段失败不会要求重做全天方向。
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from ..domain.contracts import (
+    AcceptedOutcome,
     ActivityFocusMode,
     DailyProductionPlan,
     DayBrief,
@@ -24,7 +26,7 @@ from ..domain.contracts import (
     Slot,
     SlotBrief,
 )
-from ..domain.pipeline import PipelineSettings
+from ..domain.pipeline import PipelineSettings, PlanningMode
 from ..domain.prompts import (
     PromptCompilationError,
     compile_day_director_prompt,
@@ -66,6 +68,16 @@ class PlanningResult:
 @dataclass(frozen=True, slots=True)
 class EpisodeReplanResult:
     """单个时段局部重规划结果。"""
+
+    run_id: uuid.UUID
+    slot: Slot
+    attempt: int
+    episode: EpisodePlan
+
+
+@dataclass(frozen=True, slots=True)
+class SlotPlanningResult:
+    """顺序人工模式一次只落库一个已解锁时段。"""
 
     run_id: uuid.UUID
     slot: Slot
@@ -135,7 +147,7 @@ class PlanningService:
         story_mode: str = "auto",
         creative_controls: RunCreativeControls | None = None,
     ) -> PlanningResult | DayBriefPause:
-        """按总导演→早→中→晚生成一份可执行全天方案。
+        """创建Run并按规划方式生成DayBrief或完整全天计划。
 
         ``stop_after_day_brief`` 用于创作台dayBrief阶段的手动开关：
         DayBrief落库后直接断点返回（Run保持draft），人工编辑后由
@@ -186,10 +198,12 @@ class PlanningService:
             "creativeControls": controls.model_dump(mode="json"),
         }
         run_id = self._repository.create_draft_run(target_date)
+        settings = pipeline_settings or PipelineSettings(
+            allow_paid_generation=allow_paid_generation
+        )
         self._repository.save_pipeline_settings(
             run_id=run_id,
-            settings=pipeline_settings
-            or PipelineSettings(allow_paid_generation=allow_paid_generation),
+            settings=settings,
         )
         try:
             if user_story is not None:
@@ -239,7 +253,10 @@ class PlanningService:
                 drafts,
                 planning_metadata,
             )
-            if stop_after_day_brief:
+            if (
+                settings.planning_mode is PlanningMode.GUIDED_SEQUENTIAL
+                or stop_after_day_brief
+            ):
                 return DayBriefPause(run_id=run_id, day_brief=day_brief)
             return self._complete_plan(
                 run_id=run_id,
@@ -268,6 +285,9 @@ class PlanningService:
         """复用已成功DayBrief，只补齐失败或尚未生成的时段导演。"""
 
         self._check_paid(allow_paid_generation)
+        settings = self._repository.get_pipeline_settings(run_id)
+        if settings.planning_mode is PlanningMode.GUIDED_SEQUENTIAL:
+            raise ValueError("顺序人工模式请从Web显式规划当前已解锁时段")
         stored_run = self._repository.get_run(run_id)
         if stored_run.plan is not None:
             return PlanningResult(run_id, 1, 1, stored_run.plan)
@@ -295,6 +315,79 @@ class PlanningService:
         except Exception:
             self._repository.set_run_status(run_id, RunStatus.FAILED)
             raise
+
+    def plan_slot(
+        self,
+        run_id: uuid.UUID,
+        *,
+        slot: Slot,
+        allow_paid_generation: bool,
+    ) -> SlotPlanningResult:
+        """在顺序人工模式中只规划一个已解锁时段。"""
+
+        self._check_paid(allow_paid_generation)
+        settings = self._repository.get_pipeline_settings(run_id)
+        if settings.planning_mode is not PlanningMode.GUIDED_SEQUENTIAL:
+            raise ValueError("auto_day模式由全天规划入口一次生成三个时段")
+        stored_run = self._repository.get_run(run_id)
+        if stored_run.status in {RunStatus.READY.value, RunStatus.DELIVERED.value}:
+            raise ValueError(f"Run状态{stored_run.status}不允许继续规划")
+        context = self._repository.get_planning_context(run_id)
+        if "dayBrief" not in context:
+            raise ValueError("请先完成并确认全天总导演")
+        if "dayBriefConfirmedAt" not in context:
+            raise ValueError("请先在Web保存并确认全天总导演边界")
+        day_brief = DayBrief.model_validate(context["dayBrief"])
+        existing = self._repository.list_episodes(run_id)
+        if any(item.plan.slot is slot for item in existing):
+            raise ValueError(f"{slot.value}时段已经规划")
+        expected = list(Slot)[len(existing)] if len(existing) < 3 else None
+        if expected is None or slot is not expected:
+            expected_label = "无" if expected is None else expected.value
+            raise ValueError(f"顺序模式当前只能规划{expected_label}时段")
+
+        outcomes = _parse_accepted_outcomes(context.get("acceptedOutcomes", {}))
+        previous_slots = tuple(
+            item for item in Slot if item.sort_order < slot.sort_order
+        )
+        missing = tuple(item.value for item in previous_slots if item not in outcomes)
+        if missing:
+            raise ValueError("请先批准视频并确认结果卡：" + "、".join(missing))
+        history = tuple(
+            _accepted_outcome_summary(item, outcomes[item]) for item in previous_slots
+        )
+        slot_brief = next(item for item in day_brief.slot_briefs if item.slot is slot)
+        metadata = dict(context.get("planningMetadata", {}))
+        series_profile = _series_profile_from_metadata(metadata, self._series_profile)
+        episode, _, attempt = self._generate_episode(
+            run_id=run_id,
+            day_brief=day_brief,
+            slot_brief=slot_brief,
+            previous=tuple(item.plan for item in existing),
+            previous_state_summaries=history,
+            parent_step_id=uuid.UUID(context["dayDirectorStepId"]),
+            parent_prompt_id=uuid.UUID(context["dayDirectorPromptId"]),
+            retry_reason=None,
+            recent_summaries=_parse_recent_summaries(
+                metadata.get("recentSummaries", ())
+            ),
+            story_pattern=_story_patterns_from_metadata(metadata).get(slot),
+            series_profile=series_profile,
+            user_episode_text=_user_episode_text(
+                _user_story_from_metadata(metadata),
+                slot,
+            ),
+        )
+        candidate = [*(item.plan for item in existing), episode]
+        if len(candidate) == 3:
+            self._assemble_plan(
+                run_id,
+                day_brief,
+                candidate,
+                series_profile=series_profile,
+            )
+        self._repository.save_planned_episode(run_id=run_id, episode=episode)
+        return SlotPlanningResult(run_id, slot, attempt, episode)
 
     def _complete_plan(
         self,
@@ -380,13 +473,23 @@ class PlanningService:
             RunStatus.READY.value,
         }:
             raise ValueError(f"Run状态{stored_run.status}不允许重规划")
-        # 已完成方案的局部重规划需要先作废该Episode的下游媒体；初始规划若在
-        # Episode落库前进入planning_review，数据库里本来就没有对应Episode，
-        # 此时直接使用已保存的DayBrief与候选上下文生成缺失时段。
-        if stored_run.plan is not None:
-            stored_episode = self._repository.get_episode(run_id, slot)
-            if stored_episode.status not in {EpisodeStatus.PLANNED, EpisodeStatus.FAILED}:
-                self._repository.set_episode_status(stored_episode.id, EpisodeStatus.FAILED)
+        stored_episodes = self._repository.list_episodes(run_id)
+        stored_episode = next(
+            (item for item in stored_episodes if item.plan.slot is slot),
+            None,
+        )
+        settings = self._repository.get_pipeline_settings(run_id)
+        if (
+            settings.planning_mode is PlanningMode.GUIDED_SEQUENTIAL
+            and any(item.plan.slot.sort_order > slot.sort_order for item in stored_episodes)
+        ):
+            raise ValueError("后续时段已依赖当前结果，不能原位重规划前序时段")
+        # 局部重规划只作废当前Episode的下游媒体；其他已经确认的时段保持不变。
+        if stored_episode is not None and stored_episode.status not in {
+            EpisodeStatus.PLANNED,
+            EpisodeStatus.FAILED,
+        }:
+            self._repository.set_episode_status(stored_episode.id, EpisodeStatus.FAILED)
         context = self._repository.get_planning_context(run_id)
         if "dayBrief" not in context:
             raise ValueError("该Run没有分层导演DayBrief，不能局部重规划")
@@ -395,8 +498,7 @@ class PlanningService:
             key: EpisodePlan(slot=Slot(key), script=EpisodeScript.model_validate(value))
             for key, value in context.get("episodeDrafts", {}).items()
         }
-        if stored_run.plan is not None:
-            drafts.update({item.slot.value: item for item in stored_run.plan.episodes})
+        drafts.update({item.plan.slot.value: item.plan for item in stored_episodes})
 
         slot_brief = next(item for item in day_brief.slot_briefs if item.slot is slot)
         previous = tuple(
@@ -410,11 +512,22 @@ class PlanningService:
         series_profile = _series_profile_from_metadata(metadata, self._series_profile)
         story_patterns = _story_patterns_from_metadata(metadata)
         try:
+            accepted = _parse_accepted_outcomes(context.get("acceptedOutcomes", {}))
+            guided_history = tuple(
+                _accepted_outcome_summary(item, accepted[item])
+                for item in Slot
+                if item.sort_order < slot.sort_order and item in accepted
+            )
             episode, _, attempt = self._generate_episode(
                 run_id=run_id,
                 day_brief=day_brief,
                 slot_brief=slot_brief,
                 previous=previous,
+                previous_state_summaries=(
+                    guided_history
+                    if settings.planning_mode is PlanningMode.GUIDED_SEQUENTIAL
+                    else None
+                ),
                 parent_step_id=day_step_id,
                 parent_prompt_id=day_prompt_id,
                 retry_reason=reason,
@@ -432,7 +545,11 @@ class PlanningService:
                 ),
             )
         except PlanningReviewRequired:
-            if stored_run.status != RunStatus.PLANNING_REVIEW.value:
+            if (
+                settings.planning_mode is not PlanningMode.GUIDED_SEQUENTIAL
+                and stored_run.status
+                in {RunStatus.DRAFT.value, RunStatus.FAILED.value}
+            ):
                 self._repository.set_run_status(
                     run_id,
                     RunStatus.PLANNING_REVIEW,
@@ -449,19 +566,22 @@ class PlanningService:
             context.get("planningMetadata", {}),
         )
 
-        if stored_run.plan is not None:
-            self._assemble_plan(
-                run_id,
-                day_brief,
-                [episode if item.slot is slot else item for item in stored_run.plan.episodes],
-                series_profile=series_profile,
-            )
+        if stored_episode is not None:
+            if len(drafts) == 3:
+                self._assemble_plan(
+                    run_id,
+                    day_brief,
+                    [drafts[item.value] for item in Slot],
+                    series_profile=series_profile,
+                )
             self._repository.replace_episode_plan(
                 run_id=run_id,
                 episode=episode,
             )
             if stored_run.status == RunStatus.PLANNING_REVIEW.value:
                 self._repository.set_run_status(run_id, RunStatus.PLANNED)
+        elif settings.planning_mode is PlanningMode.GUIDED_SEQUENTIAL:
+            self._repository.save_planned_episode(run_id=run_id, episode=episode)
         elif all(item.value in drafts for item in Slot):
             plan = self._assemble_plan(
                 run_id,
@@ -487,6 +607,7 @@ class PlanningService:
         day_brief: DayBrief,
         slot_brief: SlotBrief,
         previous: tuple[EpisodePlan, ...],
+        previous_state_summaries: tuple[str, ...] | None = None,
         parent_step_id: uuid.UUID,
         parent_prompt_id: uuid.UUID,
         retry_reason: str | None,
@@ -495,6 +616,11 @@ class PlanningService:
         series_profile: SeriesVisualProfile,
         user_episode_text: str | None = None,
     ) -> tuple[EpisodePlan, StoredStep, int]:
+        history = (
+            previous_state_summaries
+            if previous_state_summaries is not None
+            else tuple(summarize_episode_state(item) for item in previous)
+        )
         first_attempt = self._repository.next_director_attempt(
             run_id=run_id,
             phase="episode",
@@ -514,9 +640,7 @@ class PlanningService:
                     user_episode_text=user_episode_text,
                     day_brief=day_brief,
                     slot_brief=slot_brief,
-                    previous_state_summaries=tuple(
-                        summarize_episode_state(item) for item in previous
-                    ),
+                    previous_state_summaries=history,
                     retry_reason=retry_reason,
                     rejected_candidate=rejected_candidate,
                     validation_errors=validation_errors,
@@ -527,9 +651,7 @@ class PlanningService:
                 prompt = compile_episode_director_prompt(
                     day_brief=day_brief,
                     slot_brief=slot_brief,
-                    previous_state_summaries=tuple(
-                        summarize_episode_state(item) for item in previous
-                    ),
+                    previous_state_summaries=history,
                     retry_reason=retry_reason,
                     rejected_candidate=rejected_candidate,
                     validation_errors=validation_errors,
@@ -764,3 +886,22 @@ def _user_episode_text(user_story: UserStory | None, slot: Slot) -> str | None:
     if user_story is None:
         return None
     return user_story.episodes[slot.sort_order - 1]
+
+
+def _parse_accepted_outcomes(value: object) -> dict[Slot, AcceptedOutcome]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        Slot(raw_slot): AcceptedOutcome.model_validate(raw_outcome)
+        for raw_slot, raw_outcome in value.items()
+        if isinstance(raw_outcome, dict)
+    }
+
+
+def _accepted_outcome_summary(slot: Slot, outcome: AcceptedOutcome) -> str:
+    inherited = "、".join(outcome.carry_forward) or "无必须延续对象"
+    excluded = "、".join(outcome.do_not_carry_forward) or "无"
+    return (
+        f"{slot.value}已由用户观看并确认：{outcome.summary}；"
+        f"下一时段必须延续：{inherited}；不得继承偶发生成内容：{excluded}。"
+    )

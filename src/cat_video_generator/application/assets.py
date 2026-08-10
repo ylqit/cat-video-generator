@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from ..domain.pipeline import PlanningMode
 from ..domain.visual_profiles import DEFAULT_STYLE_PROFILE
 from ..domain.workflow import EpisodeStatus, RunStatus
 from .ports import AssetStore, MediaProbe, ProductionStore
@@ -176,12 +177,15 @@ class AssetService:
             approve
             and asset.role == "video"
             and asset.run_id is not None
-            and all(
-                item.status is EpisodeStatus.READY
-                for item in self._repository.list_episodes(asset.run_id)
-            )
         ):
-            self._repository.set_run_status(asset.run_id, RunStatus.READY)
+            episodes = self._repository.list_episodes(asset.run_id)
+            if len(episodes) == 3 and all(
+                item.status is EpisodeStatus.READY for item in episodes
+            ) and (
+                self._repository.get_pipeline_settings(asset.run_id).planning_mode
+                is PlanningMode.AUTO_DAY
+            ):
+                self._repository.set_run_status(asset.run_id, RunStatus.READY)
         return {
             "reviewId": str(result.review_id),
             "assetId": str(asset_id),

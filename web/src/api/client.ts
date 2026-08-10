@@ -7,6 +7,7 @@ import type {
   HealthStatus,
   Job,
   JobAccepted,
+  OutcomeDraftDto,
   PipelineSettings,
   PromptFull,
   PromptOverrides,
@@ -96,6 +97,25 @@ export const api = {
   createPlan: (payload: PlanPayload) => post<JobAccepted>("/plans", payload),
   generate: (runId: string, payload: GeneratePayload) =>
     post<JobAccepted>(`/runs/${runId}/generate`, payload),
+  planSlot: (runId: string, slot: string, allowPaidGeneration: boolean) =>
+    post<JobAccepted>(`/runs/${runId}/slots/${slot}/plan`, {
+      allowPaidGeneration,
+    }),
+  outcome: (runId: string, slot: string) =>
+    request<OutcomeDraftDto>(`/runs/${runId}/slots/${slot}/outcome`),
+  confirmOutcome: (
+    runId: string,
+    slot: string,
+    payload: {
+      summary: string;
+      carryForward: string[];
+      doNotCarryForward: string[];
+    },
+  ) =>
+    request<OutcomeDraftDto>(`/runs/${runId}/slots/${slot}/outcome`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
   resume: (runId: string) =>
     post<JobAccepted>(`/runs/${runId}/resume`),
   review: (assetId: string, approve: boolean, reason: string) =>
@@ -239,7 +259,12 @@ export const api = {
       body: JSON.stringify(script),
     }),
   updateDayBrief: (runId: string, brief: DayBriefDto) =>
-    request<{ runId: string; saved: boolean; episodeDraftsCleared: boolean }>(
+    request<{
+      runId: string;
+      saved: boolean;
+      confirmed: boolean;
+      episodeDraftsCleared: boolean;
+    }>(
       `/runs/${runId}/day-brief`,
       { method: "PUT", body: JSON.stringify(brief) },
     ),

@@ -6,12 +6,10 @@
 
 ```text
 Web创作配置
-→ Day Director
-→ Morning / Noon / Evening Director
-→ 定妆图
-→ 开场视觉锚点
-→ Seedance初始成片及可选官方延展
-→ 技术QC + 人工审核
+→ Day Director并人工确认全天边界
+→ Morning导演 / 视觉 / 成片 / 人工结果卡
+→ Noon导演 / 视觉 / 成片 / 人工结果卡
+→ Evening导演 / 视觉 / 成片 / 人工结果卡
 → 01 / 02 / 03本地交付
 ```
 
@@ -50,13 +48,17 @@ adaptive。总导演只解析全天方向和容量，时段导演在档位内生
 和精确秒数。Web默认编辑完整剧情、镜头段落及少量连接、承重、容器、穿戴或交接硬
 约束；高级Prompt覆盖默认关闭，脚本变化后会自动失效并要求重新确认。
 
+Web默认采用`guided_sequential`：后续时段只读取用户观看成片后确认的实际结果，
+不会把原脚本预期或诊断模型的偶发判断直接当成当天事实。需要无人值守时可显式选择
+`auto_day`，一次顺序生成三个时段脚本。
+
 ## 恢复与付费安全
 
 - 每次Ark请求前先原子持久化Step和实际Prompt。
 - 相同输入复用幂等Step；终态失败只能显式创建新attempt。
 - 已有Seedance Task ID只继续查询，不重复POST。
 - `submission_unknown`视频必须人工对账；Seedream同步超时可按配置自动重试一次。
-- 最终视频始终停在`content_review`，三条人工批准后才能交付。
+- 最终视频始终停在`content_review`；顺序模式还需确认傍晚结果卡后才能交付。
 
 ## 文档
 

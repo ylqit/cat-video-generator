@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 
@@ -127,6 +127,29 @@ class HardConstraint(StrictModel):
     def validate_shot_orders(self) -> HardConstraint:
         if self.shot_orders != sorted(set(self.shot_orders)):
             raise ValueError("硬约束的shotOrders必须唯一且递增")
+        return self
+
+
+class AcceptedOutcome(StrictModel):
+    """人工确认的实际成片结果，是下一时段导演唯一可继承的媒体事实。"""
+
+    summary: Annotated[str, Field(min_length=8)]
+    carry_forward: list[Annotated[str, Field(min_length=2)]] = Field(
+        default_factory=list,
+        alias="carryForward",
+        max_length=8,
+    )
+    do_not_carry_forward: list[Annotated[str, Field(min_length=2)]] = Field(
+        default_factory=list,
+        alias="doNotCarryForward",
+        max_length=8,
+    )
+    confirmed_at: Annotated[datetime, Field(alias="confirmedAt")]
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> AcceptedOutcome:
+        if set(self.carry_forward) & set(self.do_not_carry_forward):
+            raise ValueError("同一事实不能同时继承和禁止继承")
         return self
 
 

@@ -15,8 +15,9 @@ from ..application.planning import DayBriefPause, PlanningResult
 from ..application.ports import GatewayError
 from ..application.queries import QueryService
 from ..domain.contracts import Slot
-from ..domain.pipeline import PipelineSettings, StageMode
+from ..domain.pipeline import PipelineSettings, PlanningMode, StageMode
 from .api_helpers import _accepted, _jsonable, _submit
+from .api_schemas import AcceptedOutcomeRequest
 from .jobs import JobConflictError, JobRegistry
 
 
@@ -125,6 +126,13 @@ def create_studio_router(
             status = str(queries.run_graph(run_id)["run"]["status"])
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if settings.planning_mode is PlanningMode.GUIDED_SEQUENTIAL:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "顺序人工模式没有全局继续操作；请在当前时段节点规划、生成并确认结果卡"
+                ),
+            )
 
         def task() -> dict[str, Any]:
             if status in {"draft", "failed"}:
@@ -182,6 +190,24 @@ def create_studio_router(
     ) -> dict[str, Any]:
         return await _run_validated(
             lambda: studio_editing.update_pipeline_settings(run_id, payload)
+        )
+
+    @router.get("/runs/{run_id}/slots/{slot}/outcome")
+    async def get_outcome(run_id: uuid.UUID, slot: Slot) -> dict[str, Any]:
+        return await _run_validated(lambda: studio_editing.outcome(run_id, slot))
+
+    @router.put("/runs/{run_id}/slots/{slot}/outcome")
+    async def confirm_outcome(
+        run_id: uuid.UUID,
+        slot: Slot,
+        payload: AcceptedOutcomeRequest,
+    ) -> dict[str, Any]:
+        return await _run_validated(
+            lambda: studio_editing.confirm_outcome(
+                run_id,
+                slot,
+                payload.model_dump(mode="json", by_alias=True),
+            )
         )
 
     return router

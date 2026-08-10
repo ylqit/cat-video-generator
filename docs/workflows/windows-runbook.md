@@ -90,8 +90,10 @@ uv run cvg api --static-dir web/dist
 
 ## 5. 创建与生成
 
-Web新建Run时配置全天默认活动焦点和早中晚覆盖；每个时段选择short、medium、long
-或adaptive。总导演只解析全天容量，时段导演在档位内确定精确秒数。
+Web新建Run时先选择规划方式。默认“顺序人工确认”：总导演后保存并确认DayBrief，
+只规划上午；上午视频人工批准并确认实际结果卡后才解锁中午，傍晚同理。“全自动全天”
+保留原批量行为。两种模式均可配置全天默认活动焦点、早中晚覆盖及short、medium、long
+或adaptive；总导演只解析全天容量，时段导演在档位内确定精确秒数。
 
 “三集导演”默认编辑极简混合脚本：完整长剧情、关系弧、1～3段完整镜头描述和少量
 关键硬约束。每个镜头段落自然表达镜头目的、机位、运镜、人物与猫咪站位、动作路径、
@@ -102,7 +104,7 @@ Web新建Run时配置全天默认活动焦点和早中晚覆盖；每个时段�
 CLI核心入口仍可使用：
 
 ```powershell
-uv run cvg plan-day --target-date 2026-08-10 --allow-paid-generation
+uv run cvg plan-day --target-date 2026-08-10 --planning-mode auto_day --allow-paid-generation
 uv run cvg status <runId>
 uv run cvg run-day <runId> --slot morning --allow-paid-generation
 ```
@@ -129,7 +131,7 @@ uv run cvg deliver <runId>
 - 已有视频Task ID使用resume继续查询，不产生第二次POST。
 - 视频`submission_unknown`在Web节点列出候选并人工对账。
 - 图片同步超时按配置最多自动重试一次，可能重复计费。
-- 最终视频必须人工批准；三条都ready后才能交付1/2/3。
+- 最终视频必须人工批准；顺序模式还需确认傍晚实际结果卡，Run才会进入ready并允许交付1/2/3。
 
 ## 7. 常见故障
 
@@ -140,7 +142,7 @@ uv run cvg deliver <runId>
 | 图片语义失败 | 在具体图片Step显式重试，不覆盖拒绝结论 |
 | 视频监看窗口结束 | 继续查询已有Task ID |
 | `submission_unknown` | 视频人工对账；图片需确认重复计费后新attempt |
-| 交付不可用 | 确认早中晚最终`video`资产均已人工批准 |
+| 交付不可用 | 确认早中晚最终`video`资产均已人工批准；顺序模式再确认傍晚结果卡 |
 
 ## 8. 最终验证
 

@@ -11,9 +11,11 @@ resume_planning重生成"修改，本服务的剧本编辑只面向已定稿方�
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from ..domain.contracts import (
+    AcceptedOutcome,
     DailyProductionPlan,
     DayBrief,
     DurationBand,
@@ -99,24 +101,25 @@ class StudioEditingService:
         except PromptCompilationError as exc:
             errors.append(str(exc))
 
-        stored_run = self._repository.get_run(run_id)
-        if stored_run.plan is None:
-            # 已定稿方案才有Episode行（finalize原子插入），此处仅为防御。
-            raise ValueError("方案未定稿的剧本请编辑日导演后恢复规划重生成")
-        candidate_plan = DailyProductionPlan(
-            day_brief=day_brief,
-            episodes=[episode if item.slot is slot else item for item in stored_run.plan.episodes],
-        )
-        errors.extend(
-            item.message
-            for item in hard_failures(
-                validate_plan_gate(
-                    candidate_plan,
-                    expected_date=day_brief.content_date,
-                    series_profile=self._series_profile,
+        stored_episodes = self._repository.list_episodes(run_id)
+        candidate_episodes = [
+            episode if item.plan.slot is slot else item.plan for item in stored_episodes
+        ]
+        if len(candidate_episodes) == 3:
+            candidate_plan = DailyProductionPlan(
+                day_brief=day_brief,
+                episodes=candidate_episodes,
+            )
+            errors.extend(
+                item.message
+                for item in hard_failures(
+                    validate_plan_gate(
+                        candidate_plan,
+                        expected_date=day_brief.content_date,
+                        series_profile=self._series_profile,
+                    )
                 )
             )
-        )
         if errors:
             raise ValueError("；".join(errors))
 
@@ -145,6 +148,8 @@ class StudioEditingService:
         """编辑日导演输出；仅方案未定稿可用，落库后清空全部时段草稿。"""
 
         stored_run = self._repository.get_run(run_id)
+        if self._repository.list_episodes(run_id):
+            raise ValueError("已有时段脚本后不能改写DayBrief；请局部重规划对应时段")
         if stored_run.plan is not None:
             raise ValueError("方案已定稿，日导演输出只能经局部重规划调整")
         if stored_run.status not in {
@@ -160,7 +165,61 @@ class StudioEditingService:
         return {
             "runId": str(run_id),
             "saved": True,
+            "confirmed": True,
             "episodeDraftsCleared": True,
+        }
+
+    def outcome(self, run_id: uuid.UUID, slot: Slot) -> dict[str, Any]:
+        """返回已确认结果或由脚本、诊断和全天交接组成的可编辑草稿。"""
+
+        source = self._repository.get_outcome_source(run_id, slot)
+        accepted = source.get("acceptedOutcome")
+        if isinstance(accepted, dict):
+            return {"slot": slot.value, "confirmed": True, **accepted}
+        script = EpisodeScript.model_validate(source["script"])
+        diagnostic = source.get("diagnostic")
+        evidence = diagnostic if isinstance(diagnostic, dict) else {}
+        context = self._repository.get_planning_context(run_id)
+        day_brief = DayBrief.model_validate(context["dayBrief"])
+        handoffs = [
+            item.continuity
+            for item in day_brief.handoffs
+            if item.from_slot is slot
+        ]
+        return {
+            "slot": slot.value,
+            "confirmed": False,
+            "summary": str(evidence.get("actualOutcome") or script.ending),
+            "carryForward": list(evidence.get("carryForward") or handoffs),
+            "doNotCarryForward": list(evidence.get("doNotCarryForward") or []),
+            "source": "video_diagnostic" if evidence.get("actualOutcome") else "script_ending",
+            "episodeStatus": source["episodeStatus"],
+        }
+
+    def confirm_outcome(
+        self,
+        run_id: uuid.UUID,
+        slot: Slot,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """确认实际结果；该事实一经被后续导演读取就禁止原位改写。"""
+
+        outcome = AcceptedOutcome(
+            summary=payload.get("summary", ""),
+            carryForward=payload.get("carryForward", []),
+            doNotCarryForward=payload.get("doNotCarryForward", []),
+            confirmedAt=datetime.now(timezone.utc),
+        )
+        self._repository.save_accepted_outcome(
+            run_id=run_id,
+            slot=slot,
+            outcome=outcome,
+        )
+        return {
+            "runId": str(run_id),
+            "slot": slot.value,
+            "confirmed": True,
+            **outcome.model_dump(mode="json", by_alias=True),
         }
 
     def update_pipeline_settings(
@@ -172,6 +231,9 @@ class StudioEditingService:
 
         self._repository.get_run(run_id)
         settings = PipelineSettings.model_validate(payload)
+        current = self._repository.get_pipeline_settings(run_id)
+        if settings.planning_mode is not current.planning_mode:
+            raise ValueError("planningMode在Run创建后不可切换，请新建Run选择另一流程")
         self._repository.save_pipeline_settings(run_id=run_id, settings=settings)
         return {
             "runId": str(run_id),

@@ -118,7 +118,8 @@ def test_short_video_prompt_keeps_director_execution_depth() -> None:
     assert "固定镜头" in prompt
     assert "肢体" not in prompt  # 动作本身已具体，不输出抽象字段名。
     assert "灰白猫" in prompt and "人物" in prompt
-    assert "关系弧" in prompt
+    assert episode.script.story_text not in prompt
+    assert "完整剧情" not in prompt
     assert "同一只风筝" in prompt
     assert "原生音频" in prompt
     assert "绝对时间" not in prompt

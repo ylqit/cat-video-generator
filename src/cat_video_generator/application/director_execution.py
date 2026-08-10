@@ -13,8 +13,8 @@ from typing import Any, TypeVar
 from pydantic import ValidationError
 
 from ..domain.contract_base import StrictModel
-from ..domain.contracts import EpisodeScript, Slot
-from ..domain.normalization import normalize_episode_payload
+from ..domain.contracts import DayBrief, EpisodeScript, Slot
+from ..domain.normalization import normalize_day_brief_payload, normalize_episode_payload
 from ..domain.workflow import PromptPurpose, StepKind, StepStatus
 from .ports import DirectorGateway, GatewayError, PlanningStore, StoredStep
 
@@ -133,7 +133,9 @@ class DirectorInvoker:
             raise
         normalizations: tuple[str, ...] = ()
         output = result.payload
-        if contract is EpisodeScript:
+        if contract is DayBrief:
+            output, normalizations = normalize_day_brief_payload(result.payload)
+        elif contract is EpisodeScript:
             output, normalizations = normalize_episode_payload(result.payload)
         try:
             parsed = contract.model_validate(output)

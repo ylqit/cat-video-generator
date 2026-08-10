@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-from cat_video_generator.application.ports import StoredRun
+from cat_video_generator.application.ports import StoredEpisode, StoredRun
 from cat_video_generator.application.studio_editing import StudioEditingService
 from cat_video_generator.domain.contracts import ActivityFocus, DayBrief, Slot
 from cat_video_generator.domain.pipeline import PipelineSettings
@@ -12,6 +12,7 @@ from cat_video_generator.domain.visual_profiles import (
     DEFAULT_SERIES_VISUAL_PROFILE,
     DEFAULT_STYLE_PROFILE,
 )
+from cat_video_generator.domain.workflow import EpisodeStatus
 
 
 class StudioRepository:
@@ -40,6 +41,20 @@ class StudioRepository:
 
     def get_run(self, run_id):
         return StoredRun(self.run_id, self.plan.content_date, "planned", self.plan)
+
+    def list_episodes(self, run_id):
+        if self.plan is None:
+            return ()
+        return tuple(
+            StoredEpisode(
+                id=self.episode_ids[item.slot],
+                run_id=self.run_id,
+                plan=item,
+                status=EpisodeStatus.PLANNED,
+                selected_video_asset_id=None,
+            )
+            for item in self.plan.episodes
+        )
 
     def replace_episode_plan(self, **kwargs):
         self.replacement = kwargs
@@ -96,6 +111,7 @@ def test_pipeline_settings_round_trip_uses_new_five_stages(daily_plan) -> None:
     )
 
     assert result["pipelineSettings"] == {
+        "planningMode": "guided_sequential",
         "allowPaidGeneration": True,
         "dayBrief": "manual",
         "script": "auto",
