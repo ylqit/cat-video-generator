@@ -4,6 +4,7 @@ import { computed, ref } from "vue";
 
 import { api, ApiError } from "../api/client";
 import type {
+  JobAccepted,
   ReconciliationCandidateDto,
   StepActionDto,
   StepDto,
@@ -13,6 +14,7 @@ import StatusBadge from "./StatusBadge.vue";
 const props = defineProps<{ steps: StepDto[] }>();
 const emit = defineEmits<{
   changed: [];
+  job: [job: JobAccepted];
   review: [step: StepDto];
 }>();
 
@@ -63,7 +65,7 @@ async function confirmRetry() {
   }
   activeStepId.value = step.id;
   try {
-    await api.retryStep(
+    const job = await api.retryStep(
       step.id,
       reason.value.trim(),
       action.paid,
@@ -72,7 +74,7 @@ async function confirmRetry() {
     );
     ElMessage.success("新attempt已提交；旧任务和错误记录保持不变");
     closeRetry();
-    emit("changed");
+    emit("job", job);
   } catch (error) {
     ElMessage.error(error instanceof ApiError ? error.message : String(error));
   } finally {
@@ -84,9 +86,9 @@ async function confirmRetry() {
 async function resumeStep(step: StepDto) {
   activeStepId.value = step.id;
   try {
-    await api.resumeStep(step.id);
+    const job = await api.resumeStep(step.id);
     ElMessage.success("已恢复监看原Ark任务，不会重复收费");
-    emit("changed");
+    emit("job", job);
   } catch (error) {
     ElMessage.error(error instanceof ApiError ? error.message : String(error));
   } finally {
@@ -119,10 +121,10 @@ async function confirmReconciliation() {
   }
   activeStepId.value = step.id;
   try {
-    await api.reconcileStep(step.id, selectedTaskId.value);
+    const job = await api.reconcileStep(step.id, selectedTaskId.value);
     ElMessage.success("已绑定所选Ark任务并恢复查询");
     reconcileTarget.value = null;
-    emit("changed");
+    emit("job", job);
   } catch (error) {
     ElMessage.error(error instanceof ApiError ? error.message : String(error));
   } finally {

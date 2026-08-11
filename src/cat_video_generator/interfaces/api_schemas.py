@@ -131,11 +131,54 @@ class RetryStepRequest(BaseModel):
 
     reason: str = Field(min_length=4, max_length=500)
     allow_paid_generation: bool = Field(False, alias="allowPaidGeneration")
+    acknowledge_downstream_replacement: bool = Field(
+        False,
+        alias="acknowledgeDownstreamReplacement",
+    )
     acknowledge_duplicate_billing: bool = Field(
         False,
         alias="acknowledgeDuplicateBilling",
     )
     restart_from_beginning: bool = Field(False, alias="restartFromBeginning")
+
+
+class RegenerateStepRequest(BaseModel):
+    """为已经执行过的图片或整条视频节点创建非破坏性新attempt。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    reason: str = Field(min_length=4, max_length=500)
+    prompt_override: str | None = Field(None, alias="promptOverride", max_length=20_000)
+    allow_paid_generation: bool = Field(False, alias="allowPaidGeneration")
+    acknowledge_downstream_replacement: bool = Field(
+        False,
+        alias="acknowledgeDownstreamReplacement",
+    )
+
+
+class RangeEditRequest(BaseModel):
+    """时间轴选区AI重生成；区间单位为毫秒。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    start_ms: int = Field(alias="startMs", ge=0)
+    end_ms: int = Field(alias="endMs", gt=0)
+    boundary_mode: str = Field(
+        "snap_to_shot",
+        alias="boundaryMode",
+        pattern=r"^(snap_to_shot|exact)$",
+    )
+    instruction: str = Field(min_length=4, max_length=2000)
+    allow_paid_generation: bool = Field(False, alias="allowPaidGeneration")
+
+
+class SelectVideoSequenceRequest(BaseModel):
+    """选择已批准版本时，显式决定如何处理已确认结果卡。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    revoke_confirmed_outcome: bool = Field(False, alias="revokeConfirmedOutcome")
+    keep_confirmed_outcome: bool = Field(False, alias="keepConfirmedOutcome")
 
 
 class ReconcileStepRequest(BaseModel):

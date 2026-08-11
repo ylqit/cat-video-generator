@@ -170,6 +170,8 @@ export type StepActionType =
   | "reconcile"
   | "review"
   | "deliver"
+  | "regenerate"
+  | "replan"
   | "none";
 
 export interface StepActionDto {
@@ -259,18 +261,23 @@ export interface ReviewDto {
 }
 
 export interface WorkflowNodeDto {
-  id: string;
+  semanticNodeId: string;
   type:
     | "director"
     | "look"
     | "opening_anchor"
     | "video"
-     | "video_extension"
-     | "content_review"
-     | "accepted_outcome";
+    | "content_review"
+    | "accepted_outcome"
+    | "day_confirmation"
+    | "delivery";
   slot: Slot | null;
   label: string;
   status: string;
+  availability: "locked" | "ready" | "active" | "completed";
+  executionStatus: string;
+  lockReason: string | null;
+  unlockRequirements: string[];
   providerStatus: string;
   contractStatus: string;
   semanticReviewStatus: string;
@@ -280,8 +287,37 @@ export interface WorkflowNodeDto {
   reviewIds: string[];
   error: StepError | null;
   nextAction: string | null;
-  availableActions: StepActionDto[];
+  allowedActions: StepActionDto[];
+  currentAttemptId: string | null;
+  attemptIds: string[];
+  stale?: boolean;
   attempts: StepDto[];
+}
+
+export interface VideoSequenceClipDto {
+  order: number;
+  source_asset_id: string;
+  source_start_ms: number;
+  source_end_ms: number;
+  timeline_start_ms: number;
+  timeline_end_ms: number;
+  origin: "original" | "generated";
+  replacement_step_id: string | null;
+}
+
+export interface VideoSequenceDto {
+  id: string;
+  episodeId: string;
+  revision: number;
+  parentSequenceId: string | null;
+  baseAssetId: string;
+  renderedAssetId: string | null;
+  status: "draft" | "generating" | "content_review" | "approved" | "rejected";
+  durationMs: number;
+  audioPolicy: "preserve_original";
+  clips: VideoSequenceClipDto[];
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface RunGraph {
@@ -293,6 +329,7 @@ export interface RunGraph {
   reviews: ReviewDto[];
   episodeDrafts?: Record<string, EpisodeScript>;
   workflowNodes?: WorkflowNodeDto[];
+  videoSequences?: VideoSequenceDto[];
 }
 
 export interface ReconciliationCandidateDto {

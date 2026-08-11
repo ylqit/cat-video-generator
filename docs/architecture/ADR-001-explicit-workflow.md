@@ -83,8 +83,9 @@ application/retry.py               显式attempt、恢复和对账
 
 ## PostgreSQL与不变量
 
-八张核心表保持为`production_runs / episodes / workflow_steps / prompt_records /
-assets / reviews / delivery_packages / delivery_items`。
+八张生产事实表保持为`production_runs / episodes / workflow_steps / prompt_records /
+assets / reviews / delivery_packages / delivery_items`。`0013`另增加`video_sequences`，它只
+保存一个Episode的视频EDL revision，不成为工作流状态源，也不拆分Clip明细表。
 
 1. 收费意图和实际Prompt先在同一短事务落库，再调用Ark。
 2. PostgreSQL是唯一工作流状态源；JobRegistry只展示本进程异步任务。
@@ -98,3 +99,19 @@ assets / reviews / delivery_packages / delivery_items`。
    投影完整Trace，禁止把Key、Base64、签名URL或SDK对象写入数据库。
 10. 高级Prompt覆盖绑定当前脚本哈希；上游脚本变化后自动失效，旧attempt Prompt永久保留。
 11. 视频语义诊断只能生成结果卡草稿；只有人工批准视频并确认结果卡，后续导演才可读取。
+
+## 固定语义画布与非破坏性视频版本
+
+Run Graph固定投影总导演、DayBrief确认、早中晚五类节点及交付节点。每个节点分别返回
+`availability`和`executionStatus`：锁定占位节点使用`not_created`且不写`workflow_steps`；
+Provider成功但待审核的节点不会伪装为完成。`guided_sequential`只在本时段视频批准且
+`AcceptedOutcome`确认后解锁下一时段导演；`auto_day`在DayBrief可用后同时开放三条泳道。
+
+Vue Flow只渲染后端给出的稳定`semanticNodeId`和固定边，不允许任意新增、删除或连接。
+URL保存run、stage、slot、node和sequence；轮询只刷新数据，不能重置用户当前视口、
+时间轴选区或未保存编辑。
+
+每条正式视频首先形成`video_sequences` revision 1。整条重生成形成新的单Clip revision；
+区间编辑从上一revision派生一个EDL，在单一来源Clip内部用Ark源视频和两张边界帧生成
+替换候选，再由FFmpeg规范化画面并映射原视频完整音轨。候选审核通过前不改变Episode
+正式资产；已经确认结果卡时，切换版本必须显式选择保留既有事实或撤销确认并使后续过期。

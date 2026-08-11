@@ -25,11 +25,13 @@ from ..domain.contracts import (
     RunCreativeControls,
     Slot,
     SlotBrief,
+    SlotCreativeControl,
 )
 from ..domain.pipeline import PipelineSettings, PlanningMode
 from ..domain.prompts import (
     PromptCompilationError,
     compile_day_director_prompt,
+    compile_day_repair_prompt,
     compile_day_structuring_prompt,
     compile_episode_adaptation_prompt,
     compile_episode_director_prompt,
@@ -49,7 +51,7 @@ from ..domain.visual_profiles import (
     SeriesVisualProfile,
     StyleProfile,
 )
-from ..domain.workflow import EpisodeStatus, RunStatus
+from ..domain.workflow import EpisodeStatus, PromptPurpose, RunStatus
 from .director_execution import DirectorCandidateRejected, DirectorInvoker
 from .event_seeds import EventSeedCatalog
 from .ports import DirectorGateway, PlanningStore, StoredStep
@@ -205,6 +207,14 @@ class PlanningService:
             run_id=run_id,
             settings=settings,
         )
+        # 创作控制和用户输入必须先于收费调用落库。若Provider返回可修复但不合契约的
+        # JSON，节点重执行可以复用同一Run，而不要求用户为系统丢失上下文重新建Run。
+        self._repository.save_initial_planning_metadata(
+            run_id=run_id,
+            planning_metadata=planning_metadata,
+            planning_context=planning_context,
+            story_mode=story_mode,
+        )
         try:
             if user_story is not None:
                 day_prompt = compile_day_structuring_prompt(
@@ -275,6 +285,97 @@ class PlanningService:
             # Step仍保留精确失败或submission_unknown状态，后续不得盲目重复POST。
             self._repository.set_run_status(run_id, RunStatus.FAILED)
             raise
+
+    def regenerate_day_brief(
+        self,
+        step_id: uuid.UUID,
+        *,
+        reason: str,
+        prompt_override: str | None,
+        allow_paid_generation: bool,
+    ) -> dict[str, Any]:
+        """只重做契约拒绝的Day Director，并在成功后恢复人工确认断点。"""
+
+        self._check_paid(allow_paid_generation)
+        if len(reason.strip()) < 4:
+            raise ValueError("总导演重执行必须填写具体原因")
+        previous = self._repository.get_step(step_id)
+        if (
+            previous.kind.value != "director"
+            or previous.episode_id is not None
+            or previous.operation_key != "director:day"
+        ):
+            raise ValueError("只有全天总导演节点可使用此重执行入口")
+        if previous.status.value == "submission_unknown":
+            raise ValueError("submission_unknown必须先对账，不能创建新attempt")
+        if previous.status.value != "failed":
+            raise ValueError("总导演重执行只接受failed步骤")
+        candidate = previous.input_snapshot.get("provider_output")
+        if not isinstance(candidate, dict):
+            raise ValueError("失败总导演步骤缺少可审计的Provider原始输出")
+
+        original = self._repository.get_prompt_for_step(
+            step_id,
+            purpose=PromptPurpose.DIRECTOR,
+        )
+        prompt = compile_day_repair_prompt(
+            original_prompt=(prompt_override or original.text),
+            rejected_candidate=candidate,
+            validation_error=previous.error_message or reason,
+        )
+        context = self._repository.get_planning_context(previous.run_id)
+        metadata = dict(context.get("planningMetadata", {}))
+        controls = _controls_for_day_retry(metadata, candidate)
+        attempt = self._repository.next_director_attempt(
+            run_id=previous.run_id,
+            phase="day",
+            slot=None,
+        )
+        day_brief, step, prompt_id, _ = self._director_invoker.invoke(
+            run_id=previous.run_id,
+            episode_id=None,
+            parent_step_id=previous.id,
+            parent_prompt_id=original.id,
+            phase="day",
+            slot=None,
+            attempt=attempt,
+            prompt=prompt,
+            contract=DayBrief,
+            repair_of_step_id=previous.id,
+        )
+        stored_run = self._repository.get_run(previous.run_id)
+        if day_brief.content_date != stored_run.content_date:
+            raise ValueError("修复后的DayBrief日期与Run不一致")
+        _validate_day_brief_controls(day_brief, controls)
+
+        series_profile = _series_profile_from_metadata(metadata, self._series_profile)
+        if not metadata:
+            metadata = {
+                "planningRevision": attempt,
+                "seriesProfileHash": series_profile.fingerprint(),
+                "seriesProfile": series_profile.model_dump(mode="json"),
+                "recentSummaries": [],
+                "eventSeeds": [],
+                "storyPatterns": {},
+                "userStory": None,
+                "creativeControls": controls.model_dump(mode="json"),
+            }
+        self._save_context(
+            previous.run_id,
+            day_brief,
+            step.id,
+            prompt_id,
+            {},
+            metadata,
+        )
+        if stored_run.status == RunStatus.FAILED.value:
+            self._repository.set_run_status(previous.run_id, RunStatus.PLANNING_REVIEW)
+        return {
+            "runId": str(previous.run_id),
+            "stepId": str(step.id),
+            "attempt": attempt,
+            "status": step.status.value,
+        }
 
     def resume_planning(
         self,
@@ -461,6 +562,7 @@ class PlanningService:
         slot: Slot,
         reason: str,
         allow_paid_generation: bool,
+        acknowledge_downstream_replacement: bool = False,
     ) -> EpisodeReplanResult:
         """只重做一个时段导演，不重写DayBrief和其他时段。"""
 
@@ -468,10 +570,7 @@ class PlanningService:
         if len(reason.strip()) < 4:
             raise ValueError("局部重规划必须提供具体原因")
         stored_run = self._repository.get_run(run_id)
-        if stored_run.status in {
-            RunStatus.DELIVERED.value,
-            RunStatus.READY.value,
-        }:
+        if stored_run.status == RunStatus.DELIVERED.value:
             raise ValueError(f"Run状态{stored_run.status}不允许重规划")
         stored_episodes = self._repository.list_episodes(run_id)
         stored_episode = next(
@@ -484,12 +583,16 @@ class PlanningService:
             and any(item.plan.slot.sort_order > slot.sort_order for item in stored_episodes)
         ):
             raise ValueError("后续时段已依赖当前结果，不能原位重规划前序时段")
-        # 局部重规划只作废当前Episode的下游媒体；其他已经确认的时段保持不变。
-        if stored_episode is not None and stored_episode.status not in {
-            EpisodeStatus.PLANNED,
-            EpisodeStatus.FAILED,
-        }:
-            self._repository.set_episode_status(stored_episode.id, EpisodeStatus.FAILED)
+        # 新导演成功前保持现有Episode和正式媒体不变；避免一次外部调用失败先污染本地事实。
+        if (
+            stored_episode is not None
+            and stored_episode.status not in {EpisodeStatus.PLANNED, EpisodeStatus.FAILED}
+            and not acknowledge_downstream_replacement
+        ):
+            raise ValueError(
+                "该时段已经进入视觉或视频生产；重新规划会使现有下游结果过期，"
+                "必须显式确认acknowledgeDownstreamReplacement"
+            )
         context = self._repository.get_planning_context(run_id)
         if "dayBrief" not in context:
             raise ValueError("该Run没有分层导演DayBrief，不能局部重规划")
@@ -577,6 +680,7 @@ class PlanningService:
             self._repository.replace_episode_plan(
                 run_id=run_id,
                 episode=episode,
+                acknowledge_downstream_replacement=acknowledge_downstream_replacement,
             )
             if stored_run.status == RunStatus.PLANNING_REVIEW.value:
                 self._repository.set_run_status(run_id, RunStatus.PLANNED)
@@ -878,6 +982,46 @@ def _validate_day_brief_controls(
             and brief.duration_band.value != control.duration_mode.value
         ):
             raise ValueError(f"总导演改写了{brief.slot.value}固定时长档")
+
+
+def _controls_for_day_retry(
+    metadata: dict[str, Any],
+    candidate: dict[str, Any],
+) -> RunCreativeControls:
+    """优先恢复收费前冻结的控制；旧失败Run缺失元数据时仅从原候选恢复意图。"""
+
+    stored = metadata.get("creativeControls")
+    if isinstance(stored, dict):
+        return RunCreativeControls.model_validate(stored)
+    raw_briefs = candidate.get("slot_briefs")
+    by_slot = {
+        str(item.get("slot")): item
+        for item in raw_briefs
+        if isinstance(item, dict) and isinstance(item.get("slot"), str)
+    } if isinstance(raw_briefs, list) else {}
+    controls: list[SlotCreativeControl] = []
+    for slot in Slot:
+        item = by_slot.get(slot.value, {})
+        raw_focus = str(item.get("activity_focus", "adaptive"))
+        raw_duration = str(item.get("duration_band", "adaptive"))
+        focus = (
+            ActivityFocusMode(raw_focus)
+            if raw_focus in {value.value for value in ActivityFocusMode}
+            else ActivityFocusMode.ADAPTIVE
+        )
+        duration = (
+            DurationMode(raw_duration)
+            if raw_duration in {value.value for value in DurationMode}
+            else DurationMode.ADAPTIVE
+        )
+        controls.append(
+            SlotCreativeControl(
+                slot=slot,
+                activity_focus=focus,
+                duration_mode=duration,
+            )
+        )
+    return RunCreativeControls(slot_controls=controls)
 
 
 def _user_episode_text(user_story: UserStory | None, slot: Slot) -> str | None:

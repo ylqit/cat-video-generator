@@ -20,7 +20,7 @@ from ..domain.contracts import (
     Slot,
 )
 from ..domain.pipeline import PipelineSettings
-from ..domain.rendering import VideoInputPlan
+from ..domain.rendering import SequenceStatus, VideoInputPlan, VideoSequencePlan
 from ..domain.workflow import (
     EpisodeStatus,
     PromptPurpose,
@@ -94,6 +94,7 @@ class VideoDiagnosticResult:
     confidence: float
     violations: tuple[str, ...]
     evidence: tuple[dict[str, str | None], ...]
+    shot_boundaries_seconds: tuple[float, ...]
     actual_outcome: str
     carry_forward: tuple[str, ...]
     do_not_carry_forward: tuple[str, ...]
@@ -163,6 +164,32 @@ class StoredAsset:
     sha256: str
     metadata: dict[str, Any]
     semantic_key: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StoredVideoSequence:
+    """数据库中的一个非破坏性视频时间轴版本；状态可推进，EDL不原位覆写历史版本。"""
+
+    id: uuid.UUID
+    episode_id: uuid.UUID
+    revision: int
+    parent_sequence_id: uuid.UUID | None
+    base_asset_id: uuid.UUID
+    rendered_asset_id: uuid.UUID | None
+    status: SequenceStatus
+    plan: VideoSequencePlan
+    audio_policy: str
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class VideoSequenceSelectionResult:
+    """正式视频切换结果；视频选择和结果卡处理必须来自同一个数据库事务。"""
+
+    sequence: StoredVideoSequence
+    outcome_kept: bool
+    outcome_revoked: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,8 +274,7 @@ class MediaGenerationGateway(Protocol):
         *,
         prompt: str,
         input_plan: VideoInputPlan,
-        input_paths: tuple[Path, ...] = (),
-        input_urls: tuple[str, ...] = (),
+        input_sources: tuple[Path | str, ...],
     ) -> VideoTaskResult: ...
 
     def get_video_task(self, task_id: str) -> VideoTaskResult: ...
@@ -294,6 +320,7 @@ class PlanningStore(Protocol):
     def fail_step(self, step_id: uuid.UUID, **kwargs: Any) -> None: ...
     def finalize_plan(self, **kwargs: Any) -> None: ...
     def save_planned_episode(self, **kwargs: Any) -> StoredEpisode: ...
+    def save_initial_planning_metadata(self, **kwargs: Any) -> None: ...
     def save_planning_context(self, **kwargs: Any) -> None: ...
     def list_recent_completed_summaries(
         self, *, limit: int
@@ -304,6 +331,9 @@ class PlanningStore(Protocol):
     def get_run(self, run_id: uuid.UUID) -> StoredRun: ...
     def list_episodes(self, run_id: uuid.UUID) -> tuple[StoredEpisode, ...]: ...
     def get_step(self, step_id: uuid.UUID) -> StoredStep: ...
+    def get_prompt_for_step(
+        self, step_id: uuid.UUID, *, purpose: PromptPurpose
+    ) -> StoredPrompt: ...
     def set_step_status(self, step_id: uuid.UUID, target: StepStatus, **kwargs: Any) -> None: ...
     def set_run_status(self, run_id: uuid.UUID, target: RunStatus) -> None: ...
     def record_review(self, **kwargs: Any) -> uuid.UUID: ...
@@ -342,12 +372,25 @@ class ProductionStore(Protocol):
     def patch_step_snapshot(self, step_id: uuid.UUID, patch: dict[str, Any]) -> None: ...
     def find_step_by_provider_task_id(self, provider_task_id: str) -> StoredStep | None: ...
     def save_asset(self, **kwargs: Any) -> StoredAsset: ...
+    def patch_asset_metadata(self, asset_id: uuid.UUID, patch: dict[str, Any]) -> None: ...
     def record_review(self, **kwargs: Any) -> uuid.UUID: ...
     def commit_asset_review(self, **kwargs: Any) -> ReviewCommitResult: ...
     def asset_detail(self, asset_id: uuid.UUID) -> StoredAsset: ...
     def episode_detail(self, episode_id: uuid.UUID) -> dict[str, Any]: ...
     def next_delivery_revision(self, run_id: uuid.UUID) -> int: ...
     def save_delivery(self, **kwargs: Any) -> uuid.UUID: ...
+    def create_video_sequence(self, **kwargs: Any) -> StoredVideoSequence: ...
+    def get_video_sequence(self, sequence_id: uuid.UUID) -> StoredVideoSequence: ...
+    def list_video_sequences(self, episode_id: uuid.UUID) -> tuple[StoredVideoSequence, ...]: ...
+    def update_video_sequence(self, **kwargs: Any) -> StoredVideoSequence: ...
+    def next_video_sequence_revision(self, episode_id: uuid.UUID) -> int: ...
+    def select_video_sequence(
+        self,
+        sequence_id: uuid.UUID,
+        *,
+        revoke_confirmed_outcome: bool,
+        keep_confirmed_outcome: bool,
+    ) -> VideoSequenceSelectionResult: ...
 
 
 class QueryStore(Protocol):
@@ -368,6 +411,7 @@ class QueryStore(Protocol):
     def list_delivery_packages(self, run_id: uuid.UUID) -> list[dict[str, Any]]: ...
     def delivery_package_detail(self, package_id: uuid.UUID) -> dict[str, Any]: ...
     def health(self) -> dict[str, Any]: ...
+    def list_video_sequences(self, episode_id: uuid.UUID) -> tuple[StoredVideoSequence, ...]: ...
 
 
 class StudioStore(Protocol):
@@ -417,6 +461,24 @@ class AssetStore(Protocol):
 
     def concatenate_videos(self, paths: tuple[Path, ...]) -> LandedAsset: ...
 
+    def render_range_replacement(
+        self,
+        *,
+        base_path: Path,
+        replacement_path: Path,
+        replacement_duration_ms: int,
+        start_ms: int,
+        end_ms: int,
+    ) -> LandedAsset: ...
+
+    def extract_video_range(
+        self,
+        *,
+        source_path: Path,
+        start_ms: int,
+        end_ms: int,
+    ) -> LandedAsset: ...
+
     def build_delivery(
         self,
         *,
@@ -441,6 +503,7 @@ class MediaProbe(Protocol):
         minimum_duration_seconds: int = 8,
         maximum_duration_seconds: int = 15,
         duration_tolerance_ms: int = 1000,
+        require_audio: bool = True,
     ) -> dict[str, Any]: ...
 
 
@@ -452,4 +515,11 @@ class ReviewFrameExtractor(Protocol):
         source: StoredAsset,
         *,
         count: int,
+    ) -> tuple[Path, ...]: ...
+
+    def extract_frames_at(
+        self,
+        source: StoredAsset,
+        *,
+        timestamps_ms: tuple[int, ...],
     ) -> tuple[Path, ...]: ...

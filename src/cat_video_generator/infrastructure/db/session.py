@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from ...config import DatabaseOperation, DatabaseSettings
 from .models import SCHEMA_NAME
 
-ALEMBIC_HEAD = "0012_minimal_director_contract"
+ALEMBIC_HEAD = "0013_canvas_video_sequences"
 
 
 def create_database_engine(

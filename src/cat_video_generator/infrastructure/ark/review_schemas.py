@@ -53,6 +53,11 @@ VIDEO_DIAGNOSTIC_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "shotBoundariesSeconds": {
+            "type": "array",
+            "items": {"type": "number", "minimum": 0, "maximum": 45},
+            "maxItems": 4,
+        },
     },
     "required": [
         "identityOk",
@@ -65,6 +70,7 @@ VIDEO_DIAGNOSTIC_SCHEMA = {
         "carryForward",
         "doNotCarryForward",
         "evidence",
+        "shotBoundariesSeconds",
     ],
     "additionalProperties": False,
 }

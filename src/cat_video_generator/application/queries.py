@@ -160,6 +160,10 @@ class QueryService:
                     "text": preview["openingAnchor"],
                 }
             ]
+        elif operation_key.startswith("video:range_edit:"):
+            # 区间编辑Prompt绑定一次具体时间选区与边界帧，不能脱离原attempt重编译。
+            # 已持久化actualPrompts就是唯一可审计事实。
+            trace["currentCompiledPrompts"] = []
         elif operation_key.startswith("video:"):
             try:
                 section_order = 1 if operation_key == "video:single_pass" else int(
@@ -187,6 +191,31 @@ class QueryService:
             for asset in self._repository.list_assets(episode_id=episode_id)
             if asset.episode_id == episode_id
         )
+
+    def video_sequences(self, episode_id: uuid.UUID) -> list[dict[str, Any]]:
+        """返回Episode的非破坏性视频版本和单轨EDL。"""
+
+        return [
+            {
+                "id": str(item.id),
+                "episodeId": str(item.episode_id),
+                "revision": item.revision,
+                "parentSequenceId": (
+                    None if item.parent_sequence_id is None else str(item.parent_sequence_id)
+                ),
+                "baseAssetId": str(item.base_asset_id),
+                "renderedAssetId": (
+                    None if item.rendered_asset_id is None else str(item.rendered_asset_id)
+                ),
+                "status": item.status.value,
+                "durationMs": item.plan.duration_ms,
+                "audioPolicy": item.audio_policy,
+                "clips": [clip.model_dump(mode="json") for clip in item.plan.clips],
+                "createdAt": item.created_at.isoformat(),
+                "updatedAt": item.updated_at.isoformat(),
+            }
+            for item in self._repository.list_video_sequences(episode_id)
+        ]
 
     def list_canon(self) -> list[dict[str, Any]]:
         assets = self._repository.list_assets(

@@ -87,6 +87,10 @@ def create_app(
     def episode_detail(episode_id: uuid.UUID) -> dict:
         return _not_found(lambda: query_service.episode(episode_id))
 
+    @app.get("/api/v1/episodes/{episode_id}/video-sequences")
+    def video_sequences(episode_id: uuid.UUID) -> list[dict]:
+        return _not_found(lambda: query_service.video_sequences(episode_id))
+
     @app.get("/api/v1/episodes/{episode_id}/prompt-preview")
     def episode_prompt_preview(episode_id: uuid.UUID) -> dict:
         return _not_found(lambda: query_service.prompt_preview(episode_id))
@@ -161,6 +165,8 @@ def create_full_app(
             delivery=container.delivery,
             queries=container.queries,
             retry=container.retry,
+            regeneration=container.regeneration,
+            video_editing=container.video_editing,
             job_registry=job_registry,
             default_candidate_count=runtime.candidate_count,
             upload_dir=runtime.work_root / "uploads",

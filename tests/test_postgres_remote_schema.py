@@ -17,6 +17,12 @@ from sqlalchemy.exc import IntegrityError
 from alembic import command
 from cat_video_generator.config import DatabaseOperation, DatabaseSettings, load_local_env
 from cat_video_generator.domain.contracts import Slot
+from cat_video_generator.domain.rendering import (
+    ClipOrigin,
+    SequenceStatus,
+    VideoSequenceClip,
+    VideoSequencePlan,
+)
 from cat_video_generator.domain.snapshots import DirectorInputSnapshot, ImageInputSnapshot
 from cat_video_generator.domain.workflow import PromptPurpose, StepKind, StepStatus
 from cat_video_generator.infrastructure.db.repositories import SqlAlchemyWorkflowRepository
@@ -27,7 +33,7 @@ from cat_video_generator.infrastructure.db.session import (
 
 
 @pytest.mark.postgres
-def test_remote_0012_migration_atomic_intent_and_review(monkeypatch) -> None:
+def test_remote_0013_migration_atomic_intent_review_and_video_sequences(monkeypatch) -> None:
     if os.environ.get("CAT_VIDEO_POSTGRES_TEST_MODE") != "remote-schema":
         pytest.skip("需要显式CAT_VIDEO_POSTGRES_TEST_MODE=remote-schema")
     load_local_env()
@@ -69,7 +75,7 @@ def test_remote_0012_migration_atomic_intent_and_review(monkeypatch) -> None:
             revision = connection.execute(
                 text(f"SELECT version_num FROM {quoted}.alembic_version")
             ).scalar_one()
-            assert revision == "0012_minimal_director_contract"
+            assert revision == "0013_canvas_video_sequences"
 
         repository = SqlAlchemyWorkflowRepository(create_session_factory(engine))
         run_id = repository.create_draft_run(date(2026, 8, 10))
@@ -246,6 +252,118 @@ def test_remote_0012_migration_atomic_intent_and_review(monkeypatch) -> None:
                 warnings=[],
                 evidence={},
             )
+
+        video_asset_id = uuid.uuid4()
+        with engine.begin() as connection:
+            quoted = connection.dialect.identifier_preparer.quote_schema(schema)
+            connection.execute(
+                text(
+                    f"INSERT INTO {quoted}.assets "
+                    "(id, production_run_id, episode_id, role, semantic_key, scope, status, "
+                    "media_type, local_path, sha256, metadata_json) VALUES "
+                    "(:id, :run, :episode, 'video', 'video:test', 'episode', 'ready', "
+                    "'video', 'C:/tmp/video.mp4', :sha, '{}'::jsonb)"
+                ),
+                {
+                    "id": video_asset_id,
+                    "run": run_id,
+                    "episode": episode_id,
+                    "sha": "1" * 64,
+                },
+            )
+        sequence = repository.create_video_sequence(
+            episode_id=episode_id,
+            parent_sequence_id=None,
+            base_asset_id=video_asset_id,
+            rendered_asset_id=video_asset_id,
+            status=SequenceStatus.CONTENT_REVIEW,
+            plan=VideoSequencePlan(
+                duration_ms=12_000,
+                clips=[
+                    VideoSequenceClip(
+                        order=1,
+                        source_asset_id=video_asset_id,
+                        source_start_ms=0,
+                        source_end_ms=12_000,
+                        timeline_start_ms=0,
+                        timeline_end_ms=12_000,
+                        origin=ClipOrigin.ORIGINAL,
+                    )
+                ],
+            ),
+        )
+        assert sequence.revision == 1
+        assert repository.list_video_sequences(episode_id)[0].rendered_asset_id == video_asset_id
+        repository.update_video_sequence(
+            sequence_id=sequence.id,
+            status=SequenceStatus.APPROVED,
+        )
+        selected = repository.select_video_sequence(
+            sequence.id,
+            revoke_confirmed_outcome=False,
+            keep_confirmed_outcome=False,
+        )
+        assert selected.sequence.id == sequence.id
+
+        replacement_asset_id = uuid.uuid4()
+        with engine.begin() as connection:
+            quoted = connection.dialect.identifier_preparer.quote_schema(schema)
+            connection.execute(
+                text(
+                    f"INSERT INTO {quoted}.assets "
+                    "(id, production_run_id, episode_id, role, semantic_key, scope, status, "
+                    "media_type, local_path, sha256, metadata_json) VALUES "
+                    "(:id, :run, :episode, 'video', 'video:replacement', 'episode', 'ready', "
+                    "'video', 'C:/tmp/video-r2.mp4', :sha, '{}'::jsonb)"
+                ),
+                {
+                    "id": replacement_asset_id,
+                    "run": run_id,
+                    "episode": episode_id,
+                    "sha": "2" * 64,
+                },
+            )
+            connection.execute(
+                text(
+                    f"UPDATE {quoted}.episodes SET status='ready' WHERE id=:episode"
+                ),
+                {"episode": episode_id},
+            )
+            connection.execute(
+                text(
+                    f"UPDATE {quoted}.production_runs SET status='ready', "
+                    "planning_json=CAST(:planning AS jsonb) WHERE id=:run"
+                ),
+                {
+                    "run": run_id,
+                    "planning": '{"acceptedOutcomes":{"morning":{"summary":"旧视频事实"}}}',
+                },
+            )
+        replacement = repository.create_video_sequence(
+            episode_id=episode_id,
+            parent_sequence_id=sequence.id,
+            base_asset_id=video_asset_id,
+            rendered_asset_id=replacement_asset_id,
+            status=SequenceStatus.CONTENT_REVIEW,
+            plan=sequence.plan,
+        )
+        repository.update_video_sequence(
+            sequence_id=replacement.id,
+            status=SequenceStatus.APPROVED,
+        )
+        switched = repository.select_video_sequence(
+            replacement.id,
+            revoke_confirmed_outcome=True,
+            keep_confirmed_outcome=False,
+        )
+        assert switched.outcome_revoked is True
+        assert repository.get_episode(run_id, Slot.MORNING).selected_video_asset_id == (
+            replacement_asset_id
+        )
+        context = repository.get_planning_context(run_id)
+        assert "morning" not in context["acceptedOutcomes"]
+        assert context["staleSlots"] == ["evening", "noon"]
+        assert repository.get_run(run_id).status == "generating"
 
         with engine.connect() as connection:
             quoted = connection.dialect.identifier_preparer.quote_schema(schema)

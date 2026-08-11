@@ -316,13 +316,14 @@ class ArkGateway:
                 "text": "以下图片按视频时间顺序排列，请只返回结构化诊断。",
             }
         ]
-        content.extend(
-            {
-                "type": "input_image",
-                "image_url": _asset_data_url(path),
-            }
-            for path in frame_paths
-        )
+        for index, path in enumerate(frame_paths, 1):
+            content.append({"type": "input_text", "text": f"有序抽帧{index}"})
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": _asset_data_url(path),
+                }
+            )
         try:
             response = self._client.responses.create(
                 model=self.review_model,
@@ -370,6 +371,9 @@ class ArkGateway:
                     }
                     for item in payload["evidence"]
                 ),
+                shot_boundaries_seconds=tuple(
+                    float(item) for item in payload["shotBoundariesSeconds"]
+                ),
                 response_id=response.id,
                 model=response.model,
                 request_hash=request_hash,
@@ -386,23 +390,25 @@ class ArkGateway:
         *,
         prompt: str,
         input_plan: VideoInputPlan,
-        input_paths: tuple[Path, ...] = (),
-        input_urls: tuple[str, ...] = (),
+        input_sources: tuple[Path | str, ...],
     ) -> VideoTaskResult:
-        if bool(input_paths) == bool(input_urls):
+        if not input_sources:
             raise ArkGatewayError(
-                "视频输入必须且只能选择本地图片或供应商视频URL",
+                "视频输入不能为空",
                 code="invalid_visual_input_source",
                 retryable=False,
             )
-        inputs: tuple[Path | str, ...] = input_paths or input_urls
-        if len(input_plan.bindings) != len(inputs):
+        if len(input_plan.bindings) != len(input_sources):
             raise ArkGatewayError(
                 "多模态输入计划与实际素材数量不一致",
                 code="invalid_visual_input_count",
                 retryable=False,
             )
-        if sum(path.stat().st_size for path in input_paths if path.is_file()) > 64 * 1024 * 1024:
+        if sum(
+            source.stat().st_size
+            for source in input_sources
+            if isinstance(source, Path) and source.is_file()
+        ) > 64 * 1024 * 1024:
             raise ArkGatewayError(
                 "多模态请求素材总大小超过64MB",
                 code="reference_payload_too_large",
@@ -410,7 +416,7 @@ class ArkGateway:
             )
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         for source, binding in zip(
-            inputs,
+            input_sources,
             input_plan.bindings,
             strict=True,
         ):

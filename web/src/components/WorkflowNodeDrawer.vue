@@ -1,8 +1,9 @@
 <script setup lang="ts">
+import { ElMessage } from "element-plus";
 import { computed, ref, watch } from "vue";
 
 import { api, ApiError } from "../api/client";
-import type { RunGraph, StepDto, StepTraceDto, WorkflowNodeDto } from "../api/types";
+import type { JobAccepted, RunGraph, StepDto, StepTraceDto, WorkflowNodeDto } from "../api/types";
 import AssetThumb from "./AssetThumb.vue";
 import StatusBadge from "./StatusBadge.vue";
 import StepList from "./StepList.vue";
@@ -15,13 +16,20 @@ const props = defineProps<{
 const emit = defineEmits<{
   "update:modelValue": [value: boolean];
   changed: [];
+  job: [job: JobAccepted];
   review: [step: StepDto];
+  replan: [slot: "morning" | "noon" | "evening"];
 }>();
 
 const activePanel = ref("content");
 const trace = ref<StepTraceDto | null>(null);
 const traceLoading = ref(false);
 const traceError = ref("");
+const regenerateOpen = ref(false);
+const regenerateReason = ref("");
+const regeneratePrompt = ref("");
+const regeneratePaidConfirmed = ref(false);
+const regenerating = ref(false);
 
 async function loadTrace() {
   const stepId = props.node?.stepId;
@@ -40,7 +48,7 @@ async function loadTrace() {
 
 watch(
   [
-    () => props.node?.id,
+    () => props.node?.semanticNodeId,
     () => props.node?.stepId,
     () => props.node?.status,
     () => props.node?.attempts.length,
@@ -103,6 +111,36 @@ function promptAttempt(stepId: string) {
 function close() {
   emit("update:modelValue", false);
 }
+
+function openRegenerate() {
+  const prompt = trace.value?.currentCompiledPrompts.at(-1)?.text
+    ?? trace.value?.actualPrompts.at(-1)?.text
+    ?? "";
+  regenerateReason.value = "";
+  regeneratePrompt.value = prompt;
+  regeneratePaidConfirmed.value = false;
+  regenerateOpen.value = true;
+}
+
+async function regenerate() {
+  if (!props.node?.stepId || regenerateReason.value.trim().length < 4) return;
+  regenerating.value = true;
+  try {
+    const job = await api.regenerateStep(props.node.stepId, {
+      reason: regenerateReason.value.trim(),
+      promptOverride: regeneratePrompt.value.trim() || undefined,
+      allowPaidGeneration: true,
+      acknowledgeDownstreamReplacement: props.node.type === "video",
+    });
+    regenerateOpen.value = false;
+    ElMessage.info("节点新版本已提交");
+    emit("job", job);
+  } catch (error) {
+    ElMessage.error(error instanceof ApiError ? error.message : String(error));
+  } finally {
+    regenerating.value = false;
+  }
+}
 </script>
 
 <template>
@@ -133,6 +171,15 @@ function close() {
         </template>
         <div v-if="node.nextAction">下一步：{{ node.nextAction }}</div>
       </el-alert>
+      <el-alert
+        v-else-if="node.availability === 'locked'"
+        type="info"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 12px"
+        :title="node.lockReason ?? '该节点尚未解锁'"
+        :description="node.unlockRequirements.join('；')"
+      />
 
       <el-tabs v-model="activePanel">
         <el-tab-pane label="内容结果" name="content">
@@ -151,7 +198,7 @@ function close() {
             </el-descriptions-item>
           </el-descriptions>
 
-          <template v-if="node.id === 'director:day'">
+          <template v-if="node.semanticNodeId === 'run:day-director'">
             <h4>全天导演结果</h4>
             <pre class="json-view">{{ JSON.stringify(graph.run.dayBrief, null, 2) }}</pre>
           </template>
@@ -286,6 +333,7 @@ function close() {
         <el-tab-pane label="Provider任务" name="provider">
           <StepList
             :steps="attempts"
+            @job="emit('job', $event)"
             @changed="emit('changed')"
             @review="emit('review', $event)"
           />
@@ -323,6 +371,7 @@ function close() {
         <el-tab-pane label="尝试历史" name="attempts">
           <StepList
             :steps="attempts"
+            @job="emit('job', $event)"
             @changed="emit('changed')"
             @review="emit('review', $event)"
           />
@@ -331,9 +380,50 @@ function close() {
     </template>
 
     <template #footer>
+      <el-button
+        v-if="node?.allowedActions.some((item) => item.type === 'regenerate')"
+        type="warning"
+        @click="openRegenerate"
+      >重新生成此节点</el-button>
+      <el-button
+        v-if="node?.slot && node.allowedActions.some((item) => item.type === 'replan')"
+        type="warning"
+        @click="emit('replan', node.slot)"
+      >重新规划该时段</el-button>
       <el-button @click="close">关闭</el-button>
     </template>
   </el-drawer>
+
+  <el-dialog v-model="regenerateOpen" :title="`重新生成 ${node?.label ?? '节点'}`" width="680px">
+    <el-alert
+      type="warning"
+      :closable="false"
+      show-icon
+      title="新attempt会产生Ark费用"
+      description="旧Prompt、Task ID、媒体与审核永久保留；新结果批准前不会替换正式资产。"
+      style="margin-bottom: 12px"
+    />
+    <el-form label-position="top">
+      <el-form-item label="重生成原因">
+        <el-input v-model="regenerateReason" type="textarea" :rows="3" placeholder="说明需要修复的问题（至少4个字符）" />
+      </el-form-item>
+      <el-form-item label="本次实际Prompt（高级，可编辑）">
+        <el-input v-model="regeneratePrompt" type="textarea" :rows="12" />
+      </el-form-item>
+      <el-checkbox v-model="regeneratePaidConfirmed">
+        我确认本次会创建新的Ark付费调用，并接受下游产生新候选版本
+      </el-checkbox>
+    </el-form>
+    <template #footer>
+      <el-button @click="regenerateOpen = false">取消</el-button>
+      <el-button
+        type="primary"
+        :loading="regenerating"
+        :disabled="regenerateReason.trim().length < 4 || !regeneratePaidConfirmed"
+        @click="regenerate"
+      >确认并创建新attempt</el-button>
+    </template>
+  </el-dialog>
 </template>
 
 <style scoped>

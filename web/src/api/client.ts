@@ -173,6 +173,37 @@ export const api = {
       acknowledgeDuplicateBilling,
       restartFromBeginning,
     }),
+  regenerateStep: (
+    stepId: string,
+    payload: {
+      reason: string;
+      promptOverride?: string;
+      allowPaidGeneration: boolean;
+      acknowledgeDownstreamReplacement: boolean;
+    },
+  ) => post<JobAccepted>(`/steps/${stepId}/regenerate`, payload),
+  videoSequences: (episodeId: string) =>
+    request<import("./types").VideoSequenceDto[]>(
+      `/episodes/${episodeId}/video-sequences`,
+    ),
+  rangeEdit: (
+    episodeId: string,
+    sequenceId: string,
+    payload: {
+      startMs: number;
+      endMs: number;
+      boundaryMode: "snap_to_shot" | "exact";
+      instruction: string;
+      allowPaidGeneration: boolean;
+    },
+  ) => post<JobAccepted>(
+    `/episodes/${episodeId}/video-sequences/${sequenceId}/range-edits`,
+    payload,
+  ),
+  selectVideoSequence: (
+    sequenceId: string,
+    payload: { revokeConfirmedOutcome: boolean; keepConfirmedOutcome: boolean },
+  ) => post<Record<string, unknown>>(`/video-sequences/${sequenceId}/select`, payload),
   resumeStep: (stepId: string) =>
     post<JobAccepted>(`/steps/${stepId}/resume`),
   reconciliationCandidates: (stepId: string) =>
@@ -190,10 +221,12 @@ export const api = {
     slot: string,
     reason: string,
     allowPaidGeneration: boolean,
+    acknowledgeDownstreamReplacement = false,
   ) =>
     post<JobAccepted>(`/runs/${runId}/episodes/${slot}/replan`, {
       reason,
       allowPaidGeneration,
+      acknowledgeDownstreamReplacement,
     }),
   uploadReference: async (
     episodeId: string,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -14,10 +15,12 @@ from cat_video_generator.application.ports import (
     StoredAsset,
     StoredEpisode,
     StoredStep,
+    StoredVideoSequence,
     VideoTaskResult,
 )
 from cat_video_generator.application.video_execution import VideoExecutionService
 from cat_video_generator.domain.contracts import Slot
+from cat_video_generator.domain.rendering import SequenceStatus
 from cat_video_generator.domain.visual_profiles import (
     DEFAULT_SERIES_VISUAL_PROFILE,
     DEFAULT_STYLE_PROFILE,
@@ -30,6 +33,7 @@ class Repository:
         self.episode = episode
         self.steps: dict[uuid.UUID, StoredStep] = {}
         self.assets: dict[uuid.UUID, StoredAsset] = {anchor.id: anchor}
+        self.sequences: dict[uuid.UUID, StoredVideoSequence] = {}
 
     def create_step_with_prompt_intent(self, **kwargs):
         existing = next(
@@ -144,14 +148,32 @@ class Repository:
             None,
         )
 
+    def create_video_sequence(self, **kwargs):
+        now = datetime.now(timezone.utc)
+        sequence = StoredVideoSequence(
+            id=uuid.uuid4(),
+            episode_id=kwargs["episode_id"],
+            revision=len(self.sequences) + 1,
+            parent_sequence_id=kwargs["parent_sequence_id"],
+            base_asset_id=kwargs["base_asset_id"],
+            rendered_asset_id=kwargs.get("rendered_asset_id"),
+            status=kwargs["status"],
+            plan=kwargs["plan"],
+            audio_policy="preserve_original",
+            created_at=now,
+            updated_at=now,
+        )
+        self.sequences[sequence.id] = sequence
+        return sequence
+
 
 class Gateway:
     def __init__(self, model="doubao-seedance-2-0-260128") -> None:
         self.video_model = model
         self.calls = []
 
-    def submit_video(self, *, prompt, input_plan, input_paths=(), input_urls=()):
-        self.calls.append((prompt, input_plan, input_paths or input_urls))
+    def submit_video(self, *, prompt, input_plan, input_sources):
+        self.calls.append((prompt, input_plan, input_sources))
         index = len(self.calls)
         return VideoTaskResult(
             task_id=f"task-{index}",
@@ -201,6 +223,7 @@ class Probe:
         return {
             "passed": True,
             "durationSeconds": kwargs["expected_duration_seconds"],
+            "durationMs": kwargs["expected_duration_seconds"] * 1000,
             "resolution": kwargs["expected_resolution"],
             "failures": [],
         }
@@ -274,9 +297,12 @@ def test_medium_video_uses_initial_then_one_cumulative_extension(tmp_path: Path)
         item.role for item in repository.assets.values() if item.media_type == "video"
     ) == [
         "video",
+        "video_extension_segment",
         "video_intermediate",
     ]
     assert repository.episode.status is EpisodeStatus.CONTENT_REVIEW
+    assert len(repository.sequences) == 1
+    assert next(iter(repository.sequences.values())).status is SequenceStatus.CONTENT_REVIEW
 
 
 def test_long_video_uses_at_most_two_extensions(tmp_path: Path) -> None:

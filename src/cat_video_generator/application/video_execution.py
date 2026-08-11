@@ -18,10 +18,14 @@ from typing import Any
 
 from ..domain.prompts import compile_video_diagnostic_prompt, compile_video_prompt
 from ..domain.rendering import (
+    ClipOrigin,
     MediaSource,
     RenderOperation,
     RenderPlan,
     RenderSection,
+    SequenceStatus,
+    VideoSequenceClip,
+    VideoSequencePlan,
     build_render_plan,
     build_video_input_plan,
     supports_video_extension,
@@ -129,6 +133,39 @@ class VideoExecutionService:
             raise ValueError("continue-query 只接受已有 task ID 的 queued/running 视频步骤")
         if not step.provider_task_id:
             raise ValueError("视频步骤缺少 provider task ID")
+        # Provider 成功后的下载、Sequence 落库与语义诊断之间可能发生进程中断。
+        # 若最终候选已经由当前 Step 落盘，恢复必须复用该不可变资产，不能再次下载、
+        # 创建重复 Sequence，也不能把已在 content_review 的 Episode 倒退到 media_qc。
+        landed_candidates = tuple(
+            asset
+            for asset in self._repository.list_assets(
+                run_id=episode.run_id,
+                episode_id=episode.id,
+                roles=("video",),
+                statuses=("candidate", "approved", "ready"),
+            )
+            if asset.step_id == step.id
+        )
+        if landed_candidates:
+            if len(landed_candidates) != 1:
+                raise ValueError(f"视频步骤 {step.id} 存在多个最终候选资产，需人工对账")
+            asset = landed_candidates[0]
+            qc = asset.metadata.get("qc")
+            self._repository.set_step_status(
+                step.id,
+                StepStatus.AWAITING_REVIEW,
+                input_snapshot_patch={
+                    "provider_task_status": "succeeded",
+                    "media_qc": qc if isinstance(qc, dict) else None,
+                },
+            )
+            self._run_diagnostic(episode, asset, self._repository.get_step(step.id))
+            return {
+                "status": "succeeded",
+                "stepId": str(step.id),
+                "assetId": str(asset.id),
+                "reusedLandedAsset": True,
+            }
         if local_recovery:
             self._ensure_episode_generating(episode)
             self._repository.reopen_video_step_for_local_recovery(step.id)
@@ -223,6 +260,45 @@ class VideoExecutionService:
             source=landed,
             start_order=section.order + 1,
             prompt_override=None,
+        )
+
+    def regenerate_video(
+        self,
+        episode: StoredEpisode,
+        step: StoredStep,
+        *,
+        reason: str,
+        prompt_override: str | None = None,
+    ) -> dict[str, Any]:
+        """从批准开场锚点重新生成整条视频，旧版本继续保持可选。"""
+
+        if step.kind is not StepKind.VIDEO or step.status in {
+            StepStatus.PENDING,
+            StepStatus.SUBMITTING,
+            StepStatus.SUBMISSION_UNKNOWN,
+            StepStatus.QUEUED,
+            StepStatus.RUNNING,
+        }:
+            raise ValueError("视频节点仍在执行或提交结果未知，不能整条重生成")
+        anchors = self._repository.list_assets(
+            run_id=episode.run_id,
+            episode_id=episode.id,
+            roles=("opening_anchor",),
+            statuses=("approved", "ready"),
+        )
+        if not anchors:
+            raise ValueError("整条重生成需要已批准的开场锚点")
+        plan = build_render_plan(episode.plan)
+        self._require_extension_capability(plan)
+        return self._execute_sections(
+            episode,
+            plan,
+            source=anchors[-1],
+            start_order=1,
+            prompt_override=prompt_override,
+            fresh_attempts=True,
+            retry_of_step_id=step.id,
+            retry_reason=reason,
         )
 
     def reconciliation_candidates(self, step: StoredStep) -> tuple[dict[str, Any], ...]:
@@ -425,7 +501,7 @@ class VideoExecutionService:
                 task = self._gateway.submit_video(
                     prompt=prompt,
                     input_plan=input_plan,
-                    input_paths=(source.path,),
+                    input_sources=(source.path,),
                 )
             else:
                 # Ark延展不接受本地MP4或Base64。通过上一段已持久化的task ID
@@ -448,7 +524,7 @@ class VideoExecutionService:
                 task = self._gateway.submit_video(
                     prompt=prompt,
                     input_plan=input_plan,
-                    input_urls=(source_task.video_url,),
+                    input_sources=(source_task.video_url,),
                 )
         except GatewayError as exc:
             self._repository.fail_step(
@@ -557,8 +633,29 @@ class VideoExecutionService:
                     "media_qc": segment_qc,
                 },
             )
-            self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
+            current_episode = self._repository.get_episode(episode.run_id, episode.plan.slot)
+            if current_episode.selected_video_asset_id is None:
+                self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
             raise RuntimeError(f"视频区段技术QC失败: {segment_qc.get('failures', [])}")
+
+        segment_asset = None
+        if section.order > 1:
+            segment_asset = self._repository.save_asset(
+                run_id=episode.run_id,
+                episode_id=episode.id,
+                step_id=step.id,
+                role="video_extension_segment",
+                semantic_key=f"video:{episode.plan.slot.value}:segment-{section.order}",
+                scope="episode",
+                status="ready",
+                media_type="video",
+                landed=landed,
+                metadata={
+                    "qc": segment_qc,
+                    "providerTaskId": step.provider_task_id,
+                    "renderSectionOrder": section.order,
+                },
+            )
 
         if section.order == 1:
             component_paths = (landed.path,)
@@ -579,6 +676,16 @@ class VideoExecutionService:
             )
             component_paths = (*previous_paths, landed.path)
             component_sha256 = (*previous_hashes, landed.sha256)
+            stored_asset_ids = source.metadata.get("componentAssetIds")
+            previous_asset_ids = (
+                tuple(uuid.UUID(str(item)) for item in stored_asset_ids)
+                if isinstance(stored_asset_ids, list) and stored_asset_ids
+                else (source.id,)
+            )
+            assert segment_asset is not None
+            component_asset_ids = (*previous_asset_ids, segment_asset.id)
+        if section.order == 1:
+            component_asset_ids = ()
 
         expected_total = sum(
             item.duration_seconds for item in render_plan.sections[: section.order]
@@ -608,8 +715,11 @@ class VideoExecutionService:
                 message=json.dumps(qc, ensure_ascii=False),
                 input_snapshot_patch={"provider_task_status": "succeeded", "media_qc": qc},
             )
-            self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
+            current_episode = self._repository.get_episode(episode.run_id, episode.plan.slot)
+            if current_episode.selected_video_asset_id is None:
+                self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
             raise RuntimeError(f"视频累计成片技术QC失败: {qc.get('failures', [])}")
+        actual_duration_ms = int(qc.get("durationMs") or expected_total * 1000)
         asset = self._repository.save_asset(
             run_id=episode.run_id,
             episode_id=episode.id,
@@ -629,8 +739,13 @@ class VideoExecutionService:
                 "providerTaskId": step.provider_task_id,
                 "componentPaths": [str(item) for item in component_paths],
                 "componentSha256": list(component_sha256),
+                "componentAssetIds": [str(item) for item in component_asset_ids],
                 "assemblyMode": (
                     "ffmpeg_concat_stream_copy" if final and section.order > 1 else "none"
+                ),
+                "shotBoundariesMs": _shot_boundaries(
+                    actual_duration_ms if final else int(segment_qc.get("durationMs") or 0),
+                    len(episode.plan.script.shots),
                 ),
             },
         )
@@ -641,13 +756,48 @@ class VideoExecutionService:
                 input_snapshot_patch={"provider_task_status": "succeeded", "media_qc": qc},
             )
             return {"status": "succeeded", "stepId": str(step.id), "assetId": str(asset.id)}
-        self._repository.set_episode_status(episode.id, EpisodeStatus.MEDIA_QC)
+        sequence_plan = (
+            VideoSequencePlan(
+                duration_ms=actual_duration_ms,
+                clips=[
+                    VideoSequenceClip(
+                        order=1,
+                        source_asset_id=asset.id,
+                        source_start_ms=0,
+                        source_end_ms=actual_duration_ms,
+                        timeline_start_ms=0,
+                        timeline_end_ms=actual_duration_ms,
+                        origin=ClipOrigin.ORIGINAL,
+                    )
+                ],
+            )
+            if not component_asset_ids
+            else _sequence_plan_from_assets(
+                tuple(self._repository.asset_detail(item) for item in component_asset_ids)
+            )
+        )
+        self._repository.create_video_sequence(
+            episode_id=episode.id,
+            parent_sequence_id=None,
+            base_asset_id=asset.id,
+            rendered_asset_id=asset.id,
+            status=SequenceStatus.CONTENT_REVIEW,
+            plan=sequence_plan,
+        )
+        current_episode = self._repository.get_episode(episode.run_id, episode.plan.slot)
+        replacing_existing_video = (
+            current_episode.status is EpisodeStatus.READY
+            and current_episode.selected_video_asset_id is not None
+        )
+        if not replacing_existing_video:
+            self._repository.set_episode_status(episode.id, EpisodeStatus.MEDIA_QC)
         self._repository.set_step_status(
             step.id,
             StepStatus.AWAITING_REVIEW,
             input_snapshot_patch={"provider_task_status": "succeeded", "media_qc": qc},
         )
-        self._repository.set_episode_status(episode.id, EpisodeStatus.CONTENT_REVIEW)
+        if not replacing_existing_video:
+            self._repository.set_episode_status(episode.id, EpisodeStatus.CONTENT_REVIEW)
         self._run_diagnostic(episode, asset, step)
         return {"status": "succeeded", "stepId": str(step.id), "assetId": str(asset.id)}
 
@@ -716,10 +866,48 @@ class VideoExecutionService:
                 "carryForward": result.carry_forward,
                 "doNotCarryForward": result.do_not_carry_forward,
                 "evidence": result.evidence,
+                "shotBoundariesSeconds": result.shot_boundaries_seconds,
                 "requestHash": result.request_hash,
                 "responseId": result.response_id,
             },
         )
+        qc_metadata = asset.metadata.get("qc")
+        duration_value = (
+            qc_metadata.get("durationMs")
+            if isinstance(qc_metadata, dict)
+            else asset.metadata.get("durationMs")
+        )
+        if not isinstance(duration_value, int) or duration_value <= 0:
+            return
+        duration_ms = duration_value
+        diagnostic_boundaries = sorted(
+            {
+                round(value * 1000)
+                for value in result.shot_boundaries_seconds
+                if 0 < value * 1000 < duration_ms
+            }
+        )
+        if diagnostic_boundaries:
+            self._repository.patch_asset_metadata(
+                asset.id,
+                {
+                    "diagnosticShotBoundariesMs": [
+                        0,
+                        *diagnostic_boundaries,
+                        duration_ms,
+                    ]
+                },
+            )
+
+    def diagnose_candidate(
+        self,
+        episode: StoredEpisode,
+        asset: StoredAsset,
+        step: StoredStep,
+    ) -> None:
+        """让局部编辑成片复用同一视频诊断边界。"""
+
+        self._run_diagnostic(episode, asset, step)
 
     def _asset_for_step(
         self,
@@ -775,6 +963,39 @@ def _input_hash(prompt: str, input_plan: dict[str, Any], source_sha: str) -> str
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _shot_boundaries(duration_ms: int, shot_count: int) -> list[int]:
+    """生成确定性计划镜头边界，供时间轴吸附；不伪装成视觉场景检测。"""
+
+    if duration_ms <= 0 or shot_count <= 0:
+        return []
+    return [round(duration_ms * index / shot_count) for index in range(shot_count + 1)]
+
+
+def _sequence_plan_from_assets(assets: tuple[StoredAsset, ...]) -> VideoSequencePlan:
+    """把Ark初始段和延展尾段映射为可单独编辑的来源Clip。"""
+
+    clips: list[VideoSequenceClip] = []
+    cursor = 0
+    for order, asset in enumerate(assets, 1):
+        qc = asset.metadata.get("qc")
+        duration_ms = qc.get("durationMs") if isinstance(qc, dict) else None
+        if not isinstance(duration_ms, int) or duration_ms <= 0:
+            raise ValueError(f"视频区段资产{asset.id}缺少durationMs")
+        clips.append(
+            VideoSequenceClip(
+                order=order,
+                source_asset_id=asset.id,
+                source_start_ms=0,
+                source_end_ms=duration_ms,
+                timeline_start_ms=cursor,
+                timeline_end_ms=cursor + duration_ms,
+                origin=ClipOrigin.ORIGINAL,
+            )
+        )
+        cursor += duration_ms
+    return VideoSequencePlan(duration_ms=cursor, clips=clips)
 
 
 def _matches_task(

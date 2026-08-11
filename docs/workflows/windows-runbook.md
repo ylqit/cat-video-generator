@@ -32,7 +32,7 @@ IMAGE_REVIEW_MODE=semantic_auto|manual
 MEDIA_WORK_ROOT / MEDIA_ASSET_ROOT / DELIVERY_OUTPUT_ROOT
 ```
 
-## 2. 迁移到0012
+## 2. 迁移到0013
 
 0012启用极简混合导演契约版本2，且不转换旧Episode JSON，因此要求旧生产Run为空。
 先预览并保存诊断清单：
@@ -51,7 +51,9 @@ uv run cvg doctor
 
 清理删除带Run外键的业务记录和已验证位于媒体根下的历史文件，同时只保留当前正式
 语义键的最新批准Canon；仍被保留Canon引用的文件路径永远不会被删除。
-Doctor最终必须报告`0012_minimal_director_contract`。
+升级0012后继续执行`uv run alembic upgrade head`。0013只新增非破坏性
+`video_sequences`表，不清理Canon或生产媒体。Doctor最终必须报告
+`0013_canvas_video_sequences`。
 
 ## 3. Canon
 
@@ -117,6 +119,11 @@ uv run cvg run-day <runId> --slot morning --allow-paid-generation
 当前编译Prompt、各attempt实际调用Prompt、Ark原始结构化JSON、可选归一化结果和警告；
 Provider、媒体、审核与尝试历史分别展示，页面轮询不会改变当前stage、slot或node。
 
+中央固定语义画布会完整展示未来锁定路线；锁定节点不对应收费Step。选中视频节点后，
+页面底部展示非破坏性单轨时间轴、版本对比、镜头边界、精确选区、整条重生成和区间
+重生成。区间需0.5～13秒且不能跨来源Clip；来源必须保有可查询Ark task URL。新版本
+批准前不会替换Episode正式视频，原视频完整音轨会保留。
+
 ## 6. 恢复、审核和交付
 
 ```powershell
@@ -153,6 +160,7 @@ $env:CAT_VIDEO_POSTGRES_TEST_MODE='remote-schema'
 uv run pytest -m postgres -q
 Remove-Item Env:CAT_VIDEO_POSTGRES_TEST_MODE
 npm --prefix web run build
+npm --prefix web run test:e2e
 git diff --check
 uv run cvg doctor
 ```

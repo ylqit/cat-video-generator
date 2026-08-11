@@ -71,11 +71,11 @@ def test_gateway_maps_initial_anchor_and_extension_video_roles(tmp_path: Path) -
         source=MediaSource(uuid4(), "video:section-1", "video", "b" * 64, {}),
     )
 
-    gateway.submit_video(prompt="initial", input_plan=image_plan, input_paths=(image_path,))
+    gateway.submit_video(prompt="initial", input_plan=image_plan, input_sources=(image_path,))
     gateway.submit_video(
         prompt="extend",
         input_plan=extend_plan,
-        input_urls=("https://example.invalid/previous.mp4",),
+        input_sources=("https://example.invalid/previous.mp4",),
     )
 
     first_media = client.tasks.calls[0]["content"][1]
@@ -162,7 +162,7 @@ def test_step_projection_returns_resume_reconcile_and_retry_actions() -> None:
     assert failed["availableActions"][0]["type"] == "retry"
 
 
-def test_medium_episode_graph_contains_one_extension_node() -> None:
+def test_medium_episode_graph_aggregates_extensions_into_stable_video_node() -> None:
     episode_id = uuid4()
     plan = episode_for(Slot.NOON, duration=22)
     row = Episode(
@@ -179,10 +179,63 @@ def test_medium_episode_graph_contains_one_extension_node() -> None:
         _step(episode_id=episode_id, operation_key="video:single_pass", status="succeeded"),
         _step(episode_id=episode_id, operation_key="video:extend:2", status="running"),
     )
-    nodes = _workflow_nodes((row,), steps, (), (), ())
+    nodes = _workflow_nodes(
+        (row,), steps, (), (), (), guided=False, day_brief_confirmed=True
+    )
 
-    ids = {item["id"] for item in nodes}
-    assert "video:noon:1" in ids
-    assert "video:noon:2" in ids
-    assert "video:noon:3" not in ids
+    ids = {item["semanticNodeId"] for item in nodes}
+    assert "noon:video" in ids
+    assert not any(item.startswith("video:noon:") for item in ids)
+    video = next(item for item in nodes if item["semanticNodeId"] == "noon:video")
+    assert len(video["attemptIds"]) == 2
     assert len(build_render_plan(plan).sections) == 2
+
+
+def test_guided_canvas_projects_locked_future_nodes_without_fake_steps() -> None:
+    nodes = _workflow_nodes(
+        (), (), (), (), (), guided=True, day_brief_confirmed=False
+    )
+    by_id = {item["semanticNodeId"]: item for item in nodes}
+
+    assert by_id["morning:director"]["availability"] == "locked"
+    assert by_id["noon:director"]["executionStatus"] == "not_created"
+    assert by_id["evening:video"]["stepId"] is None
+    assert by_id["noon:director"]["lockReason"] == "确认DayBrief"
+
+
+def test_guided_canvas_unlocks_only_next_director_after_outcome() -> None:
+    morning = episode_for(Slot.MORNING)
+    row = Episode(
+        id=uuid4(),
+        production_run_id=uuid4(),
+        slot="morning",
+        sort_order=1,
+        script_json=morning.script.model_dump(mode="json"),
+        prompt_overrides_json={},
+        status="ready",
+        selected_video_asset_id=None,
+    )
+    nodes = _workflow_nodes(
+        (row,),
+        (),
+        (),
+        (),
+        (),
+        {"morning": {"summary": "上午实际结果"}},
+        guided=True,
+        day_brief_confirmed=True,
+    )
+    by_id = {item["semanticNodeId"]: item for item in nodes}
+
+    assert by_id["noon:director"]["availability"] == "ready"
+    assert by_id["evening:director"]["availability"] == "locked"
+    assert by_id["noon:director"]["stepId"] is None
+
+
+def test_auto_day_canvas_unlocks_all_slot_directors_after_day_brief() -> None:
+    nodes = _workflow_nodes(
+        (), (), (), (), (), guided=False, day_brief_confirmed=True
+    )
+    by_id = {item["semanticNodeId"]: item for item in nodes}
+
+    assert all(by_id[f"{slot.value}:director"]["availability"] == "ready" for slot in Slot)

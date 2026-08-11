@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import uuid
 from collections.abc import Callable
@@ -19,6 +20,7 @@ from ..application.planning import DayBriefPause
 from ..application.ports import GatewayError
 from ..domain.contracts import Slot
 from ..domain.pipeline import PipelineSettings, StageMode
+from ..domain.rendering import BoundaryMode
 from .api_helpers import _accepted, _jsonable, _submit
 from .api_schemas import (
     CANON_ROLES as _CANON_ROLES,
@@ -41,10 +43,13 @@ from .api_schemas import (
     PaidRequest,
     PlanRequest,
     PromptOverridesRequest,
+    RangeEditRequest,
     ReconcileStepRequest,
+    RegenerateStepRequest,
     ReplanRequest,
     RetryStepRequest,
     ReviewRequest,
+    SelectVideoSequenceRequest,
 )
 from .api_studio import (
     build_plan_payload,
@@ -62,6 +67,8 @@ def create_write_router(
     delivery: Any,
     queries: Any,
     retry: Any,
+    regeneration: Any,
+    video_editing: Any,
     job_registry: JobRegistry,
     default_candidate_count: int,
     upload_dir: Path,
@@ -326,6 +333,114 @@ def create_write_router(
         )
         return _accepted(record)
 
+    @router.post("/steps/{step_id}/regenerate", status_code=202)
+    def regenerate_step(
+        step_id: uuid.UUID,
+        request: RegenerateStepRequest,
+    ) -> dict[str, Any]:
+        """保留旧attempt并创建节点的新版本；不覆盖既有正式媒体。"""
+
+        if not request.allow_paid_generation:
+            raise HTTPException(
+                status_code=422,
+                detail="节点重生成必须显式确认allowPaidGeneration",
+            )
+        try:
+            target = queries.step(step_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        def task() -> dict[str, Any]:
+            return _jsonable(
+                regeneration.regenerate_step(
+                    step_id,
+                    reason=request.reason,
+                    prompt_override=request.prompt_override,
+                    allow_paid_generation=True,
+                    acknowledge_downstream_replacement=(
+                        request.acknowledge_downstream_replacement
+                    ),
+                )
+            )
+
+        record = _submit(
+            job_registry,
+            kind="regenerate_step",
+            dedup_key=f"regenerate:{step_id}",
+            fn=task,
+            context={
+                "runId": target.get("runId"),
+                "episodeId": target.get("episodeId"),
+                "operationKey": target.get("operationKey"),
+            },
+        )
+        return _accepted(record)
+
+    @router.post(
+        "/episodes/{episode_id}/video-sequences/{sequence_id}/range-edits",
+        status_code=202,
+    )
+    def range_edit(
+        episode_id: uuid.UUID,
+        sequence_id: uuid.UUID,
+        request: RangeEditRequest,
+    ) -> dict[str, Any]:
+        if not request.allow_paid_generation:
+            raise HTTPException(
+                status_code=422,
+                detail="视频区间重生成必须显式确认allowPaidGeneration",
+            )
+        try:
+            episode = queries.episode(episode_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        def task() -> dict[str, Any]:
+            return _jsonable(
+                video_editing.range_edit(
+                    episode_id,
+                    sequence_id,
+                    start_ms=request.start_ms,
+                    end_ms=request.end_ms,
+                    boundary_mode=BoundaryMode(request.boundary_mode),
+                    instruction=request.instruction,
+                    allow_paid_generation=True,
+                )
+            )
+
+        record = _submit(
+            job_registry,
+            kind="video_range_edit",
+            dedup_key=(
+                f"range-edit:{sequence_id}:{request.start_ms}:{request.end_ms}:"
+                f"{request.boundary_mode}:"
+                f"{hashlib.sha256(request.instruction.strip().encode('utf-8')).hexdigest()[:12]}"
+            ),
+            fn=task,
+            context={
+                "runId": episode.get("runId"),
+                "episodeId": episode_id,
+                "operationKey": "video:range_edit",
+            },
+        )
+        return _accepted(record)
+
+    @router.post("/video-sequences/{sequence_id}/select")
+    def select_video_sequence(
+        sequence_id: uuid.UUID,
+        request: SelectVideoSequenceRequest,
+    ) -> dict[str, Any]:
+        try:
+            return video_editing.select_sequence(
+                sequence_id,
+                revoke_confirmed_outcome=request.revoke_confirmed_outcome,
+                keep_confirmed_outcome=request.keep_confirmed_outcome,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @router.post("/steps/{step_id}/resume", status_code=202)
     def resume_step(step_id: uuid.UUID) -> dict[str, Any]:
         """继续查询已有Ark Task ID；不创建新的供应商生成请求。"""
@@ -441,6 +556,9 @@ def create_write_router(
                 slot=slot,
                 reason=request.reason,
                 allow_paid_generation=True,
+                acknowledge_downstream_replacement=(
+                    request.acknowledge_downstream_replacement
+                ),
             )
             payload: dict[str, Any] = {"replan": _jsonable(result)}
             status = str(queries.run_graph(run_id)["run"]["status"])

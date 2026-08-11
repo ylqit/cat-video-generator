@@ -27,8 +27,8 @@ class FrameExtractionError(RuntimeError):
 class FfmpegFrameExtractor:
     """从已通过技术QC的视频均匀抽取只读诊断帧。
 
-    本类只服务最终视频语义诊断，不提取镜头尾帧，也不承担视频拼接或转码。
-    临时帧由调用方在审核请求结束后删除。
+    本类服务最终视频语义诊断与用户选区的精确边界帧提取，不承担视频拼接或转码。
+    临时帧由调用方在审核或边界资产落盘后删除。
     """
 
     def __init__(self, *, ffmpeg_path: Path, work_root: Path) -> None:
@@ -79,6 +79,53 @@ class FfmpegFrameExtractor:
                 frame.unlink(missing_ok=True)
             raise
 
+    def extract_frames_at(
+        self,
+        source: StoredAsset,
+        *,
+        timestamps_ms: tuple[int, ...],
+    ) -> tuple[Path, ...]:
+        """在精确毫秒位置抽取边界帧，供非破坏性区间编辑使用。"""
+
+        if not timestamps_ms or len(timestamps_ms) > 8:
+            raise ValueError("精确抽帧数量必须在1至8之间")
+        qc_metadata = source.metadata.get("qc")
+        duration_ms = (
+            qc_metadata.get("durationMs")
+            if isinstance(qc_metadata, dict)
+            else source.metadata.get("durationMs")
+        )
+        if not isinstance(duration_ms, int) or duration_ms <= 0:
+            raise ValueError("视频资产缺少durationMs")
+        if any(value < 0 or value >= duration_ms for value in timestamps_ms):
+            raise ValueError("抽帧时间必须位于视频有效区间")
+        self._work_root.mkdir(parents=True, exist_ok=True)
+        token = uuid.uuid4().hex
+        frames: list[Path] = []
+        try:
+            for index, timestamp_ms in enumerate(timestamps_ms, 1):
+                output = self._work_root / f".boundary-{token}-{index}.png"
+                _run_ffmpeg(
+                    self._ffmpeg_path,
+                    [
+                        "-ss",
+                        f"{timestamp_ms / 1000:.3f}",
+                        "-i",
+                        str(source.path),
+                        "-frames:v",
+                        "1",
+                        str(output),
+                    ],
+                )
+                if not output.is_file():
+                    raise FrameExtractionError(f"无法抽取{timestamp_ms}ms边界帧")
+                frames.append(output)
+            return tuple(frames)
+        except Exception:
+            for frame in frames:
+                frame.unlink(missing_ok=True)
+            raise
+
 
 class FfprobeMediaProbe:
     """Pillow图片检查与ffprobe视频检查。"""
@@ -124,6 +171,7 @@ class FfprobeMediaProbe:
         minimum_duration_seconds: int = 8,
         maximum_duration_seconds: int = 15,
         duration_tolerance_ms: int = 1000,
+        require_audio: bool = True,
     ) -> dict[str, Any]:
         payload = self._ffprobe(path)
         streams = payload.get("streams", [])
@@ -146,7 +194,7 @@ class FfprobeMediaProbe:
         failures: list[str] = []
         if video is None:
             failures.append("missing_video")
-        if audio is None:
+        if require_audio and audio is None:
             failures.append("missing_audio")
         if "mp4" not in str(format_info.get("format_name", "")):
             failures.append("container_not_mp4")

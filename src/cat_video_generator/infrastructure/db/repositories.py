@@ -52,6 +52,7 @@ from .records import (
     stored_step,
 )
 from .review_repository import ReviewPersistenceMixin
+from .video_sequence_repository import VideoSequencePersistenceMixin
 
 _GENERATION_PROMPT_PURPOSES = frozenset(
     {
@@ -67,6 +68,7 @@ class SqlAlchemyWorkflowRepository(
     DeliveryPersistenceMixin,
     PlanPersistenceMixin,
     ReviewPersistenceMixin,
+    VideoSequencePersistenceMixin,
     SqlAlchemyReadRepository,
 ):
     """远程PostgreSQL中的工作流唯一写入实现。"""
@@ -641,3 +643,12 @@ class SqlAlchemyWorkflowRepository(
                 ):
                     previous.status = "rejected"
             return stored_asset(row)
+
+    def patch_asset_metadata(self, asset_id: uuid.UUID, patch: dict[str, Any]) -> None:
+        """合并媒体派生证据，不改变资产状态或不可变文件身份。"""
+
+        if not patch:
+            return
+        with self._sessions.begin() as session:
+            row = required_record(session, Asset, asset_id)
+            row.metadata_json = {**row.metadata_json, **patch}

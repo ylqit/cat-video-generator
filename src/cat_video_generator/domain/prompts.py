@@ -72,8 +72,10 @@ def compile_day_director_prompt(
             "猫咪通过探索、发现、追逐、等待、误触或自然反应推动观众注意力，"
             "不代替人物完成复杂工具劳动。",
             "每个slotBrief只输出narrativeRole、eventDirection、appearanceIntent、"
-            "activityFocus、durationBand与decisionReason。只有用户选择adaptive时才可"
-            "自行解析活动焦点或时长档；固定选择必须原样保留。",
+            "activityFocus、durationBand与decisionReason。用户选择adaptive表示由你"
+            "现在完成决策，不是合法输出值：最终activityFocus只能是cat_lead、"
+            "person_lead或balanced，durationBand只能是short、medium或long；"
+            "固定选择必须原样保留。",
             "short承载8至15秒轻量事件；medium承载16至30秒的变化、受阻或协作恢复；"
             "long承载31至45秒连续过程。长时段仍只有一个主事件，不得用第二个任务填时长。",
             "早间建立当天活动，中午推进变化或主要事件，傍晚回收前文并兑现关系与情绪。"
@@ -86,6 +88,29 @@ def compile_day_director_prompt(
             "handoffs只用name、fromSlot、toSlot和continuity登记真正跨时段延续的同一"
             "关键道具或结果；人物、猫咪和普通背景不得登记。slotBriefs严格按"
             "morning、noon、evening排序。",
+        )
+    )
+
+
+def compile_day_repair_prompt(
+    *,
+    original_prompt: str,
+    rejected_candidate: dict[str, object],
+    validation_error: str,
+) -> str:
+    """让总导演用同一创作意图重新输出完整DayBrief，而不是生成局部JSON补丁。"""
+
+    return "\n".join(
+        (
+            original_prompt,
+            "【上次输出的契约修复】上次Provider已成功返回，但JSON未通过DayBrief契约。",
+            "上次完整候选："
+            + json.dumps(rejected_candidate, ensure_ascii=False, separators=(",", ":")),
+            f"精确错误：{validation_error}",
+            "请重新输出一份完整DayBrief，不要输出补丁或解释。特别注意：adaptive只存在于"
+            "用户输入控制中；每个slotBrief的durationBand最终必须选择short、medium或long，"
+            "activityFocus最终必须选择cat_lead、person_lead或balanced。保留原主题、时段边界、"
+            "已冻结选项和handoff，不得借修复改变剧情方向。",
         )
     )
 
@@ -112,7 +137,7 @@ def compile_day_structuring_prompt(
             "创作控制：" + json.dumps(controls.model_dump(mode="json"), ensure_ascii=False),
             "用dayArc完整概括全天递进关系，并提炼三个时段作用、事件方向、外观意图、"
             "活动焦点、时长档和跨时段handoff。固定选择不得改写；adaptive活动焦点与"
-            "时长档按原剧情容量解析。",
+            "时长档按原剧情容量立即解析，最终JSON不得保留adaptive。",
             "默认以猫咪推动可见信息、人物承担工具活动或回应、最终关系汇合的方式整理，"
             "但不得改变用户原文的实际主次。",
             f"固定主体：{series_profile.person_identity}；{series_profile.cat_identity}。",
@@ -576,6 +601,10 @@ def compile_video_diagnostic_prompt(
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
 ) -> str:
     constraints = _constraint_requirements(episode)
+    sample_times = "、".join(
+        f"{index * episode.duration_seconds / 11:.2f}"
+        for index in range(12)
+    )
     return "\n".join(
         (
             "你是视频语义诊断器，只返回给定JSON；诊断不自动批准或重新生成。",
@@ -589,10 +618,49 @@ def compile_video_diagnostic_prompt(
             "relationError；没有关系错误时relationError为null。"
             "连接线、承重物、容器、交接物或穿戴物归属错误必须判为constraintsOk=false。"
             "轻微表情和合理切镜变化不得误判为硬失败。",
+            f"本次固定按12张均匀抽帧审核，对应估算秒点依次为：{sample_times}。"
+            "timestamp必须使用最接近的上述秒点，不得虚构更精确时间。",
+            "shotBoundariesSeconds只填写抽帧中能够确认的稳定切镜时刻（秒），按升序输出；"
+            "不要填写0或片尾；连续单镜头或无法确认时返回空数组，不得按总时长机械均分。",
             "actualOutcome只总结抽帧中确实可见的最终事实，不用原剧本补写未实现内容。"
             "carryForward只列出后续剧情可以安全继承的实际人物、关系、道具或环境结果；"
             "doNotCarryForward列出分身、错误配饰、错误道具连接、空间突变等偶发生成错误，"
             "后续导演必须明确忽略这些错误。三个字段都使用简短自然语言。",
+        )
+    )
+
+
+def compile_video_range_edit_prompt(
+    episode: EpisodePlan,
+    *,
+    instruction: str,
+    duration_seconds: int,
+    source_start_ms: int,
+    source_end_ms: int,
+    relevant_constraints: tuple[str, ...] = (),
+) -> CompiledPrompt:
+    """编译单点区间修复Prompt；不复述整集剧情。"""
+
+    edit = instruction.strip()
+    if len(edit) < 4:
+        raise PromptCompilationError("区间编辑指令必须说明需要修复的具体问题")
+    constraints = "；".join(item.strip() for item in relevant_constraints if item.strip())
+    return _compiled(
+        "\n".join(
+            (
+                "【编辑对象与边界】严格编辑@视频1中"
+                f"约{source_start_ms / 1000:.2f}秒至{source_end_ms / 1000:.2f}秒的唯一选定区间。"
+                "@图片1是编辑前边界帧，"
+                "@图片2是编辑后边界帧；生成内容必须从@图片1自然进入并在@图片2状态前稳定结束。"
+                f"输出9:16竖屏、约{duration_seconds}秒，沿用源视频的二维画风和原有运动方向。",
+                f"【唯一修改】{edit}。只修复这一项，不重演区间外剧情，不新增角色、道具或任务。",
+                "【保持不变】同一个中性儿童、同一只灰白猫、服装、机位、空间轴线、光线、"
+                "动作方向和区间外对象保持不变。"
+                + (f"相关硬约束：{constraints}。" if constraints else "")
+                + f"本集关系目标仅作为语义边界：{episode.script.relationship_arc}。"
+                "原视频音轨由本地无损继承，本次生成声音不进入最终替换成片。禁止字幕、水印、"
+                "Logo、角色复制、镜头重置和无原因换装。",
+            )
         )
     )
 

@@ -13,13 +13,14 @@ from typing import Any
 from sqlalchemy import select
 
 from ...application.ports import ReviewCommitResult
+from ...domain.rendering import SequenceStatus, transition_sequence
 from ...domain.workflow import (
     EpisodeStatus,
     StepStatus,
     transition_episode,
     transition_step,
 )
-from .models import Asset, Episode, Review, WorkflowStep
+from .models import Asset, Episode, ProductionRun, Review, VideoSequence, WorkflowStep
 from .query_repository import RecordNotFoundError
 
 
@@ -107,6 +108,17 @@ class ReviewPersistenceMixin:
             if StepStatus(step.status) is not StepStatus.AWAITING_REVIEW:
                 raise ValueError("资产生产步骤当前不在等待审核状态")
 
+            supersedes_visual = False
+            if decision == "approved" and asset.role in {"look_reference", "opening_anchor"}:
+                supersedes_visual = session.execute(
+                    select(Asset.id).where(
+                        Asset.episode_id == asset.episode_id,
+                        Asset.role == asset.role,
+                        Asset.id != asset.id,
+                        Asset.status.in_(("approved", "ready")),
+                    )
+                ).first() is not None
+
             review = Review(
                 step_id=step.id,
                 asset_id=asset.id,
@@ -127,12 +139,20 @@ class ReviewPersistenceMixin:
                 (StepStatus.SUCCEEDED if decision == "approved" else StepStatus.FAILED),
             ).value
             step.completed_at = datetime.now(timezone.utc)
+            sequence = session.execute(
+                select(VideoSequence)
+                .where(VideoSequence.rendered_asset_id == asset.id)
+                .with_for_update()
+            ).scalar_one_or_none()
             if episode is not None:
                 if decision == "rejected":
-                    episode.status = transition_episode(
-                        EpisodeStatus(episode.status),
-                        EpisodeStatus.FAILED,
-                    ).value
+                    # 候选版本被拒绝时，已经批准的正式视频仍然有效；只有Episode
+                    # 尚无正式视频时才进入failed。
+                    if episode.selected_video_asset_id is None:
+                        episode.status = transition_episode(
+                            EpisodeStatus(episode.status),
+                            EpisodeStatus.FAILED,
+                        ).value
                 elif asset.role == "video":
                     if asset.episode_id != episode.id:
                         raise ValueError("视频资产不属于被锁定的Episode")
@@ -143,10 +163,34 @@ class ReviewPersistenceMixin:
                             EpisodeStatus.FAILED,
                             EpisodeStatus.CONTENT_REVIEW,
                         ).value
-                    episode.selected_video_asset_id = asset.id
-                    episode.status = transition_episode(
-                        EpisodeStatus(episode.status),
-                        EpisodeStatus.READY,
-                    ).value
+                    # 首个批准版本直接成为正式视频。后续重生成或区间编辑版本只标记
+                    # 为approved，必须由用户在时间轴显式选择，避免静默改写结果卡事实。
+                    if episode.selected_video_asset_id is None:
+                        episode.selected_video_asset_id = asset.id
+                        episode.status = transition_episode(
+                            EpisodeStatus(episode.status),
+                            EpisodeStatus.READY,
+                        ).value
+            if sequence is not None:
+                sequence.status = transition_sequence(
+                    SequenceStatus(sequence.status),
+                    SequenceStatus.APPROVED if decision == "approved" else SequenceStatus.REJECTED,
+                ).value
+            if supersedes_visual and episode is not None:
+                run = session.execute(
+                    select(ProductionRun)
+                    .where(ProductionRun.id == episode.production_run_id)
+                    .with_for_update()
+                ).scalar_one()
+                stale_nodes = set(run.planning_json.get("staleNodes", []))
+                if asset.role == "look_reference":
+                    suffixes = ("opening-anchor", "video", "review", "outcome")
+                else:
+                    suffixes = ("video", "review", "outcome")
+                stale_nodes.update(f"{episode.slot}:{suffix}" for suffix in suffixes)
+                run.planning_json = {
+                    **run.planning_json,
+                    "staleNodes": sorted(stale_nodes),
+                }
             session.flush()
             return ReviewCommitResult(review.id, decision, False)

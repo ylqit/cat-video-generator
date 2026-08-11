@@ -16,8 +16,10 @@ from .application.event_seeds import EventSeedCatalog
 from .application.planning import PlanningService
 from .application.production import ProductionService
 from .application.queries import QueryService
+from .application.regeneration import RegenerationService
 from .application.retry import RetryService
 from .application.studio_editing import StudioEditingService
+from .application.video_editing import VideoEditingService
 from .application.video_execution import VideoExecutionService
 from .application.visual_preparation import VisualPreparationService
 from .config import (
@@ -61,6 +63,8 @@ class RuntimeContainer(QueryContainer):
     planning: PlanningService
     production: ProductionService
     retry: RetryService
+    regeneration: RegenerationService
+    video_editing: VideoEditingService
     studio_editing: StudioEditingService
     runtime_settings: RuntimeSettings
 
@@ -127,6 +131,8 @@ def build_runtime_container(
         if runtime.ffprobe_path is None:
             raise ValueError("恢复任务要求ffprobe可用")
     assert runtime.ffprobe_path is not None
+    if runtime.ffmpeg_path is None:
+        raise ValueError("完整生产服务要求ffmpeg可用，以支持边界帧与非破坏性区间替换")
     engine = _ready_engine(
         database,
         pool_size=pool_size,
@@ -141,13 +147,9 @@ def build_runtime_container(
         ffmpeg_path=runtime.ffmpeg_path,
     )
     probe = FfprobeMediaProbe(runtime.ffprobe_path)
-    frame_extractor = (
-        None
-        if runtime.ffmpeg_path is None
-        else FfmpegFrameExtractor(
-            ffmpeg_path=runtime.ffmpeg_path,
-            work_root=runtime.work_root,
-        )
+    frame_extractor = FfmpegFrameExtractor(
+        ffmpeg_path=runtime.ffmpeg_path,
+        work_root=runtime.work_root,
     )
     visual_preparation = VisualPreparationService(
         repository=repository,
@@ -179,6 +181,40 @@ def build_runtime_container(
         task_timeout_seconds=runtime.ark_task_timeout_seconds,
         style_profile=DEFAULT_STYLE_PROFILE,
     )
+    planning = PlanningService(
+        repository=repository,
+        director=gateway,
+        provider_name=runtime.provider_profile,
+        event_seed_catalog=EventSeedCatalog(runtime.event_seed_root),
+        series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
+        style_profile=DEFAULT_STYLE_PROFILE,
+        video_resolution=runtime.ark_video_resolution,
+    )
+    regeneration = RegenerationService(
+        repository=repository,
+        planning=planning,
+        visual_preparation=visual_preparation,
+        video_execution=video_execution,
+    )
+    video_editing = VideoEditingService(
+        repository=repository,
+        media_gateway=gateway,
+        asset_store=store,
+        media_probe=probe,
+        frame_extractor=frame_extractor,
+        video_execution=video_execution,
+        provider_name=runtime.provider_profile,
+        resolution=runtime.ark_video_resolution,
+        poll_interval_seconds=runtime.ark_poll_interval_seconds,
+        task_timeout_seconds=runtime.ark_task_timeout_seconds,
+        api_timeout_seconds=runtime.ark_video_api_timeout_seconds,
+    )
+    retry = RetryService(
+        repository=repository,
+        visual_preparation=visual_preparation,
+        video_execution=video_execution,
+        video_editing=video_editing,
+    )
     return RuntimeContainer(
         engine=engine,
         queries=QueryService(
@@ -191,25 +227,15 @@ def build_runtime_container(
             media_probe=probe,
         ),
         delivery=DeliveryService(repository=repository, asset_store=store),
-        planning=PlanningService(
-            repository=repository,
-            director=gateway,
-            provider_name=runtime.provider_profile,
-            event_seed_catalog=EventSeedCatalog(runtime.event_seed_root),
-            series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
-            style_profile=DEFAULT_STYLE_PROFILE,
-            video_resolution=runtime.ark_video_resolution,
-        ),
+        planning=planning,
         production=ProductionService(
             repository=repository,
             visual_preparation=visual_preparation,
             video_execution=video_execution,
         ),
-        retry=RetryService(
-            repository=repository,
-            visual_preparation=visual_preparation,
-            video_execution=video_execution,
-        ),
+        retry=retry,
+        regeneration=regeneration,
+        video_editing=video_editing,
         studio_editing=StudioEditingService(
             repository=repository,
             series_profile=DEFAULT_SERIES_VISUAL_PROFILE,

@@ -125,6 +125,9 @@ _RUN_TRANSITIONS = {
         RunStatus.FAILED,
     },
     RunStatus.READY: {
+        # 非破坏性视频版本可能在交付前撤销已确认结果卡；此时回到生成态，
+        # 重新确认结果后才能再次ready，已经交付的Run仍保持终态不可改写。
+        RunStatus.GENERATING,
         RunStatus.DELIVERED,
         RunStatus.FAILED,
     },
@@ -163,7 +166,9 @@ _EPISODE_TRANSITIONS = {
         EpisodeStatus.READY,
         EpisodeStatus.FAILED,
     },
-    EpisodeStatus.READY: set(),
+    # 已完成Episode只有在用户明确撤销既有结果并重做时才会回到FAILED；
+    # Repository会先确认没有活动中的收费或审核Step，并永久保留旧媒体与审核记录。
+    EpisodeStatus.READY: {EpisodeStatus.FAILED},
     EpisodeStatus.FAILED: {
         EpisodeStatus.PLANNED,
         EpisodeStatus.PREPARING_VISUALS,

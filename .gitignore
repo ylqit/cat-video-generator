@@ -16,7 +16,11 @@ docs/设计脚本教程/
 docs/公众号文章解析
 docs/LibTV
 /.playwright-mcp
-/docs
+/docs/*
+!/docs/checklists/
+/docs/checklists/*
+!/docs/checklists/narrative-render-core.md
+!/docs/checklists/workflow-canvas-range-edit.md
 
 # Web frontend
 web/node_modules/

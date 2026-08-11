@@ -31,6 +31,7 @@ from .models import (
     ProductionRun,
     PromptRecord,
     Review,
+    VideoSequence,
     WorkflowStep,
 )
 from .records import (
@@ -128,6 +129,29 @@ def _trace_input_bindings(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _video_sequence_dict(item: VideoSequence) -> dict[str, Any]:
+    """把单轨EDL版本投影给Web；JSON只描述剪辑决定，不复制媒体或Step详情。"""
+
+    return {
+        "id": str(item.id),
+        "episodeId": str(item.episode_id),
+        "revision": item.revision,
+        "parentSequenceId": (
+            None if item.parent_sequence_id is None else str(item.parent_sequence_id)
+        ),
+        "baseAssetId": str(item.base_asset_id),
+        "renderedAssetId": (
+            None if item.rendered_asset_id is None else str(item.rendered_asset_id)
+        ),
+        "status": item.status,
+        "durationMs": item.duration_ms,
+        "audioPolicy": item.audio_policy,
+        "clips": list(item.clips_json or []),
+        "createdAt": item.created_at.isoformat(),
+        "updatedAt": item.updated_at.isoformat(),
+    }
+
+
 def _current_stage(
     run: ProductionRun,
     episodes: tuple[Episode, ...],
@@ -221,6 +245,11 @@ def _workflow_nodes(
     assets: tuple[Asset, ...],
     reviews: tuple[Review, ...],
     accepted_outcomes: dict[str, Any] | None = None,
+    *,
+    guided: bool,
+    day_brief_confirmed: bool,
+    stale_slots: tuple[str, ...] = (),
+    stale_nodes: tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
     accepted_outcomes = accepted_outcomes or {}
     prompt_ids: dict[uuid.UUID, list[str]] = {}
@@ -239,6 +268,8 @@ def _workflow_nodes(
         ]
         return max(matches, key=lambda item: item.created_at, default=None)
 
+    active_statuses = {"pending", "submitting", "queued", "running", "awaiting_review"}
+
     def node(
         *,
         node_id: str,
@@ -250,30 +281,53 @@ def _workflow_nodes(
         status: str | None = None,
         contract_status: str = "not_applicable",
         semantic_status: str = "not_applicable",
+        availability: str | None = None,
+        lock_reason: str | None = None,
+        unlock_requirements: tuple[str, ...] = (),
+        completed: bool = False,
+        extra_steps: tuple[WorkflowStep, ...] = (),
     ) -> dict[str, Any]:
         step_payload = None if step is None else step_dict(step)
-        attempts = (
-            []
+        attempt_source = extra_steps or (
+            ()
             if step is None
-            else [
-                step_dict(item)
-                for item in sorted(
-                    (
-                        item
-                        for item in steps
-                        if item.operation_key == step.operation_key
-                        and item.episode_id == step.episode_id
-                    ),
-                    key=lambda item: item.created_at,
-                )
-            ]
+            else tuple(
+                item
+                for item in steps
+                if item.operation_key == step.operation_key
+                and item.episode_id == step.episode_id
+            )
         )
+        attempts = [
+            step_dict(item)
+            for item in sorted(attempt_source, key=lambda item: item.created_at)
+        ]
+        execution_status = "not_created" if step is None else step.status
+        resolved_availability = availability or (
+            "completed"
+            if completed
+            else "active"
+            if execution_status in active_statuses
+            else "ready"
+        )
+        actions = [] if step_payload is None else list(step_payload["availableActions"])
+        if (
+            step is not None
+            and step.kind in {"image", "video"}
+            and step.status
+            not in {"pending", "submitting", "queued", "running", "submission_unknown"}
+        ):
+            actions.append({"type": "regenerate", "label": "重新生成新版本", "paid": True})
         return {
-            "id": node_id,
+            "semanticNodeId": node_id,
             "type": node_type,
             "slot": slot,
             "label": label,
             "status": status or ("pending" if step is None else step.status),
+            "availability": resolved_availability,
+            "executionStatus": execution_status,
+            "lockReason": lock_reason,
+            "unlockRequirements": list(unlock_requirements),
             "providerStatus": "pending" if step is None else step.status,
             "contractStatus": contract_status,
             "semanticReviewStatus": semantic_status,
@@ -282,9 +336,16 @@ def _workflow_nodes(
             "assetIds": [str(item.id) for item in node_assets],
             "reviewIds": [] if step is None else review_ids.get(step.id, []),
             "error": None if step_payload is None else step_payload["error"],
-            "nextAction": None if step_payload is None else step_payload["nextAction"],
-            "availableActions": [] if step_payload is None else step_payload["availableActions"],
+            "nextAction": (
+                lock_reason
+                if resolved_availability == "locked"
+                else None if step_payload is None else step_payload["nextAction"]
+            ),
+            "allowedActions": actions,
+            "currentAttemptId": None if step is None else str(step.id),
+            "attemptIds": [item["id"] for item in attempts],
             "attempts": attempts,
+            "stale": node_id in stale_nodes or (slot is not None and slot in stale_slots),
         }
 
     def director_state(step: WorkflowStep | None) -> tuple[str, str, str]:
@@ -313,16 +374,49 @@ def _workflow_nodes(
     nodes = [
         {
             **node(
-                node_id="director:day",
+                node_id="run:day-director",
                 node_type="director",
                 label="全天总导演",
                 step=day_step,
                 contract_status=contract,
+                completed=day_step is not None and day_step.status == "succeeded",
             ),
             "providerStatus": provider,
             "semanticReviewStatus": semantic,
         }
     ]
+    if day_step is not None and day_step.status == "failed":
+        nodes[0]["allowedActions"] = [
+            {
+                "type": "regenerate",
+                "label": "修复并重执行总导演",
+                "paid": True,
+            }
+        ]
+        nodes[0]["nextAction"] = "查看契约错误后重执行总导演"
+    day_confirm_unlocked = day_step is not None and day_step.status == "succeeded"
+    nodes.append(
+        {
+            **node(
+                node_id="run:day-confirmation",
+                node_type="day_confirmation",
+                label="DayBrief人工确认",
+                step=None,
+                status="confirmed" if day_brief_confirmed else "pending",
+                availability=(
+                    "completed"
+                    if day_brief_confirmed
+                    else "ready"
+                    if day_confirm_unlocked
+                    else "locked"
+                ),
+                lock_reason=None if day_confirm_unlocked else "等待总导演完成",
+                unlock_requirements=("总导演完成",),
+                completed=day_brief_confirmed,
+            ),
+            "providerStatus": "not_applicable",
+        }
+    )
     episodes_by_slot = {item.slot: item for item in episodes}
     for slot_item in Slot:
         slot = slot_item.value
@@ -333,16 +427,45 @@ def _workflow_nodes(
         )
         director = latest(f"director:episode:{slot}")
         provider, contract, semantic = director_state(director)
+        previous_slots = [item.value for item in Slot if item.sort_order < slot_item.sort_order]
+        slot_unlocked = day_brief_confirmed and (
+            not guided or all(item in accepted_outcomes for item in previous_slots)
+        )
+        slot_requirement = (
+            "确认DayBrief"
+            if not day_brief_confirmed
+            else f"确认{previous_slots[-1]}结果卡"
+            if guided and previous_slots and previous_slots[-1] not in accepted_outcomes
+            else None
+        )
         director_node = node(
-            node_id=f"director:{slot}",
+            node_id=f"{slot}:director",
             node_type="director",
             slot=slot,
             label=f"{slot}导演",
             step=director,
             contract_status=contract,
             semantic_status=("approved" if semantic == "approved" and episode else semantic),
+            availability=(
+                "completed"
+                if episode is not None
+                else "ready"
+                if slot_unlocked
+                else "locked"
+            ),
+            lock_reason=slot_requirement,
+            unlock_requirements=(() if slot_requirement is None else (slot_requirement,)),
+            completed=episode is not None,
         )
         director_node["providerStatus"] = provider
+        if episode is not None:
+            director_node["allowedActions"] = [
+                {
+                    "type": "replan",
+                    "label": "重新规划该时段",
+                    "paid": True,
+                }
+            ]
         if contract == "rejected" or semantic == "rejected":
             director_node["status"] = "planning_rejected"
             director_node["nextAction"] = "查看拒绝原因后显式重规划本时段"
@@ -351,42 +474,57 @@ def _workflow_nodes(
             nodes.extend(
                 (
                     node(
-                        node_id=f"look:{slot}",
+                        node_id=f"{slot}:look",
                         node_type="look",
                         slot=slot,
                         label=f"{slot}定妆图",
                         step=None,
+                        availability="locked",
+                        lock_reason=f"等待{slot}导演完成",
+                        unlock_requirements=(f"{slot}导演完成",),
                     ),
                     node(
-                        node_id=f"opening-anchor:{slot}",
+                        node_id=f"{slot}:opening-anchor",
                         node_type="opening_anchor",
                         slot=slot,
                         label=f"{slot}开场锚点",
                         step=None,
+                        availability="locked",
+                        lock_reason=f"等待{slot}定妆图批准",
+                        unlock_requirements=(f"{slot}定妆图批准",),
                     ),
                     node(
-                        node_id=f"video:{slot}:1",
+                        node_id=f"{slot}:video",
                         node_type="video",
                         slot=slot,
                         label=f"{slot}视频",
                         step=None,
+                        availability="locked",
+                        lock_reason=f"等待{slot}开场锚点批准",
+                        unlock_requirements=(f"{slot}开场锚点批准",),
                     ),
                     node(
-                        node_id=f"content-review:{slot}",
+                        node_id=f"{slot}:review",
                         node_type="content_review",
                         slot=slot,
                         label=f"{slot}内容审核",
                         step=None,
+                        availability="locked",
+                        lock_reason=f"等待{slot}视频生成",
+                        unlock_requirements=(f"{slot}视频生成",),
                     ),
                     {
                         **node(
-                            node_id=f"outcome:{slot}",
+                            node_id=f"{slot}:outcome",
                             node_type="accepted_outcome",
                             slot=slot,
                             label=f"{slot}结果卡",
                             step=None,
                             status="locked",
                             semantic_status="pending",
+                            availability="locked",
+                            lock_reason=f"等待{slot}视频批准",
+                            unlock_requirements=(f"{slot}视频批准",),
                         ),
                         "providerStatus": "not_applicable",
                     },
@@ -414,8 +552,14 @@ def _workflow_nodes(
                 key=lambda item: item.created_at,
                 default=None,
             )
+            active_attempt = max(
+                (item for item in operation_steps if item.status in active_statuses),
+                key=lambda item: item.created_at,
+                default=None,
+            )
             step = (
-                next(
+                active_attempt
+                or next(
                     (
                         item
                         for item in operation_steps
@@ -440,7 +584,7 @@ def _workflow_nodes(
             )
             nodes.append(
                 node(
-                    node_id=f"{node_type.replace('_', '-')}:{slot}",
+                    node_id=f"{slot}:{node_type.replace('_', '-')}",
                     node_type=node_type,
                     slot=slot,
                     label=label,
@@ -448,6 +592,14 @@ def _workflow_nodes(
                     node_assets=node_assets,
                     status=None if semantic == "pending" else semantic,
                     semantic_status=semantic,
+                    availability=(
+                        "completed"
+                        if semantic == "approved"
+                        else "active"
+                        if step is not None and step.status in active_statuses
+                        else "ready"
+                    ),
+                    completed=semantic == "approved",
                 )
             )
         render_plan = build_render_plan(
@@ -455,6 +607,11 @@ def _workflow_nodes(
         )
         final_video_assets: tuple[Asset, ...] = ()
         final_video_step: WorkflowStep | None = None
+        video_steps = tuple(
+            item
+            for item in steps
+            if item.episode_id == episode.id and item.operation_key.startswith("video:")
+        )
         for section in render_plan.sections:
             operation_key = (
                 "video:single_pass" if section.order == 1 else f"video:extend:{section.order}"
@@ -467,19 +624,84 @@ def _workflow_nodes(
                 and item.producing_step_id == step.id
                 and item.media_type == "video"
             )
-            nodes.append(
-                node(
-                    node_id=f"video:{slot}:{section.order}",
-                    node_type="video" if section.order == 1 else "video_extension",
-                    slot=slot,
-                    label=(f"{slot}视频" if section.order == 1 else f"{slot}延展{section.order}"),
-                    step=step,
-                    node_assets=node_assets,
-                )
-            )
             if section.order == len(render_plan.sections):
                 final_video_assets = tuple(item for item in node_assets if item.role == "video")
                 final_video_step = step
+        approved_anchor = any(
+            item.role == "opening_anchor" and item.status in {"approved", "ready"}
+            for item in episode_assets
+        )
+        selected_video = next(
+            (
+                item
+                for item in episode_assets
+                if episode.selected_video_asset_id is not None
+                and item.id == episode.selected_video_asset_id
+            ),
+            None,
+        )
+        candidate_video = max(
+            (
+                item
+                for item in episode_assets
+                if item.role == "video" and item.status == "candidate"
+            ),
+            key=lambda item: item.created_at,
+            default=None,
+        )
+        active_video_step = max(
+            (item for item in video_steps if item.status in active_statuses),
+            key=lambda item: item.created_at,
+            default=None,
+        )
+        # 语义画布展示的是当前正式采用的视频；未批准的重生成与局部编辑
+        # 只属于版本/尝试历史，不能反向把已经完成的主流程节点降级为待审核。
+        if selected_video is not None and selected_video.producing_step_id is not None:
+            final_video_assets = (selected_video,)
+            final_video_step = next(
+                (item for item in video_steps if item.id == selected_video.producing_step_id),
+                final_video_step,
+            )
+        elif candidate_video is not None:
+            final_video_assets = (candidate_video,)
+            if candidate_video.producing_step_id is not None:
+                final_video_step = next(
+                    (
+                        item
+                        for item in video_steps
+                        if item.id == candidate_video.producing_step_id
+                    ),
+                    final_video_step,
+                )
+        elif active_video_step is not None:
+            final_video_step = active_video_step
+        nodes.append(
+            node(
+                node_id=f"{slot}:video",
+                node_type="video",
+                slot=slot,
+                label=f"{slot}视频与版本",
+                step=final_video_step,
+                node_assets=tuple(item for item in episode_assets if item.media_type == "video"),
+                availability=(
+                    "completed"
+                    if selected_video is not None
+                    else "active"
+                    if candidate_video is not None or active_video_step is not None
+                    else "active"
+                    if final_video_step is not None and final_video_step.status in active_statuses
+                    else "ready"
+                    if approved_anchor
+                    else "locked"
+                ),
+                lock_reason=None if approved_anchor else f"等待{slot}开场锚点批准",
+                unlock_requirements=(
+                    () if approved_anchor else (f"{slot}开场锚点批准",)
+                ),
+                completed=selected_video is not None,
+                extra_steps=video_steps,
+            )
+        )
         content_status = (
             "approved"
             if any(item.status == "ready" for item in final_video_assets)
@@ -489,7 +711,7 @@ def _workflow_nodes(
         )
         nodes.append(
             node(
-                node_id=f"content-review:{slot}",
+                node_id=f"{slot}:review",
                 node_type="content_review",
                 slot=slot,
                 label=f"{slot}内容审核",
@@ -497,13 +719,25 @@ def _workflow_nodes(
                 node_assets=final_video_assets,
                 status=None if content_status == "pending" else content_status,
                 semantic_status=content_status,
+                availability=(
+                    "completed"
+                    if content_status == "approved"
+                    else "ready"
+                    if final_video_assets
+                    else "locked"
+                ),
+                lock_reason=None if final_video_assets else f"等待{slot}视频生成",
+                unlock_requirements=(
+                    () if final_video_assets else (f"{slot}视频生成",)
+                ),
+                completed=content_status == "approved",
             )
         )
         outcome = accepted_outcomes.get(slot)
         nodes.append(
             {
                 **node(
-                    node_id=f"outcome:{slot}",
+                    node_id=f"{slot}:outcome",
                     node_type="accepted_outcome",
                     slot=slot,
                     label=f"{slot}结果卡",
@@ -518,6 +752,24 @@ def _workflow_nodes(
                     semantic_status=(
                         "approved" if isinstance(outcome, dict) else "pending"
                     ),
+                    availability=(
+                        "completed"
+                        if isinstance(outcome, dict)
+                        else "ready"
+                        if content_status == "approved"
+                        else "locked"
+                    ),
+                    lock_reason=(
+                        None
+                        if isinstance(outcome, dict) or content_status == "approved"
+                        else f"等待{slot}视频批准"
+                    ),
+                    unlock_requirements=(
+                        ()
+                        if isinstance(outcome, dict) or content_status == "approved"
+                        else (f"{slot}视频批准",)
+                    ),
+                    completed=isinstance(outcome, dict),
                 ),
                 "providerStatus": "not_applicable",
                 "nextAction": (
@@ -527,6 +779,32 @@ def _workflow_nodes(
                 ),
             }
         )
+    delivery_ready = (
+        all(item.value in accepted_outcomes for item in Slot)
+        if guided
+        else len(episodes) == 3
+        and all(item.status == EpisodeStatus.READY.value for item in episodes)
+    )
+    nodes.append(
+        {
+            **node(
+                node_id="run:delivery",
+                node_type="delivery",
+                label="审核交付",
+                step=None,
+                status="ready" if delivery_ready else "locked",
+                availability="ready" if delivery_ready else "locked",
+                lock_reason=None if delivery_ready else "等待三个时段完成审核与结果确认",
+                unlock_requirements=("三个时段完成审核与结果确认",),
+            ),
+            "providerStatus": "not_applicable",
+            "allowedActions": (
+                [{"type": "deliver", "label": "构建交付包", "paid": False}]
+                if delivery_ready
+                else []
+            ),
+        }
+    )
     return nodes
 
 
@@ -570,30 +848,45 @@ class SqlAlchemyReadRepository:
             assets = tuple(
                 session.execute(select(Asset).where(Asset.production_run_id == run_id)).scalars()
             )
+            episode_ids = tuple(item.id for item in episodes)
+            sequences = tuple(
+                session.execute(
+                    select(VideoSequence)
+                    .where(VideoSequence.episode_id.in_(episode_ids))
+                    .order_by(VideoSequence.episode_id, VideoSequence.revision)
+                ).scalars()
+            ) if episode_ids else ()
             payload = run_dict(run)
+            settings = PipelineSettings.model_validate(run.pipeline_settings_json or {})
+            day_brief_confirmed = "dayBriefConfirmedAt" in run.planning_json
+            # auto_day由规划用例在同一链路中接受DayBrief并继续三个时段；只有
+            # guided_sequential需要额外的人工确认时间戳才能解锁Morning。
+            day_brief_ready = day_brief_confirmed or (
+                settings.planning_mode.value == "auto_day"
+                and isinstance(run.planning_json.get("dayBrief"), dict)
+            )
             payload.update(
                 {
                     "dayBrief": run.planning_json.get("dayBrief"),
                     "episodeDrafts": run.planning_json.get("episodeDrafts", {}),
                     "planningMetadata": run.planning_json.get("planningMetadata", {}),
                     "acceptedOutcomes": run.planning_json.get("acceptedOutcomes", {}),
-                    "dayBriefConfirmed": "dayBriefConfirmedAt" in run.planning_json,
+                    "dayBriefConfirmed": day_brief_ready,
                     "currentStage": _current_stage(run, episodes, steps),
                 }
             )
-            settings = PipelineSettings.model_validate(run.pipeline_settings_json or {})
             payload["planningMode"] = settings.planning_mode.value
             payload["slotPlanning"] = _slot_planning_state(
                 episodes,
                 run.planning_json.get("acceptedOutcomes", {}),
                 guided=settings.planning_mode.value == "guided_sequential",
-                day_brief_confirmed="dayBriefConfirmedAt" in run.planning_json,
+                day_brief_confirmed=day_brief_ready,
             )
             if settings.planning_mode.value == "guided_sequential":
                 payload["nextAction"] = _guided_next_action(
                     episodes,
                     run.planning_json.get("acceptedOutcomes", {}),
-                    day_brief_confirmed="dayBriefConfirmedAt" in run.planning_json,
+                    day_brief_confirmed=day_brief_ready,
                 )
             return {
                 "run": payload,
@@ -602,6 +895,7 @@ class SqlAlchemyReadRepository:
                 "prompts": [prompt_dict(item) for item in prompts],
                 "assets": [asset_dict(item) for item in assets],
                 "reviews": [review_dict(item) for item in reviews],
+                "videoSequences": [_video_sequence_dict(item) for item in sequences],
                 "workflowNodes": _workflow_nodes(
                     episodes,
                     steps,
@@ -609,6 +903,10 @@ class SqlAlchemyReadRepository:
                     assets,
                     reviews,
                     run.planning_json.get("acceptedOutcomes", {}) or {},
+                    guided=settings.planning_mode.value == "guided_sequential",
+                    day_brief_confirmed=day_brief_ready,
+                    stale_slots=tuple(run.planning_json.get("staleSlots", []) or ()),
+                    stale_nodes=tuple(run.planning_json.get("staleNodes", []) or ()),
                 ),
             }
 

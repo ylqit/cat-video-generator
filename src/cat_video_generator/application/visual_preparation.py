@@ -175,6 +175,57 @@ class VisualPreparationService:
             duplicate_billing_risk_accepted=duplicate_billing_risk_accepted,
         )
 
+    def regenerate_image(
+        self,
+        step_id: uuid.UUID,
+        *,
+        reason: str,
+        prompt_override: str | None = None,
+    ) -> StoredAsset:
+        """从任意已结束图片attempt创建新候选，不覆盖旧资产或审核。"""
+
+        step = self._repository.get_step(step_id)
+        if step.kind is not StepKind.IMAGE or step.status in {
+            StepStatus.PENDING,
+            StepStatus.SUBMITTING,
+            StepStatus.SUBMISSION_UNKNOWN,
+            StepStatus.QUEUED,
+            StepStatus.RUNNING,
+        }:
+            raise ValueError("图片节点仍在执行或提交结果未知，不能整节点重生成")
+        if step.episode_id is None:
+            raise ValueError("图片Step缺少Episode")
+        detail = self._repository.episode_detail(step.episode_id)
+        episode = self._repository.get_episode(
+            uuid.UUID(detail["runId"]), Slot(str(detail["slot"]))
+        )
+        snapshot = ImageInputSnapshot.model_validate(step.input_snapshot)
+        look = None
+        if snapshot.target == "opening_anchor":
+            looks = self._repository.list_assets(
+                run_id=episode.run_id,
+                episode_id=episode.id,
+                roles=("look_reference",),
+                statuses=("approved", "ready"),
+            )
+            if not looks:
+                raise ValueError("重新生成开场锚点前必须有已批准定妆图")
+            look = looks[-1]
+        return self._ensure_image(
+            episode,
+            target=snapshot.target,
+            look=look,
+            attempt=self._repository.next_step_attempt(
+                episode_id=episode.id,
+                kind=StepKind.IMAGE,
+                operation_key=step.operation_key,
+            ),
+            retry_of_step_id=step.id,
+            retry_reason=reason,
+            retry_feedback=reason,
+            prompt_override=prompt_override,
+        )
+
     def _ensure_image(
         self,
         episode: StoredEpisode,
@@ -314,7 +365,9 @@ class VisualPreparationService:
                     auto_timeout_retry_index=auto_timeout_retry_index + 1,
                     duplicate_billing_risk_accepted=True,
                 )
-            self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
+            current_episode = self._repository.get_episode(episode.run_id, episode.plan.slot)
+            if current_episode.selected_video_asset_id is None:
+                self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
             raise
         try:
             landed = self._asset_store.download(result.url, suffix=".png")
@@ -340,7 +393,9 @@ class VisualPreparationService:
             )
         except Exception as exc:
             self._repository.fail_step(step.id, code="image_technical_qc_failed", message=str(exc))
-            self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
+            current_episode = self._repository.get_episode(episode.run_id, episode.plan.slot)
+            if current_episode.selected_video_asset_id is None:
+                self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
             raise
         self._repository.set_step_status(step.id, StepStatus.AWAITING_REVIEW)
         if self._review_mode == "manual":

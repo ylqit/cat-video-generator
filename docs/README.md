@@ -9,6 +9,7 @@
 - [火山方舟视觉锚点与视频延展基线](providers/volcengine-multimodal.md)
 - [FastAPI 接口](http-api.md)
 - [实施 Checklist](checklists/narrative-render-core.md)
+- [语义画布与区间重生成 Checklist](checklists/workflow-canvas-range-edit.md)
 - [猫咪主活动放风筝真实验证](real-tests/2026-08-10-cat-lead-kite-validation.md)
 - [用户提供的设计脚本教程](设计脚本教程)
 - [Seedance 工程化 Prompt 规则](SKILL.md)

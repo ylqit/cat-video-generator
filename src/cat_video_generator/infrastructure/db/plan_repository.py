@@ -18,10 +18,11 @@ from ...domain.pipeline import PipelineSettings
 from ...domain.workflow import (
     EpisodeStatus,
     RunStatus,
+    StepStatus,
     transition_episode,
     transition_run,
 )
-from .models import Episode, ProductionRun
+from .models import Episode, ProductionRun, WorkflowStep
 from .query_repository import required_record as _required
 
 
@@ -111,6 +112,27 @@ class PlanPersistenceMixin:
             session.flush()
             return stored_episode(row)
 
+    def save_initial_planning_metadata(
+        self,
+        *,
+        run_id: uuid.UUID,
+        planning_metadata: dict[str, Any],
+        planning_context: str,
+        story_mode: str,
+    ) -> None:
+        """在调用总导演前保存可重建输入，避免契约拒绝后只能新建整条Run。"""
+
+        with self._sessions.begin() as session:  # type: ignore[attr-defined]
+            run = _required(session, ProductionRun, run_id)
+            run.planning_json = {
+                **run.planning_json,
+                "planningMetadata": planning_metadata,
+                "planningRequest": {
+                    "planningContext": planning_context,
+                    "storyMode": story_mode,
+                },
+            }
+
     def save_planning_context(
         self,
         *,
@@ -144,6 +166,7 @@ class PlanPersistenceMixin:
         run_id: uuid.UUID,
         episode: EpisodePlan,
         day_brief: DayBrief | None = None,
+        acknowledge_downstream_replacement: bool = False,
     ) -> None:
         """原子替换时段脚本及可选的总导演边界。"""
 
@@ -156,15 +179,28 @@ class PlanPersistenceMixin:
                 )
             ).scalar_one()
             current = EpisodeStatus(row.status)
-            if current not in {
-                EpisodeStatus.PLANNED,
-                EpisodeStatus.VIDEO_PENDING,
-                EpisodeStatus.FAILED,
-            }:
-                raise ValueError(f"{episode.slot.value}状态{current.value}不允许局部重规划")
-            if current is EpisodeStatus.VIDEO_PENDING:
-                # 开场锚点批准后、视频尚未提交前仍允许人工修正剧本。旧视觉资产和审核
-                # 保持不可变审计，新剧本会形成新的输入哈希并重新进入视觉准备。
+            active_step = session.execute(
+                select(WorkflowStep.id).where(
+                    WorkflowStep.episode_id == row.id,
+                    WorkflowStep.status.in_(
+                        tuple(
+                            item.value
+                            for item in (
+                                StepStatus.PENDING,
+                                StepStatus.SUBMITTING,
+                                StepStatus.QUEUED,
+                                StepStatus.RUNNING,
+                                StepStatus.AWAITING_REVIEW,
+                            )
+                        )
+                    ),
+                )
+            ).scalar_one_or_none()
+            if active_step is not None:
+                raise ValueError("该时段仍有活动中的Provider或审核节点，不能同时重新规划")
+            if current not in {EpisodeStatus.PLANNED, EpisodeStatus.FAILED}:
+                if not acknowledge_downstream_replacement:
+                    raise ValueError("该时段已有下游结果，必须显式确认替换后才能重新规划")
                 current = transition_episode(current, EpisodeStatus.FAILED)
                 row.status = current.value
             if current is EpisodeStatus.FAILED:
@@ -173,6 +209,7 @@ class PlanPersistenceMixin:
                     EpisodeStatus.PLANNED,
                 ).value
             row.script_json = episode.script.model_dump(mode="json")
+            row.selected_video_asset_id = None
             # 覆盖正文仍作为创作草稿保留，但脚本变化后必须显式重新确认；生产读取只会返回
             # enabled且非stale的覆盖，因此不会把旧Prompt误用到新Episode。
             if row.prompt_overrides_json:
@@ -182,10 +219,32 @@ class PlanPersistenceMixin:
                 }
             drafts = dict(run.planning_json.get("episodeDrafts", {}))
             drafts[episode.slot.value] = episode.script.model_dump(mode="json")
-            planning_json = {**run.planning_json, "episodeDrafts": drafts}
+            stale_nodes = set(run.planning_json.get("staleNodes", []))
+            stale_nodes.update(
+                {
+                    f"{episode.slot.value}:look",
+                    f"{episode.slot.value}:opening-anchor",
+                    f"{episode.slot.value}:video",
+                    f"{episode.slot.value}:review",
+                    f"{episode.slot.value}:outcome",
+                }
+            )
+            outcomes = dict(run.planning_json.get("acceptedOutcomes", {}))
+            if episode.slot.value in outcomes:
+                if not acknowledge_downstream_replacement:
+                    raise ValueError("该时段结果卡已经确认，必须显式撤销后才能重新规划")
+                outcomes.pop(episode.slot.value, None)
+            planning_json = {
+                **run.planning_json,
+                "episodeDrafts": drafts,
+                "staleNodes": sorted(stale_nodes),
+                "acceptedOutcomes": outcomes,
+            }
             if day_brief is not None:
                 planning_json["dayBrief"] = day_brief.model_dump(mode="json")
             run.planning_json = planning_json
+            if RunStatus(run.status) is RunStatus.READY:
+                run.status = transition_run(RunStatus.READY, RunStatus.GENERATING).value
 
     def get_prompt_overrides(self, episode_id: uuid.UUID) -> dict[str, str]:
         """只返回已显式启用、已确认且与当前脚本匹配的Prompt覆盖。"""
@@ -279,19 +338,36 @@ class PlanPersistenceMixin:
             ).scalar_one_or_none()
             if episode is None or EpisodeStatus(episode.status) is not EpisodeStatus.READY:
                 raise ValueError("只有人工批准的最终视频才能确认时段结果")
-            later = session.execute(
-                select(Episode.id).where(
-                    Episode.production_run_id == run_id,
-                    Episode.sort_order > slot.sort_order,
+            later_slots = {
+                str(value)
+                for value in session.execute(
+                    select(Episode.slot).where(
+                        Episode.production_run_id == run_id,
+                        Episode.sort_order > slot.sort_order,
+                    )
+                ).scalars()
+            }
+            stale_slots = set(run.planning_json.get("staleSlots", []))
+            if later_slots and not later_slots.issubset(stale_slots):
+                raise ValueError(
+                    "后续时段已经读取当前结果；请先在视频版本选择中撤销旧结果卡并标记后续内容过期"
                 )
-            ).first()
-            if later is not None:
-                raise ValueError("后续时段已经规划，不能改写其依赖的已确认结果")
             outcomes = dict(run.planning_json.get("acceptedOutcomes", {}))
             if slot.value in outcomes:
                 raise ValueError("结果卡已经确认；如成片事实错误，请重做该时段而不是覆盖历史")
             outcomes[slot.value] = outcome.model_dump(mode="json", by_alias=True)
-            run.planning_json = {**run.planning_json, "acceptedOutcomes": outcomes}
+            stale_slots.discard(slot.value)
+            stale_nodes = {
+                item
+                for item in run.planning_json.get("staleNodes", [])
+                if not str(item).startswith(f"{slot.value}:")
+            }
+            run.planning_json = {
+                **run.planning_json,
+                "acceptedOutcomes": outcomes,
+                "staleSlots": sorted(stale_slots),
+                "staleNodes": sorted(stale_nodes),
+            }
             if len(outcomes) == len(Slot):
                 episodes = tuple(
                     session.execute(

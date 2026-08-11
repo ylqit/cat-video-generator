@@ -51,7 +51,13 @@ class VideoInputSnapshot(StrictModel):
     prompt_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     input_plan: VideoInputPlan
     input_asset_ids: tuple[UUID, ...]
-    render_section_order: Annotated[int, Field(ge=1, le=3)]
+    render_section_order: Annotated[int, Field(ge=0, le=3)]
+    sequence_id: UUID | None = None
+    selection_start_ms: int | None = None
+    selection_end_ms: int | None = None
+    source_start_ms: int | None = None
+    source_end_ms: int | None = None
+    edit_instruction: str | None = None
     retry_of_step_id: UUID | None = None
     retry_reason: str | None = None
     api_request_timeout_seconds: float | None = None

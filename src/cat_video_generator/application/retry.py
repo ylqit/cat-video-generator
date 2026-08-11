@@ -7,6 +7,7 @@ from typing import Any
 
 from ..domain.workflow import RunStatus, StepKind, StepStatus
 from .ports import ProductionStore
+from .video_editing import VideoEditingService
 from .video_execution import VideoExecutionService
 from .visual_preparation import VisualPreparationService
 
@@ -20,10 +21,12 @@ class RetryService:
         repository: ProductionStore,
         visual_preparation: VisualPreparationService,
         video_execution: VideoExecutionService,
+        video_editing: VideoEditingService,
     ) -> None:
         self._repository = repository
         self._visual_preparation = visual_preparation
         self._video_execution = video_execution
+        self._video_editing = video_editing
 
     def retry_step(
         self,
@@ -62,6 +65,7 @@ class RetryService:
             supported = step.kind is StepKind.VIDEO and (
                 step.operation_key == "video:single_pass"
                 or step.operation_key in {"video:extend:2", "video:extend:3"}
+                or step.operation_key.startswith("video:range_edit:")
             )
         if not supported:
             raise ValueError(f"operationKey={step.operation_key!r} 不支持显式重试")
@@ -87,6 +91,8 @@ class RetryService:
                 "assetIds": [str(asset.id)],
                 "status": asset.status,
             }
+        if step.operation_key.startswith("video:range_edit:"):
+            return self._video_editing.retry_edit(step, reason=reason)
         return self._video_execution.retry_video(
             episode,
             step,
@@ -97,10 +103,15 @@ class RetryService:
 
     def resume_step(self, step_id: uuid.UUID) -> dict[str, Any]:
         step = self._repository.get_step(step_id)
+        if step.operation_key.startswith("video:range_edit:"):
+            return self._video_editing.resume_step(step)
         return self._video_execution.resume_step(self._episode(step), step)
 
     def reconciliation_candidates(self, step_id: uuid.UUID) -> tuple[dict[str, Any], ...]:
-        return self._video_execution.reconciliation_candidates(self._repository.get_step(step_id))
+        step = self._repository.get_step(step_id)
+        if step.operation_key.startswith("video:range_edit:"):
+            return self._video_editing.reconciliation_candidates(step)
+        return self._video_execution.reconciliation_candidates(step)
 
     def reconcile_step(
         self,
@@ -109,6 +120,11 @@ class RetryService:
         provider_task_id: str,
     ) -> dict[str, Any]:
         step = self._repository.get_step(step_id)
+        if step.operation_key.startswith("video:range_edit:"):
+            return self._video_editing.reconcile_step(
+                step,
+                provider_task_id=provider_task_id,
+            )
         return self._video_execution.reconcile_step(
             self._episode(step),
             step,

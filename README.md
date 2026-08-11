@@ -24,6 +24,10 @@ Web创作配置
 - 8～15秒单次成片；16～45秒使用完整模型的官方视频延展。
 - 媒体以SHA-256不可变落盘，不写入数据库。
 - FastAPI与Vue提供统一生产工作台；Typer保留运维CLI。
+- 工作台使用固定语义画布展示当前节点和未来锁定路线；画布只读投影PostgreSQL，
+  不允许任意连线或创建业务节点。
+- 每条成片具有非破坏性单轨时间轴。整条重生成保留旧attempt；0.5～13秒的单Clip区间
+  可生成候选revision，经QC和人工审核后再显式切换正式版本，原视频和原音轨不覆盖。
 - 不使用故事板组图、逐镜独立生成、创作型多片段拼接、LangGraph、Celery或Redis。
 - Seedance延展实际返回新增尾段；中长视频仅用FFmpeg `stream copy`把原始区段顺序封装，
   不重新编码画面或声音。
@@ -69,6 +73,7 @@ Web默认采用`guided_sequential`：后续时段只读取用户观看成片后�
 - [Docker Compose部署](docs/workflows/docker-deployment.md)
 - [HTTP接口](docs/http-api.md)
 - [实施Checklist](docs/checklists/narrative-render-core.md)
+- [语义画布与区间重生成Checklist](docs/checklists/workflow-canvas-range-edit.md)
 
 ## 安全边界
 

@@ -17,12 +17,17 @@ from cat_video_generator.domain.prompts import (
     compile_video_diagnostic_prompt,
     compile_video_prompt,
     compile_video_prompt_preview,
+    compile_video_range_edit_prompt,
 )
 from cat_video_generator.domain.rendering import (
+    ClipOrigin,
     MediaSource,
     RenderMode,
     RenderOperation,
+    VideoSequenceClip,
+    VideoSequencePlan,
     build_render_plan,
+    build_video_edit_input_plan,
     build_video_input_plan,
     supports_video_extension,
 )
@@ -72,6 +77,78 @@ def test_initial_and_extension_input_plans_use_one_semantic_source() -> None:
     assert initial.bindings[0].provider_role.value == "first_frame"
     assert extension.bindings[0].prompt_alias == "@视频1"
     assert extension.bindings[0].provider_role.value == "reference_video"
+
+
+def test_edit_input_plan_keeps_video_then_two_boundary_images() -> None:
+    video = MediaSource(uuid4(), "video:source", "video", "a" * 64, {})
+    before = MediaSource(uuid4(), "boundary:before", "image", "b" * 64, {})
+    after = MediaSource(uuid4(), "boundary:after", "image", "c" * 64, {})
+
+    plan = build_video_edit_input_plan(
+        resolution="720p",
+        duration_seconds=12,
+        source_video=video,
+        before_frame=before,
+        after_frame=after,
+    )
+
+    assert [item.prompt_alias for item in plan.bindings] == ["@视频1", "@图片1", "@图片2"]
+    assert plan.operation is RenderOperation.EDIT
+
+
+def test_video_sequence_edl_requires_one_continuous_timeline() -> None:
+    first, second = uuid4(), uuid4()
+    plan = VideoSequencePlan(
+        duration_ms=12_000,
+        clips=[
+            VideoSequenceClip(
+                order=1,
+                source_asset_id=first,
+                source_start_ms=0,
+                source_end_ms=4_000,
+                timeline_start_ms=0,
+                timeline_end_ms=4_000,
+                origin=ClipOrigin.ORIGINAL,
+            ),
+            VideoSequenceClip(
+                order=2,
+                source_asset_id=second,
+                source_start_ms=0,
+                source_end_ms=8_000,
+                timeline_start_ms=4_000,
+                timeline_end_ms=12_000,
+                origin=ClipOrigin.ORIGINAL,
+            ),
+        ],
+    )
+
+    assert plan.duration_ms == 12_000
+    with pytest.raises(ValueError, match="连续"):
+        VideoSequencePlan(
+            duration_ms=13_000,
+            clips=[
+                plan.clips[0],
+                plan.clips[1].model_copy(
+                    update={"timeline_start_ms": 5_000, "timeline_end_ms": 13_000}
+                ),
+            ],
+        )
+
+
+def test_range_edit_prompt_describes_one_change_and_boundaries() -> None:
+    prompt = compile_video_range_edit_prompt(
+        episode_for(Slot.NOON),
+        instruction="让钓线只连接人物手中鱼竿和浮标",
+        duration_seconds=12,
+        source_start_ms=2_000,
+        source_end_ms=5_000,
+        relevant_constraints=("钓线不得接触猫咪身体",),
+    ).text
+
+    assert "@视频1" in prompt and "@图片1" in prompt and "@图片2" in prompt
+    assert "2.00秒至5.00秒" in prompt
+    assert prompt.count("让钓线只连接人物手中鱼竿和浮标") == 1
+    assert "原视频音轨由本地无损继承" in prompt
 
 
 def test_director_prompts_separate_day_capacity_from_episode_execution(daily_plan) -> None:

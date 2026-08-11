@@ -196,6 +196,150 @@ class LocalAssetStore:
             manifest.unlink(missing_ok=True)
             output.unlink(missing_ok=True)
 
+    def render_range_replacement(
+        self,
+        *,
+        base_path: Path,
+        replacement_path: Path,
+        replacement_duration_ms: int,
+        start_ms: int,
+        end_ms: int,
+    ) -> LandedAsset:
+        """替换单个视频区间并完整继承基础视频音轨。"""
+
+        if self._ffmpeg_path is None:
+            raise AssetStorageError("视频区间替换需要配置ffmpeg")
+        base = base_path.expanduser().resolve()
+        replacement = replacement_path.expanduser().resolve()
+        if not base.is_file() or not replacement.is_file():
+            raise AssetStorageError("区间替换的基础视频或生成片段不存在")
+        if not 0 <= start_ms < end_ms or replacement_duration_ms <= 0:
+            raise AssetStorageError("区间替换时间参数不合法")
+        self._work_root.mkdir(parents=True, exist_ok=True)
+        output = self._work_root / f".range-edit-{uuid.uuid4().hex}.mp4"
+        target_seconds = (end_ms - start_ms) / 1000
+        replacement_seconds = replacement_duration_ms / 1000
+        ratio = target_seconds / replacement_seconds
+        filters: list[str] = []
+        inputs: list[str] = []
+        if start_ms > 0:
+            filters.append(
+                f"[0:v]trim=start=0:end={start_ms / 1000:.3f},setpts=PTS-STARTPTS,"
+                "settb=AVTB,fps=30,setsar=1,format=yuv420p[vpre]"
+            )
+            inputs.append("[vpre]")
+        filters.append(
+            "[1:v]"
+            f"trim=start=0:end={replacement_seconds:.3f},"
+            f"setpts={ratio:.9f}*(PTS-STARTPTS),"
+            "settb=AVTB,fps=30,setsar=1,format=yuv420p[vreplace]"
+        )
+        inputs.append("[vreplace]")
+        filters.append(
+            f"[0:v]trim=start={end_ms / 1000:.3f},setpts=PTS-STARTPTS,"
+            "settb=AVTB,fps=30,setsar=1,format=yuv420p[vpost]"
+        )
+        inputs.append("[vpost]")
+        filters.append(f"{''.join(inputs)}concat=n={len(inputs)}:v=1:a=0[vout]")
+        try:
+            subprocess.run(
+                [
+                    str(self._ffmpeg_path),
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(base),
+                    "-i",
+                    str(replacement),
+                    "-filter_complex",
+                    ";".join(filters),
+                    "-map",
+                    "[vout]",
+                    "-map",
+                    "0:a?",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "copy",
+                    "-movflags",
+                    "+faststart",
+                    str(output),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=900,
+            )
+            return self.import_local(output)
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            detail = (
+                exc.stderr.strip()[-1000:]
+                if isinstance(exc, subprocess.CalledProcessError)
+                else str(exc)
+            )
+            raise AssetStorageError(f"视频区间替换失败: {detail}") from exc
+        finally:
+            output.unlink(missing_ok=True)
+
+    def extract_video_range(
+        self,
+        *,
+        source_path: Path,
+        start_ms: int,
+        end_ms: int,
+    ) -> LandedAsset:
+        """精确截取供应商编辑结果中的替换片段，不保留其音轨。"""
+
+        if self._ffmpeg_path is None:
+            raise AssetStorageError("视频区间截取需要配置ffmpeg")
+        source = source_path.expanduser().resolve()
+        if not source.is_file() or not 0 <= start_ms < end_ms:
+            raise AssetStorageError("视频区间截取参数不合法")
+        self._work_root.mkdir(parents=True, exist_ok=True)
+        output = self._work_root / f".range-clip-{uuid.uuid4().hex}.mp4"
+        try:
+            subprocess.run(
+                [
+                    str(self._ffmpeg_path),
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-ss",
+                    f"{start_ms / 1000:.3f}",
+                    "-to",
+                    f"{end_ms / 1000:.3f}",
+                    "-i",
+                    str(source),
+                    "-an",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    str(output),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=600,
+            )
+            return self.import_local(output)
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            detail = (
+                exc.stderr.strip()[-1000:]
+                if isinstance(exc, subprocess.CalledProcessError)
+                else str(exc)
+            )
+            raise AssetStorageError(f"视频区间截取失败: {detail}") from exc
+        finally:
+            output.unlink(missing_ok=True)
+
     def build_delivery(
         self,
         *,

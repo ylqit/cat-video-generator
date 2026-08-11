@@ -12,6 +12,7 @@ import type {
   PromptOverrides,
   Slot,
   WorkflowNodeDto,
+  JobAccepted,
 } from "../api/types";
 import AssetReviewPanel from "../components/AssetReviewPanel.vue";
 import DayBriefPanel from "../components/DayBriefPanel.vue";
@@ -20,6 +21,8 @@ import PlanCreateDialog from "../components/PlanCreateDialog.vue";
 import ScriptEditorPanel from "../components/ScriptEditorPanel.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import WorkflowNodeDrawer from "../components/WorkflowNodeDrawer.vue";
+import WorkflowCanvas from "../components/WorkflowCanvas.vue";
+import VideoTimeline from "../components/VideoTimeline.vue";
 import { useJobsStore } from "../stores/jobs";
 import { useRunsStore } from "../stores/runs";
 
@@ -92,11 +95,29 @@ const slotCards = computed(() =>
     slot,
     episode: episodes.value.find((item) => item.slot === slot),
     state: graph.value?.run.slotPlanning?.find((item) => item.slot === slot),
-    directorNode: graph.value?.workflowNodes?.find((item) => item.id === `director:${slot}`),
+    directorNode: graph.value?.workflowNodes?.find(
+      (item) => item.semanticNodeId === `${slot}:director`,
+    ),
   })),
 );
 
-function setLocation(stage: Stage, slot: Slot | null = selectedSlot.value, node?: string) {
+const selectedVideoEpisode = computed(() => {
+  if (selectedNode.value?.type !== "video" || !selectedNode.value.slot) return undefined;
+  return episodes.value.find((item) => item.slot === selectedNode.value?.slot);
+});
+const selectedVideoSequences = computed(() => {
+  const episode = selectedVideoEpisode.value;
+  return episode
+    ? (graph.value?.videoSequences ?? []).filter((item) => item.episodeId === episode.id)
+    : [];
+});
+
+function setLocation(
+  stage: Stage,
+  slot: Slot | null = selectedSlot.value,
+  node?: string,
+  sequence?: string | null,
+) {
   router.replace({
     path: "/studio",
     query: {
@@ -104,6 +125,7 @@ function setLocation(stage: Stage, slot: Slot | null = selectedSlot.value, node?
       stage,
       slot: slot ?? undefined,
       node: node ?? undefined,
+      sequence: sequence === null ? undefined : sequence ?? route.query.sequence ?? undefined,
     },
   });
 }
@@ -149,32 +171,51 @@ watch(
   () => {
     const nodeId = String(route.query.node ?? "");
     if (!nodeId || !graph.value) return;
-    const node = graph.value.workflowNodes?.find((item) => item.id === nodeId);
+    const node = graph.value.workflowNodes?.find((item) => item.semanticNodeId === nodeId);
     if (node) {
+      const changedNode = selectedNode.value?.semanticNodeId !== node.semanticNodeId;
       selectedNode.value = node;
-      drawerOpen.value = true;
+      // 轮询会替换Graph对象，但不应把用户刚关闭的详情抽屉重新打开。
+      // 只有URL实际切换到另一个语义节点时才自动展开；重复点击仍由openNode显式打开。
+      if (changedNode) drawerOpen.value = true;
     }
   },
   { immediate: true },
 );
 
 function nodeFor(id: string) {
-  return graph.value?.workflowNodes?.find((item) => item.id === id);
+  return graph.value?.workflowNodes?.find((item) => item.semanticNodeId === id);
 }
 
 function openNode(node: WorkflowNodeDto | undefined) {
   if (!node || !graph.value) return;
   selectedNode.value = node;
   drawerOpen.value = true;
-  setLocation(activeStage.value, node.slot, node.id);
+  const stage: Stage = node.type === "director" || node.type === "day_confirmation"
+    ? (node.slot ? "script" : "dayBrief")
+    : node.type === "look" || node.type === "opening_anchor"
+    ? "visual"
+    : node.type === "video"
+    ? "video"
+    : "review";
+  setLocation(
+    stage,
+    node.slot,
+    node.semanticNodeId,
+    node.type === "video" ? undefined : null,
+  );
+}
+
+function trackCanvasJob(job: JobAccepted) {
+  jobs.track(job);
+  ElMessage.info("节点任务已提交，旧版本保持不变");
 }
 
 function setDrawerOpen(value: boolean) {
   drawerOpen.value = value;
-  if (!value && route.query.node) {
-    selectedNode.value = null;
-    setLocation(activeStage.value, selectedSlot.value);
-  }
+  // 关闭详情抽屉不等于取消语义节点选择。视频时间轴依赖当前节点与版本，
+  // 若在这里清空URL，用户刚关闭抽屉就会同时失去时间轴和未提交的选区。
+  // 节点选择只在点击另一个节点、切换Run或显式导航时改变。
 }
 
 function assetsFor(episode: EpisodeDto, roles: string[]): AssetDto[] {
@@ -185,6 +226,38 @@ function assetsFor(episode: EpisodeDto, roles: string[]): AssetDto[] {
 
 function reviewsFor(asset: AssetDto) {
   return (graph.value?.reviews ?? []).filter((review) => review.assetId === asset.id);
+}
+
+async function uploadEpisodeReference(episode: EpisodeDto, role: "element" | "scene") {
+  try {
+    const prefix = `${role}:`;
+    const { value } = await ElMessageBox.prompt(
+      `填写${role === "element" ? "关键道具" : "场景"}语义键，例如 ${prefix}red_kite。`,
+      `添加${SLOT_LABEL[episode.slot]}参考素材`,
+      {
+        inputValue: prefix,
+        inputValidator: (text) =>
+          new RegExp(`^${role}:[a-z0-9][a-z0-9_-]{1,80}$`).test(text.trim())
+          || `必须使用 ${prefix}英文标识`,
+      },
+    );
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".png,.jpg,.jpeg,.webp";
+    const file = await new Promise<File | null>((resolve) => {
+      input.onchange = () => resolve(input.files?.[0] ?? null);
+      input.oncancel = () => resolve(null);
+      input.click();
+    });
+    if (!file) return;
+    await api.uploadReference(episode.id, role, value.trim(), file);
+    ElMessage.success("参考素材已导入；后续视觉attempt会按语义键重新选择素材");
+    await refresh();
+  } catch (error) {
+    if (!isDialogCancellation(error)) {
+      ElMessage.error(error instanceof ApiError ? error.message : String(error));
+    }
+  }
 }
 
 function planningStateFor(slot: Slot) {
@@ -217,7 +290,13 @@ async function replanSlot(slot: Slot) {
       },
     );
     await confirmPaid(`重新调用${SLOT_LABEL[slot]}时段导演？原失败attempt会永久保留。`);
-    const accepted = await api.replanEpisode(runId.value, slot, value.trim(), true);
+    const accepted = await api.replanEpisode(
+      runId.value,
+      slot,
+      value.trim(),
+      true,
+      true,
+    );
     jobs.track(accepted);
     ElMessage.info(`${SLOT_LABEL[slot]}重规划任务已提交`);
   } catch (error) {
@@ -419,7 +498,7 @@ onBeforeUnmount(() => window.clearInterval(poller));
 
       <el-alert
         v-for="node in failedNodes"
-        :key="node.id"
+        :key="node.semanticNodeId"
         type="error"
         :closable="false"
         show-icon
@@ -429,6 +508,36 @@ onBeforeUnmount(() => window.clearInterval(poller));
         <template #title>{{ node.label }}：{{ node.error?.message ?? node.nextAction ?? "节点未通过" }}</template>
       </el-alert>
 
+      <div class="canvas-workspace">
+        <aside class="canvas-sidebar">
+          <strong>当前生产</strong>
+          <span class="mono">{{ runId.slice(0, 8) }}</span>
+          <el-tag :type="guided ? 'success' : 'info'">
+            {{ guided ? "顺序生产" : "自动全天" }}
+          </el-tag>
+          <el-divider />
+          <strong>素材入口</strong>
+          <el-button text @click="router.push('/canon')">Canon资产</el-button>
+          <div v-for="episode in episodes" :key="episode.id" class="sidebar-slot">
+            <div>{{ SLOT_LABEL[episode.slot] }} · {{ assetsFor(episode, ['element', 'scene']).length }} 项参考</div>
+            <div class="sidebar-reference-actions">
+              <el-button text size="small" @click="uploadEpisodeReference(episode, 'element')">+ 道具</el-button>
+              <el-button text size="small" @click="uploadEpisodeReference(episode, 'scene')">+ 场景</el-button>
+            </div>
+          </div>
+          <el-divider />
+          <strong>画布说明</strong>
+          <span class="muted">锁定节点仅为路线投影，不会提前创建收费Step。</span>
+        </aside>
+        <main class="canvas-main">
+          <WorkflowCanvas
+            :nodes="graph.workflowNodes ?? []"
+            :selected-id="selectedNode?.semanticNodeId"
+            @select="openNode"
+          />
+        </main>
+      </div>
+
       <el-steps :active="STAGES.findIndex((item) => item.key === graph.run.currentStage)" finish-status="success" align-center class="workflow-steps">
         <el-step v-for="stage in STAGES" :key="stage.key" :title="stage.label" />
       </el-steps>
@@ -437,7 +546,7 @@ onBeforeUnmount(() => window.clearInterval(poller));
       </el-tabs>
 
       <section v-if="activeStage === 'dayBrief'" class="stage-panel">
-        <div class="section-title"><h3>全天总导演</h3><el-button @click="openNode(nodeFor('director:day'))">查看实际Prompt与任务</el-button></div>
+        <div class="section-title"><h3>全天总导演</h3><el-button @click="openNode(nodeFor('run:day-director'))">查看实际Prompt与任务</el-button></div>
         <DayBriefPanel
           v-if="graph.run.dayBrief"
           :run-id="runId"
@@ -481,7 +590,7 @@ onBeforeUnmount(() => window.clearInterval(poller));
               <el-tag v-else :type="card.state?.unlocked ? 'warning' : 'info'">
                 {{ card.state?.unlocked ? "已解锁" : "锁定" }}
               </el-tag>
-              <el-button text type="primary" @click="openNode(nodeFor(`director:${card.slot}`))">导演节点</el-button>
+              <el-button text type="primary" @click="openNode(nodeFor(`${card.slot}:director`))">导演节点</el-button>
             </div>
           </template>
           <template v-if="card.episode">
@@ -545,7 +654,7 @@ onBeforeUnmount(() => window.clearInterval(poller));
               <AssetReviewPanel :asset="asset" :reviews="reviewsFor(asset)" @reviewed="refresh" />
             </div>
           </div>
-          <div class="node-links"><el-button size="small" @click="openNode(nodeFor(`look:${episode.slot}`))">定妆节点</el-button><el-button size="small" @click="openNode(nodeFor(`opening-anchor:${episode.slot}`))">开场锚点节点</el-button></div>
+          <div class="node-links"><el-button size="small" @click="openNode(nodeFor(`${episode.slot}:look`))">定妆节点</el-button><el-button size="small" @click="openNode(nodeFor(`${episode.slot}:opening-anchor`))">开场锚点节点</el-button></div>
         </el-card>
       </section>
 
@@ -579,14 +688,14 @@ onBeforeUnmount(() => window.clearInterval(poller));
           <div class="media-grid">
             <AssetReviewPanel v-for="asset in assetsFor(episode, ['video_intermediate', 'video'])" :key="asset.id" :asset="asset" :reviews="reviewsFor(asset)" @reviewed="refresh" />
           </div>
-          <div class="node-links"><el-button v-for="section in episode.renderPlan.sections" :key="section.order" size="small" @click="openNode(nodeFor(`video:${episode.slot}:${section.order}`))">{{ section.order === 1 ? '初始视频' : `延展${section.order}` }}</el-button></div>
+          <div class="node-links"><el-button size="small" @click="openNode(nodeFor(`${episode.slot}:video`))">视频节点与全部版本</el-button></div>
         </el-card>
       </section>
 
       <section v-else class="stage-panel">
         <div class="section-title"><h3>人工审核与1/2/3交付</h3><span class="muted">最终视频必须逐条观看后批准。</span></div>
         <el-card v-for="episode in episodes" :key="episode.id" class="episode-card" shadow="never">
-          <template #header><div class="row"><strong>{{ SLOT_LABEL[episode.slot] }} · {{ episode.title }}</strong><StatusBadge :status="episode.status" /><el-button text @click="openNode(nodeFor(`content-review:${episode.slot}`))">审核节点</el-button></div></template>
+          <template #header><div class="row"><strong>{{ SLOT_LABEL[episode.slot] }} · {{ episode.title }}</strong><StatusBadge :status="episode.status" /><el-button text @click="openNode(nodeFor(`${episode.slot}:review`))">审核节点</el-button></div></template>
           <AssetReviewPanel v-for="asset in assetsFor(episode, ['video'])" :key="asset.id" :asset="asset" :reviews="reviewsFor(asset)" :max-width="360" @reviewed="refresh" />
           <el-divider />
           <div class="section-title">
@@ -617,12 +726,27 @@ onBeforeUnmount(() => window.clearInterval(poller));
         <DeliveryPanel :run-id="runId" :can-deliver="canDeliver" />
       </section>
 
+      <VideoTimeline
+        v-if="selectedVideoEpisode && selectedNode"
+        :episode="selectedVideoEpisode"
+        :node="selectedNode"
+        :sequences="selectedVideoSequences"
+        :assets="graph.assets"
+        :outcome-confirmed="Boolean(graph.run.acceptedOutcomes?.[selectedVideoEpisode.slot])"
+        :sequence-id="String(route.query.sequence ?? '') || undefined"
+        @job="trackCanvasJob"
+        @changed="refresh"
+        @sequence-selected="(id) => setLocation('video', selectedVideoEpisode?.slot ?? null, selectedNode?.semanticNodeId, id)"
+      />
+
       <WorkflowNodeDrawer
         :model-value="drawerOpen"
         :node="selectedNode"
         :graph="graph"
         @update:model-value="setDrawerOpen"
+        @job="trackCanvasJob"
         @changed="refresh"
+        @replan="replanSlot"
       />
     </template>
     <PlanCreateDialog ref="createDialog" @created="runs.fetchRuns()" />
@@ -636,6 +760,13 @@ onBeforeUnmount(() => window.clearInterval(poller));
 .wrap { flex-wrap: wrap; }
 .run-card { margin-bottom: 10px; cursor: pointer; background: #16181d; border-color: #2b2d33; }
 .workflow-steps { margin: 24px 0 14px; }
+.canvas-workspace { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 12px; margin-top: 18px; }
+.canvas-sidebar { display: flex; flex-direction: column; align-items: flex-start; gap: 9px; padding: 14px; border: 1px solid #2b2d33; border-radius: 12px; background: #16181d; }
+.canvas-sidebar .el-divider { margin: 4px 0; }
+.sidebar-slot { color: #9ca3af; font-size: 12px; }
+.sidebar-reference-actions { display: flex; gap: 2px; }
+.sidebar-reference-actions .el-button { margin: 0; padding: 2px 3px; }
+.canvas-main { min-width: 0; }
 .stage-panel { padding: 4px 0 28px; }
 .section-title { display: flex; align-items: baseline; gap: 14px; margin-bottom: 12px; }
 .section-title h3 { margin: 0; }

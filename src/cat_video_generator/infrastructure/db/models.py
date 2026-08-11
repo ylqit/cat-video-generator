@@ -355,6 +355,63 @@ class Asset(Base):
     )
 
 
+class VideoSequence(Base):
+    """一个Episode的非破坏性单轨视频版本。"""
+
+    __tablename__ = "video_sequences"
+    __table_args__ = (
+        CheckConstraint("revision >= 1", name="ck_video_sequences_revision"),
+        CheckConstraint(
+            "status IN ('draft', 'generating', 'content_review', 'approved', 'rejected')",
+            name="ck_video_sequences_status",
+        ),
+        CheckConstraint(
+            "duration_ms > 0 AND duration_ms <= 45000",
+            name="ck_video_sequences_duration",
+        ),
+        CheckConstraint(
+            "audio_policy = 'preserve_original'",
+            name="ck_video_sequences_audio_policy",
+        ),
+        UniqueConstraint("episode_id", "revision", name="uq_video_sequences_episode_revision"),
+        Index("ix_video_sequences_episode_status", "episode_id", "status", "revision"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    episode_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.episodes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    parent_sequence_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.video_sequences.id", ondelete="SET NULL"),
+    )
+    base_asset_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.assets.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    rendered_asset_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.assets.id", ondelete="SET NULL"),
+    )
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    audio_policy: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="preserve_original"
+    )
+    clips_json: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class Review(Base):
     __tablename__ = "reviews"
     __table_args__ = (

@@ -129,6 +129,16 @@ class PlanningRepository:
         attempts = [step.attempt for step in self.steps.values() if step.operation_key == prefix]
         return max(attempts, default=0) + 1
 
+    def save_initial_planning_metadata(self, **kwargs):
+        self.context = {
+            **self.context,
+            "planningMetadata": kwargs["planning_metadata"],
+            "planningRequest": {
+                "planningContext": kwargs["planning_context"],
+                "storyMode": kwargs["story_mode"],
+            },
+        }
+
     def save_planning_context(self, **kwargs):
         self.context = {
             "dayBrief": kwargs["day_brief"].model_dump(mode="json"),

@@ -15,10 +15,21 @@ const SLOT_LABEL: Record<string, string> = {
 };
 
 const draft = reactive<DayBriefDto>(structuredClone(toRaw(props.dayBrief)));
+const loaded = ref("");
+function snapshot() { return JSON.stringify(draft); }
+function reset(brief: DayBriefDto) {
+  Object.assign(draft, structuredClone(toRaw(brief)));
+  loaded.value = snapshot();
+}
 watch(
-  () => props.dayBrief,
-  (brief) => Object.assign(draft, structuredClone(toRaw(brief))),
-  { deep: true },
+  [() => props.runId, () => props.dayBrief] as const,
+  ([runId, brief], previous) => {
+    const runChanged = !previous || previous[0] !== runId;
+    // 轮询只能刷新服务端状态，不能覆盖用户尚未保存的全天边界编辑。
+    // 切换Run时则必须装载新Run，避免把旧草稿带到另一个生产任务。
+    if (runChanged || !loaded.value || snapshot() === loaded.value) reset(brief);
+  },
+  { deep: true, immediate: true },
 );
 const saving = ref(false);
 
@@ -26,6 +37,7 @@ async function save() {
   saving.value = true;
   try {
     await api.updateDayBrief(props.runId, structuredClone(toRaw(draft)));
+    loaded.value = snapshot();
     ElMessage.success("总导演边界已保存并确认；当前已解锁时段可以开始规划");
     emit("saved");
   } catch (error) {
