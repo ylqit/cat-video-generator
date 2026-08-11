@@ -16,17 +16,14 @@ from typing import Any
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-from ..application.planning import DayBriefPause
 from ..application.ports import GatewayError
-from ..domain.contracts import Slot
+from ..domain.contracts import Slot, StoryInputMode
 from ..domain.pipeline import PipelineSettings, StageMode
 from ..domain.rendering import BoundaryMode
+from ..domain.user_story import preview_user_story
 from .api_helpers import _accepted, _jsonable, _submit
 from .api_schemas import (
     CANON_ROLES as _CANON_ROLES,
-)
-from .api_schemas import (
-    DEFAULT_PLANNING_CONTEXT as _DEFAULT_PLANNING_CONTEXT,
 )
 from .api_schemas import (
     IMAGE_SUFFIXES as _IMAGE_SUFFIXES,
@@ -39,9 +36,9 @@ from .api_schemas import (
 )
 from .api_schemas import (
     DeriveCropRequest,
+    EpisodeSourceRequest,
     GenerateRequest,
     PaidRequest,
-    PlanRequest,
     PromptOverridesRequest,
     RangeEditRequest,
     ReconcileStepRequest,
@@ -50,12 +47,11 @@ from .api_schemas import (
     RetryStepRequest,
     ReviewRequest,
     SelectVideoSequenceRequest,
+    SlotPlanRequest,
+    StoryPreviewRequest,
+    StoryProjectRequest,
 )
-from .api_studio import (
-    build_plan_payload,
-    chain_after_planning,
-    maybe_continue_media,
-)
+from .api_studio import chain_after_planning, maybe_continue_media
 from .jobs import JobRegistry
 
 
@@ -70,7 +66,6 @@ def create_write_router(
     regeneration: Any,
     video_editing: Any,
     job_registry: JobRegistry,
-    default_candidate_count: int,
     upload_dir: Path,
     delivery_root: Path,
 ) -> APIRouter:
@@ -79,56 +74,103 @@ def create_write_router(
     router = APIRouter(prefix="/api/v1")
     resolved_delivery_root = delivery_root.expanduser().resolve()
 
-    @router.post("/plans", status_code=202)
-    def create_plan(request: PlanRequest) -> dict[str, Any]:
-        if not request.allow_paid_generation:
-            raise HTTPException(
-                status_code=422,
-                detail="规划调用付费模型，必须显式确认allowPaidGeneration",
-            )
+    @router.post("/story-projects/preview")
+    def preview_story_project(request: StoryPreviewRequest) -> dict[str, Any]:
+        preview = preview_user_story(request.text)
+        return {
+            "theme": preview.theme,
+            "episodeSources": preview.episode_sources.model_dump(mode="json"),
+            "detectedSlots": [slot.value for slot in preview.detected_slots],
+            "issues": list(preview.issues),
+            "canConfirm": preview.complete and not preview.issues,
+        }
+
+    @router.post("/projects", status_code=202)
+    def create_story_project(request: StoryProjectRequest) -> dict[str, Any]:
+        project_input = request.project_input.to_domain()
         settings = (
             PipelineSettings.model_validate(request.pipeline_settings)
             if request.pipeline_settings
-            # 未显式给流水线开关时，视觉锚点自动推进，视频等待人工确认。
             else PipelineSettings(
-                allow_paid_generation=True,
+                allow_paid_generation=request.allow_paid_generation,
                 visual=StageMode.AUTO,
                 video=StageMode.MANUAL,
             )
         )
+        settings = settings.model_copy(
+            update={"allow_paid_generation": request.allow_paid_generation}
+        )
+        requires_day_director = project_input.input_mode is StoryInputMode.THEME_EXPAND
+        requires_paid_planning = (
+            requires_day_director
+            or settings.planning_mode.value == "auto_day"
+        )
+        if requires_paid_planning and not request.allow_paid_generation:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "主题扩写或全自动三集会调用付费导演，"
+                    "必须显式确认allowPaidGeneration"
+                ),
+            )
 
         def task() -> dict[str, Any]:
-            result = planning.plan_day(
+            result = planning.create_project(
                 target_date=request.target_date,
-                planning_context=(request.planning_context or _DEFAULT_PLANNING_CONTEXT),
-                candidate_count=(
-                    request.candidate_count
-                    if request.candidate_count is not None
-                    else default_candidate_count
-                ),
-                allow_paid_generation=True,
+                project_input=project_input,
+                allow_paid_generation=request.allow_paid_generation,
                 creative_profile=(
                     request.creative_profile.to_domain()
                     if request.creative_profile is not None
                     else None
                 ),
-                stop_after_day_brief=settings.day_brief is StageMode.MANUAL,
                 pipeline_settings=settings,
-                story_mode=request.story_mode,
                 creative_controls=request.creative_controls,
             )
-            payload = build_plan_payload(result)
-            if isinstance(result, DayBriefPause):
-                return payload
-            # 同一付费串行门内按流水线开关链式推进；创作台默认路径。
-            return chain_after_planning(production, result.run_id, settings, payload)
+            payload = _jsonable(result)
+            run_id = result.run_id
+            response: dict[str, Any] = {
+                "runId": str(run_id),
+                "project": payload,
+            }
+            if (
+                request.allow_paid_generation
+                and getattr(result, "plan", None) is not None
+            ):
+                return chain_after_planning(production, run_id, settings, response)
+            return response
 
+        input_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "contentDate": request.target_date.isoformat(),
+                    "projectInput": project_input.model_dump(mode="json"),
+                    "pipelineSettings": settings.model_dump(mode="json", by_alias=True),
+                    "creativeControls": (
+                        None
+                        if request.creative_controls is None
+                        else request.creative_controls.model_dump(mode="json")
+                    ),
+                    "creativeProfile": (
+                        None
+                        if request.creative_profile is None
+                        else request.creative_profile.model_dump(mode="json")
+                    ),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
         record = _submit(
             job_registry,
-            kind="plan_day",
-            dedup_key=f"plan:{request.target_date.isoformat()}",
+            kind="create_project",
+            dedup_key=f"project:{request.target_date.isoformat()}:{input_digest}",
             fn=task,
-            context={"operationKey": "director:day"},
+            context={
+                "operationKey": (
+                    "director:day" if requires_day_director else "project:episode-scripts"
+                )
+            },
         )
         return _accepted(record)
 
@@ -161,7 +203,7 @@ def create_write_router(
     def plan_slot(
         run_id: uuid.UUID,
         slot: Slot,
-        request: PaidRequest,
+        request: SlotPlanRequest,
     ) -> dict[str, Any]:
         """顺序人工模式只调用当前已解锁时段的导演。"""
 
@@ -177,6 +219,7 @@ def create_write_router(
                     run_id,
                     slot=slot,
                     allow_paid_generation=True,
+                    generate_from_theme=request.generate_from_theme,
                 )
             )
 
@@ -189,6 +232,67 @@ def create_write_router(
                 "runId": run_id,
                 "slot": slot.value,
                 "operationKey": f"director:episode:{slot.value}",
+            },
+        )
+        return _accepted(record)
+
+    @router.put("/runs/{run_id}/slots/{slot}/source")
+    def update_episode_source(
+        run_id: uuid.UUID,
+        slot: Slot,
+        request: EpisodeSourceRequest,
+    ) -> dict[str, Any]:
+        try:
+            project_input = planning.update_episode_source(
+                run_id,
+                slot=slot,
+                source_text=request.source,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "runId": str(run_id),
+            "slot": slot.value,
+            "sourceText": request.source,
+            "saved": True,
+            "projectInput": project_input.model_dump(mode="json", by_alias=True),
+        }
+
+    @router.post(
+        "/runs/{run_id}/slots/{slot}/connection/suggest",
+        status_code=202,
+    )
+    def suggest_story_connection(
+        run_id: uuid.UUID,
+        slot: Slot,
+        request: PaidRequest,
+    ) -> dict[str, Any]:
+        if not request.allow_paid_generation:
+            raise HTTPException(
+                status_code=422,
+                detail="剧情关联建议会调用付费导演模型，必须显式确认allowPaidGeneration",
+            )
+
+        def task() -> dict[str, Any]:
+            return _jsonable(
+                planning.suggest_connection(
+                    run_id,
+                    slot=slot,
+                    allow_paid_generation=True,
+                )
+            )
+
+        record = _submit(
+            job_registry,
+            kind="suggest_story_connection",
+            dedup_key=f"suggest-connection:{run_id}:{slot.value}",
+            fn=task,
+            context={
+                "runId": run_id,
+                "slot": slot.value,
+                "operationKey": f"director:connection:{slot.value}",
             },
         )
         return _accepted(record)

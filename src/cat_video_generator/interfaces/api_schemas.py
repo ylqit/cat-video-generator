@@ -10,7 +10,17 @@ from datetime import date
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..domain.contracts import RunCreativeControls, Slot
+from ..domain.contracts import (
+    CrossSlotReferenceRole,
+    CrossSlotReferenceTarget,
+    EpisodeSources,
+    RunCreativeControls,
+    SceneRoute,
+    Slot,
+    StoryConnectionMode,
+    StoryInputMode,
+    StoryProjectInput,
+)
 from ..domain.visual_profiles import CreativeProfileOverride
 
 CANON_ROLES = frozenset({"person", "cat", "style"})
@@ -24,7 +34,6 @@ REFERENCE_SUFFIXES = {
     "element": IMAGE_SUFFIXES,
     "scene": IMAGE_SUFFIXES,
 }
-DEFAULT_PLANNING_CONTEXT = "根据日期、天气和角色习惯设计自然的一天。"
 
 
 class CreativeProfileRequest(BaseModel):
@@ -57,29 +66,67 @@ class CreativeProfileRequest(BaseModel):
         return CreativeProfileOverride.model_validate(self.model_dump())
 
 
-class PlanRequest(BaseModel):
-    """触发全天规划的请求体；付费许可缺省为拒绝。"""
+class StoryPreviewRequest(BaseModel):
+    """仅执行本地三集文本拆分，不创建Run或收费意图。"""
 
     model_config = ConfigDict(populate_by_name=True)
 
-    target_date: date = Field(alias="targetDate")
-    planning_context: str | None = Field(None, alias="planningContext")
+    text: str = Field(min_length=1, max_length=50_000)
+
+
+class EpisodeSourcesRequest(BaseModel):
+    morning: str | None = Field(None, min_length=4, max_length=20_000)
+    noon: str | None = Field(None, min_length=4, max_length=20_000)
+    evening: str | None = Field(None, min_length=4, max_length=20_000)
+
+
+class StoryProjectInputRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    theme: str = Field(min_length=2, max_length=160)
+    input_mode: StoryInputMode = Field(alias="inputMode")
+    scene_route: SceneRoute = Field(SceneRoute.ADAPTIVE, alias="sceneRoute")
+    episode_sources: EpisodeSourcesRequest = Field(
+        default_factory=EpisodeSourcesRequest,
+        alias="episodeSources",
+    )
+
+    def to_domain(self) -> StoryProjectInput:
+        return StoryProjectInput(
+            theme=self.theme,
+            input_mode=self.input_mode,
+            scene_route=self.scene_route,
+            episode_sources=EpisodeSources.model_validate(
+                self.episode_sources.model_dump()
+            ),
+        )
+
+
+class StoryProjectRequest(BaseModel):
+    """创建生活故事项目；是否需要总导演由projectInput.inputMode决定。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    target_date: date = Field(alias="contentDate")
+    project_input: StoryProjectInputRequest = Field(alias="projectInput")
     creative_profile: CreativeProfileRequest | None = Field(
         None,
         alias="creativeProfile",
     )
-    candidate_count: int | None = Field(None, alias="candidateCount", ge=1, le=5)
     allow_paid_generation: bool = Field(False, alias="allowPaidGeneration")
     pipeline_settings: dict | None = Field(None, alias="pipelineSettings")
-    story_mode: str = Field(
-        "auto",
-        alias="storyMode",
-        pattern=r"^(auto|create|expand)$",
-    )
     creative_controls: RunCreativeControls | None = Field(
         None,
         alias="creativeControls",
     )
+
+
+class EpisodeSourceRequest(BaseModel):
+    """用户在当前时段导演执行前保存的原始剧情。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    source: str = Field(alias="sourceText", min_length=4, max_length=20_000)
 
 
 class GenerateRequest(BaseModel):
@@ -106,8 +153,14 @@ class PaidRequest(BaseModel):
     allow_paid_generation: bool = Field(False, alias="allowPaidGeneration")
 
 
+class SlotPlanRequest(PaidRequest):
+    """逐时段镜头化；无用户原文时必须显式要求AI生成。"""
+
+    generate_from_theme: bool = Field(False, alias="generateFromTheme")
+
+
 class AcceptedOutcomeRequest(BaseModel):
-    """人工确认的实际成片结果；确认后才允许后续时段导演读取。"""
+    """人工确认的实际成片结果；用于解锁与可选关联，不会被导演隐式读取。"""
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -122,6 +175,42 @@ class AcceptedOutcomeRequest(BaseModel):
         alias="doNotCarryForward",
         max_length=8,
     )
+
+
+class StoryConnectionRequest(BaseModel):
+    """用户确认的关联卡；保存正文和是否加载，不隐式调用AI。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    use_for_director: bool = Field(False, alias="useForDirector")
+    mode: StoryConnectionMode = StoryConnectionMode.INDEPENDENT
+    brief: str = Field("", max_length=1200)
+
+
+class CrossSlotReferenceItemRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    asset_id: str = Field(alias="assetId", min_length=36, max_length=36)
+    role: CrossSlotReferenceRole
+    apply_to: CrossSlotReferenceTarget = Field(alias="applyTo")
+
+
+class CrossSlotReferencesRequest(BaseModel):
+    references: list[CrossSlotReferenceItemRequest] = Field(
+        default_factory=list,
+        max_length=12,
+    )
+
+
+class ShotNoteRequest(BaseModel):
+    """非付费人工镜头备注，关联现有视频区间。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    asset_id: str = Field(alias="assetId", min_length=36, max_length=36)
+    start_ms: int = Field(alias="startMs", ge=0)
+    end_ms: int = Field(alias="endMs", gt=0)
+    note: str = Field(min_length=2, max_length=2000)
 
 
 class RetryStepRequest(BaseModel):

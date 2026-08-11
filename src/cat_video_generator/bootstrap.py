@@ -160,8 +160,6 @@ def build_runtime_container(
         provider_name=runtime.provider_profile,
         image_review_mode=runtime.image_review_mode.value,
         image_request_timeout_seconds=runtime.ark_image_request_timeout_seconds,
-        image_timeout_auto_retries=runtime.ark_image_timeout_auto_retries,
-        image_retry_delay_seconds=runtime.ark_image_retry_delay_seconds,
         series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
         style_profile=DEFAULT_STYLE_PROFILE,
     )
@@ -188,7 +186,6 @@ def build_runtime_container(
         event_seed_catalog=EventSeedCatalog(runtime.event_seed_root),
         series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
         style_profile=DEFAULT_STYLE_PROFILE,
-        video_resolution=runtime.ark_video_resolution,
     )
     regeneration = RegenerationService(
         repository=repository,

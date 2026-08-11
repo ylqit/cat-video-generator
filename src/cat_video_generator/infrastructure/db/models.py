@@ -61,7 +61,7 @@ class ProductionRun(Base):
             name="ck_production_runs_status",
         ),
         CheckConstraint(
-            f"contract_version = {CURRENT_CONTRACT_VERSION}",
+            "contract_version IN (2, 3)",
             name="ck_production_runs_contract_version",
         ),
         Index("ix_production_runs_queue", "status", "content_date", "created_at"),
@@ -77,6 +77,8 @@ class ProductionRun(Base):
     contract_version: Mapped[int] = mapped_column(
         SmallInteger,
         nullable=False,
+        default=CURRENT_CONTRACT_VERSION,
+        server_default=text(str(CURRENT_CONTRACT_VERSION)),
     )
     planning_json: Mapped[dict[str, Any]] = mapped_column(
         JSONB,

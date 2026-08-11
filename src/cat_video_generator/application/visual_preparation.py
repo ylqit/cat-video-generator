@@ -1,17 +1,16 @@
 """定妆图与开场视觉锚点的生产用例。
 
-本服务只拥有Seedream图片生命周期和图片语义审核；不生成故事板组图，也不提交视频。
+本服务只拥有Seedream图片生命周期和非阻断AI检查建议；不生成故事板组图，也不提交视频。
 收费意图与Prompt先原子落库，失败重试始终创建新attempt。
 """
 
 from __future__ import annotations
 
 import hashlib
-import time
 import uuid
 from dataclasses import dataclass
 
-from ..domain.contracts import Slot
+from ..domain.contracts import CrossSlotReference, CrossSlotReferenceTarget, Slot
 from ..domain.prompts import (
     CompiledPrompt,
     compile_image_review_prompt,
@@ -54,13 +53,11 @@ class VisualPreparationService:
         provider_name: str,
         image_review_mode: str,
         image_request_timeout_seconds: float = 600,
-        image_timeout_auto_retries: int = 1,
-        image_retry_delay_seconds: float = 15,
         series_profile: SeriesVisualProfile,
         style_profile: StyleProfile,
     ) -> None:
-        if image_review_mode not in {"semantic_auto", "manual"}:
-            raise ValueError("图片审核只允许semantic_auto或manual")
+        if image_review_mode not in {"advisory", "manual"}:
+            raise ValueError("图片审核只允许advisory或manual")
         self._repository = repository
         self._media_gateway = media_gateway
         self._review_gateway = visual_review_gateway
@@ -69,8 +66,6 @@ class VisualPreparationService:
         self._provider_name = provider_name
         self._review_mode = image_review_mode
         self._image_request_timeout = image_request_timeout_seconds
-        self._image_timeout_auto_retries = image_timeout_auto_retries
-        self._image_retry_delay = image_retry_delay_seconds
         self._series_profile = series_profile
         self._style_profile = style_profile
 
@@ -237,7 +232,6 @@ class VisualPreparationService:
         retry_of_step_id: uuid.UUID | None = None,
         retry_reason: str | None = None,
         retry_feedback: str | None = None,
-        auto_timeout_retry_index: int = 0,
         duplicate_billing_risk_accepted: bool = False,
     ) -> StoredAsset:
         if target not in {"look", "opening_anchor"}:
@@ -301,7 +295,6 @@ class VisualPreparationService:
             retry_of_step_id=retry_of_step_id,
             retry_reason=retry_reason,
             request_timeout_seconds=self._image_request_timeout,
-            auto_timeout_retry_index=auto_timeout_retry_index,
             duplicate_billing_risk_accepted=duplicate_billing_risk_accepted,
         )
         step, _ = self._repository.create_step_with_prompt_intent(
@@ -345,26 +338,6 @@ class VisualPreparationService:
                     else "failed"
                 },
             )
-            if (
-                exc.submission_unknown
-                and exc.timed_out
-                and auto_timeout_retry_index < self._image_timeout_auto_retries
-            ):
-                time.sleep(self._image_retry_delay)
-                return self._ensure_image(
-                    episode,
-                    target=target,
-                    look=look,
-                    attempt=self._repository.next_step_attempt(
-                        episode_id=episode.id,
-                        kind=StepKind.IMAGE,
-                        operation_key=f"image:{target}",
-                    ),
-                    retry_of_step_id=step.id,
-                    retry_reason="Seedream同步请求超时，按配置自动重试一次",
-                    auto_timeout_retry_index=auto_timeout_retry_index + 1,
-                    duplicate_billing_risk_accepted=True,
-                )
             current_episode = self._repository.get_episode(episode.run_id, episode.plan.slot)
             if current_episode.selected_video_asset_id is None:
                 self._repository.set_episode_status(episode.id, EpisodeStatus.FAILED)
@@ -449,22 +422,11 @@ class VisualPreparationService:
                 asset_id=asset.id,
                 source="ark_visual",
                 decision="pending",
-                reason=f"图片语义审核异常，转人工：{type(exc).__name__}",
+                reason=f"AI图片检查异常，直接转人工判断：{type(exc).__name__}",
                 warnings=[],
                 evidence={"semanticReviewStatus": "pending", "semanticVerified": False},
             )
             return asset
-        # 定妆图只负责人物身份和完整服装，不应因剧情场景、猫咪或道具缺席被拒绝；
-        # 开场锚点才承担一人一猫、活动焦点和关键道具的画面语义。
-        passed = all(
-            (
-                result.identity_ok,
-                result.style_ok,
-                result.appearance_ok,
-                result.composition_ok,
-                *((result.constraints_ok,) if target == "opening_anchor" else ()),
-            )
-        )
         evidence = {
             "identityOk": result.identity_ok,
             "styleOk": result.style_ok,
@@ -477,26 +439,23 @@ class VisualPreparationService:
             "responseId": result.response_id,
             "requestHash": result.request_hash,
         }
-        if result.confidence < 0.8:
-            self._repository.record_review(
-                step_id=asset.step_id,
-                asset_id=asset.id,
-                source="ark_visual",
-                decision="pending",
-                reason="图片审核置信度低，转人工",
-                warnings=[{"code": "image_warning", "message": item} for item in result.warnings],
-                evidence=evidence,
-            )
-            return asset
-        self._repository.commit_asset_review(
+        suggestions = [*result.violations, *result.warnings]
+        self._repository.record_review(
+            step_id=asset.step_id,
             asset_id=asset.id,
             source="ark_visual",
-            decision="approved" if passed else "rejected",
-            reason="图片语义审核通过" if passed else "图片存在身份、画风、构图或关键道具错误",
-            warnings=[{"code": "image_warning", "message": item} for item in result.warnings],
+            decision="pending",
+            reason=(
+                "AI图片建议已完成，等待人工判断"
+                if result.confidence >= 0.8
+                else "AI图片建议置信度较低，请人工判断"
+            ),
+            warnings=[
+                {"code": "image_suggestion", "message": item} for item in suggestions
+            ],
             evidence=evidence,
         )
-        return self._repository.asset_detail(asset.id)
+        return asset
 
     def _look_references(self, episode: StoredEpisode) -> ReferenceSelectionPlan:
         contextual = (
@@ -522,6 +481,43 @@ class VisualPreparationService:
         selected = self._select_assets(episode, tuple(keys[1:]))
         assets.extend(selected.assets)
         reference_roles = [str(look.semantic_key), *selected.semantic_keys]
+        context = self._repository.get_planning_context(episode.run_id)
+        raw_by_slot = context.get("crossSlotReferences", {})
+        raw_references = (
+            raw_by_slot.get(episode.plan.slot.value, [])
+            if isinstance(raw_by_slot, dict)
+            else []
+        )
+        chosen = tuple(
+            CrossSlotReference.model_validate(item)
+            for item in raw_references
+            if isinstance(item, dict)
+        )
+        anchor_ids = {
+            item.asset_id
+            for item in chosen
+            if item.apply_to
+            in {CrossSlotReferenceTarget.OPENING_ANCHOR, CrossSlotReferenceTarget.BOTH}
+        }
+        if anchor_ids:
+            previous_assets = {
+                item.id: item
+                for item in self._repository.list_assets(
+                    run_id=episode.run_id,
+                    statuses=("approved", "ready"),
+                )
+                if item.id in anchor_ids and item.media_type == "image"
+            }
+            if len(previous_assets) != len(anchor_ids):
+                raise ValueError("选中的前序锚点参考不存在、未批准或不是图片")
+            for reference in chosen:
+                if reference.asset_id not in anchor_ids:
+                    continue
+                asset = previous_assets[reference.asset_id]
+                assets.append(asset)
+                reference_roles.append(
+                    f"previous:{reference.role.value}:{asset.semantic_key or asset.role}"
+                )
         return ReferenceSelectionPlan(
             semantic_keys=tuple(reference_roles),
             assets=tuple(assets),

@@ -30,9 +30,9 @@ class DatabaseOperation(StrEnum):
 
 
 class ImageReviewMode(StrEnum):
-    """定妆图和开场锚点的语义审核模式。"""
+    """定妆图和开场锚点的AI建议或纯人工审核模式。"""
 
-    SEMANTIC_AUTO = "semantic_auto"
+    ADVISORY = "advisory"
     MANUAL = "manual"
 
 
@@ -116,9 +116,6 @@ class RuntimeSettings:
     ark_poll_interval_seconds: float
     ark_task_timeout_seconds: float
     ark_image_request_timeout_seconds: float
-    ark_image_timeout_auto_retries: int
-    ark_image_retry_delay_seconds: float
-    candidate_count: int
     image_review_mode: ImageReviewMode
     video_semantic_review_mode: str
     configuration_warnings: tuple[str, ...]
@@ -149,11 +146,6 @@ class RuntimeSettings:
         image_request_timeout = float(
             _number(values, "ARK_IMAGE_REQUEST_TIMEOUT_SECONDS", "600", float)
         )
-        image_timeout_auto_retries = int(
-            _number(values, "ARK_IMAGE_TIMEOUT_AUTO_RETRIES", "1", int)
-        )
-        image_retry_delay = float(_number(values, "ARK_IMAGE_RETRY_DELAY_SECONDS", "15", float))
-        candidate_count = int(_number(values, "DAILY_PLAN_CANDIDATE_COUNT", "1", int))
         if any(
             value <= 0
             for value in (
@@ -163,27 +155,22 @@ class RuntimeSettings:
                 poll_interval,
                 timeout,
                 image_request_timeout,
-                image_retry_delay,
             )
         ):
             raise ConfigurationError("Ark轮询间隔和请求超时必须大于0")
-        if image_timeout_auto_retries not in {0, 1}:
-            raise ConfigurationError("ARK_IMAGE_TIMEOUT_AUTO_RETRIES只允许0或1")
-        if candidate_count != 1:
-            raise ConfigurationError("分层导演模式下DAILY_PLAN_CANDIDATE_COUNT必须为1")
+        configuration_warnings: list[str] = []
         review_mode_value = (
             values.get(
                 "IMAGE_REVIEW_MODE",
-                "semantic_auto",
+                "advisory",
             )
             .strip()
             .lower()
         )
-        configuration_warnings: list[str] = []
         try:
             image_review_mode = ImageReviewMode(review_mode_value)
         except ValueError as exc:
-            raise ConfigurationError("IMAGE_REVIEW_MODE必须是semantic_auto或manual") from exc
+            raise ConfigurationError("IMAGE_REVIEW_MODE必须是advisory或manual") from exc
         video_review_mode = (
             values.get(
                 "VIDEO_SEMANTIC_REVIEW_MODE",
@@ -247,9 +234,6 @@ class RuntimeSettings:
             ark_poll_interval_seconds=poll_interval,
             ark_task_timeout_seconds=timeout,
             ark_image_request_timeout_seconds=image_request_timeout,
-            ark_image_timeout_auto_retries=image_timeout_auto_retries,
-            ark_image_retry_delay_seconds=image_retry_delay,
-            candidate_count=candidate_count,
             image_review_mode=image_review_mode,
             video_semantic_review_mode=video_review_mode,
             configuration_warnings=tuple(configuration_warnings),
@@ -332,8 +316,6 @@ class RuntimeSettings:
             "arkPollIntervalSeconds": self.ark_poll_interval_seconds,
             "arkTaskTimeoutSeconds": self.ark_task_timeout_seconds,
             "arkImageRequestTimeoutSeconds": self.ark_image_request_timeout_seconds,
-            "arkImageTimeoutAutoRetries": self.ark_image_timeout_auto_retries,
-            "arkImageRetryDelaySeconds": self.ark_image_retry_delay_seconds,
             "imageReviewMode": self.image_review_mode.value,
             "videoSemanticReviewMode": self.video_semantic_review_mode,
             "configurationWarnings": list(self.configuration_warnings),

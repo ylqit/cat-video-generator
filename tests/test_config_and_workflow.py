@@ -28,7 +28,7 @@ def runtime_env(tmp_path: Path) -> dict[str, str]:
         "ARK_PLANNING_MODEL": "doubao-seed-2-1-pro-260628",
         "ARK_REVIEW_MODEL": "doubao-seed-2-1-pro-260628",
         "ARK_VIDEO_RESOLUTION": "720p",
-        "IMAGE_REVIEW_MODE": "semantic_auto",
+        "IMAGE_REVIEW_MODE": "advisory",
         "CAT_VIDEO_EVENT_SEED_ROOT": str(event_root),
         "FFMPEG_PATH": str(tmp_path / "ffmpeg"),
         "FFPROBE_PATH": str(tmp_path / "ffprobe"),
@@ -41,16 +41,15 @@ def test_runtime_exposes_full_model_extension_and_timeouts(tmp_path: Path) -> No
 
     assert report["supportsVideoExtension"] is True
     assert report["arkTaskTimeoutSeconds"] == 1800.0
-    assert report["arkImageTimeoutAutoRetries"] == 1
-    assert report["imageReviewMode"] == "semantic_auto"
+    assert "arkImageTimeoutAutoRetries" not in report
+    assert report["imageReviewMode"] == "advisory"
 
 
 @pytest.mark.parametrize(
     ("name", "value", "message"),
     [
         ("ARK_TASK_TIMEOUT_SECONDS", "0", "必须大于0"),
-        ("ARK_IMAGE_TIMEOUT_AUTO_RETRIES", "2", "只允许0或1"),
-        ("IMAGE_REVIEW_MODE", "technical_auto", "semantic_auto或manual"),
+        ("IMAGE_REVIEW_MODE", "technical_auto", "advisory或manual"),
     ],
 )
 def test_invalid_runtime_values_fail_at_startup(tmp_path, name, value, message) -> None:
@@ -62,18 +61,18 @@ def test_invalid_runtime_values_fail_at_startup(tmp_path, name, value, message) 
 
 
 def test_pipeline_has_only_five_current_stages() -> None:
-    assert PIPELINE_STAGES == ("dayBrief", "script", "visual", "video", "review")
+    assert PIPELINE_STAGES == ("projectOutline", "script", "visual", "video", "review")
     settings = PipelineSettings.model_validate(
         {
             "allowPaidGeneration": True,
-            "dayBrief": "manual",
+            "projectOutline": "manual",
             "script": "auto",
             "visual": "manual",
             "video": "manual",
             "review": "manual",
         }
     )
-    assert settings.stage("dayBrief") is StageMode.MANUAL
+    assert settings.stage("projectOutline") is StageMode.MANUAL
     assert settings.stage("visual") is StageMode.MANUAL
 
 

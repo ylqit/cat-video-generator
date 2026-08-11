@@ -12,10 +12,12 @@ import hashlib
 import json
 import time
 import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from ..domain.contracts import CrossSlotReference, CrossSlotReferenceTarget
 from ..domain.prompts import compile_video_diagnostic_prompt, compile_video_prompt
 from ..domain.rendering import (
     ClipOrigin,
@@ -231,9 +233,13 @@ class VideoExecutionService:
             )
 
         snapshot = VideoInputSnapshot.model_validate(step.input_snapshot)
-        if len(snapshot.input_asset_ids) != 1:
-            raise ValueError("视频步骤必须只有一个开场锚点或上一版视频输入")
+        if not snapshot.input_asset_ids:
+            raise ValueError("视频步骤缺少开场锚点或上一版视频输入")
         source = self._repository.asset_detail(snapshot.input_asset_ids[0])
+        initial_references = tuple(
+            self._repository.asset_detail(asset_id)
+            for asset_id in snapshot.input_asset_ids[1:]
+        )
         section = _section(render_plan, snapshot.render_section_order)
         result = self._run_section(
             episode,
@@ -248,6 +254,7 @@ class VideoExecutionService:
             retry_of_step_id=step.id,
             retry_reason=reason,
             prompt_override=(prompt_override if section.order == 1 else None),
+            initial_references=(initial_references if section.order == 1 else ()),
         )
         if result["status"] != "succeeded":
             return result
@@ -378,7 +385,12 @@ class VideoExecutionService:
         fresh_attempts: bool = False,
         retry_of_step_id: uuid.UUID | None = None,
         retry_reason: str | None = None,
+        initial_references: tuple[StoredAsset, ...] | None = None,
     ) -> dict[str, Any]:
+        if initial_references is None:
+            initial_references = (
+                self._selected_video_references(episode) if start_order == 1 else ()
+            )
         current_source = source
         last_result: dict[str, Any] | None = None
         for section in render_plan.sections:
@@ -406,6 +418,7 @@ class VideoExecutionService:
                 prompt_override=prompt_override if section.order == 1 else None,
                 retry_of_step_id=retry_of_step_id if fresh_attempts else None,
                 retry_reason=retry_reason if fresh_attempts else None,
+                initial_references=(initial_references if section.order == 1 else ()),
             )
             if last_result["status"] != "succeeded":
                 return last_result
@@ -425,6 +438,7 @@ class VideoExecutionService:
         prompt_override: str | None = None,
         retry_of_step_id: uuid.UUID | None = None,
         retry_reason: str | None = None,
+        initial_references: tuple[StoredAsset, ...] = (),
     ) -> dict[str, Any]:
         media_source = MediaSource(
             asset_id=source.id,
@@ -438,6 +452,19 @@ class VideoExecutionService:
             resolution=self._resolution,
             duration_seconds=section.duration_seconds,
             source=media_source,
+            references=tuple(
+                MediaSource(
+                    asset_id=item.id,
+                    semantic_key=(
+                        f"previous:{item.metadata.get('crossSlotRole', 'reference')}:"
+                        f"{item.semantic_key or item.role}"
+                    ),
+                    media_type=item.media_type,
+                    sha256=item.sha256,
+                    metadata=item.metadata,
+                )
+                for item in initial_references
+            ),
         )
         compiled = compile_video_prompt(
             episode.plan,
@@ -458,7 +485,7 @@ class VideoExecutionService:
         snapshot = VideoInputSnapshot(
             prompt_sha256=prompt_sha,
             input_plan=input_plan,
-            input_asset_ids=(source.id,),
+            input_asset_ids=(source.id, *(item.id for item in initial_references)),
             render_section_order=section.order,
             retry_of_step_id=retry_of_step_id,
             retry_reason=retry_reason,
@@ -466,7 +493,12 @@ class VideoExecutionService:
             task_timeout_seconds=self._task_timeout,
             poll_interval_seconds=self._poll_interval,
         )
-        input_hash = _input_hash(prompt, input_plan.model_dump(mode="json"), source.sha256)
+        input_hash = _input_hash(
+            prompt,
+            input_plan.model_dump(mode="json"),
+            source.sha256,
+            *(item.sha256 for item in initial_references),
+        )
         step, _ = self._repository.create_step_with_prompt_intent(
             run_id=episode.run_id,
             episode_id=episode.id,
@@ -501,7 +533,10 @@ class VideoExecutionService:
                 task = self._gateway.submit_video(
                     prompt=prompt,
                     input_plan=input_plan,
-                    input_sources=(source.path,),
+                    input_sources=(
+                        source.path,
+                        *(self._provider_reference_source(item) for item in initial_references),
+                    ),
                 )
             else:
                 # Ark延展不接受本地MP4或Base64。通过上一段已持久化的task ID
@@ -940,6 +975,73 @@ class VideoExecutionService:
         if current.status is EpisodeStatus.VIDEO_PENDING:
             self._repository.set_episode_status(current.id, EpisodeStatus.VIDEO_GENERATING)
 
+    def _selected_video_references(
+        self,
+        episode: StoredEpisode,
+    ) -> tuple[StoredAsset, ...]:
+        context = self._repository.get_planning_context(episode.run_id)
+        raw_by_slot = context.get("crossSlotReferences", {})
+        raw_values = (
+            raw_by_slot.get(episode.plan.slot.value, [])
+            if isinstance(raw_by_slot, dict)
+            else []
+        )
+        references = tuple(
+            CrossSlotReference.model_validate(item)
+            for item in raw_values
+            if isinstance(item, dict)
+        )
+        selected_ids = {
+            item.asset_id
+            for item in references
+            if item.apply_to
+            in {CrossSlotReferenceTarget.VIDEO, CrossSlotReferenceTarget.BOTH}
+        }
+        if not selected_ids:
+            return ()
+        if len(selected_ids) > 2:
+            raise ValueError("视频节点最多附加两项前序参考媒体")
+        assets = {
+            item.id: item
+            for item in self._repository.list_assets(
+                run_id=episode.run_id,
+                statuses=("approved", "ready"),
+            )
+            if item.id in selected_ids and item.media_type in {"image", "video"}
+        }
+        if len(assets) != len(selected_ids):
+            raise ValueError("选中的前序视频参考不存在、未批准或模态不支持")
+        return tuple(
+            replace(
+                assets[item.asset_id],
+                metadata={
+                    **assets[item.asset_id].metadata,
+                    "crossSlotRole": item.role.value,
+                },
+            )
+            for item in references
+            if item.asset_id in selected_ids
+        )
+
+    def _provider_reference_source(self, asset: StoredAsset) -> Path | str:
+        if asset.media_type == "image":
+            return asset.path
+        task_id = str(asset.metadata.get("providerTaskId") or "")
+        if not task_id:
+            raise GatewayError(
+                "前序完整视频缺少Ark task ID，不能作为供应商参考视频",
+                code="missing_cross_slot_source_task_id",
+                retryable=False,
+            )
+        task = self._gateway.get_video_task(task_id)
+        if task.status != "succeeded" or not task.video_url:
+            raise GatewayError(
+                "前序完整视频目前没有可访问的供应商URL",
+                code="cross_slot_source_url_unavailable",
+                retryable=True,
+            )
+        return task.video_url
+
     def _require_extension_capability(self, plan: RenderPlan) -> None:
         if len(plan.sections) > 1 and not supports_video_extension(self._gateway.video_model):
             raise ValueError(
@@ -955,7 +1057,7 @@ def _section(plan: RenderPlan, order: int) -> RenderSection:
         raise ValueError(f"RenderPlan 不存在区段 {order}") from exc
 
 
-def _input_hash(prompt: str, input_plan: dict[str, Any], source_sha: str) -> str:
+def _input_hash(prompt: str, input_plan: dict[str, Any], *source_sha: str) -> str:
     payload = json.dumps(
         {"prompt": prompt, "inputPlan": input_plan, "sourceSha256": source_sha},
         ensure_ascii=False,

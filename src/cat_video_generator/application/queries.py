@@ -5,14 +5,19 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from ..domain.contracts import EpisodePlan, EpisodeScript
+from ..domain.contracts import (
+    CrossSlotReference,
+    CrossSlotReferenceTarget,
+    EpisodePlan,
+    EpisodeScript,
+)
 from ..domain.pipeline import PipelineSettings
 from ..domain.prompts import (
     compile_look_prompt,
     compile_opening_anchor_prompt,
     compile_video_prompt_preview,
 )
-from ..domain.rendering import build_render_plan
+from ..domain.rendering import MediaModality, build_render_plan
 from ..domain.visual_profiles import (
     DEFAULT_SERIES_VISUAL_PROFILE,
     DEFAULT_STYLE_PROFILE,
@@ -74,8 +79,8 @@ class QueryService:
             ),
         )
         run_id = uuid.UUID(detail["runId"])
-        context = self._repository.get_planning_context(run_id)
-        metadata = context.get("planningMetadata", {})
+        run_projection = self._repository.workflow_graph(run_id).get("run", {})
+        metadata = run_projection.get("planningMetadata", {})
         raw_profile = metadata.get("seriesProfile") if isinstance(metadata, dict) else None
         series = (
             SeriesVisualProfile.model_validate(raw_profile)
@@ -84,12 +89,44 @@ class QueryService:
         )
         style = DEFAULT_STYLE_PROFILE
         look_roles = ("person:front", style.line_reference_key)
-        scene_style = (
-            style.indoor_reference_key
-            if episode.script.visual_context == "indoor"
-            else style.outdoor_reference_key
+        raw_references = run_projection.get("crossSlotReferences", {})
+        slot_references = (
+            raw_references.get(episode.slot.value, [])
+            if isinstance(raw_references, dict)
+            else []
         )
-        anchor_roles = ("look:current-appearance", "cat:front", scene_style)
+        references = tuple(
+            CrossSlotReference.model_validate(item)
+            for item in slot_references
+            if isinstance(item, dict)
+        )
+        referenced_assets = {
+            item.asset_id: self._repository.asset_detail(item.asset_id)
+            for item in references
+        }
+        referenced_labels = {
+            asset_id: asset.semantic_key or asset.role
+            for asset_id, asset in referenced_assets.items()
+        }
+        anchor_roles = (
+            "look:current-appearance",
+            "cat:front",
+            *(
+                f"previous:{item.role.value}:{referenced_labels[item.asset_id]}"
+                for item in references
+                if item.apply_to
+                in {CrossSlotReferenceTarget.OPENING_ANCHOR, CrossSlotReferenceTarget.BOTH}
+            ),
+        )
+        video_references = tuple(
+            (
+                f"previous:{item.role.value}:{referenced_labels[item.asset_id]}",
+                MediaModality(referenced_assets[item.asset_id].media_type),
+            )
+            for item in references
+            if item.apply_to
+            in {CrossSlotReferenceTarget.VIDEO, CrossSlotReferenceTarget.BOTH}
+        )
         render_plan = build_render_plan(episode)
         return {
             "episodeId": str(episode_id),
@@ -114,6 +151,7 @@ class QueryService:
                         episode,
                         resolution=self._video_resolution,
                         section_order=section.order,
+                        references=video_references if section.order == 1 else (),
                         style_profile=style,
                         series_profile=series,
                     ).text,
@@ -192,6 +230,40 @@ class QueryService:
             if asset.episode_id == episode_id
         )
 
+    def eligible_cross_slot_assets(
+        self,
+        run_id: uuid.UUID,
+        slot: str,
+    ) -> list[dict[str, Any]]:
+        """列出当前项目中更早时段的已批准媒体；是否引用仍由用户决定。"""
+
+        target_order = {"morning": 1, "noon": 2, "evening": 3}[slot]
+        graph = self._repository.workflow_graph(run_id)
+        values: list[dict[str, Any]] = []
+        for episode in graph.get("episodes", []):
+            if int(episode.get("sortOrder", 0)) >= target_order:
+                continue
+            episode_id = uuid.UUID(str(episode["id"]))
+            for asset in self.episode_assets(episode_id):
+                if asset.status not in {"approved", "ready"}:
+                    continue
+                if asset.media_type not in {"image", "video"}:
+                    continue
+                values.append(
+                    {
+                        "assetId": str(asset.id),
+                        "episodeId": str(episode_id),
+                        "sourceSlot": episode["slot"],
+                        "role": asset.role,
+                        "mediaType": asset.media_type,
+                        "semanticKey": asset.semantic_key,
+                        "sha256": asset.sha256,
+                        "suggestedRole": _suggested_cross_slot_role(asset),
+                        "recommendationReason": _cross_slot_reference_reason(asset),
+                    }
+                )
+        return values
+
     def video_sequences(self, episode_id: uuid.UUID) -> list[dict[str, Any]]:
         """返回Episode的非破坏性视频版本和单轨EDL。"""
 
@@ -244,3 +316,27 @@ class QueryService:
 
     def health(self) -> dict[str, Any]:
         return self._repository.health()
+
+
+def _suggested_cross_slot_role(asset: StoredAsset) -> str:
+    if asset.role == "look_reference":
+        return "identity"
+    if asset.role == "opening_anchor":
+        return "composition"
+    if asset.media_type == "video":
+        return "motion"
+    if asset.role in {"element", "prop", "reference"}:
+        return "prop"
+    return "scene"
+
+
+def _cross_slot_reference_reason(asset: StoredAsset) -> str:
+    role = _suggested_cross_slot_role(asset)
+    label = {
+        "identity": "适合帮助保持人物或猫咪身份",
+        "composition": "适合参考前序空间和相对站位",
+        "motion": "适合参考前序动作方向或运动节奏",
+        "prop": "适合保持跨时段关键道具外观",
+        "scene": "适合参考前序场景气氛",
+    }[role]
+    return f"{label}；仅为素材类型建议，不会自动加入请求"

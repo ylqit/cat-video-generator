@@ -14,10 +14,10 @@ from .rendering import VideoInputPlan
 
 class DirectorInputSnapshot(StrictModel):
     type: Literal["director"] = "director"
-    phase: Literal["day", "episode"]
+    phase: Literal["project_outline", "episode", "connection"]
     slot: Literal["morning", "noon", "evening"] | None = None
     prompt_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
-    output_contract: Literal["DayBrief", "EpisodeScript"]
+    output_contract: Literal["ProjectOutlineV3", "EpisodeScript", "ConnectionSuggestion"]
     repair_of_step_id: UUID | None = None
     response_id: str | None = None
     request_hash: str | None = None
@@ -42,7 +42,6 @@ class ImageInputSnapshot(StrictModel):
     retry_reason: str | None = None
     provider_task_status: str | None = None
     request_timeout_seconds: float | None = None
-    auto_timeout_retry_index: Annotated[int, Field(ge=0, le=1)] = 0
     duplicate_billing_risk_accepted: bool = False
 
 

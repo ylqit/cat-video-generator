@@ -190,7 +190,7 @@ async function regenerate() {
             <el-descriptions-item label="契约">
               {{ node.contractStatus }}
             </el-descriptions-item>
-            <el-descriptions-item label="语义审核">
+            <el-descriptions-item label="AI检查建议">
               {{ node.semanticReviewStatus }}
             </el-descriptions-item>
             <el-descriptions-item label="Step">
@@ -199,8 +199,16 @@ async function regenerate() {
           </el-descriptions>
 
           <template v-if="node.semanticNodeId === 'run:day-director'">
-            <h4>全天导演结果</h4>
-            <pre class="json-view">{{ JSON.stringify(graph.run.dayBrief, null, 2) }}</pre>
+            <h4>总导演项目大纲</h4>
+            <pre class="json-view">{{ JSON.stringify(graph.run.projectOutline, null, 2) }}</pre>
+          </template>
+          <template v-else-if="node.type === 'project_input' || node.type === 'project_confirmation'">
+            <h4>{{ node.type === 'project_input' ? '用户项目输入' : '项目输入确认' }}</h4>
+            <pre class="json-view">{{ JSON.stringify(graph.run.projectInput, null, 2) }}</pre>
+            <template v-if="graph.run.projectOutline">
+              <h4>项目大纲</h4>
+              <pre class="json-view">{{ JSON.stringify(graph.run.projectOutline, null, 2) }}</pre>
+            </template>
           </template>
           <template v-else-if="node.type === 'director' && episode">
             <h4>{{ episode.title }}</h4>
@@ -217,8 +225,8 @@ async function regenerate() {
             <h4>人工确认的实际成片结果</h4>
             <el-descriptions v-if="acceptedOutcome" :column="1" border size="small">
               <el-descriptions-item label="实际结果">{{ acceptedOutcome.summary }}</el-descriptions-item>
-              <el-descriptions-item label="继续继承">{{ acceptedOutcome.carryForward.join('；') || '无' }}</el-descriptions-item>
-              <el-descriptions-item label="禁止继承">{{ acceptedOutcome.doNotCarryForward.join('；') || '无' }}</el-descriptions-item>
+              <el-descriptions-item label="可供关联建议参考">{{ acceptedOutcome.carryForward.join('；') || '无' }}</el-descriptions-item>
+              <el-descriptions-item label="关联建议应排除">{{ acceptedOutcome.doNotCarryForward.join('；') || '无' }}</el-descriptions-item>
               <el-descriptions-item label="确认时间">{{ acceptedOutcome.confirmedAt ?? '—' }}</el-descriptions-item>
             </el-descriptions>
             <el-empty v-else description="视频批准后可在审核交付页编辑并确认结果卡" />
@@ -233,7 +241,7 @@ async function regenerate() {
             />
           </div>
           <el-empty
-            v-if="!outputAssets.length && node.type !== 'director'"
+            v-if="!outputAssets.length && !['director', 'project_input', 'project_confirmation'].includes(node.type)"
             description="该节点尚未产生媒体资产"
           />
         </el-tab-pane>
@@ -248,7 +256,7 @@ async function regenerate() {
               <el-descriptions :column="3" border size="small" style="margin: 12px 0">
                 <el-descriptions-item label="Provider">{{ node.providerStatus }}</el-descriptions-item>
                 <el-descriptions-item label="契约校验">{{ node.contractStatus }}</el-descriptions-item>
-                <el-descriptions-item label="语义审核">{{ node.semanticReviewStatus }}</el-descriptions-item>
+                <el-descriptions-item label="AI建议状态">{{ node.semanticReviewStatus }}</el-descriptions-item>
               </el-descriptions>
 
               <h4>当前结构化结果</h4>

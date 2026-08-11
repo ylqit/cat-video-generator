@@ -1,45 +1,25 @@
-"""供应商结构化输出的无损归一化回归。"""
+"""供应商Episode输出只做不改变剧情意图的机械归一化。"""
 
-from cat_video_generator.domain.normalization import normalize_day_brief_payload
-
-
-def _brief(slot: str, role: str) -> dict[str, str]:
-    return {"slot": slot, "narrative_role": role}
+from cat_video_generator.domain.normalization import normalize_episode_payload
 
 
-def test_day_brief_removes_only_identical_duplicate_slot() -> None:
-    noon = _brief("noon", "推进变化")
+def test_episode_sound_list_is_joined_without_mutating_provider_payload() -> None:
     payload = {
-        "slot_briefs": [
-            _brief("morning", "建立开场"),
-            noon,
-            dict(noon),
-            _brief("evening", "形成回报"),
-        ]
+        "title": "池塘边的浮标信号",
+        "sound_design": ["微风和水声", "浮标入水轻响", "猫咪轻叫"],
     }
 
-    normalized, warnings = normalize_day_brief_payload(payload)
+    normalized, warnings = normalize_episode_payload(payload)
 
-    assert [item["slot"] for item in normalized["slot_briefs"]] == [
-        "morning",
-        "noon",
-        "evening",
-    ]
-    assert warnings == ("slot_briefs去除完全相同的重复时段：noon",)
-    assert len(payload["slot_briefs"]) == 4
+    assert normalized["sound_design"] == "微风和水声；浮标入水轻响；猫咪轻叫"
+    assert warnings == ("sound_design由列表合并为字符串",)
+    assert isinstance(payload["sound_design"], list)
 
 
-def test_day_brief_keeps_conflicting_duplicate_for_contract_rejection() -> None:
-    payload = {
-        "slot_briefs": [
-            _brief("morning", "建立开场"),
-            _brief("noon", "推进变化A"),
-            _brief("noon", "推进变化B"),
-            _brief("evening", "形成回报"),
-        ]
-    }
+def test_episode_scalar_sound_is_left_unchanged() -> None:
+    payload = {"sound_design": "微风、水声和鱼竿轻响同步"}
 
-    normalized, warnings = normalize_day_brief_payload(payload)
+    normalized, warnings = normalize_episode_payload(payload)
 
     assert normalized == payload
     assert warnings == ()

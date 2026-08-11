@@ -10,7 +10,7 @@ from uuid import uuid4
 from conftest import episode_for
 
 from cat_video_generator.config import RuntimeSettings
-from cat_video_generator.domain.contracts import Slot
+from cat_video_generator.domain.contracts import Slot, StoryInputMode
 from cat_video_generator.domain.rendering import (
     MediaSource,
     RenderOperation,
@@ -21,7 +21,7 @@ from cat_video_generator.infrastructure.ark.gateway import ArkGateway
 from cat_video_generator.infrastructure.db.models import Episode, WorkflowStep
 from cat_video_generator.infrastructure.db.query_repository import _workflow_nodes
 from cat_video_generator.infrastructure.db.records import step_dict
-from cat_video_generator.interfaces.api_schemas import PlanRequest, RetryStepRequest
+from cat_video_generator.interfaces.api_schemas import RetryStepRequest, StoryProjectRequest
 
 
 class TaskClient:
@@ -88,10 +88,15 @@ def test_gateway_maps_initial_anchor_and_extension_video_roles(tmp_path: Path) -
     assert all(call["ratio"] == "9:16" for call in client.tasks.calls)
 
 
-def test_plan_request_accepts_web_focus_and_duration_controls() -> None:
-    request = PlanRequest.model_validate(
+def test_story_project_request_accepts_web_focus_and_duration_controls() -> None:
+    request = StoryProjectRequest.model_validate(
         {
-            "targetDate": "2026-08-10",
+            "contentDate": "2026-08-10",
+            "projectInput": {
+                "theme": "春日放风筝的一天",
+                "inputMode": "theme_expand",
+                "sceneRoute": "progressive_locations",
+            },
             "allowPaidGeneration": True,
             "creativeControls": {
                 "default_activity_focus": "cat_lead",
@@ -180,7 +185,14 @@ def test_medium_episode_graph_aggregates_extensions_into_stable_video_node() -> 
         _step(episode_id=episode_id, operation_key="video:extend:2", status="running"),
     )
     nodes = _workflow_nodes(
-        (row,), steps, (), (), (), guided=False, day_brief_confirmed=True
+        (row,),
+        steps,
+        (),
+        (),
+        (),
+        guided=False,
+        project_ready=True,
+        input_mode=StoryInputMode.THEME_EXPAND,
     )
 
     ids = {item["semanticNodeId"] for item in nodes}
@@ -193,14 +205,21 @@ def test_medium_episode_graph_aggregates_extensions_into_stable_video_node() -> 
 
 def test_guided_canvas_projects_locked_future_nodes_without_fake_steps() -> None:
     nodes = _workflow_nodes(
-        (), (), (), (), (), guided=True, day_brief_confirmed=False
+        (),
+        (),
+        (),
+        (),
+        (),
+        guided=True,
+        project_ready=False,
+        input_mode=StoryInputMode.THEME_EXPAND,
     )
     by_id = {item["semanticNodeId"]: item for item in nodes}
 
     assert by_id["morning:director"]["availability"] == "locked"
     assert by_id["noon:director"]["executionStatus"] == "not_created"
     assert by_id["evening:video"]["stepId"] is None
-    assert by_id["noon:director"]["lockReason"] == "确认DayBrief"
+    assert by_id["noon:director"]["lockReason"] == "确认生活故事项目边界"
 
 
 def test_guided_canvas_unlocks_only_next_director_after_outcome() -> None:
@@ -223,7 +242,8 @@ def test_guided_canvas_unlocks_only_next_director_after_outcome() -> None:
         (),
         {"morning": {"summary": "上午实际结果"}},
         guided=True,
-        day_brief_confirmed=True,
+        project_ready=True,
+        input_mode=StoryInputMode.THEME_EXPAND,
     )
     by_id = {item["semanticNodeId"]: item for item in nodes}
 
@@ -232,9 +252,16 @@ def test_guided_canvas_unlocks_only_next_director_after_outcome() -> None:
     assert by_id["noon:director"]["stepId"] is None
 
 
-def test_auto_day_canvas_unlocks_all_slot_directors_after_day_brief() -> None:
+def test_auto_day_canvas_unlocks_all_slot_directors_after_project_outline() -> None:
     nodes = _workflow_nodes(
-        (), (), (), (), (), guided=False, day_brief_confirmed=True
+        (),
+        (),
+        (),
+        (),
+        (),
+        guided=False,
+        project_ready=True,
+        input_mode=StoryInputMode.THEME_EXPAND,
     )
     by_id = {item["semanticNodeId"]: item for item in nodes}
 

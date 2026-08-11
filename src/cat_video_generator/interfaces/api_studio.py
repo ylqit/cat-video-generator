@@ -11,13 +11,17 @@ from typing import Any
 from fastapi import APIRouter, Body, HTTPException
 from pydantic import ValidationError
 
-from ..application.planning import DayBriefPause, PlanningResult
 from ..application.ports import GatewayError
 from ..application.queries import QueryService
 from ..domain.contracts import Slot
 from ..domain.pipeline import PipelineSettings, PlanningMode, StageMode
 from .api_helpers import _accepted, _jsonable, _submit
-from .api_schemas import AcceptedOutcomeRequest
+from .api_schemas import (
+    AcceptedOutcomeRequest,
+    CrossSlotReferencesRequest,
+    ShotNoteRequest,
+    StoryConnectionRequest,
+)
 from .jobs import JobConflictError, JobRegistry
 
 
@@ -176,12 +180,14 @@ def create_studio_router(
             lambda: queries.prompt_preview(episode_id, script_override=payload)
         )
 
-    @router.put("/runs/{run_id}/day-brief")
-    async def update_day_brief(
+    @router.put("/runs/{run_id}/project-outline")
+    async def update_project_outline(
         run_id: uuid.UUID,
         payload: dict[str, Any] = Body(...),  # noqa: B008
     ) -> dict[str, Any]:
-        return await _run_validated(lambda: studio_editing.update_day_brief(run_id, payload))
+        return await _run_validated(
+            lambda: studio_editing.update_project_outline(run_id, payload)
+        )
 
     @router.put("/runs/{run_id}/pipeline-settings")
     async def update_pipeline_settings(
@@ -210,28 +216,77 @@ def create_studio_router(
             )
         )
 
-    return router
-
-
-def build_plan_payload(result: PlanningResult | DayBriefPause) -> dict[str, Any]:
-    if isinstance(result, DayBriefPause):
+    @router.get("/runs/{run_id}/slots/{slot}/connection")
+    async def get_story_connection(run_id: uuid.UUID, slot: Slot) -> dict[str, Any]:
+        graph = await asyncio.to_thread(queries.run_graph, run_id)
+        values = graph.get("run", {}).get("storyConnections", {})
         return {
-            "runId": str(result.run_id),
-            "stages": {
-                "planning": {
-                    "status": "paused",
-                    "dayBrief": result.day_brief.model_dump(mode="json"),
-                }
-            },
-            "pausedAt": "dayBrief",
+            "runId": str(run_id),
+            "slot": slot.value,
+            "storyConnection": values.get(slot.value),
         }
-    return {
-        "runId": str(result.run_id),
-        "selectedCandidate": result.selected_candidate,
-        "candidateCount": result.candidate_count,
-        "plan": result.plan.model_dump(mode="json"),
-        "stages": {"planning": {"status": "completed"}},
-    }
+
+    @router.put("/runs/{run_id}/slots/{slot}/connection")
+    async def update_story_connection(
+        run_id: uuid.UUID,
+        slot: Slot,
+        payload: StoryConnectionRequest,
+    ) -> dict[str, Any]:
+        return await _run_validated(
+            lambda: studio_editing.update_story_connection(
+                run_id,
+                slot,
+                payload.model_dump(mode="json", by_alias=True),
+            )
+        )
+
+    @router.get("/runs/{run_id}/slots/{slot}/references")
+    async def get_cross_slot_references(run_id: uuid.UUID, slot: Slot) -> dict[str, Any]:
+        graph, eligible = await asyncio.gather(
+            asyncio.to_thread(queries.run_graph, run_id),
+            asyncio.to_thread(queries.eligible_cross_slot_assets, run_id, slot.value),
+        )
+        values = graph.get("run", {}).get("crossSlotReferences", {})
+        return {
+            "runId": str(run_id),
+            "slot": slot.value,
+            "references": values.get(slot.value, []),
+            "eligibleAssets": eligible,
+        }
+
+    @router.put("/runs/{run_id}/slots/{slot}/references")
+    async def update_cross_slot_references(
+        run_id: uuid.UUID,
+        slot: Slot,
+        payload: CrossSlotReferencesRequest,
+    ) -> dict[str, Any]:
+        return await _run_validated(
+            lambda: studio_editing.update_cross_slot_references(
+                run_id,
+                slot,
+                [
+                    item.model_dump(mode="json", by_alias=True)
+                    for item in payload.references
+                ],
+            )
+        )
+
+    @router.post("/episodes/{episode_id}/shot-notes")
+    async def save_shot_note(
+        episode_id: uuid.UUID,
+        payload: ShotNoteRequest,
+    ) -> dict[str, Any]:
+        return await _run_validated(
+            lambda: studio_editing.save_shot_note(
+                episode_id,
+                asset_id=uuid.UUID(payload.asset_id),
+                start_ms=payload.start_ms,
+                end_ms=payload.end_ms,
+                note=payload.note,
+            )
+        )
+
+    return router
 
 
 async def _run_validated(operation: Callable[[], Any]) -> Any:

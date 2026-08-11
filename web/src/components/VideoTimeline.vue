@@ -7,6 +7,7 @@ import type {
   AssetDto,
   EpisodeDto,
   JobAccepted,
+  ReviewDto,
   VideoSequenceDto,
   WorkflowNodeDto,
 } from "../api/types";
@@ -16,6 +17,7 @@ const props = defineProps<{
   node: WorkflowNodeDto;
   sequences: VideoSequenceDto[];
   assets: AssetDto[];
+  reviews: ReviewDto[];
   outcomeConfirmed: boolean;
   sequenceId?: string;
 }>();
@@ -56,6 +58,54 @@ const boundaries = computed(() => {
     ?? activeAsset.value?.metadata.shotBoundariesMs;
   return Array.isArray(raw) ? raw.map(Number).filter(Number.isFinite) : [];
 });
+const shotCards = computed(() => {
+  const cuts = [0, ...boundaries.value.filter((value) => value > 0 && value < durationMs.value), durationMs.value];
+  return props.episode.script.shots.map((shot, index) => {
+    const start = cuts[index] ?? Math.round(durationMs.value * index / props.episode.script.shots.length);
+    const end = cuts[index + 1] ?? Math.round(durationMs.value * (index + 1) / props.episode.script.shots.length);
+    return {
+      order: shot.order,
+      direction: shot.direction,
+      startMs: start,
+      endMs: end,
+      aiFindings: findingsForRange(start, end),
+      humanNotes: notesForRange(start, end),
+      thumbnail: thumbnails.value[Math.min(thumbnails.value.length - 1, Math.max(0, Math.round(index * thumbnails.value.length / props.episode.script.shots.length)))],
+    };
+  });
+});
+
+function assetReviews() {
+  return props.reviews.filter((item) => item.assetId === activeAsset.value?.id);
+}
+
+function findingsForRange(start: number, end: number) {
+  const findings: string[] = [];
+  for (const review of assetReviews().filter((item) => item.source === "ark_visual")) {
+    const evidence = review.evidence.evidence;
+    if (!Array.isArray(evidence)) continue;
+    for (const item of evidence) {
+      if (!item || typeof item !== "object") continue;
+      const row = item as Record<string, unknown>;
+      const timestamp = Number.parseFloat(String(row.timestamp ?? "")) * 1000;
+      if (!Number.isFinite(timestamp) || timestamp < start || timestamp > end) continue;
+      const message = String(row.relationError ?? row.observation ?? "").trim();
+      if (message && !findings.includes(message)) findings.push(message);
+    }
+  }
+  return findings;
+}
+
+function notesForRange(start: number, end: number) {
+  return assetReviews()
+    .filter((item) => item.source === "human_note")
+    .filter((item) => {
+      const noteStart = Number(item.evidence.startMs ?? -1);
+      const noteEnd = Number(item.evidence.endMs ?? -1);
+      return noteStart < end && noteEnd > start;
+    })
+    .map((item) => item.reason ?? "人工备注");
+}
 
 watch(
   [() => props.sequences, () => props.sequenceId] as const,
@@ -223,6 +273,29 @@ async function editRange() {
   }
 }
 
+async function saveShotNote(start: number, end: number) {
+  if (!activeAsset.value) return;
+  try {
+    const { value } = await ElMessageBox.prompt(
+      `记录 ${formatTime(start)}–${formatTime(end)} 的人工观察；本操作不调用Ark。`,
+      "添加镜头备注",
+      { inputValidator: (text) => text.trim().length >= 2 || "至少填写2个字符" },
+    );
+    await api.saveShotNote(props.episode.id, {
+      assetId: activeAsset.value.id,
+      startMs: start,
+      endMs: end,
+      note: value.trim(),
+    });
+    ElMessage.success("镜头备注已保存");
+    emit("changed");
+  } catch (error) {
+    if (error !== "cancel" && error !== "close") {
+      ElMessage.error(error instanceof ApiError ? error.message : String(error));
+    }
+  }
+}
+
 async function selectVersion() {
   const sequence = activeSequence.value;
   if (!sequence || sequence.status !== "approved") return;
@@ -230,9 +303,9 @@ async function selectVersion() {
   let revoke = false;
   if (props.outcomeConfirmed) {
     const action = await ElMessageBox.confirm(
-      "本时段结果卡已经确认。选择新版本时保留既有剧情事实；如新视频改变事实，请先撤销结果卡。",
+      "本时段结果卡已经确认。选择新版本时可以保留既有事实；如新视频改变事实，请撤销结果卡后重新确认。已保存的剧情关联卡不会被系统自动改写。",
       "选择正式版本",
-      { confirmButtonText: "保留结果卡", cancelButtonText: "撤销并使后续过期", distinguishCancelAndClose: true },
+      { confirmButtonText: "保留结果卡", cancelButtonText: "撤销结果卡", distinguishCancelAndClose: true },
     ).then(() => "keep").catch((reason) => reason === "cancel" ? "revoke" : Promise.reject(reason));
     keep = action === "keep";
     revoke = action === "revoke";
@@ -258,6 +331,13 @@ async function selectVersion() {
         <el-button type="primary" :disabled="!activeSequence" @click="editRange">选区重新生成</el-button>
       </div>
     </div>
+
+    <el-alert
+      type="info"
+      :closable="false"
+      title="只向AI重新生成选中区间；区间外沿用原视频素材。精确区间合成可能产生轻微编码差异。"
+      style="margin: 12px 0"
+    />
 
     <div class="version-controls">
       <el-select v-model="activeSequenceId" style="width: 220px">
@@ -309,6 +389,23 @@ async function selectVersion() {
       </el-radio-group>
       <el-checkbox v-model="loopSelection">循环选区</el-checkbox>
     </div>
+    <div class="post-shot-cards">
+      <div v-for="shot in shotCards" :key="shot.order" class="post-shot-card">
+        <img v-if="shot.thumbnail" :src="shot.thumbnail" alt="镜头代表帧" />
+        <div>
+          <strong>镜头{{ shot.order }} · {{ formatTime(shot.startMs) }}–{{ formatTime(shot.endMs) }}</strong>
+          <p>{{ shot.direction }}</p>
+          <div v-if="shot.aiFindings.length" class="shot-findings">
+            AI建议：{{ shot.aiFindings.join("；") }}
+          </div>
+          <div v-if="shot.humanNotes.length" class="shot-notes">
+            人工备注：{{ shot.humanNotes.join("；") }}
+          </div>
+          <el-button size="small" @click="startMs = shot.startMs; endMs = shot.endMs">选择此镜头区间</el-button>
+          <el-button size="small" @click="saveShotNote(shot.startMs, shot.endMs)">添加备注</el-button>
+        </div>
+      </div>
+    </div>
   </section>
 </template>
 
@@ -317,6 +414,12 @@ async function selectVersion() {
 .timeline-header, .version-controls, .timeline-actions, .range-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .timeline-header { justify-content: space-between; }
 .timeline-header .muted { margin-left: 12px; }
+.post-shot-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; margin-top: 14px; }
+.post-shot-card { display: grid; grid-template-columns: 72px 1fr; gap: 10px; padding: 10px; border: 1px solid var(--el-border-color); border-radius: 8px; }
+.post-shot-card img { width: 72px; height: 120px; object-fit: cover; border-radius: 6px; }
+.post-shot-card p { margin: 6px 0; color: #aab2bf; font-size: 12px; }
+.shot-findings { margin: 5px 0; color: #d29922; font-size: 12px; }
+.shot-notes { margin: 5px 0; color: #58a6ff; font-size: 12px; }
 .version-controls { margin: 12px 0; }
 .player-grid { display: grid; grid-template-columns: minmax(260px, 440px); gap: 12px; }
 .player-grid.comparing { grid-template-columns: repeat(2, minmax(240px, 1fr)); }

@@ -13,7 +13,17 @@ from typing import Any
 
 from sqlalchemy import select
 
-from ...domain.contracts import AcceptedOutcome, DailyProductionPlan, DayBrief, EpisodePlan, Slot
+from ...domain.contracts import (
+    AcceptedOutcome,
+    CrossSlotReference,
+    CrossSlotReferenceTarget,
+    DailyProductionPlan,
+    EpisodePlan,
+    ProjectOutlineV3,
+    Slot,
+    StoryConnection,
+    StoryProjectInput,
+)
 from ...domain.pipeline import PipelineSettings
 from ...domain.workflow import (
     EpisodeStatus,
@@ -22,8 +32,9 @@ from ...domain.workflow import (
     transition_episode,
     transition_run,
 )
-from .models import Episode, ProductionRun, WorkflowStep
+from .models import Asset, Episode, ProductionRun, WorkflowStep
 from .query_repository import required_record as _required
+from .records import ensure_current_contract
 
 
 def _script_sha256(value: dict[str, Any]) -> str:
@@ -42,18 +53,20 @@ class PlanPersistenceMixin:
         *,
         run_id: uuid.UUID,
         plan: DailyProductionPlan,
-        selected_candidate: int,
     ) -> None:
         with self._sessions.begin() as session:  # type: ignore[attr-defined]
             run = _required(session, ProductionRun, run_id)
+            ensure_current_contract(run)
             run.status = transition_run(
                 RunStatus(run.status),
                 RunStatus.PLANNED,
             ).value
             run.planning_json = {
                 **run.planning_json,
-                "dayBrief": plan.day_brief.model_dump(mode="json"),
-                "selectedCandidate": selected_candidate,
+                "projectInput": plan.project_input.model_dump(mode="json"),
+                "projectOutline": (
+                    None if plan.outline is None else plan.outline.model_dump(mode="json")
+                ),
             }
             existing = session.execute(
                 select(Episode.id).where(Episode.production_run_id == run_id)
@@ -83,6 +96,7 @@ class PlanPersistenceMixin:
 
         with self._sessions.begin() as session:  # type: ignore[attr-defined]
             run = _required(session, ProductionRun, run_id)
+            ensure_current_contract(run)
             existing = session.execute(
                 select(Episode).where(
                     Episode.production_run_id == run_id,
@@ -117,61 +131,66 @@ class PlanPersistenceMixin:
         *,
         run_id: uuid.UUID,
         planning_metadata: dict[str, Any],
-        planning_context: str,
-        story_mode: str,
+        project_input: StoryProjectInput,
+        episode_drafts: dict[str, dict[str, Any]] | None = None,
     ) -> None:
-        """在调用总导演前保存可重建输入，避免契约拒绝后只能新建整条Run。"""
+        """保存生活故事项目输入；已有剧本项目不会因此产生Director Step。"""
 
         with self._sessions.begin() as session:  # type: ignore[attr-defined]
             run = _required(session, ProductionRun, run_id)
+            ensure_current_contract(run)
             run.planning_json = {
                 **run.planning_json,
                 "planningMetadata": planning_metadata,
-                "planningRequest": {
-                    "planningContext": planning_context,
-                    "storyMode": story_mode,
-                },
+                "projectInput": project_input.model_dump(mode="json"),
+                "episodeDrafts": episode_drafts or {},
             }
 
     def save_planning_context(
         self,
         *,
         run_id: uuid.UUID,
-        day_brief: DayBrief,
-        day_step_id: uuid.UUID,
-        day_prompt_id: uuid.UUID,
+        project_input: StoryProjectInput,
+        project_outline: ProjectOutlineV3,
+        project_outline_step_id: uuid.UUID,
+        project_outline_prompt_id: uuid.UUID,
         episode_drafts: dict[str, dict[str, Any]],
         planning_metadata: dict[str, Any],
     ) -> None:
-        """保存可恢复的导演上下文，不要求三个Episode已经全部成功。"""
+        """保存可恢复的主题扩写上下文，不要求三个Episode已经全部成功。"""
 
         with self._sessions.begin() as session:  # type: ignore[attr-defined]
             run = _required(session, ProductionRun, run_id)
+            ensure_current_contract(run)
             run.planning_json = {
                 **run.planning_json,
-                "dayBrief": day_brief.model_dump(mode="json"),
-                "dayDirectorStepId": str(day_step_id),
-                "dayDirectorPromptId": str(day_prompt_id),
+                "projectInput": project_input.model_dump(mode="json"),
+                "projectOutline": project_outline.model_dump(mode="json"),
+                "projectOutlineDirectorStepId": str(project_outline_step_id),
+                "projectOutlineDirectorPromptId": str(project_outline_prompt_id),
                 "episodeDrafts": episode_drafts,
                 "planningMetadata": planning_metadata,
             }
 
     def get_planning_context(self, run_id: uuid.UUID) -> dict[str, Any]:
         with self._sessions() as session:  # type: ignore[attr-defined]
-            return dict(_required(session, ProductionRun, run_id).planning_json)
+            run = _required(session, ProductionRun, run_id)
+            ensure_current_contract(run)
+            return dict(run.planning_json)
 
     def replace_episode_plan(
         self,
         *,
         run_id: uuid.UUID,
         episode: EpisodePlan,
-        day_brief: DayBrief | None = None,
+        project_outline: ProjectOutlineV3 | None = None,
         acknowledge_downstream_replacement: bool = False,
     ) -> None:
         """原子替换时段脚本及可选的总导演边界。"""
 
         with self._sessions.begin() as session:  # type: ignore[attr-defined]
             run = _required(session, ProductionRun, run_id)
+            ensure_current_contract(run)
             row = session.execute(
                 select(Episode).where(
                     Episode.production_run_id == run_id,
@@ -240,8 +259,8 @@ class PlanPersistenceMixin:
                 "staleNodes": sorted(stale_nodes),
                 "acceptedOutcomes": outcomes,
             }
-            if day_brief is not None:
-                planning_json["dayBrief"] = day_brief.model_dump(mode="json")
+            if project_outline is not None:
+                planning_json["projectOutline"] = project_outline.model_dump(mode="json")
             run.planning_json = planning_json
             if RunStatus(run.status) is RunStatus.READY:
                 run.status = transition_run(RunStatus.READY, RunStatus.GENERATING).value
@@ -251,6 +270,9 @@ class PlanPersistenceMixin:
 
         with self._sessions() as session:  # type: ignore[attr-defined]
             row = _required(session, Episode, episode_id)
+            ensure_current_contract(
+                _required(session, ProductionRun, row.production_run_id)
+            )
             raw = row.prompt_overrides_json or {}
             stale = bool(raw.get("stale")) or raw.get("sourceScriptSha256") != _script_sha256(
                 row.script_json
@@ -269,6 +291,9 @@ class PlanPersistenceMixin:
     def get_prompt_override_state(self, episode_id: uuid.UUID) -> dict[str, Any]:
         with self._sessions() as session:  # type: ignore[attr-defined]
             row = _required(session, Episode, episode_id)
+            ensure_current_contract(
+                _required(session, ProductionRun, row.production_run_id)
+            )
             raw = row.prompt_overrides_json or {}
             values = raw.get("values") if isinstance(raw.get("values"), dict) else {}
             source_hash = raw.get("sourceScriptSha256")
@@ -295,6 +320,9 @@ class PlanPersistenceMixin:
 
         with self._sessions.begin() as session:  # type: ignore[attr-defined]
             row = _required(session, Episode, episode_id)
+            ensure_current_contract(
+                _required(session, ProductionRun, row.production_run_id)
+            )
             row.prompt_overrides_json = {
                 "enabled": enabled,
                 "stale": False,
@@ -302,21 +330,163 @@ class PlanPersistenceMixin:
                 "values": overrides or {},
             }
 
-    def update_day_brief(
+    def update_project_outline(
         self,
         *,
         run_id: uuid.UUID,
-        day_brief: DayBrief,
+        project_outline: ProjectOutlineV3,
     ) -> None:
-        """人工编辑日导演输出；旧的时段草稿与新Brief错配，必须清空。"""
+        """人工确认主题扩写边界；已有剧本项目不需要这个确认节点。"""
 
         with self._sessions.begin() as session:  # type: ignore[attr-defined]
             run = _required(session, ProductionRun, run_id)
+            ensure_current_contract(run)
+            raw_input = run.planning_json.get("projectInput")
+            if not isinstance(raw_input, dict):
+                raise ValueError("该项目缺少StoryProjectInput")
+            project_input = StoryProjectInput.model_validate(raw_input)
+            if project_input.input_mode.value != "theme_expand":
+                raise ValueError("已有剧本项目不需要确认总导演大纲")
+            if project_outline.content_date != run.content_date:
+                raise ValueError("ProjectOutlineV3日期不能改写项目固定日期")
+            if project_outline.theme != project_input.theme:
+                raise ValueError("ProjectOutlineV3主题不能改写项目主题")
             run.planning_json = {
                 **run.planning_json,
-                "dayBrief": day_brief.model_dump(mode="json"),
+                "projectOutline": project_outline.model_dump(mode="json"),
                 "episodeDrafts": {},
-                "dayBriefConfirmedAt": datetime.now(timezone.utc).isoformat(),
+                "projectOutlineConfirmedAt": datetime.now(timezone.utc).isoformat(),
+            }
+
+    def save_episode_source(
+        self,
+        *,
+        run_id: uuid.UUID,
+        slot: Slot,
+        source: str,
+    ) -> StoryProjectInput:
+        """在时段导演收费前保存用户原文；已规划时段不可被静默改写。"""
+
+        normalized = source.strip()
+        if len(normalized) < 4:
+            raise ValueError("时段原始剧本至少需要4个字符")
+        with self._sessions.begin() as session:  # type: ignore[attr-defined]
+            run = _required(session, ProductionRun, run_id)
+            ensure_current_contract(run)
+            existing = session.execute(
+                select(Episode.id).where(
+                    Episode.production_run_id == run_id,
+                    Episode.slot == slot.value,
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                raise ValueError(f"{slot.value}已经完成镜头化规划，不能覆盖其原始剧本")
+            raw_input = run.planning_json.get("projectInput")
+            if not isinstance(raw_input, dict):
+                raise ValueError("该项目缺少StoryProjectInput")
+            project_input = StoryProjectInput.model_validate(raw_input)
+            if project_input.input_mode.value != "episode_scripts":
+                raise ValueError("只有已有剧本项目允许逐时段保存原始剧本")
+            sources = project_input.episode_sources.model_copy(update={slot.value: normalized})
+            updated = project_input.model_copy(update={"episode_sources": sources})
+            run.planning_json = {
+                **run.planning_json,
+                "projectInput": updated.model_dump(mode="json"),
+            }
+            return updated
+
+    def save_story_connection(
+        self,
+        *,
+        run_id: uuid.UUID,
+        slot: Slot,
+        connection: StoryConnection,
+    ) -> None:
+        """保存用户确认的可选关联卡；关联卡与是否加载是同一个明确决定。"""
+
+        if slot is Slot.MORNING:
+            raise ValueError("上午没有前序时段，不能保存剧情关联卡")
+        with self._sessions.begin() as session:  # type: ignore[attr-defined]
+            run = _required(session, ProductionRun, run_id)
+            ensure_current_contract(run)
+            outcomes = run.planning_json.get("acceptedOutcomes", {}) or {}
+            required_slots = [
+                previous.value
+                for previous in Slot
+                if previous.sort_order < slot.sort_order
+            ]
+            if any(previous not in outcomes for previous in required_slots):
+                raise ValueError("前序实际结果卡尚未全部确认，不能建立剧情关联")
+            episodes = session.execute(
+                select(Episode.slot).where(
+                    Episode.production_run_id == run_id,
+                    Episode.sort_order >= slot.sort_order,
+                )
+            ).scalars().all()
+            if episodes:
+                raise ValueError("目标时段已经完成镜头化；请先重置该时段后再修改关联卡")
+            connections = dict(run.planning_json.get("storyConnections", {}))
+            connections[slot.value] = connection.model_dump(mode="json", by_alias=True)
+            run.planning_json = {
+                **run.planning_json,
+                "storyConnections": connections,
+            }
+
+    def save_cross_slot_references(
+        self,
+        *,
+        run_id: uuid.UUID,
+        slot: Slot,
+        references: tuple[CrossSlotReference, ...],
+    ) -> None:
+        """保存用户显式选择的前序媒体，不自动扩张为所有匹配素材。"""
+
+        if slot is Slot.MORNING and references:
+            raise ValueError("上午没有前序时段，不能引用前序媒体")
+        asset_ids = [reference.asset_id for reference in references]
+        if len(asset_ids) != len(set(asset_ids)):
+            raise ValueError("同一前序媒体只能选择一次")
+        with self._sessions.begin() as session:  # type: ignore[attr-defined]
+            run = _required(session, ProductionRun, run_id)
+            ensure_current_contract(run)
+            assets = {
+                asset.id: asset
+                for asset in session.execute(
+                    select(Asset).where(Asset.id.in_(asset_ids))
+                ).scalars()
+            }
+            if len(assets) != len(asset_ids):
+                raise ValueError("存在无法读取的前序媒体")
+            for reference in references:
+                asset = assets[reference.asset_id]
+                if asset.status not in {"approved", "ready"}:
+                    raise ValueError(f"素材{asset.id}尚未批准")
+                if asset.media_type not in {"image", "video"}:
+                    raise ValueError(f"素材{asset.id}的模态不支持跨时段引用")
+                if (
+                    reference.apply_to
+                    in {
+                        CrossSlotReferenceTarget.OPENING_ANCHOR,
+                        CrossSlotReferenceTarget.BOTH,
+                    }
+                    and asset.media_type != "image"
+                ):
+                    raise ValueError(f"素材{asset.id}不是图片，不能用于开场锚点")
+                if asset.scope == "canon":
+                    continue
+                if asset.production_run_id != run_id or asset.episode_id is None:
+                    raise ValueError(f"素材{asset.id}不属于当前项目的前序时段")
+                source_episode = _required(session, Episode, asset.episode_id)
+                if source_episode.sort_order >= slot.sort_order:
+                    raise ValueError(f"素材{asset.id}不是目标时段之前的媒体")
+            values = dict(run.planning_json.get("crossSlotReferences", {}))
+            values[slot.value] = [
+                reference.model_dump(mode="json", by_alias=True)
+                for reference in references
+            ]
+            run.planning_json = {
+                **run.planning_json,
+                "crossSlotReferences": values,
             }
 
     def save_accepted_outcome(
@@ -326,10 +496,11 @@ class PlanPersistenceMixin:
         slot: Slot,
         outcome: AcceptedOutcome,
     ) -> None:
-        """原子保存用户确认结果；较晚时段存在后禁止改写历史事实。"""
+        """原子保存用户确认结果；后续导演不会隐式读取这张结果卡。"""
 
         with self._sessions.begin() as session:  # type: ignore[attr-defined]
             run = _required(session, ProductionRun, run_id)
+            ensure_current_contract(run)
             episode = session.execute(
                 select(Episode).where(
                     Episode.production_run_id == run_id,
@@ -338,20 +509,7 @@ class PlanPersistenceMixin:
             ).scalar_one_or_none()
             if episode is None or EpisodeStatus(episode.status) is not EpisodeStatus.READY:
                 raise ValueError("只有人工批准的最终视频才能确认时段结果")
-            later_slots = {
-                str(value)
-                for value in session.execute(
-                    select(Episode.slot).where(
-                        Episode.production_run_id == run_id,
-                        Episode.sort_order > slot.sort_order,
-                    )
-                ).scalars()
-            }
             stale_slots = set(run.planning_json.get("staleSlots", []))
-            if later_slots and not later_slots.issubset(stale_slots):
-                raise ValueError(
-                    "后续时段已经读取当前结果；请先在视频版本选择中撤销旧结果卡并标记后续内容过期"
-                )
             outcomes = dict(run.planning_json.get("acceptedOutcomes", {}))
             if slot.value in outcomes:
                 raise ValueError("结果卡已经确认；如成片事实错误，请重做该时段而不是覆盖历史")
@@ -392,6 +550,7 @@ class PlanPersistenceMixin:
 
         with self._sessions.begin() as session:  # type: ignore[attr-defined]
             run = _required(session, ProductionRun, run_id)
+            ensure_current_contract(run)
             run.pipeline_settings_json = settings.model_dump(
                 mode="json",
                 by_alias=True,
@@ -401,7 +560,9 @@ class PlanPersistenceMixin:
         """读取Run持久化的流水线设置。"""
 
         with self._sessions() as session:  # type: ignore[attr-defined]
-            raw = _required(session, ProductionRun, run_id).pipeline_settings_json
+            run = _required(session, ProductionRun, run_id)
+            ensure_current_contract(run)
+            raw = run.pipeline_settings_json
         if not raw:
             return PipelineSettings()
         return PipelineSettings.model_validate(raw)

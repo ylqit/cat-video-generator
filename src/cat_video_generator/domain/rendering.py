@@ -143,10 +143,15 @@ class VideoInputPlan(StrictModel):
             raise ValueError("初始生成和视频延展时长必须在8至15秒")
         if self.operation is RenderOperation.INITIAL:
             if (
-                len(self.bindings) != 1
-                or self.bindings[0].provider_role is not ProviderMediaRole.FIRST_FRAME
+                self.bindings[0].provider_role is not ProviderMediaRole.FIRST_FRAME
             ):
-                raise ValueError("初始视频任务只能接收一张first_frame开场锚点")
+                raise ValueError("初始视频的第一项必须是first_frame开场锚点")
+            if any(
+                item.provider_role
+                not in {ProviderMediaRole.REFERENCE_IMAGE, ProviderMediaRole.REFERENCE_VIDEO}
+                for item in self.bindings[1:]
+            ):
+                raise ValueError("初始视频附加素材只能是reference_image或reference_video")
         elif self.operation is RenderOperation.EXTEND:
             if (
                 len(self.bindings) != 1
@@ -263,6 +268,7 @@ def build_video_input_plan(
     resolution: str,
     duration_seconds: int,
     source: MediaSource,
+    references: tuple[MediaSource, ...] = (),
 ) -> VideoInputPlan:
     if resolution not in {"480p", "720p"}:
         raise ValueError(f"不支持的视频分辨率{resolution}")
@@ -274,22 +280,46 @@ def build_video_input_plan(
         if operation is RenderOperation.INITIAL
         else ProviderMediaRole.REFERENCE_VIDEO
     )
+    if operation is not RenderOperation.INITIAL and references:
+        raise ValueError("只有初始视频任务允许附加前序参考媒体")
+    bindings = [
+        MediaBinding(
+            asset_id=source.asset_id,
+            semantic_key=source.semantic_key,
+            modality=MediaModality.IMAGE
+            if source.media_type == "image"
+            else MediaModality.VIDEO,
+            provider_role=role,
+            ordinal=1,
+            sha256=source.sha256,
+        )
+    ]
+    modality_counts = {
+        MediaModality.IMAGE: int(source.media_type == "image"),
+        MediaModality.VIDEO: int(source.media_type == "video"),
+    }
+    for reference in references:
+        modality = MediaModality(reference.media_type)
+        modality_counts[modality] += 1
+        bindings.append(
+            MediaBinding(
+                asset_id=reference.asset_id,
+                semantic_key=reference.semantic_key,
+                modality=modality,
+                provider_role=(
+                    ProviderMediaRole.REFERENCE_IMAGE
+                    if modality is MediaModality.IMAGE
+                    else ProviderMediaRole.REFERENCE_VIDEO
+                ),
+                ordinal=modality_counts[modality],
+                sha256=reference.sha256,
+            )
+        )
     return VideoInputPlan(
         operation=operation,
         resolution=resolution,
         duration_seconds=duration_seconds,
-        bindings=[
-            MediaBinding(
-                asset_id=source.asset_id,
-                semantic_key=source.semantic_key,
-                modality=MediaModality.IMAGE
-                if source.media_type == "image"
-                else MediaModality.VIDEO,
-                provider_role=role,
-                ordinal=1,
-                sha256=source.sha256,
-            )
-        ],
+        bindings=bindings,
     )
 
 

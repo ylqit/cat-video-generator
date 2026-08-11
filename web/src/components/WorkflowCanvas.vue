@@ -4,7 +4,7 @@ import { Controls } from "@vue-flow/controls";
 import { MarkerType, VueFlow, type Edge, type Node } from "@vue-flow/core";
 import { computed } from "vue";
 
-import type { WorkflowNodeDto } from "../api/types";
+import type { PlanningMode, WorkflowNodeDto } from "../api/types";
 
 import "@vue-flow/core/dist/style.css";
 import "@vue-flow/core/dist/theme-default.css";
@@ -12,23 +12,26 @@ import "@vue-flow/core/dist/theme-default.css";
 const props = defineProps<{
   nodes: WorkflowNodeDto[];
   selectedId?: string;
+  planningMode?: PlanningMode;
 }>();
 const emit = defineEmits<{ select: [node: WorkflowNodeDto] }>();
 
 const SLOT_Y: Record<string, number> = { morning: 70, noon: 250, evening: 430 };
 const COLUMN_X: Record<string, number> = {
-  director: 460,
-  look: 680,
-  opening_anchor: 900,
-  video: 1140,
-  content_review: 1380,
-  accepted_outcome: 1600,
+  story_connection: 650,
+  director: 870,
+  look: 1090,
+  opening_anchor: 1310,
+  video: 1550,
+  content_review: 1790,
+  accepted_outcome: 2010,
 };
 
 function position(item: WorkflowNodeDto) {
-  if (item.semanticNodeId === "run:day-director") return { x: 20, y: 205 };
-  if (item.semanticNodeId === "run:day-confirmation") return { x: 235, y: 205 };
-  if (item.semanticNodeId === "run:delivery") return { x: 1830, y: 205 };
+  if (item.semanticNodeId === "run:project-input") return { x: 20, y: 205 };
+  if (item.semanticNodeId === "run:day-director") return { x: 225, y: 205 };
+  if (item.semanticNodeId === "run:project-confirmation") return { x: 440, y: 205 };
+  if (item.semanticNodeId === "run:delivery") return { x: 2240, y: 205 };
   return {
     x: COLUMN_X[item.type] ?? 460,
     y: SLOT_Y[item.slot ?? "morning"] ?? 70,
@@ -52,15 +55,41 @@ const flowNodes = computed<Node[]>(() =>
 );
 
 const nodeIds = computed(() => new Set(props.nodes.map((item) => item.semanticNodeId)));
+type SemanticEdge = [source: string, target: string, optional?: boolean];
+
 const edgePairs = computed(() => {
-  const pairs: Array<[string, string]> = [["run:day-director", "run:day-confirmation"]];
+  const pairs: SemanticEdge[] = [];
+  const projectInput = "run:project-input";
+  const dayDirector = "run:day-director";
+  const projectConfirmation = "run:project-confirmation";
+  // 已有剧本项目没有收费总导演节点，项目输入直接连接本地确认节点。
+  if (nodeIds.value.has(projectInput) && nodeIds.value.has(dayDirector)) {
+    pairs.push([projectInput, dayDirector]);
+  }
+  if (nodeIds.value.has(dayDirector) && nodeIds.value.has(projectConfirmation)) {
+    pairs.push([dayDirector, projectConfirmation]);
+  } else if (nodeIds.value.has(projectInput) && nodeIds.value.has(projectConfirmation)) {
+    pairs.push([projectInput, projectConfirmation]);
+  }
   const slots = ["morning", "noon", "evening"];
-  const suffixes = ["director", "look", "opening-anchor", "video", "review", "outcome"];
+  const projectEntry = nodeIds.value.has(projectConfirmation)
+    ? projectConfirmation
+    : nodeIds.value.has(dayDirector) ? dayDirector : projectInput;
   slots.forEach((slot, slotIndex) => {
-    const ids = suffixes.map((suffix) => `${slot}:${suffix}`);
-    const source = slotIndex === 0 ? "run:day-confirmation" : `${slots[slotIndex - 1]}:outcome`;
+    const ids = ["director", "look", "opening-anchor", "video", "review", "outcome"]
+      .map((suffix) => `${slot}:${suffix}`);
+    const source = props.planningMode === "auto_day" || slotIndex === 0
+      ? projectEntry
+      : `${slots[slotIndex - 1]}:outcome`;
     pairs.push([source, ids[0]]);
     ids.slice(0, -1).forEach((id, index) => pairs.push([id, ids[index + 1]]));
+    if (slotIndex > 0) {
+      const connectionId = `${slot}:connection`;
+      // 关联卡是可选支线。主生产路径始终可以从前一时段结果直接进入导演，
+      // 避免画布把“生成关联建议”误画成收费必经步骤。
+      pairs.push([source, connectionId, true]);
+      pairs.push([connectionId, ids[0], true]);
+    }
   });
   pairs.push(["evening:outcome", "run:delivery"]);
   return pairs;
@@ -68,11 +97,13 @@ const edgePairs = computed(() => {
 const edges = computed<Edge[]>(() =>
   edgePairs.value
     .filter(([source, target]) => nodeIds.value.has(source) && nodeIds.value.has(target))
-    .map(([source, target]) => ({
+    .map(([source, target, optional]) => ({
       id: `${source}->${target}`,
       source,
       target,
       type: "smoothstep",
+      style: optional ? { strokeDasharray: "6 5", opacity: 0.72 } : undefined,
+      label: optional ? "可选关联" : undefined,
       markerEnd: MarkerType.ArrowClosed,
       animated: props.nodes.find((item) => item.semanticNodeId === target)?.availability === "active",
     })),

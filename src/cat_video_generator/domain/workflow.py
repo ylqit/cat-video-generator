@@ -111,15 +111,18 @@ _RUN_TRANSITIONS = {
         RunStatus.FAILED,
     },
     RunStatus.PLANNED: {
+        RunStatus.PLANNING_REVIEW,
         RunStatus.GENERATING,
         RunStatus.FAILED,
     },
     RunStatus.GENERATING: {
+        RunStatus.PLANNING_REVIEW,
         RunStatus.REVIEWING,
         RunStatus.READY,
         RunStatus.FAILED,
     },
     RunStatus.REVIEWING: {
+        RunStatus.PLANNING_REVIEW,
         RunStatus.GENERATING,
         RunStatus.READY,
         RunStatus.FAILED,
@@ -132,7 +135,7 @@ _RUN_TRANSITIONS = {
         RunStatus.FAILED,
     },
     RunStatus.DELIVERED: set(),
-    # 初始导演链失败后可复用已成功的DayBrief继续补齐Episode，再回到planned。
+    # 初始导演链失败后可复用已成功的ProjectOutlineV3继续补齐Episode，再回到planned。
     RunStatus.FAILED: {
         RunStatus.PLANNING_REVIEW,
         RunStatus.PLANNED,

@@ -194,9 +194,6 @@ class VideoSequencePersistenceMixin:
             if confirmed and revoke_confirmed_outcome:
                 outcomes.pop(slot.value)
                 stale_slots = set(run.planning_json.get("staleSlots", []))
-                stale_slots.update(
-                    item.value for item in Slot if item.sort_order > slot.sort_order
-                )
                 run.planning_json = {
                     **run.planning_json,
                     "acceptedOutcomes": outcomes,

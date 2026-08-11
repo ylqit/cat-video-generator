@@ -1,7 +1,8 @@
 import type {
   CanonAsset,
+  CrossSlotReferenceDto,
+  EligibleCrossSlotAssetDto,
   DeliveryPackageDto,
-  DayBriefDto,
   EpisodePromptPreview,
   EpisodeScript,
   HealthStatus,
@@ -10,11 +11,15 @@ import type {
   OutcomeDraftDto,
   PipelineSettings,
   PromptFull,
+  ProjectOutlineDto,
   PromptOverrides,
   ReconciliationCandidateDto,
   RunCreativeControlsDto,
   RunGraph,
   RunSummary,
+  StoryProjectInputDto,
+  StoryProjectPreview,
+  StoryConnectionDto,
   StepTraceDto,
 } from "./types";
 
@@ -67,19 +72,21 @@ function post<T>(path: string, body?: unknown): Promise<T> {
   });
 }
 
-export interface PlanPayload {
-  targetDate: string;
-  planningContext?: string;
+export interface ProjectPayload {
+  contentDate: string;
+  projectInput: StoryProjectInputDto;
   creativeProfile?: {
     personPersonality?: string;
     catPersonality?: string;
     humorStyle?: string;
   };
-  candidateCount?: number;
   allowPaidGeneration: boolean;
   pipelineSettings?: PipelineSettings;
-  storyMode?: "auto" | "create" | "expand";
   creativeControls?: RunCreativeControlsDto;
+}
+
+export interface StoryPreviewPayload {
+  text: string;
 }
 
 export interface GeneratePayload {
@@ -94,13 +101,27 @@ export const api = {
     request<PromptFull>(`/prompts/${promptId}`),
   stepTrace: (stepId: string) =>
     request<StepTraceDto>(`/steps/${stepId}/trace`),
-  createPlan: (payload: PlanPayload) => post<JobAccepted>("/plans", payload),
+  previewStoryProject: (payload: StoryPreviewPayload) =>
+    post<StoryProjectPreview>("/story-projects/preview", payload),
+  createProject: (payload: ProjectPayload) =>
+    post<JobAccepted>("/projects", payload),
   generate: (runId: string, payload: GeneratePayload) =>
     post<JobAccepted>(`/runs/${runId}/generate`, payload),
-  planSlot: (runId: string, slot: string, allowPaidGeneration: boolean) =>
+  planSlot: (
+    runId: string,
+    slot: string,
+    allowPaidGeneration: boolean,
+    generateFromTheme = false,
+  ) =>
     post<JobAccepted>(`/runs/${runId}/slots/${slot}/plan`, {
       allowPaidGeneration,
+      generateFromTheme,
     }),
+  updateEpisodeSource: (runId: string, slot: string, sourceText: string) =>
+    request<{ runId: string; slot: string; sourceText: string; saved: boolean }>(
+      `/runs/${runId}/slots/${slot}/source`,
+      { method: "PUT", body: JSON.stringify({ sourceText }) },
+    ),
   outcome: (runId: string, slot: string) =>
     request<OutcomeDraftDto>(`/runs/${runId}/slots/${slot}/outcome`),
   confirmOutcome: (
@@ -116,6 +137,43 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(payload),
     }),
+  storyConnection: (runId: string, slot: string) =>
+    request<{ runId: string; slot: string; storyConnection: StoryConnectionDto | null }>(
+      `/runs/${runId}/slots/${slot}/connection`,
+    ),
+  saveStoryConnection: (runId: string, slot: string, payload: StoryConnectionDto) =>
+    request<{ runId: string; slot: string; storyConnection: StoryConnectionDto }>(
+      `/runs/${runId}/slots/${slot}/connection`,
+      { method: "PUT", body: JSON.stringify(payload) },
+    ),
+  suggestStoryConnection: (runId: string, slot: string) =>
+    post<JobAccepted>(`/runs/${runId}/slots/${slot}/connection/suggest`, {
+      allowPaidGeneration: true,
+    }),
+  crossSlotReferences: (runId: string, slot: string) =>
+    request<{
+      runId: string;
+      slot: string;
+      references: CrossSlotReferenceDto[];
+      eligibleAssets: EligibleCrossSlotAssetDto[];
+    }>(`/runs/${runId}/slots/${slot}/references`),
+  saveCrossSlotReferences: (
+    runId: string,
+    slot: string,
+    references: CrossSlotReferenceDto[],
+  ) =>
+    request<{ runId: string; slot: string; crossSlotReferences: CrossSlotReferenceDto[] }>(
+      `/runs/${runId}/slots/${slot}/references`,
+      { method: "PUT", body: JSON.stringify({ references }) },
+    ),
+  saveShotNote: (
+    episodeId: string,
+    payload: { assetId: string; startMs: number; endMs: number; note: string },
+  ) =>
+    post<{ episodeId: string; assetId: string; reviewId: string; saved: boolean }>(
+      `/episodes/${episodeId}/shot-notes`,
+      payload,
+    ),
   resume: (runId: string) =>
     post<JobAccepted>(`/runs/${runId}/resume`),
   review: (assetId: string, approve: boolean, reason: string) =>
@@ -287,19 +345,20 @@ export const api = {
       episodeId: string;
       saved: boolean;
       promptOverrideStale: boolean;
+      suggestions: string[];
     }>(`/episodes/${episodeId}/script`, {
       method: "PUT",
       body: JSON.stringify(script),
     }),
-  updateDayBrief: (runId: string, brief: DayBriefDto) =>
+  updateProjectOutline: (runId: string, outline: ProjectOutlineDto) =>
     request<{
       runId: string;
       saved: boolean;
       confirmed: boolean;
       episodeDraftsCleared: boolean;
     }>(
-      `/runs/${runId}/day-brief`,
-      { method: "PUT", body: JSON.stringify(brief) },
+      `/runs/${runId}/project-outline`,
+      { method: "PUT", body: JSON.stringify(outline) },
     ),
   savePipelineSettings: (runId: string, settings: PipelineSettings) =>
     request<{ runId: string; pipelineSettings: PipelineSettings }>(

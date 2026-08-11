@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable
+from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from fastapi import HTTPException
@@ -57,6 +58,8 @@ def _jsonable(result: Any) -> Any:
         return str(result)
     if hasattr(result, "model_dump"):
         return result.model_dump(mode="json")
+    if is_dataclass(result) and not isinstance(result, type):
+        return _jsonable(asdict(result))
     if hasattr(result, "_asdict"):
         return _jsonable(result._asdict())
     if isinstance(result, dict):

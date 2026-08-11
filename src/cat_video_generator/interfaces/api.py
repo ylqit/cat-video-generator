@@ -168,7 +168,6 @@ def create_full_app(
             regeneration=container.regeneration,
             video_editing=container.video_editing,
             job_registry=job_registry,
-            default_candidate_count=runtime.candidate_count,
             upload_dir=runtime.work_root / "uploads",
             delivery_root=runtime.delivery_root,
         )

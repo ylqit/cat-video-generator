@@ -64,7 +64,7 @@ onBeforeUnmount(() => window.clearInterval(timer));
         style="flex: 1"
       >
         <el-menu-item index="/studio">生产工作台</el-menu-item>
-        <el-menu-item index="/runs">生产运行</el-menu-item>
+        <el-menu-item index="/runs">生活故事项目</el-menu-item>
         <el-menu-item index="/canon">Canon 资产</el-menu-item>
       </el-menu>
       <div

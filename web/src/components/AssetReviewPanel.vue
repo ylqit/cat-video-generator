@@ -11,6 +11,7 @@ const props = defineProps<{
   reviews: ReviewDto[];
   /** 预览最大宽度，默认适配视频 */
   maxWidth?: number;
+  readOnly?: boolean;
 }>();
 const emit = defineEmits<{ reviewed: [] }>();
 
@@ -52,7 +53,7 @@ const technicalPassed = computed(() => {
   );
 });
 
-/** Ark 视觉语义审核证据（身份、画风、关键道具和叙事）。 */
+/** Ark 视觉检查建议（身份、画风、关键道具和叙事），不代替人工决定。 */
 const visualReview = computed(() =>
   [...props.reviews]
     .filter(
@@ -103,16 +104,10 @@ const visualConfidence = computed(() => {
 });
 
 const visualDecisionLabel = computed(() => {
-  if (visualReview.value?.decision === "approved") {
-    return "通过";
-  }
-  if (visualReview.value?.decision === "rejected") {
-    return "打回";
-  }
   if (typeof visualEvidence.value?.diagnosticError === "string") {
     return "诊断未完成";
   }
-  return "待处理";
+  return "建议已生成，待人工判断";
 });
 
 const visualDiagnosticError = computed(() => {
@@ -174,7 +169,7 @@ async function decide(approve: boolean) {
     </div>
     <div v-if="visualReview" style="margin-top: 6px">
       <div class="muted">
-        语义审核：{{ visualDecisionLabel }}
+        AI检查建议：{{ visualDecisionLabel }}
         <span v-if="visualConfidence !== null">
           · 置信度 {{ (visualConfidence * 100).toFixed(0) }}%
         </span>
@@ -192,7 +187,7 @@ async function decide(approve: boolean) {
         {{ flag.label }}{{ flag.ok ? "✓" : "✗" }}
       </el-tag>
       <div v-if="visualViolations.length" class="muted" style="margin-top: 4px">
-        违规：{{ visualViolations.join("；") }}
+        关注项：{{ visualViolations.join("；") }}
       </div>
       <div
         v-if="visualObservations.length"
@@ -206,7 +201,7 @@ async function decide(approve: boolean) {
       人工审核：{{ humanDecision.decision === "approved" ? "通过" : "打回" }}
       · {{ humanDecision.reason }}
     </div>
-    <template v-if="asset.status === 'candidate'">
+    <template v-if="asset.status === 'candidate' && !readOnly">
       <el-input
         v-model="reason"
         size="small"

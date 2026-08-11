@@ -22,7 +22,7 @@ class PlanningMode(StrEnum):
     AUTO_DAY = "auto_day"
 
 
-PIPELINE_STAGES = ("dayBrief", "script", "visual", "video", "review")
+PIPELINE_STAGES = ("projectOutline", "script", "visual", "video", "review")
 
 
 class PipelineSettings(StrictModel):
@@ -31,15 +31,15 @@ class PipelineSettings(StrictModel):
         Field(alias="planningMode"),
     ] = PlanningMode.GUIDED_SEQUENTIAL
     allow_paid_generation: Annotated[bool, Field(alias="allowPaidGeneration")] = False
-    day_brief: Annotated[StageMode, Field(alias="dayBrief")] = StageMode.AUTO
+    project_outline: Annotated[StageMode, Field(alias="projectOutline")] = StageMode.AUTO
     script: StageMode = StageMode.AUTO
     visual: StageMode = StageMode.AUTO
     video: StageMode = StageMode.AUTO
     review: StageMode = StageMode.MANUAL
 
     def stage(self, name: str) -> StageMode:
-        aliases = {"dayBrief": "day_brief"}
+        aliases = {"projectOutline": "project_outline"}
         attribute = aliases.get(name, name)
-        if attribute not in {"day_brief", "script", "visual", "video", "review"}:
+        if attribute not in {"project_outline", "script", "visual", "video", "review"}:
             raise ValueError(f"未知流水线阶段：{name!r}")
         return getattr(self, attribute)

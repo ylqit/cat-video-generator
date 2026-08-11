@@ -22,23 +22,37 @@ Domain不依赖框架或I/O；Application只依赖Domain和所需Port；Infrastr
 决定业务状态；接口层不直接写数据库或调用Ark。禁止只改名、转发参数或格式化
 路径的薄包装。
 
-## 两种规划模式与唯一生产模型
+## 两种剧情来源、两种规划模式与唯一生产模型
 
 ```text
-RunCreativeControls
-→ DayBrief
+StoryProjectInput
+→ ProjectOutlineV3（仅theme_expand）
 → EpisodeScript × 3
 → RenderPlan（确定性推导）
 ```
 
-Web默认使用`guided_sequential`：DayBrief人工确认后只规划Morning；Morning最终视频
-人工批准并确认`AcceptedOutcome`后才解锁Noon，Evening同理。结果卡只保存实际成片
-摘要、可安全继承事实和禁止继承的偶发错误，位于`production_runs.planning_json`，
-不增加第二套状态源。`auto_day`保留为无人值守批量模式，仍一次顺序生成三个脚本。
+`StoryProjectInput`明确区分`theme_expand`与`episode_scripts`。前者调用一次总导演，
+输出固定命名的`episodes.morning/noon/evening`方向；后者直接保存用户原文，不创建
+Day Director Step，也不伪造总导演结果。完整三集粘贴由本地解析器预览并经用户确认，
+不触发任何供应商调用。契约V3不使用可重复的时段数组，因此不存在重复Noon或第四时段。
 
-轻量总导演只定义全天边界、时段职责、活动焦点、时长档和交接意图，不设计手部动作、
-道具机制或镜头。顺序模式的后续时段导演读取人工确认后的实际成片结果，而不是把上一
-时段原始脚本或视觉诊断自动当成事实。
+Web默认使用`guided_sequential`：项目输入或Project Outline确认后只规划Morning；Morning最终视频
+人工批准并确认`AcceptedOutcome`后才解锁Noon，Evening同理。结果卡只保存实际成片
+事实，位于`production_runs.planning_json`，不增加第二套状态源。后续导演不会自动
+读取它；用户显式保存并启用`StoryConnection`后才注入关联正文。`auto_day`保留为
+无人值守批量模式。
+
+可选总导演只定义全天边界、时段场景方向和交接意图，不设计手部动作、道具机制、镜头、
+活动焦点或时长；后两项始终以用户的`RunCreativeControls`为准。顺序模式的后续时段
+导演只读取用户启用的关联卡，不读取完整前序脚本、结果卡或视觉诊断。AI关联建议是
+独立付费节点，只产生草稿，不自动保存或加载。
+
+已有剧本进入时段导演后只做镜头化适配。用户明确写出的核心事件、场景路线和结尾不得
+被改写；缺失的时段可在解锁后由用户补写，或显式选择“根据主题生成”；只有另行启用
+关联卡时才会参考前序。
+`progressive_locations`用于“家中准备→户外主活动→归家收束”，`single_location`
+用于同地点阶段递进，`adaptive`根据主题选择。场景路线是导演指导和诊断信息，不是
+对剧情审美的硬校验。
 
 `EpisodeScript`采用极简混合契约：完整长剧情是创作事实主体，活动焦点、时长、外观、
 关系弧、1～3段完整镜头描述和少量`hardConstraints`构成机器可读控制壳。镜头段落一次
@@ -68,13 +82,13 @@ Web默认使用`guided_sequential`：DayBrief人工确认后只规划Morning；M
 ## 模块所有权
 
 ```text
-domain/contracts.py    DayBriefV2、EpisodeScriptV2、创作控制与极简导演壳
+domain/contracts.py    StoryProjectInput、ProjectOutlineV3、EpisodeScript与极简导演壳
 domain/rendering.py    RenderPlan、VideoInputPlan与延展能力
 domain/prompts.py      导演、定妆、开场锚点、视频和审核Prompt
 domain/rules.py        少量身份、时长与跨时段硬门
 domain/workflow.py     Run/Episode/Step合法状态转换
 
-application/planning.py            auto_day四次调用或guided逐时段导演与局部重规划
+application/planning.py            可选总导演、已有剧本镜头化、guided逐时段导演与局部重规划
 application/visual_preparation.py  定妆图、开场锚点和图片审核
 application/video_execution.py     初始生成、官方延展、恢复、下载和QC
 application/production.py          流程编排
@@ -98,14 +112,20 @@ assets / reviews / delivery_packages / delivery_items`。`0013`另增加`video_s
 9. 导演原始结构化JSON、可选归一化结果和警告保存在Step快照；查询层只在打开节点时
    投影完整Trace，禁止把Key、Base64、签名URL或SDK对象写入数据库。
 10. 高级Prompt覆盖绑定当前脚本哈希；上游脚本变化后自动失效，旧attempt Prompt永久保留。
-11. 视频语义诊断只能生成结果卡草稿；只有人工批准视频并确认结果卡，后续导演才可读取。
+11. 视频语义诊断只能生成建议与结果卡草稿；后续导演只有在用户另行启用关联卡时才可读取其正文。
+12. 前序媒体引用默认关闭，素材职责和使用节点由用户逐项确认；查询层可以给建议但不能自动绑定。
 
 ## 固定语义画布与非破坏性视频版本
 
-Run Graph固定投影总导演、DayBrief确认、早中晚五类节点及交付节点。每个节点分别返回
+Run Graph按输入模式投影项目输入或总导演、项目确认、早中晚五类节点及交付节点。已有
+剧本项目不会显示虚假Provider调用；未解锁的未来时段仍显示只读占位。每个节点分别返回
 `availability`和`executionStatus`：锁定占位节点使用`not_created`且不写`workflow_steps`；
 Provider成功但待审核的节点不会伪装为完成。`guided_sequential`只在本时段视频批准且
-`AcceptedOutcome`确认后解锁下一时段导演；`auto_day`在DayBrief可用后同时开放三条泳道。
+`AcceptedOutcome`确认后解锁下一时段导演；`auto_day`在项目输入就绪后开放三条泳道。
+
+生产契约版本由`production_runs.contract_version`明确记录。V3新Run只接受当前结构；
+V2历史Run可以查看摘要，但不能继续规划、生成、重试或被近期记忆复用。系统不通过
+Pydantic别名或字段猜测把旧结构伪装成新结构。
 
 Vue Flow只渲染后端给出的稳定`semanticNodeId`和固定边，不允许任意新增、删除或连接。
 URL保存run、stage、slot、node和sequence；轮询只刷新数据，不能重置用户当前视口、

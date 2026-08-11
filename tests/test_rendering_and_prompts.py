@@ -7,7 +7,7 @@ from uuid import uuid4
 import pytest
 from conftest import episode_for
 
-from cat_video_generator.domain.contracts import Slot
+from cat_video_generator.domain.contracts import DurationBand, Slot
 from cat_video_generator.domain.prompts import (
     PromptCompilationError,
     compile_day_director_prompt,
@@ -154,16 +154,20 @@ def test_range_edit_prompt_describes_one_change_and_boundaries() -> None:
 def test_director_prompts_separate_day_capacity_from_episode_execution(daily_plan) -> None:
     day_prompt = compile_day_director_prompt(
         target_date=daily_plan.content_date,
-        planning_context="放风筝主题",
+        project_input=daily_plan.project_input,
     )
     slot_prompt = compile_episode_director_prompt(
-        day_brief=daily_plan.day_brief,
-        slot_brief=daily_plan.day_brief.slot_briefs[1],
+        project_theme=daily_plan.theme,
+        scene_route=daily_plan.project_input.scene_route,
+        slot=Slot.NOON,
+        outline_episode=daily_plan.outline.episodes.noon,
+        activity_focus=daily_plan.episodes[1].script.activity_focus,
+        duration_band=DurationBand.MEDIUM,
         previous_state_summaries=("上午已完成风筝制作",),
     )
 
     assert "不得输出具体动作、镜头、精确秒数" in day_prompt
-    assert "猫咪主活动" in day_prompt
+    assert "猫咪" in day_prompt
     assert "精确时长必须在16至30秒" in slot_prompt
     assert "relationshipArc" in slot_prompt
     assert "猫咪保持四足自然行为" in slot_prompt

@@ -19,6 +19,8 @@ from ...domain.contracts import (
     EpisodeScript,
     RecentContentSummary,
     Slot,
+    StoryInputMode,
+    StoryProjectInput,
 )
 from ...domain.pipeline import PipelineSettings
 from ...domain.rendering import build_render_plan
@@ -58,7 +60,7 @@ def _slot_planning_state(
     accepted_outcomes: object,
     *,
     guided: bool,
-    day_brief_confirmed: bool = True,
+    project_ready: bool = True,
 ) -> list[dict[str, Any]]:
     """投影逐时段解锁状态；只依据已落库Episode和人工确认结果。"""
 
@@ -69,12 +71,12 @@ def _slot_planning_state(
         previous = [item.value for item in Slot if item.sort_order < slot.sort_order]
         missing_outcomes = [item for item in previous if item not in outcomes]
         is_planned = slot.value in planned
-        if not guided:
+        if not project_ready:
+            unlocked, reason = False, "请先确认生活故事项目边界"
+        elif not guided:
             unlocked, reason = not is_planned, None
         elif is_planned:
             unlocked, reason = False, "该时段已经规划"
-        elif not day_brief_confirmed:
-            unlocked, reason = False, "请先保存并确认全天总导演边界"
         elif any(
             item.value not in planned
             for item in Slot
@@ -95,6 +97,41 @@ def _slot_planning_state(
             }
         )
     return result
+
+
+def _active_slot_projection(
+    episodes: tuple[Episode, ...],
+    accepted_outcomes: object,
+    *,
+    guided: bool,
+    project_ready: bool,
+) -> tuple[str | None, str | None, dict[str, str]]:
+    outcomes = accepted_outcomes if isinstance(accepted_outcomes, dict) else {}
+    by_slot = {item.slot: item for item in episodes}
+    active = next((slot for slot in Slot if slot.value not in outcomes), None)
+    if active is None:
+        return None, None, {slot.value: "completed" for slot in Slot}
+    following = next(
+        (slot for slot in Slot if slot.sort_order == active.sort_order + 1),
+        None,
+    )
+    availability: dict[str, str] = {}
+    for slot in Slot:
+        if not project_ready:
+            availability[slot.value] = "locked"
+        elif slot.value in outcomes:
+            availability[slot.value] = "completed"
+        elif guided and slot is not active:
+            availability[slot.value] = "locked"
+        elif slot.value in by_slot:
+            availability[slot.value] = "active"
+        else:
+            availability[slot.value] = "ready"
+    return (
+        active.value,
+        None if following is None else following.value,
+        availability,
+    )
 
 
 def _trace_input_bindings(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
@@ -157,12 +194,17 @@ def _current_stage(
     episodes: tuple[Episode, ...],
     steps: tuple[WorkflowStep, ...],
 ) -> str:
-    if "dayBrief" not in run.planning_json:
-        return "dayBrief"
+    raw_project_input = run.planning_json.get("projectInput")
+    if not isinstance(raw_project_input, dict):
+        return "projectOutline"
+    project_input = StoryProjectInput.model_validate(raw_project_input)
     settings = PipelineSettings.model_validate(run.pipeline_settings_json or {})
     if settings.planning_mode.value == "guided_sequential":
-        if "dayBriefConfirmedAt" not in run.planning_json:
-            return "dayBrief"
+        if (
+            project_input.input_mode is StoryInputMode.THEME_EXPAND
+            and "projectOutlineConfirmedAt" not in run.planning_json
+        ):
+            return "projectOutline"
         outcomes = run.planning_json.get("acceptedOutcomes", {}) or {}
         by_slot = {item.slot: item for item in episodes}
         for slot in Slot:
@@ -186,7 +228,7 @@ def _current_stage(
                 return "script"
         return "review"
     if run.status == RunStatus.DRAFT.value:
-        return "dayBrief"
+        return "projectOutline"
     if run.status == RunStatus.PLANNING_REVIEW.value:
         return "script"
     statuses = {item.status for item in episodes}
@@ -205,12 +247,12 @@ def _guided_next_action(
     episodes: tuple[Episode, ...],
     accepted_outcomes: object,
     *,
-    day_brief_confirmed: bool,
+    project_ready: bool,
 ) -> str:
     """返回顺序工作台唯一应执行的下一步，不用Run粗粒度状态猜测。"""
 
-    if not day_brief_confirmed:
-        return "保存并确认全天总导演边界"
+    if not project_ready:
+        return "确认生活故事项目边界"
     outcomes = accepted_outcomes if isinstance(accepted_outcomes, dict) else {}
     by_slot = {item.slot: item for item in episodes}
     for slot in Slot:
@@ -238,6 +280,35 @@ def _guided_next_action(
     return "构建本地1/2/3交付包"
 
 
+def _connection_status_projection(
+    steps: tuple[WorkflowStep, ...],
+    raw_connections: object,
+) -> dict[str, str]:
+    connections = raw_connections if isinstance(raw_connections, dict) else {}
+    result = {Slot.MORNING.value: "not_applicable"}
+    for slot in (Slot.NOON, Slot.EVENING):
+        saved = connections.get(slot.value)
+        if isinstance(saved, dict) and saved.get("confirmedAt"):
+            result[slot.value] = (
+                "confirmed_enabled" if saved.get("useForDirector") else "confirmed_disabled"
+            )
+            continue
+        candidates = [
+            item
+            for item in steps
+            if item.operation_key == f"director:connection:{slot.value}"
+        ]
+        latest = max(candidates, key=lambda item: item.created_at, default=None)
+        result[slot.value] = (
+            "not_created"
+            if latest is None
+            else "suggested"
+            if latest.status == "succeeded"
+            else latest.status
+        )
+    return result
+
+
 def _workflow_nodes(
     episodes: tuple[Episode, ...],
     steps: tuple[WorkflowStep, ...],
@@ -245,13 +316,16 @@ def _workflow_nodes(
     assets: tuple[Asset, ...],
     reviews: tuple[Review, ...],
     accepted_outcomes: dict[str, Any] | None = None,
+    story_connections: dict[str, Any] | None = None,
     *,
     guided: bool,
-    day_brief_confirmed: bool,
+    project_ready: bool,
+    input_mode: StoryInputMode,
     stale_slots: tuple[str, ...] = (),
     stale_nodes: tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
     accepted_outcomes = accepted_outcomes or {}
+    story_connections = story_connections or {}
     prompt_ids: dict[uuid.UUID, list[str]] = {}
     review_ids: dict[uuid.UUID, list[str]] = {}
     for prompt in prompts:
@@ -369,54 +443,67 @@ def _workflow_nodes(
             else "pending",
         )
 
-    day_step = latest("director:day")
-    provider, contract, semantic = director_state(day_step)
-    nodes = [
-        {
-            **node(
-                node_id="run:day-director",
-                node_type="director",
-                label="全天总导演",
-                step=day_step,
-                contract_status=contract,
-                completed=day_step is not None and day_step.status == "succeeded",
-            ),
-            "providerStatus": provider,
-            "semanticReviewStatus": semantic,
-        }
-    ]
-    if day_step is not None and day_step.status == "failed":
-        nodes[0]["allowedActions"] = [
+    nodes: list[dict[str, Any]] = []
+    if input_mode is StoryInputMode.THEME_EXPAND:
+        day_step = latest("director:day")
+        provider, contract, semantic = director_state(day_step)
+        nodes.append(
             {
-                "type": "regenerate",
-                "label": "修复并重执行总导演",
-                "paid": True,
-            }
-        ]
-        nodes[0]["nextAction"] = "查看契约错误后重执行总导演"
-    day_confirm_unlocked = day_step is not None and day_step.status == "succeeded"
-    nodes.append(
-        {
-            **node(
-                node_id="run:day-confirmation",
-                node_type="day_confirmation",
-                label="DayBrief人工确认",
-                step=None,
-                status="confirmed" if day_brief_confirmed else "pending",
-                availability=(
-                    "completed"
-                    if day_brief_confirmed
-                    else "ready"
-                    if day_confirm_unlocked
-                    else "locked"
+                **node(
+                    node_id="run:day-director",
+                    node_type="director",
+                    label="主题扩写总导演",
+                    step=day_step,
+                    contract_status=contract,
+                    completed=day_step is not None and day_step.status == "succeeded",
                 ),
-                lock_reason=None if day_confirm_unlocked else "等待总导演完成",
-                unlock_requirements=("总导演完成",),
-                completed=day_brief_confirmed,
-            ),
-            "providerStatus": "not_applicable",
-        }
-    )
+                "providerStatus": provider,
+                "semanticReviewStatus": semantic,
+            }
+        )
+        if day_step is not None and day_step.status == "failed":
+            nodes[0]["allowedActions"] = [
+                {"type": "regenerate", "label": "修复并重执行总导演", "paid": True}
+            ]
+            nodes[0]["nextAction"] = "查看契约错误后重执行总导演"
+        day_confirm_unlocked = day_step is not None and day_step.status == "succeeded"
+        nodes.append(
+            {
+                **node(
+                    node_id="run:project-confirmation",
+                    node_type="project_confirmation",
+                    label="项目大纲人工确认",
+                    step=None,
+                    status="confirmed" if project_ready else "pending",
+                    availability=(
+                        "completed"
+                        if project_ready
+                        else "ready"
+                        if day_confirm_unlocked
+                        else "locked"
+                    ),
+                    lock_reason=None if day_confirm_unlocked else "等待主题扩写总导演完成",
+                    unlock_requirements=("主题扩写总导演完成",),
+                    completed=project_ready,
+                ),
+                "providerStatus": "not_applicable",
+            }
+        )
+    else:
+        nodes.append(
+            {
+                **node(
+                    node_id="run:project-input",
+                    node_type="project_input",
+                    label="用户剧本输入",
+                    step=None,
+                    status="confirmed",
+                    availability="completed",
+                    completed=True,
+                ),
+                "providerStatus": "not_applicable",
+            }
+        )
     episodes_by_slot = {item.slot: item for item in episodes}
     for slot_item in Slot:
         slot = slot_item.value
@@ -428,16 +515,65 @@ def _workflow_nodes(
         director = latest(f"director:episode:{slot}")
         provider, contract, semantic = director_state(director)
         previous_slots = [item.value for item in Slot if item.sort_order < slot_item.sort_order]
-        slot_unlocked = day_brief_confirmed and (
+        slot_unlocked = project_ready and (
             not guided or all(item in accepted_outcomes for item in previous_slots)
         )
         slot_requirement = (
-            "确认DayBrief"
-            if not day_brief_confirmed
+            "确认生活故事项目边界"
+            if not project_ready
             else f"确认{previous_slots[-1]}结果卡"
             if guided and previous_slots and previous_slots[-1] not in accepted_outcomes
             else None
         )
+        if slot_item is not Slot.MORNING:
+            connection_step = latest(f"director:connection:{slot}")
+            connection_provider, connection_contract, connection_semantic = director_state(
+                connection_step
+            )
+            if connection_step is not None and connection_step.status == "succeeded":
+                connection_semantic = "suggested"
+            connection = story_connections.get(slot)
+            connection_saved = isinstance(connection, dict) and bool(
+                connection.get("confirmedAt")
+            )
+            connection_lock_reason = slot_requirement
+            if episode is not None and not connection_saved:
+                connection_lock_reason = f"{slot}已经完成镜头化；关联卡需在导演前确认"
+            connection_editable = slot_unlocked and episode is None
+            connection_node = node(
+                node_id=f"{slot}:connection",
+                node_type="story_connection",
+                slot=slot,
+                label=f"{slot}可选剧情关联",
+                step=connection_step,
+                status="confirmed" if connection_saved else None,
+                availability=(
+                    "completed"
+                    if connection_saved
+                    else "active"
+                    if connection_step is not None
+                    and connection_step.status in active_statuses
+                    else "ready"
+                    if connection_editable
+                    else "locked"
+                ),
+                lock_reason=connection_lock_reason,
+                unlock_requirements=(
+                    ()
+                    if connection_lock_reason is None
+                    else (connection_lock_reason,)
+                ),
+                completed=connection_saved,
+                contract_status=connection_contract,
+                semantic_status=connection_semantic,
+            )
+            connection_node["providerStatus"] = connection_provider
+            if connection_contract == "rejected":
+                connection_node["status"] = "planning_rejected"
+                connection_node["nextAction"] = "查看原始输出后重新生成关联建议"
+            nodes.append(
+                connection_node
+            )
         director_node = node(
             node_id=f"{slot}:director",
             node_type="director",
@@ -857,36 +993,95 @@ class SqlAlchemyReadRepository:
                 ).scalars()
             ) if episode_ids else ()
             payload = run_dict(run)
+            if run.contract_version != CURRENT_CONTRACT_VERSION:
+                historical_steps = []
+                for item in steps:
+                    historical = step_dict(item)
+                    historical["availableActions"] = []
+                    historical["nextAction"] = "旧契约记录只读"
+                    historical_steps.append(historical)
+                return {
+                    "run": payload,
+                    "episodes": [],
+                    "steps": historical_steps,
+                    "prompts": [prompt_dict(item) for item in prompts],
+                    "assets": [asset_dict(item) for item in assets],
+                    "reviews": [review_dict(item) for item in reviews],
+                    "videoSequences": [_video_sequence_dict(item) for item in sequences],
+                    "workflowNodes": [],
+                }
             settings = PipelineSettings.model_validate(run.pipeline_settings_json or {})
-            day_brief_confirmed = "dayBriefConfirmedAt" in run.planning_json
-            # auto_day由规划用例在同一链路中接受DayBrief并继续三个时段；只有
-            # guided_sequential需要额外的人工确认时间戳才能解锁Morning。
-            day_brief_ready = day_brief_confirmed or (
-                settings.planning_mode.value == "auto_day"
-                and isinstance(run.planning_json.get("dayBrief"), dict)
+            raw_project_input = run.planning_json.get("projectInput")
+            if not isinstance(raw_project_input, dict):
+                payload.update(
+                    {
+                        "projectInput": None,
+                        "projectOutline": None,
+                        "projectReady": False,
+                        "currentStage": "projectOutline",
+                        "availableActions": [],
+                        "nextAction": "项目输入未完整落库，请检查创建任务错误",
+                    }
+                )
+                return {
+                    "run": payload,
+                    "episodes": [],
+                    "steps": [step_dict(item) for item in steps],
+                    "prompts": [prompt_dict(item) for item in prompts],
+                    "assets": [asset_dict(item) for item in assets],
+                    "reviews": [review_dict(item) for item in reviews],
+                    "videoSequences": [_video_sequence_dict(item) for item in sequences],
+                    "workflowNodes": [],
+                }
+            project_input = StoryProjectInput.model_validate(raw_project_input)
+            outline_confirmed = "projectOutlineConfirmedAt" in run.planning_json
+            project_ready = project_input.input_mode is StoryInputMode.EPISODE_SCRIPTS or (
+                outline_confirmed
+                or (
+                    settings.planning_mode.value == "auto_day"
+                    and isinstance(run.planning_json.get("projectOutline"), dict)
+                )
             )
             payload.update(
                 {
-                    "dayBrief": run.planning_json.get("dayBrief"),
-                    "episodeDrafts": run.planning_json.get("episodeDrafts", {}),
+                    "projectInput": raw_project_input,
+                    "projectOutline": run.planning_json.get("projectOutline"),
                     "planningMetadata": run.planning_json.get("planningMetadata", {}),
                     "acceptedOutcomes": run.planning_json.get("acceptedOutcomes", {}),
-                    "dayBriefConfirmed": day_brief_ready,
+                    "storyConnections": run.planning_json.get("storyConnections", {}),
+                    "crossSlotReferences": run.planning_json.get(
+                        "crossSlotReferences", {}
+                    ),
+                    "projectOutlineConfirmed": outline_confirmed,
+                    "projectReady": project_ready,
                     "currentStage": _current_stage(run, episodes, steps),
                 }
             )
             payload["planningMode"] = settings.planning_mode.value
+            active_slot, next_slot, slot_availability = _active_slot_projection(
+                episodes,
+                run.planning_json.get("acceptedOutcomes", {}),
+                guided=settings.planning_mode.value == "guided_sequential",
+                project_ready=project_ready,
+            )
+            payload["activeSlot"] = active_slot
+            payload["nextSlot"] = next_slot
+            payload["slotAvailability"] = slot_availability
+            payload["connectionStatus"] = _connection_status_projection(
+                steps,
+                run.planning_json.get("storyConnections", {}),
+            )
             payload["slotPlanning"] = _slot_planning_state(
                 episodes,
                 run.planning_json.get("acceptedOutcomes", {}),
                 guided=settings.planning_mode.value == "guided_sequential",
-                day_brief_confirmed=day_brief_ready,
+                project_ready=project_ready,
             )
             if settings.planning_mode.value == "guided_sequential":
                 payload["nextAction"] = _guided_next_action(
                     episodes,
                     run.planning_json.get("acceptedOutcomes", {}),
-                    day_brief_confirmed=day_brief_ready,
+                    project_ready=project_ready,
                 )
             return {
                 "run": payload,
@@ -903,8 +1098,10 @@ class SqlAlchemyReadRepository:
                     assets,
                     reviews,
                     run.planning_json.get("acceptedOutcomes", {}) or {},
+                    run.planning_json.get("storyConnections", {}) or {},
                     guided=settings.planning_mode.value == "guided_sequential",
-                    day_brief_confirmed=day_brief_ready,
+                    project_ready=project_ready,
+                    input_mode=project_input.input_mode,
                     stale_slots=tuple(run.planning_json.get("staleSlots", []) or ()),
                     stale_nodes=tuple(run.planning_json.get("staleNodes", []) or ()),
                 ),
@@ -971,7 +1168,6 @@ class SqlAlchemyReadRepository:
         with self._sessions() as session:
             rows = session.execute(
                 select(ProductionRun)
-                .where(ProductionRun.contract_version == CURRENT_CONTRACT_VERSION)
                 .order_by(ProductionRun.content_date.desc(), ProductionRun.created_at.desc())
                 .limit(limit)
                 .offset(offset)
@@ -1016,7 +1212,7 @@ class SqlAlchemyReadRepository:
                         location_keys=tuple(item.location_key for item in scripts),
                         summary_text=(
                             f"{run.content_date.isoformat()}主题="
-                            f"{run.planning_json.get('dayBrief', {}).get('theme', '')}；"
+                            f"{run.planning_json.get('projectInput', {}).get('theme', '')}；"
                             f"剧情={'、'.join(item.story_text for item in scripts)}"
                         ),
                     )

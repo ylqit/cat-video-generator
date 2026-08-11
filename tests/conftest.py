@@ -9,41 +9,18 @@ import pytest
 from cat_video_generator.domain.contracts import (
     ActivityFocus,
     DailyProductionPlan,
-    DayBrief,
-    DurationBand,
     EpisodePlan,
     EpisodeScript,
     Handoff,
     HardConstraint,
+    OutlineEpisode,
+    OutlineEpisodes,
+    ProjectOutlineV3,
     ShotDirection,
     Slot,
-    SlotBrief,
+    StoryInputMode,
+    StoryProjectInput,
 )
-
-
-def _duration_band(seconds: int) -> DurationBand:
-    if seconds <= 15:
-        return DurationBand.SHORT
-    if seconds <= 30:
-        return DurationBand.MEDIUM
-    return DurationBand.LONG
-
-
-def slot_brief(
-    slot: Slot,
-    *,
-    duration: int,
-    focus: ActivityFocus = ActivityFocus.CAT_LEAD,
-) -> SlotBrief:
-    return SlotBrief(
-        slot=slot,
-        narrative_role=f"推进{slot.value}时段的风筝生活片段并承接全天关系",
-        event_direction="猫咪先推动可见变化，人物完成工具活动并在结尾回应",
-        appearance_intent="中性儿童服饰随地点自然变化，猫咪斑纹与体型保持稳定",
-        activity_focus=focus,
-        duration_band=_duration_band(duration),
-        decision_reason="根据本时段事件容量选择能够看清起因、变化和回报的时长",
-    )
 
 
 def _shot_directions(duration: int) -> list[ShotDirection]:
@@ -120,15 +97,34 @@ def episode_for(
 @pytest.fixture
 def daily_plan() -> DailyProductionPlan:
     durations = {Slot.MORNING: 12, Slot.NOON: 22, Slot.EVENING: 12}
+    project_input = StoryProjectInput(
+        theme="春日放风筝的一天",
+        input_mode=StoryInputMode.THEME_EXPAND,
+    )
     return DailyProductionPlan(
-        day_brief=DayBrief(
+        content_date=date(2026, 8, 10),
+        project_input=project_input,
+        outline=ProjectOutlineV3(
             content_date=date(2026, 8, 10),
-            theme="春日放风筝的一天",
+            theme=project_input.theme,
             day_arc=(
                 "上午在家完成风筝并建立猫咪对飘带的兴趣，中午到山坡让猫咪追影并提示线况变化，"
                 "傍晚人物收线、猫咪围着线轴活动，最后一起带着同一只风筝离开。"
             ),
-            slot_briefs=[slot_brief(slot, duration=durations[slot]) for slot in Slot],
+            episodes=OutlineEpisodes(
+                morning=OutlineEpisode(
+                    scene="春日家中的小木桌",
+                    direction="制作风筝，猫咪追彩带并引出轻微笑点。",
+                ),
+                noon=OutlineEpisode(
+                    scene="开满野花的春日山坡",
+                    direction="放飞风筝，猫咪先发现异常并与人物共同恢复飞行。",
+                ),
+                evening=OutlineEpisode(
+                    scene="夕阳下的山坡小径",
+                    direction="收好风筝并分享点心，人猫一起迎着夕阳离开。",
+                ),
+            ),
             handoffs=[
                 Handoff(
                     name="同一只彩色风筝",

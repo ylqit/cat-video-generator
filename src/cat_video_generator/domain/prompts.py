@@ -12,17 +12,26 @@ from datetime import date
 
 from .contracts import (
     ActivityFocus,
-    DayBrief,
+    DurationBand,
     EpisodePlan,
+    OutlineEpisode,
     RecentContentSummary,
     RunCreativeControls,
+    SceneRoute,
     ShotDirection,
     Slot,
-    SlotBrief,
+    StoryConnection,
+    StoryInputMode,
+    StoryProjectInput,
 )
-from .rendering import RenderOperation, RenderSection, VideoInputPlan, build_render_plan
+from .rendering import (
+    MediaModality,
+    RenderOperation,
+    RenderSection,
+    VideoInputPlan,
+    build_render_plan,
+)
 from .story_patterns import StoryPattern
-from .user_story import UserStory
 from .visual_profiles import (
     DEFAULT_SERIES_VISUAL_PROFILE,
     DEFAULT_STYLE_PROFILE,
@@ -46,7 +55,7 @@ class CompiledPrompt:
 def compile_day_director_prompt(
     *,
     target_date: date,
-    planning_context: str,
+    project_input: StoryProjectInput,
     recent_summaries: tuple[RecentContentSummary, ...] = (),
     event_seeds: tuple[str, ...] = (),
     story_patterns: dict[Slot, StoryPattern] | None = None,
@@ -54,40 +63,38 @@ def compile_day_director_prompt(
     series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
 ) -> str:
-    """总导演只输出全天关系、时段方向和自适应配置解析。"""
+    """主题扩写时生成ProjectOutlineV3；已有逐集剧本不应调用本函数。"""
 
+    if project_input.input_mode is not StoryInputMode.THEME_EXPAND:
+        raise PromptCompilationError("已有逐集剧本不需要调用全天总导演")
     controls = creative_controls or RunCreativeControls()
     recent = "；".join(item.summary_text for item in recent_summaries[-6:]) or "无"
     seeds = "；".join(event_seeds[:3]) or "无适用事件种子，可原创"
     patterns = _pattern_summary(story_patterns or {})
     return "\n".join(
         (
-            "你是持续角色生活流视频的总导演。只输出一个符合JSON Schema的DayBrief，"
+            "你是持续角色生活流视频的总导演。只输出一个符合JSON Schema的ProjectOutlineV3，"
             "不得输出具体动作、镜头、精确秒数、视频Prompt或候选数组。",
-            f"内容日期：{target_date.isoformat()}。用户主题输入：{planning_context}。",
-            "用户已冻结的活动焦点与时长意图："
+            f"内容日期：{target_date.isoformat()}。用户主题：{project_input.theme}。"
+            f"场景路线：{project_input.scene_route.value}。",
+            "用户冻结的活动焦点和时长仅作为时段容量边界，不得写入Outline："
             + json.dumps(controls.model_dump(mode="json"), ensure_ascii=False),
             f"近期已批准内容：{recent}。事件方向种子：{seeds}。模式建议：{patterns}。",
-            "全天默认关系是猫咪主活动、人物副活动或回应、两线汇合形成回报。"
-            "猫咪通过探索、发现、追逐、等待、误触或自然反应推动观众注意力，"
-            "不代替人物完成复杂工具劳动。",
-            "每个slotBrief只输出narrativeRole、eventDirection、appearanceIntent、"
-            "activityFocus、durationBand与decisionReason。用户选择adaptive表示由你"
-            "现在完成决策，不是合法输出值：最终activityFocus只能是cat_lead、"
-            "person_lead或balanced，durationBand只能是short、medium或long；"
-            "固定选择必须原样保留。",
-            "short承载8至15秒轻量事件；medium承载16至30秒的变化、受阻或协作恢复；"
-            "long承载31至45秒连续过程。长时段仍只有一个主事件，不得用第二个任务填时长。",
+            "每个时段的主次关系必须服从用户冻结的活动焦点；猫咪通过探索、发现、追逐、"
+            "等待、误触或自然反应参与事件，不代替人物完成复杂工具劳动。",
             "早间建立当天活动，中午推进变化或主要事件，傍晚回收前文并兑现关系与情绪。"
-            "dayArc用一段完整文字说明全天连续生活弧；总导演只给时段方向，具体事件、"
-            "精确秒数与镜头由时段导演决定。",
+            "day_arc用一段完整文字说明全天连续生活弧。episodes必须是包含morning、noon、"
+            "evening三个固定键的对象；每个时段只输出scene和direction。scene说明主要地点、"
+            "时间和环境阶段，direction说明本时段作用、事件方向以及如何承接前后时段。"
+            "活动焦点、时长档、精确事件和镜头均由项目配置与时段导演决定，不得写进Outline。",
+            _scene_route_instruction(project_input.scene_route),
             f"固定人物：{series_profile.person_identity}；{series_profile.person_hair}；"
             f"{series_profile.person_body}。固定猫咪：{series_profile.cat_identity}。",
             f"猫咪行为边界：{series_profile.cat_motion_rules}。全日画风："
             f"{style_profile.prompt_positive()}；排除{style_profile.prompt_negative()}。",
             "handoffs只用name、fromSlot、toSlot和continuity登记真正跨时段延续的同一"
-            "关键道具或结果；人物、猫咪和普通背景不得登记。slotBriefs严格按"
-            "morning、noon、evening排序。",
+            "关键道具或结果；人物、猫咪和普通背景不得登记。不要输出额外时段或可重复时段数组，"
+            "不要重复任何命名时段，也不要输出第四个时段。",
         )
     )
 
@@ -98,59 +105,60 @@ def compile_day_repair_prompt(
     rejected_candidate: dict[str, object],
     validation_error: str,
 ) -> str:
-    """让总导演用同一创作意图重新输出完整DayBrief，而不是生成局部JSON补丁。"""
+    """让总导演用同一创作意图重新输出完整ProjectOutlineV3。"""
 
     return "\n".join(
         (
             original_prompt,
-            "【上次输出的契约修复】上次Provider已成功返回，但JSON未通过DayBrief契约。",
+            "【上次输出的契约修复】上次Provider已成功返回，但JSON未通过ProjectOutlineV3契约。",
             "上次完整候选："
             + json.dumps(rejected_candidate, ensure_ascii=False, separators=(",", ":")),
             f"精确错误：{validation_error}",
-            "请重新输出一份完整DayBrief，不要输出补丁或解释。特别注意：adaptive只存在于"
-            "用户输入控制中；每个slotBrief的durationBand最终必须选择short、medium或long，"
-            "activityFocus最终必须选择cat_lead、person_lead或balanced。保留原主题、时段边界、"
-            "已冻结选项和handoff，不得借修复改变剧情方向。",
+            "请重新输出一份完整ProjectOutlineV3，不要输出补丁或解释。episodes必须是"
+            "morning、noon、evening三个固定键组成的对象，每个值只含scene和direction。"
+            "保留原主题、场景路线和handoff，不得借修复改变剧情方向。",
         )
     )
 
 
-def compile_day_structuring_prompt(
+def compile_connection_suggestion_prompt(
     *,
-    user_story: UserStory,
-    target_date: date,
-    creative_controls: RunCreativeControls | None = None,
-    series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
-    style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
+    project_theme: str,
+    target_slot: Slot,
+    previous_outcomes: tuple[str, ...],
+    target_source_text: str | None,
+    scene_route: SceneRoute,
 ) -> str:
-    """把用户完整三集剧情映射为DayBrief，不改写情节。"""
+    """为用户生成一张可编辑关联草稿；它不会直接进入后续导演。"""
 
-    controls = creative_controls or RunCreativeControls()
-    episodes = "\n".join(
-        f"剧本{index}（{slot.value}）：{text}"
-        for index, (slot, text) in enumerate(zip(Slot, user_story.episodes, strict=True), 1)
-    )
+    if target_slot is Slot.MORNING:
+        raise PromptCompilationError("上午没有前序时段，不需要剧情关联建议")
+    outcomes = "；".join(previous_outcomes) or "无可继承的前序事实"
+    target = target_source_text or "用户尚未填写本时段原文，只根据项目主题给出宽松连接"
     return "\n".join(
         (
-            "你是全天结构导演。只输出符合JSON Schema的DayBrief，不增删用户剧情。",
-            f"日期：{target_date.isoformat()}。主题：{user_story.theme}。\n{episodes}",
-            "创作控制：" + json.dumps(controls.model_dump(mode="json"), ensure_ascii=False),
-            "用dayArc完整概括全天递进关系，并提炼三个时段作用、事件方向、外观意图、"
-            "活动焦点、时长档和跨时段handoff。固定选择不得改写；adaptive活动焦点与"
-            "时长档按原剧情容量立即解析，最终JSON不得保留adaptive。",
-            "默认以猫咪推动可见信息、人物承担工具活动或回应、最终关系汇合的方式整理，"
-            "但不得改变用户原文的实际主次。",
-            f"固定主体：{series_profile.person_identity}；{series_profile.cat_identity}。",
-            f"唯一画风：{style_profile.prompt_positive()}；排除{style_profile.prompt_negative()}。",
+            "你是生活故事项目的剧情衔接编辑。只输出符合JSON Schema的"
+            "ConnectionSuggestion，不输出Markdown或解释。",
+            f"项目主题：{project_theme}。目标时段：{target_slot.value}。"
+            f"场景路线：{scene_route.value}。",
+            f"前序人工确认结果：{outcomes}。",
+            f"目标时段原文或方向：{target}。",
+            "只建议是否独立成篇、选择性关联或直接续接。brief使用一段自然语言，"
+            "只保留对目标剧情有价值的道具、情绪、地点或结果，不复制完整前序剧情，"
+            "不把分身、错误配饰、错误连接等偶发媒体问题写成事实。该输出只是用户可编辑草稿。",
         )
     )
 
 
 def compile_episode_director_prompt(
     *,
-    day_brief: DayBrief,
-    slot_brief: SlotBrief,
-    previous_state_summaries: tuple[str, ...],
+    project_theme: str,
+    scene_route: SceneRoute,
+    slot: Slot,
+    outline_episode: OutlineEpisode | None,
+    activity_focus: ActivityFocus,
+    duration_band: DurationBand,
+    story_connection: StoryConnection | None = None,
     retry_reason: str | None = None,
     rejected_candidate: dict[str, object] | None = None,
     validation_errors: tuple[str, ...] = (),
@@ -161,9 +169,13 @@ def compile_episode_director_prompt(
     """时段导演在总导演边界内生成精确事件、时长和镜头。"""
 
     return _episode_director_body(
-        day_brief=day_brief,
-        slot_brief=slot_brief,
-        previous_state_summaries=previous_state_summaries,
+        project_theme=project_theme,
+        scene_route=scene_route,
+        slot=slot,
+        outline_episode=outline_episode,
+        activity_focus=activity_focus,
+        duration_band=duration_band,
+        story_connection=story_connection,
         retry_reason=retry_reason,
         rejected_candidate=rejected_candidate,
         validation_errors=validation_errors,
@@ -177,9 +189,12 @@ def compile_episode_director_prompt(
 def compile_episode_adaptation_prompt(
     *,
     user_episode_text: str,
-    day_brief: DayBrief,
-    slot_brief: SlotBrief,
-    previous_state_summaries: tuple[str, ...],
+    project_theme: str,
+    scene_route: SceneRoute,
+    slot: Slot,
+    activity_focus: ActivityFocus,
+    duration_band: DurationBand,
+    story_connection: StoryConnection | None = None,
     retry_reason: str | None = None,
     rejected_candidate: dict[str, object] | None = None,
     validation_errors: tuple[str, ...] = (),
@@ -189,9 +204,13 @@ def compile_episode_adaptation_prompt(
     """把用户本集原文映射为同一EpisodeScript，不增删情节。"""
 
     return _episode_director_body(
-        day_brief=day_brief,
-        slot_brief=slot_brief,
-        previous_state_summaries=previous_state_summaries,
+        project_theme=project_theme,
+        scene_route=scene_route,
+        slot=slot,
+        outline_episode=None,
+        activity_focus=activity_focus,
+        duration_band=duration_band,
+        story_connection=story_connection,
         retry_reason=retry_reason,
         rejected_candidate=rejected_candidate,
         validation_errors=validation_errors,
@@ -204,9 +223,13 @@ def compile_episode_adaptation_prompt(
 
 def _episode_director_body(
     *,
-    day_brief: DayBrief,
-    slot_brief: SlotBrief,
-    previous_state_summaries: tuple[str, ...],
+    project_theme: str,
+    scene_route: SceneRoute,
+    slot: Slot,
+    outline_episode: OutlineEpisode | None,
+    activity_focus: ActivityFocus,
+    duration_band: DurationBand,
+    story_connection: StoryConnection | None,
     retry_reason: str | None,
     rejected_candidate: dict[str, object] | None,
     validation_errors: tuple[str, ...],
@@ -215,18 +238,34 @@ def _episode_director_body(
     style_profile: StyleProfile,
     user_episode_text: str | None,
 ) -> str:
-    previous = "；".join(previous_state_summaries) or "当天第一条，无前序结果"
-    requested = slot_brief.duration_band.range
-    source = (
-        "用户本集原文（不得增删情节）：" + user_episode_text
-        if user_episode_text is not None
-        else "根据DayBrief原创一个具体生活事件。"
+    connection = (
+        "本时段已确认剧情关联：" + story_connection.brief
+        if story_connection is not None and story_connection.use_for_director
+        else "本时段不加载前序剧情关联；独立完成当前事件，不得自行继承前序媒体偶发内容"
     )
+    requested = duration_band.range
+    if user_episode_text is not None:
+        source = "用户本集原文（核心事件、场景与结尾不得改写）：" + user_episode_text
+    elif outline_episode is not None:
+        source = "根据ProjectOutlineV3原创一个具体生活事件。"
+    else:
+        source = "根据用户项目主题生成一个具体生活事件；是否关联前序仅由关联卡决定。"
     pattern = (
         f"建议叙事模式：{story_pattern.name}；节拍：{'→'.join(story_pattern.structure)}。"
         if story_pattern is not None
         else "选择最适合本时段的叙事模式。"
     )
+    if duration_band is DurationBand.SHORT:
+        duration_capacity = (
+            "短片容量规则：只完整表现一个需要精确接触的关键交互闭环；同一镜头不得串联"
+            "多个交接、穿戴、容器收纳或带线工具操作。其余准备过程应在稳定切镜后以已经"
+            "完成的可见状态呈现，不逐件演示，不得为了保留原文每个动作而挤压因果闭环。"
+        )
+    else:
+        duration_capacity = (
+            "每个镜头最多完整表现一个需要精确接触的关键交互闭环；交接、穿戴、容器收纳"
+            "和带线工具操作分配到不同稳定段落，不得在同一镜头内连续堆叠。"
+        )
     repair = ""
     if rejected_candidate is not None:
         repair = (
@@ -236,50 +275,65 @@ def _episode_director_body(
         )
     return "\n".join(
         (
-            f"你是{slot_brief.slot.value}时段导演。只输出一个符合JSON Schema的"
+            f"你是{slot.value}时段导演。只输出一个符合JSON Schema的"
             "EpisodeScript，不输出slot、解释或Markdown。",
             source,
-            "DayBrief：" + json.dumps(day_brief.model_dump(mode="json"), ensure_ascii=False),
-            "本时段边界：" + json.dumps(slot_brief.model_dump(mode="json"), ensure_ascii=False),
-            f"前序时段结果：{previous}。{pattern}",
+            f"生活故事主题：{project_theme}。场景路线：{scene_route.value}。",
+            (
+                "本时段Outline："
+                + json.dumps(outline_episode.model_dump(mode="json"), ensure_ascii=False)
+                if outline_episode is not None
+                else "用户已明确选择AI根据项目主题生成本集；"
+                "当前不存在总导演Outline，不得伪造全天边界或继承未确认候选。"
+            ),
+            f"{connection}。{pattern}",
             f"精确时长必须在{requested[0]}至{requested[1]}秒之间；根据可见动作需要选择"
             "整数秒，不用停顿填时长。8至15秒使用1至3镜头；16至30秒至少2镜头；"
             "31至45秒至少3镜头并可使用process_montage。全程只有一个主事件。",
-            f"本时段活动焦点固定为{slot_brief.activity_focus.value}。relationshipArc用"
-            "一段完整文字写清猫咪主活动、人物副活动和两线如何汇合。cat_lead时猫咪必须"
-            "通过探索、发现、追逐、等待、误触或自然反应推动新信息，人物只承担工具"
-            "操作、辅助或回应；不能把猫写成画面边缘装饰。",
+            duration_capacity,
+            f"本时段活动焦点固定为{activity_focus.value}。"
+            + _episode_focus_direction(activity_focus),
             "猫咪保持四足自然行为：可追逐、嗅闻、拨弄、轻拍、蹭、跳上低矮物或叼"
             "轻小物；不得直立、双足行走、人手式抓握或操作复杂工具。猫咪靠近绳线、"
             "线轴、鱼竿等连接物或工具时，优先用耳朵、视线、尾巴和四足位移提示信息，"
             "不要设计持续抬起前躯、拨动被连接物牵制的部件或替人物排除工具故障。",
-            "storyText用连贯长段文字完整描述场景、剧情起因、推进、猫咪主活动、人物回应"
+            "story_text用连贯长段文字完整描述场景、剧情起因、主导活动、另一角色的独立反应"
             "和可见回报，不拆成动作字段。shots为1至3个，每项只填写order和direction；"
             "direction必须是可以直接交给视频模型的完整镜头段落，同时写清镜头目的、景别、"
             "机位、唯一运镜、人物与猫咪站位、实际动作主体、肢体路径和速度、接触对象、"
             "可见结果及稳定切点。每个镜头最多安排一个关键接触关系变化；猫咪与人物不得"
             "同时操作同一工具或连接物。不要把这些信息再拆成其他字段。",
-            "开场立即呈现一个尚未完成的小事件或可感知信号，不用空镜等待进入剧情。"
-            "全片安排3至5次彼此不同的可见信息更新，通常每2至3秒通过动作、发现、声音"
-            "或关系变化刷新一次；同一动作、景别和情绪功能不得重复填充时长。结尾必须"
-            "回应开场期待。镜头切换只能发生在动作已经落稳、接触关系清楚的状态。",
-            "hardConstraints只登记会直接影响画面正确性的自然语言关系事实，并用"
-            "shotOrders限定适用镜头；空shotOrders表示全片。普通走动、视线、背景和轻微"
+            "开场立即进入一个尚未完成的小事件或可感知信号，不用空镜等待进入剧情。"
+            + _episode_opening_direction(activity_focus)
+            + "每个镜头必须带来与上一镜不同的新动作、发现、声音或关系"
+            "变化；同一动作、景别和情绪功能不得重复填充时长。结尾回应开场期待，并让猫咪"
+            "活动线和人物活动线形成可见汇合。镜头只在动作落稳、接触关系清楚时切换。",
+            "hard_constraints只登记会直接影响画面正确性的自然语言关系事实，并用"
+            "shot_orders限定适用镜头；空shot_orders表示全片。普通走动、视线、背景和轻微"
             "表情不要登记。连接类必须写清两端归属及不得接触的角色，例如风筝线只能连接"
             "人物手中线轴与风筝，不得经过或缠绕猫咪。除非故事成败确实依赖某只手，约束"
-            "只写人物持续支撑或持有，不锁死左右手；storyText、shots和hardConstraints中的"
+            "只写人物持续支撑或持有，不锁死左右手；story_text、shots和hard_constraints中的"
             "持有者、接触方式必须一致。人物携带带线物体移动前，先将松线完整收纳在线轴或"
             "容器内，猫咪位于连接线的另一侧，不让松线跨过猫咪或行走路径。",
-            "appearance用一段文字只描述人物本时段的完整定妆，不得混入猫咪、场景或道具状态。"
-            "必须明确上装、下装、鞋袜，以及外套、帽子、包或配饰是穿戴还是明确没有；"
+            "交接关系必须描述为连续的控制权转移：交出者先稳定支撑物品，接收者建立可靠接触后，"
+            "交出者立即释放；两者在交接瞬间短暂同时接触同一物品是必要的过渡，不得写成禁止。"
+            "只有交接完成后仍长期共同持有、物品复制、落地或转交给错误对象才属于失败。",
+            "猫咪保持真实猫科动作，但不得把自然的坐姿、伏低，或前爪对低矮物体的拨、按、扶、"
+            "轻拍写成违规；只有以后腿直立、人手式抓握或用前爪搬运物品才需要禁止。轻小物品的"
+            "位移由猫咪用嘴叼取完成。",
+            "appearance用一段文字只描述人物本时段稳定不变的完整定妆，不得混入猫咪、场景或道具状态。"
+            "必须明确上装、下装、鞋袜，以及稳定穿戴的外套、帽子或配饰；会在镜头中被拿起、放下、"
+            "打开、收纳或改变位置的背包和随身物只写进story_text、相关镜头和必要硬约束，"
+            "不得写成appearance中的固定穿戴状态。"
             "描述必须足以生成一张从头顶到鞋底均完整可见的单人全身定妆图。"
-            "猫咪配饰如草帽直接写进storyText、相关镜头和必要硬约束，不写入appearance。",
-            "ending用一段可见结果兑现relationshipArc，不能用原地互看或完全静止填时长。"
-            "soundDesign明确环境底声、动作声和结尾声音回报，无对白、旁白或歌词。",
+            "猫咪配饰如草帽直接写进story_text、相关镜头和必要硬约束，不写入appearance。",
+            "ending用一段可见结果兑现relationship_arc，不能用原地互看或完全静止填时长。"
+            "sound_design明确环境底声、动作声和结尾声音回报，无对白、旁白或歌词。",
             f"人物身份：{series_profile.person_identity}；{series_profile.person_hair}；"
             f"{series_profile.person_body}。猫咪：{series_profile.cat_identity}；"
             f"{series_profile.cat_motion_rules}。",
             f"画风：{style_profile.prompt_positive()}；排除{style_profile.prompt_negative()}。",
+            _scene_route_episode_instruction(scene_route, slot, user_episode_text is not None),
             (f"人工重规划原因：{retry_reason}。" if retry_reason else "") + repair,
         )
     )
@@ -338,8 +392,10 @@ def compile_opening_anchor_prompt(
             "画风图只负责视觉媒介，道具图只负责对应道具。",
             f"【固定身份】{series_profile.person_identity}；{series_profile.person_hair}；"
             f"{series_profile.cat_identity}。全画面准确一人一猫。",
-            f"【人物定妆】{episode.script.appearance}。场景、站位和动作起点只以开场镜头为准，"
-            "不得把完整剧情中的后续动作或结果提前画入第一帧。",
+            f"【人物定妆】{episode.script.appearance}。场景、站位、穿戴状态和道具位置只以开场镜头为准，"
+            "不得把完整剧情中的后续动作或结果提前画入第一帧。若定妆参考图中出现了会在剧情中移动的"
+            "包或随身物，只继承人物身份和服装，不继承该物体位置；同一背包、容器或工具在画面中只能"
+            "出现一次，严格放在开场镜头声明的位置，不得因参考图中的携带状态复制一份。",
             f"【活动焦点】{focus}。猫咪必须处于能推动下一步事件的位置，不是边缘装饰。",
             f"【开场镜头】{first_shot.direction}。只呈现该镜头动作开始时的稳定画面，"
             "不要提前完成后续动作，也不要为展示物品而重建镜头未要求的静物陈列。",
@@ -422,6 +478,9 @@ def compile_image_review_prompt(
             "第一动作已经出现少量进展误判为道具错误。若声明了连接、承重、包含、接触、"
             "交接或穿戴关系，必须检查关系两端是否"
             "归属于正确对象；连接线不得转移、穿过或缠绕未声明的角色。"
+            "猫咪自然坐着或伏低时，前爪搭在低矮容器边缘、轻按、拨动或扶住物体仍属于正常"
+            "四足猫科行为，只能记为warning；只有以后腿直立、用前爪形成人手式抓握或搬运"
+            "物品时，才可令constraintsOk=false。"
             "没有写入开场硬约束的普通花草、光影、漂浮绒毛等环境线索，其精确数量、姿态或形状差异"
             "只写warnings，不得据此令compositionOk或constraintsOk失败。轻微表情或合理构图差异也只写warnings。",
         )
@@ -452,6 +511,12 @@ def compile_video_prompt(
         )
     binding = input_plan.bindings[0].prompt_alias
     binding_text = f"{binding}是严格开场画面，保持其人物、猫咪、服装和空间轴线"
+    if len(input_plan.bindings) > 1:
+        binding_text += "；" + "；".join(
+            f"{item.prompt_alias}仅作为{item.semantic_key.removeprefix('previous:')}参考，"
+            "不得覆盖开场画面的主体身份、服装和空间关系"
+            for item in input_plan.bindings[1:]
+        )
     shot_lines = [_video_shot_line(episode, shot) for shot in shots]
     final_section = section.order == len(build_render_plan(episode).sections)
     constraints = _constraint_requirements(
@@ -551,6 +616,7 @@ def compile_video_prompt_preview(
     *,
     resolution: str,
     section_order: int = 1,
+    references: tuple[tuple[str, MediaModality], ...] = (),
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
     series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
 ) -> CompiledPrompt:
@@ -558,7 +624,7 @@ def compile_video_prompt_preview(
 
     from uuid import UUID
 
-    from .rendering import MediaBinding, MediaModality, ProviderMediaRole, VideoInputPlan
+    from .rendering import MediaBinding, ProviderMediaRole, VideoInputPlan
 
     render_plan = build_render_plan(episode)
     try:
@@ -566,24 +632,44 @@ def compile_video_prompt_preview(
     except StopIteration as exc:
         raise PromptCompilationError(f"不存在渲染区段{section_order}") from exc
     operation = RenderOperation.INITIAL if section_order == 1 else RenderOperation.EXTEND
+    bindings = [
+        MediaBinding(
+            asset_id=UUID(int=section_order),
+            semantic_key="opening:preview" if section_order == 1 else "video:preview",
+            modality=MediaModality.IMAGE if section_order == 1 else MediaModality.VIDEO,
+            provider_role=(
+                ProviderMediaRole.FIRST_FRAME
+                if section_order == 1
+                else ProviderMediaRole.REFERENCE_VIDEO
+            ),
+            ordinal=1,
+            sha256="0" * 64,
+        )
+    ]
+    if section_order != 1 and references:
+        raise PromptCompilationError("只有初始视频Prompt允许附加前序参考素材")
+    modality_counts = {MediaModality.IMAGE: 1, MediaModality.VIDEO: 0}
+    for index, (semantic_key, modality) in enumerate(references, start=1):
+        modality_counts[modality] += 1
+        bindings.append(
+            MediaBinding(
+                asset_id=UUID(int=section_order * 10 + index),
+                semantic_key=semantic_key,
+                modality=modality,
+                provider_role=(
+                    ProviderMediaRole.REFERENCE_IMAGE
+                    if modality is MediaModality.IMAGE
+                    else ProviderMediaRole.REFERENCE_VIDEO
+                ),
+                ordinal=modality_counts[modality],
+                sha256=f"{index:x}" * 64,
+            )
+        )
     plan = VideoInputPlan(
         operation=operation,
         resolution=resolution,
         duration_seconds=section.duration_seconds,
-        bindings=[
-            MediaBinding(
-                asset_id=UUID(int=section_order),
-                semantic_key="opening:preview" if section_order == 1 else "video:preview",
-                modality=MediaModality.IMAGE if section_order == 1 else MediaModality.VIDEO,
-                provider_role=(
-                    ProviderMediaRole.FIRST_FRAME
-                    if section_order == 1
-                    else ProviderMediaRole.REFERENCE_VIDEO
-                ),
-                ordinal=1,
-                sha256="0" * 64,
-            )
-        ],
+        bindings=bindings,
     )
     return compile_video_prompt(
         episode,
@@ -616,6 +702,12 @@ def compile_video_diagnostic_prompt(
             "按抽帧顺序检查身份、二维画风、猫咪四足动作、关键道具连续性、镜头顺序"
             "和结尾回报。每条evidence必须分别填写timestamp、object、observation和"
             "relationError；没有关系错误时relationError为null。"
+            "四足自然动作不等于每一帧四只脚都必须着地：猫咪以后腿稳定支撑、双前爪"
+            "短暂搭在人物膝部或低矮物体上属于真实猫科搭靠，只能记为warning；只有无支撑"
+            "直立、双足行走、前爪形成人手式抓握或操作工具时才可判为动作硬失败。"
+            "检查交接时必须区分过渡与终态：交出者保持支撑、接收者建立接触、随后交出者释放的"
+            "短暂双向接触属于正确交接，只能按动作连续性记录；只有交接完成后仍长期共同持有、"
+            "物品复制、落地或归属错误时，才可判为constraintsOk=false。"
             "连接线、承重物、容器、交接物或穿戴物归属错误必须判为constraintsOk=false。"
             "轻微表情和合理切镜变化不得误判为硬失败。",
             f"本次固定按12张均匀抽帧审核，对应估算秒点依次为：{sample_times}。"
@@ -681,7 +773,7 @@ def _constraint_requirements(
     episode: EpisodePlan,
     shot_orders: tuple[int, ...] | None = None,
 ) -> str | None:
-    """按镜头投影硬约束；空shotOrders表示全片适用。"""
+    """按镜头投影硬约束；空shot_orders表示全片适用。"""
 
     selected = tuple(
         item
@@ -712,6 +804,37 @@ def _focus_instruction(focus: ActivityFocus) -> str:
     }[focus]
 
 
+def _episode_focus_direction(focus: ActivityFocus) -> str:
+    return {
+        ActivityFocus.CAT_LEAD: (
+            "relationship_arc写清猫咪如何推动主要可见信息、人物如何承担副活动或回应，"
+            "以及两条活动线如何汇合；猫咪不能只是画面边缘装饰。"
+        ),
+        ActivityFocus.PERSON_LEAD: (
+            "relationship_arc写清人物如何推动主事件、猫咪如何产生独立且自然的反应，"
+            "以及猫咪反应怎样在结尾回到人物关系中；不得把主导任务改写给猫咪。"
+        ),
+        ActivityFocus.BALANCED: (
+            "relationship_arc写清人物和猫咪如何共同推动同一个目标并在结尾汇合；"
+            "双方可以分别贡献新信息，但不得形成两个互不相干的任务。"
+        ),
+    }[focus]
+
+
+def _episode_opening_direction(focus: ActivityFocus) -> str:
+    return {
+        ActivityFocus.CAT_LEAD: (
+            "先由猫咪的观察、追逐、等待、误触或声音反应触发第一条可见信息，人物随后回应。"
+        ),
+        ActivityFocus.PERSON_LEAD: (
+            "先让人物正在进行的未完成活动产生第一条可见变化，猫咪随后给出独立自然反应。"
+        ),
+        ActivityFocus.BALANCED: (
+            "开场直接建立双方共同面对的同一目标，让人物和猫咪以不同动作共同推进第一条信息。"
+        ),
+    }[focus]
+
+
 def _reference_description(role: str) -> str:
     if role.startswith("person:"):
         return "人物面貌、短发与身体比例"
@@ -731,6 +854,46 @@ def _pattern_summary(patterns: dict[Slot, StoryPattern]) -> str:
         f"{slot.value}={pattern.name}（{'→'.join(pattern.structure)}）"
         for slot, pattern in patterns.items()
     )
+
+
+def _scene_route_instruction(scene_route: SceneRoute) -> str:
+    return {
+        SceneRoute.PROGRESSIVE_LOCATIONS: (
+            "本项目明确采用关联多场景：上午建立准备或出发场景，中午进入主要活动场景，"
+            "傍晚进入收束、归途或归家场景。三个scene必须清楚不同，但通过同一关键道具、"
+            "前序结果、动作方向、光线或声音自然承接。"
+        ),
+        SceneRoute.SINGLE_LOCATION: (
+            "本项目采用单地点递进：三个时段保持同一主要地点，但时间、活动阶段和关系回报"
+            "必须持续推进，不得重复同一事件。"
+        ),
+        SceneRoute.ADAPTIVE: (
+            "根据主题选择场景路线：钓鱼、放风筝、旅行等出行活动优先采用准备地点→主要活动"
+            "地点→收束或归家地点；采茶、居家等原地生活主题可以采用同地点阶段递进。"
+        ),
+    }[scene_route]
+
+
+def _scene_route_episode_instruction(
+    scene_route: SceneRoute,
+    slot: Slot,
+    uses_user_script: bool,
+) -> str:
+    if uses_user_script:
+        return (
+            "用户原文已经决定本时段场景；只做镜头化适配，不得把它改回前一时段地点，"
+            "也不得为了统一画面而删掉原文的出发、换场、归途或归家关系。"
+        )
+    if scene_route is SceneRoute.PROGRESSIVE_LOCATIONS:
+        role = {
+            Slot.MORNING: "准备、建立目标或出发",
+            Slot.NOON: "进入主要活动地点并完成当天核心变化",
+            Slot.EVENING: "进入归途、归家或情绪收束地点并回收前文",
+        }[slot]
+        return f"关联多场景中本时段职责是：{role}；不得无理由复用相邻时段的主要场景。"
+    if scene_route is SceneRoute.SINGLE_LOCATION:
+        return "本时段保持同一主要地点，但必须通过时间、活动阶段和关系变化推进新内容。"
+    return "按主题和本时段职责选择最自然的场景；出行主题不得把准备、主活动和归家全部压在同一地点。"
 
 
 def _compiled(text: str) -> CompiledPrompt:

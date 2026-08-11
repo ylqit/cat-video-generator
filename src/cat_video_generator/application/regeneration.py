@@ -51,7 +51,7 @@ class RegenerationService:
         if step.kind is StepKind.DIRECTOR:
             if step.episode_id is not None:
                 raise ValueError("时段导演节点请使用重新规划")
-            return self._planning.regenerate_day_brief(
+            return self._planning.regenerate_project_outline(
                 step.id,
                 reason=reason,
                 prompt_override=prompt_override,

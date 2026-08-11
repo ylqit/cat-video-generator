@@ -10,12 +10,13 @@ from __future__ import annotations
 from datetime import date, datetime
 from enum import StrEnum
 from typing import Annotated, Literal
+from uuid import UUID
 
 from pydantic import Field, model_validator
 
 from .contract_base import StrictModel
 
-CURRENT_CONTRACT_VERSION = 2
+CURRENT_CONTRACT_VERSION = 3
 
 
 class ContractVersionError(ValueError):
@@ -32,6 +33,58 @@ class Slot(StrEnum):
     @property
     def sort_order(self) -> int:
         return {Slot.MORNING: 1, Slot.NOON: 2, Slot.EVENING: 3}[self]
+
+
+class StoryInputMode(StrEnum):
+    """生活故事项目的剧情来源。"""
+
+    THEME_EXPAND = "theme_expand"
+    EPISODE_SCRIPTS = "episode_scripts"
+
+
+class SceneRoute(StrEnum):
+    """早中晚场景关系；只指导导演，不作为剧情质量硬门。"""
+
+    ADAPTIVE = "adaptive"
+    PROGRESSIVE_LOCATIONS = "progressive_locations"
+    SINGLE_LOCATION = "single_location"
+
+
+class EpisodeSources(StrictModel):
+    """用户提供的逐集原文；顺序人工模式允许只先填写一个时段。"""
+
+    morning: Annotated[str, Field(min_length=4)] | None = None
+    noon: Annotated[str, Field(min_length=4)] | None = None
+    evening: Annotated[str, Field(min_length=4)] | None = None
+
+    def for_slot(self, slot: Slot) -> str | None:
+        return {
+            Slot.MORNING: self.morning,
+            Slot.NOON: self.noon,
+            Slot.EVENING: self.evening,
+        }[slot]
+
+    @property
+    def populated_slots(self) -> tuple[Slot, ...]:
+        return tuple(slot for slot in Slot if self.for_slot(slot) is not None)
+
+
+class StoryProjectInput(StrictModel):
+    """生活故事项目的最小创作输入，不混入运行状态或供应商参数。"""
+
+    theme: Annotated[str, Field(min_length=2, max_length=160)]
+    input_mode: StoryInputMode = StoryInputMode.THEME_EXPAND
+    scene_route: SceneRoute = SceneRoute.ADAPTIVE
+    episode_sources: EpisodeSources = Field(default_factory=EpisodeSources)
+
+    @model_validator(mode="after")
+    def validate_source_mode(self) -> StoryProjectInput:
+        populated = self.episode_sources.populated_slots
+        if self.input_mode is StoryInputMode.THEME_EXPAND and populated:
+            raise ValueError("主题扩写模式不能同时携带用户逐集原文")
+        if self.input_mode is StoryInputMode.EPISODE_SCRIPTS and not populated:
+            raise ValueError("已有剧本模式至少需要提供一个时段原文")
+        return self
 
 
 class ActivityFocus(StrEnum):
@@ -131,7 +184,7 @@ class HardConstraint(StrictModel):
 
 
 class AcceptedOutcome(StrictModel):
-    """人工确认的实际成片结果，是下一时段导演唯一可继承的媒体事实。"""
+    """人工确认的实际成片结果，只用于审计、解锁和可选关联建议。"""
 
     summary: Annotated[str, Field(min_length=8)]
     carry_forward: list[Annotated[str, Field(min_length=2)]] = Field(
@@ -153,16 +206,89 @@ class AcceptedOutcome(StrictModel):
         return self
 
 
-class SlotBrief(StrictModel):
-    """总导演交给单个时段导演的创作边界。"""
+class StoryConnectionMode(StrEnum):
+    """后续时段与已完成剧情的关系；不存在隐式默认继承。"""
 
-    slot: Slot
-    narrative_role: Annotated[str, Field(min_length=4)]
-    event_direction: Annotated[str, Field(min_length=8)]
-    appearance_intent: Annotated[str, Field(min_length=4)]
-    activity_focus: ActivityFocus
-    duration_band: DurationBand
-    decision_reason: Annotated[str, Field(min_length=4)]
+    INDEPENDENT = "independent"
+    SELECTED_LINK = "selected_link"
+    DIRECT_CONTINUE = "direct_continue"
+
+
+class StoryConnection(StrictModel):
+    """用户确认的轻量剧情关联卡。
+
+    关联卡可以保留但不加载给导演，便于用户比较不同创作路线；后续导演只会
+    收到 ``use_for_director`` 为真的卡片正文，不读取完整 AcceptedOutcome。
+    """
+
+    use_for_director: Annotated[bool, Field(alias="useForDirector")] = False
+    mode: StoryConnectionMode = StoryConnectionMode.INDEPENDENT
+    brief: str = ""
+    confirmed_at: Annotated[
+        datetime | None,
+        Field(alias="confirmedAt"),
+    ] = None
+
+    @model_validator(mode="after")
+    def validate_connection(self) -> StoryConnection:
+        normalized = self.brief.strip()
+        if self.use_for_director and not normalized:
+            raise ValueError("加载剧情关联卡时必须填写关联说明")
+        if self.mode is StoryConnectionMode.INDEPENDENT and self.use_for_director:
+            raise ValueError("独立成篇模式不能加载前序剧情")
+        self.brief = normalized
+        return self
+
+
+class ConnectionSuggestion(StrictModel):
+    """可选Planning调用返回的关联草稿；保存前仍需用户编辑和确认。"""
+
+    mode: StoryConnectionMode
+    brief: Annotated[str, Field(min_length=1, max_length=1200)]
+
+
+class CrossSlotReferenceRole(StrEnum):
+    IDENTITY = "identity"
+    PROP = "prop"
+    SCENE = "scene"
+    COMPOSITION = "composition"
+    MOTION = "motion"
+
+
+class CrossSlotReferenceTarget(StrEnum):
+    OPENING_ANCHOR = "opening_anchor"
+    VIDEO = "video"
+    BOTH = "both"
+
+
+class CrossSlotReference(StrictModel):
+    """用户明确选择的前序媒体引用；只在目标节点的输入快照中生效。"""
+
+    asset_id: Annotated[UUID, Field(alias="assetId")]
+    role: CrossSlotReferenceRole
+    apply_to: Annotated[CrossSlotReferenceTarget, Field(alias="applyTo")]
+
+
+class OutlineEpisode(StrictModel):
+    """总导演为一个命名时段留下的场景和剧情方向。"""
+
+    scene: Annotated[str, Field(min_length=4)]
+    direction: Annotated[str, Field(min_length=8)]
+
+
+class OutlineEpisodes(StrictModel):
+    """固定命名时段从结构上杜绝重复Noon或第四个时段。"""
+
+    morning: OutlineEpisode
+    noon: OutlineEpisode
+    evening: OutlineEpisode
+
+    def for_slot(self, slot: Slot) -> OutlineEpisode:
+        return {
+            Slot.MORNING: self.morning,
+            Slot.NOON: self.noon,
+            Slot.EVENING: self.evening,
+        }[slot]
 
 
 class Handoff(StrictModel):
@@ -180,19 +306,17 @@ class Handoff(StrictModel):
         return self
 
 
-class DayBrief(StrictModel):
-    """总导演输出的全天主线，不包含具体动作和运镜。"""
+class ProjectOutlineV3(StrictModel):
+    """总导演输出的当前契约；不重复保存活动焦点和时长。"""
 
     content_date: date
     theme: Annotated[str, Field(min_length=2, max_length=160)]
     day_arc: Annotated[str, Field(min_length=12)]
-    slot_briefs: list[SlotBrief] = Field(min_length=3, max_length=3)
+    episodes: OutlineEpisodes
     handoffs: list[Handoff] = Field(default_factory=list, max_length=12)
 
     @model_validator(mode="after")
-    def validate_day(self) -> DayBrief:
-        if [item.slot for item in self.slot_briefs] != list(Slot):
-            raise ValueError("DayBrief时段必须按morning、noon、evening排序")
+    def validate_day(self) -> ProjectOutlineV3:
         handoff_keys = [(item.name, item.from_slot, item.to_slot) for item in self.handoffs]
         if len(handoff_keys) != len(set(handoff_keys)):
             raise ValueError("同一时段交接不能重复")
@@ -233,11 +357,6 @@ class EpisodeScript(StrictModel):
                 "硬约束引用不存在的镜头："
                 + ", ".join(str(item) for item in sorted(unknown_constraint_shots))
             )
-        required_shots = (
-            1 if self.duration_seconds <= 15 else 2 if self.duration_seconds <= 30 else 3
-        )
-        if len(self.shots) < required_shots:
-            raise ValueError("当前时长没有足够的连续镜头承载渲染区段")
         return self
 
 
@@ -257,37 +376,31 @@ class EpisodePlan(StrictModel):
 
 
 class DailyProductionPlan(StrictModel):
-    """DayBrief与三个顺序时段脚本的内存聚合。"""
+    """生活故事项目完成三集规划后的内存聚合。"""
 
-    day_brief: DayBrief
+    content_date: date
+    project_input: StoryProjectInput
+    outline: ProjectOutlineV3 | None = None
     episodes: list[EpisodePlan] = Field(min_length=3, max_length=3)
 
     @property
-    def content_date(self) -> date:
-        return self.day_brief.content_date
-
-    @property
     def theme(self) -> str:
-        return self.day_brief.theme
+        return self.project_input.theme
 
     @model_validator(mode="after")
     def validate_day(self) -> DailyProductionPlan:
+        if self.project_input.input_mode is StoryInputMode.THEME_EXPAND:
+            if self.outline is None:
+                raise ValueError("主题扩写项目必须包含ProjectOutlineV3")
+            if self.outline.theme != self.project_input.theme:
+                raise ValueError("ProjectOutlineV3主题与生活故事项目不一致")
+            if self.outline.content_date != self.content_date:
+                raise ValueError("ProjectOutlineV3日期与生活故事项目不一致")
+        else:
+            if self.outline is not None:
+                raise ValueError("已有剧本项目不得伪造ProjectOutlineV3")
         if [item.slot for item in self.episodes] != list(Slot):
             raise ValueError("全天Episode必须按morning、noon、evening排序")
-        if len({item.script.title for item in self.episodes}) != 3:
-            raise ValueError("早中晚标题必须互不重复")
-        if len({item.script.event_key for item in self.episodes}) != 3:
-            raise ValueError("早中晚必须使用不同的时段事件键")
-        briefs = {item.slot: item for item in self.day_brief.slot_briefs}
-        for episode in self.episodes:
-            brief = briefs[episode.slot]
-            if episode.script.activity_focus is not brief.activity_focus:
-                raise ValueError(f"{episode.slot.value}活动焦点与DayBrief不一致")
-            minimum, maximum = brief.duration_band.range
-            if not minimum <= episode.duration_seconds <= maximum:
-                raise ValueError(
-                    f"{episode.slot.value}精确时长不在{brief.duration_band.value}档"
-                )
         return self
 
 

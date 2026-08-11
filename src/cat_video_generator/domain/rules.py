@@ -1,7 +1,7 @@
 """规划、身份、输入与叙事连续性的少量确定性规则。
 
-这里只阻断引用错误、固定身份改写和跨时段道具键冲突。镜头复杂度、Prompt长度与
-动作难度只产生诊断，实际画面质量由视觉审核和人工内容审核决定。
+这里只阻断无法提交给供应商的结构、素材与渲染能力错误。身份措辞、镜头复杂度、
+Prompt长度与动作难度只产生诊断，实际画面质量由AI建议和人工内容审核决定。
 """
 
 from __future__ import annotations
@@ -13,10 +13,8 @@ from typing import Iterable
 
 from .contracts import (
     DailyProductionPlan,
-    DayBrief,
     EpisodePlan,
     RecentContentSummary,
-    SlotBrief,
 )
 from .rendering import build_render_plan
 from .visual_profiles import DEFAULT_SERIES_VISUAL_PROFILE, SeriesVisualProfile
@@ -49,21 +47,14 @@ def validate_plan_gate(
     return tuple(issues)
 
 
-def validate_episode_against_brief(
+def validate_episode_gate(
     episode: EpisodePlan,
     *,
-    day_brief: DayBrief,
-    slot_brief: SlotBrief,
     series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
 ) -> tuple[GateIssue, ...]:
+    """检查单集固有合法性；焦点和时长由应用层对照RunCreativeControls。"""
+
     issues = list(_identity_issues(episode, series_profile))
-    if episode.slot is not slot_brief.slot:
-        issues.append(_hard("plan", "slot_mismatch", "时段导演返回了错误的slot"))
-    if episode.script.activity_focus is not slot_brief.activity_focus:
-        issues.append(_hard("plan", "activity_focus_mismatch", "时段导演改写了固定活动焦点"))
-    minimum, maximum = slot_brief.duration_band.range
-    if not minimum <= episode.duration_seconds <= maximum:
-        issues.append(_hard("plan", "duration_band_mismatch", "精确时长超出总导演解析档位"))
     try:
         build_render_plan(episode)
     except ValueError as exc:
@@ -116,10 +107,10 @@ def _identity_issues(
     protected = text.replace("少年宫", "").replace("马尾松", "")
     if any(item.casefold() in protected for item in profile.forbidden_identity_rewrites):
         return (
-            _hard(
+            _warning(
                 "identity",
                 "gendered_identity_rewrite",
-                f"{episode.slot.value}改写了中性儿童身份或固定发长",
+                f"{episode.slot.value}可能改写中性儿童身份或固定发长，请人工确认",
             ),
         )
     return ()

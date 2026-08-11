@@ -14,10 +14,16 @@ from cat_video_generator.domain.contracts import (
     DailyProductionPlan,
     EpisodePlan,
     EpisodeScript,
+    EpisodeSources,
+    ProjectOutlineV3,
     RunCreativeControls,
+    SceneRoute,
     Slot,
     SlotCreativeControl,
+    StoryInputMode,
+    StoryProjectInput,
 )
+from cat_video_generator.domain.user_story import preview_user_story
 
 
 def test_creative_controls_default_to_cat_lead_and_inherit_per_slot() -> None:
@@ -53,12 +59,14 @@ def test_episode_supports_short_medium_and_long(seconds: int, expected_shots: in
     assert episode.script.activity_focus is ActivityFocus.CAT_LEAD
 
 
-def test_long_episode_requires_three_shots() -> None:
+def test_long_episode_does_not_use_shot_count_as_a_hard_gate() -> None:
     payload = episode_for(Slot.MORNING, duration=22).script.model_dump(mode="json")
     payload["duration_seconds"] = 36
 
-    with pytest.raises(ValidationError, match="没有足够的连续镜头"):
-        EpisodeScript.model_validate(payload)
+    script = EpisodeScript.model_validate(payload)
+
+    assert script.duration_seconds == 36
+    assert len(script.shots) == 2
 
 
 def test_shots_are_complete_text_instead_of_repeated_action_fields() -> None:
@@ -82,20 +90,50 @@ def test_hard_constraint_must_reference_existing_shots() -> None:
 
 def test_duplicate_handoff_is_rejected(daily_plan) -> None:
     payload = daily_plan.model_dump(mode="json")
-    payload["day_brief"]["handoffs"].append(
-        deepcopy(payload["day_brief"]["handoffs"][0])
+    payload["outline"]["handoffs"].append(
+        deepcopy(payload["outline"]["handoffs"][0])
     )
 
     with pytest.raises(ValidationError, match="同一时段交接不能重复"):
         DailyProductionPlan.model_validate(payload)
 
 
-def test_episode_focus_and_duration_must_match_day_brief(daily_plan) -> None:
+def test_outline_does_not_duplicate_episode_focus_or_duration(daily_plan) -> None:
     payload = deepcopy(daily_plan.model_dump(mode="json"))
     payload["episodes"][0]["script"]["activity_focus"] = "person_lead"
 
-    with pytest.raises(ValidationError, match="morning活动焦点与DayBrief不一致"):
-        DailyProductionPlan.model_validate(payload)
+    plan = DailyProductionPlan.model_validate(payload)
+
+    assert plan.episodes[0].script.activity_focus is ActivityFocus.PERSON_LEAD
+
+
+def test_existing_scripts_project_can_start_with_only_morning_source() -> None:
+    project = StoryProjectInput(
+        theme="出去钓鱼",
+        input_mode=StoryInputMode.EPISODE_SCRIPTS,
+        scene_route=SceneRoute.PROGRESSIVE_LOCATIONS,
+        episode_sources=EpisodeSources(morning="在家中整理钓具，猫咪发现鱼饵盒。"),
+    )
+
+    assert project.episode_sources.populated_slots == (Slot.MORNING,)
+
+
+def test_project_outline_uses_named_episodes_and_rejects_a_fourth_slot(daily_plan) -> None:
+    payload = daily_plan.outline.model_dump(mode="json")
+    payload["episodes"]["night"] = {
+        "scene": "夜间房间",
+        "direction": "额外的第四时段不属于生产契约。",
+    }
+
+    with pytest.raises(ValidationError, match="Extra inputs"):
+        ProjectOutlineV3.model_validate(payload)
+
+
+def test_story_preview_returns_issues_before_strict_confirmation() -> None:
+    preview = preview_user_story("主题：钓鱼\n剧本1：短\n剧本2：河边钓鱼\n剧本3：归家")
+
+    assert not (preview.complete and not preview.issues)
+    assert preview.issues
 
 
 def test_episode_plan_keeps_slot_outside_script() -> None:

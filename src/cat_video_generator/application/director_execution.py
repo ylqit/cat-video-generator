@@ -1,6 +1,6 @@
 """单次Ark导演调用、幂等意图和候选持久化。
 
-本模块只拥有一次外部调用的生命周期。全天顺序、自动修复次数和Run状态仍由
+本模块只拥有一次外部调用的生命周期。全天顺序、显式人工重执行和Run状态仍由
 PlanningService决定，避免Ark异常策略与剧情编排混在同一个大模块中。
 """
 
@@ -13,8 +13,8 @@ from typing import Any, TypeVar
 from pydantic import ValidationError
 
 from ..domain.contract_base import StrictModel
-from ..domain.contracts import DayBrief, EpisodeScript, Slot
-from ..domain.normalization import normalize_day_brief_payload, normalize_episode_payload
+from ..domain.contracts import ConnectionSuggestion, EpisodeScript, ProjectOutlineV3, Slot
+from ..domain.normalization import normalize_episode_payload
 from ..domain.workflow import PromptPurpose, StepKind, StepStatus
 from .ports import DirectorGateway, GatewayError, PlanningStore, StoredStep
 
@@ -74,7 +74,14 @@ class DirectorInvoker:
         """
 
         input_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        operation_key = "director:day" if slot is None else f"director:episode:{slot.value}"
+        if phase == "project_outline":
+            operation_key = "director:day"
+        elif phase == "connection" and slot is not None:
+            operation_key = f"director:connection:{slot.value}"
+        elif phase == "episode" and slot is not None:
+            operation_key = f"director:episode:{slot.value}"
+        else:
+            raise ValueError(f"不支持的导演阶段与时段组合：phase={phase}, slot={slot}")
         snapshot: dict[str, Any] = {
             "type": "director",
             "phase": phase,
@@ -133,10 +140,11 @@ class DirectorInvoker:
             raise
         normalizations: tuple[str, ...] = ()
         output = result.payload
-        if contract is DayBrief:
-            output, normalizations = normalize_day_brief_payload(result.payload)
-        elif contract is EpisodeScript:
+        if contract is EpisodeScript:
             output, normalizations = normalize_episode_payload(result.payload)
+        elif contract in {ProjectOutlineV3, ConnectionSuggestion}:
+            # 项目大纲的命名episodes对象必须原样校验，边界不猜测改写剧情。
+            output = result.payload
         try:
             parsed = contract.model_validate(output)
         except ValidationError as exc:

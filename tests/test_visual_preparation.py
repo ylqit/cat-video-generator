@@ -257,7 +257,9 @@ def canon_assets(tmp_path: Path) -> list[StoredAsset]:
     return result
 
 
-def test_episode_generates_only_look_and_opening_anchor(tmp_path: Path) -> None:
+def test_episode_generates_only_look_and_opening_anchor_with_human_approval(
+    tmp_path: Path,
+) -> None:
     run_id = uuid.uuid4()
     episode = StoredEpisode(
         id=uuid.uuid4(),
@@ -275,13 +277,19 @@ def test_episode_generates_only_look_and_opening_anchor(tmp_path: Path) -> None:
         asset_store=AssetStore(tmp_path),
         media_probe=Probe(),
         provider_name="volcengine-ark-standard",
-        image_review_mode="semantic_auto",
-        image_retry_delay_seconds=0.001,
+        image_review_mode="advisory",
         series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
         style_profile=DEFAULT_STYLE_PROFILE,
     )
 
-    anchor = service.prepare(episode)
+    assert service.prepare(episode) is None
+    look = next(item for item in repository.assets.values() if item.role == "look_reference")
+    repository.commit_asset_review(asset_id=look.id, decision="approved")
+
+    assert service.prepare(repository.episode) is None
+    anchor = next(item for item in repository.assets.values() if item.role == "opening_anchor")
+    repository.commit_asset_review(asset_id=anchor.id, decision="approved")
+    anchor = service.prepare(repository.episode)
 
     assert anchor is not None and anchor.role == "opening_anchor"
     assert anchor.status == "approved"
@@ -308,11 +316,14 @@ def test_same_appearance_reuses_approved_look(tmp_path: Path) -> None:
         asset_store=AssetStore(tmp_path),
         media_probe=Probe(),
         provider_name="volcengine-ark-standard",
-        image_review_mode="semantic_auto",
+        image_review_mode="advisory",
         series_profile=DEFAULT_SERIES_VISUAL_PROFILE,
         style_profile=DEFAULT_STYLE_PROFILE,
     )
-    service.prepare(first)
+    assert service.prepare(first) is None
+    look = next(item for item in repository.assets.values() if item.role == "look_reference")
+    repository.commit_asset_review(asset_id=look.id, decision="approved")
+    assert service.prepare(repository.episode) is None
     second = StoredEpisode(
         uuid.uuid4(),
         run_id,

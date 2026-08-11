@@ -1,4 +1,4 @@
-"""统一Web工作台的剧本编辑、时长同步和五阶段设置。"""
+"""生活故事工作台的剧本、项目大纲与五阶段设置。"""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import uuid
 
 from cat_video_generator.application.ports import StoredEpisode, StoredRun
 from cat_video_generator.application.studio_editing import StudioEditingService
-from cat_video_generator.domain.contracts import ActivityFocus, DayBrief, Slot
+from cat_video_generator.domain.contracts import ProjectOutlineV3, Slot
 from cat_video_generator.domain.pipeline import PipelineSettings
 from cat_video_generator.domain.visual_profiles import (
     DEFAULT_SERIES_VISUAL_PROFILE,
@@ -22,7 +22,12 @@ class StudioRepository:
         self.plan = plan
         self.settings = PipelineSettings()
         self.replacement = None
-        self.updated_day_brief = None
+        self.updated_project_outline = None
+        self.context = {
+            "projectInput": plan.project_input.model_dump(mode="json"),
+            "projectOutline": plan.outline.model_dump(mode="json"),
+            "planningMetadata": {},
+        }
 
     def episode_detail(self, episode_id):
         slot = next(slot for slot, value in self.episode_ids.items() if value == episode_id)
@@ -37,7 +42,7 @@ class StudioRepository:
         }
 
     def get_planning_context(self, run_id):
-        return {"dayBrief": self.plan.day_brief.model_dump(mode="json")}
+        return self.context
 
     def get_run(self, run_id):
         return StoredRun(self.run_id, self.plan.content_date, "planned", self.plan)
@@ -59,8 +64,8 @@ class StudioRepository:
     def replace_episode_plan(self, **kwargs):
         self.replacement = kwargs
 
-    def update_day_brief(self, **kwargs):
-        self.updated_day_brief = kwargs["day_brief"]
+    def update_project_outline(self, **kwargs):
+        self.updated_project_outline = kwargs["project_outline"]
 
     def save_pipeline_settings(self, **kwargs):
         self.settings = kwargs["settings"]
@@ -78,11 +83,12 @@ def service(repository) -> StudioEditingService:
     )
 
 
-def test_episode_editor_synchronizes_focus_and_duration_to_day_brief(daily_plan) -> None:
+def test_episode_editor_updates_only_the_episode_contract(daily_plan) -> None:
     repository = StudioRepository(daily_plan)
     payload = daily_plan.episodes[0].script.model_dump(mode="json")
-    payload["activity_focus"] = "balanced"
-    payload["duration_seconds"] = 20
+    payload["relationship_arc"] = (
+        "人物先完成桌面制作，灰白猫对彩带产生独立反应，最后回到人物手边形成关系汇合。"
+    )
 
     result = service(repository).update_episode_script(
         repository.episode_ids[Slot.MORNING],
@@ -90,19 +96,18 @@ def test_episode_editor_synchronizes_focus_and_duration_to_day_brief(daily_plan)
     )
 
     assert result["saved"] is True
-    saved_brief = repository.replacement["day_brief"].slot_briefs[0]
-    assert saved_brief.activity_focus is ActivityFocus.BALANCED
-    assert saved_brief.duration_band.value == "medium"
-    assert repository.replacement["episode"].duration_seconds == 20
+    assert repository.replacement["episode"].script.relationship_arc == payload["relationship_arc"]
+    assert repository.replacement["project_outline"] == daily_plan.outline
 
 
-def test_pipeline_settings_round_trip_uses_new_five_stages(daily_plan) -> None:
+def test_pipeline_settings_round_trip_uses_project_outline_stage(daily_plan) -> None:
     repository = StudioRepository(daily_plan)
     result = service(repository).update_pipeline_settings(
         repository.run_id,
         {
+            "planningMode": "guided_sequential",
             "allowPaidGeneration": True,
-            "dayBrief": "manual",
+            "projectOutline": "manual",
             "script": "auto",
             "visual": "manual",
             "video": "manual",
@@ -113,7 +118,7 @@ def test_pipeline_settings_round_trip_uses_new_five_stages(daily_plan) -> None:
     assert result["pipelineSettings"] == {
         "planningMode": "guided_sequential",
         "allowPaidGeneration": True,
-        "dayBrief": "manual",
+        "projectOutline": "manual",
         "script": "auto",
         "visual": "manual",
         "video": "manual",
@@ -121,7 +126,7 @@ def test_pipeline_settings_round_trip_uses_new_five_stages(daily_plan) -> None:
     }
 
 
-def test_draft_day_brief_edit_keeps_slot_controls(daily_plan) -> None:
+def test_project_outline_confirmation_uses_v3_named_episodes(daily_plan) -> None:
     repository = StudioRepository(daily_plan)
     repository.plan = None
     repository.get_run = lambda run_id: StoredRun(
@@ -131,11 +136,11 @@ def test_draft_day_brief_edit_keeps_slot_controls(daily_plan) -> None:
         None,
     )
 
-    result = service(repository).update_day_brief(
+    result = service(repository).update_project_outline(
         repository.run_id,
-        daily_plan.day_brief.model_dump(mode="json"),
+        daily_plan.outline.model_dump(mode="json"),
     )
 
     assert result["episodeDraftsCleared"] is True
-    assert isinstance(repository.updated_day_brief, DayBrief)
-    assert [item.slot for item in repository.updated_day_brief.slot_briefs] == list(Slot)
+    assert isinstance(repository.updated_project_outline, ProjectOutlineV3)
+    assert repository.updated_project_outline.episodes.noon.scene

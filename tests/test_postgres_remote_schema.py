@@ -33,7 +33,7 @@ from cat_video_generator.infrastructure.db.session import (
 
 
 @pytest.mark.postgres
-def test_remote_0013_migration_atomic_intent_review_and_video_sequences(monkeypatch) -> None:
+def test_remote_0014_migration_atomic_intent_review_and_video_sequences(monkeypatch) -> None:
     if os.environ.get("CAT_VIDEO_POSTGRES_TEST_MODE") != "remote-schema":
         pytest.skip("需要显式CAT_VIDEO_POSTGRES_TEST_MODE=remote-schema")
     load_local_env()
@@ -75,14 +75,14 @@ def test_remote_0013_migration_atomic_intent_review_and_video_sequences(monkeypa
             revision = connection.execute(
                 text(f"SELECT version_num FROM {quoted}.alembic_version")
             ).scalar_one()
-            assert revision == "0013_canvas_video_sequences"
+            assert revision == "0014_story_project_v3"
 
         repository = SqlAlchemyWorkflowRepository(create_session_factory(engine))
         run_id = repository.create_draft_run(date(2026, 8, 10))
         director_snapshot = DirectorInputSnapshot(
-            phase="day",
+            phase="project_outline",
             prompt_sha256="a" * 64,
-            output_contract="DayBrief",
+            output_contract="ProjectOutlineV3",
         ).model_dump(mode="json")
         first, first_prompt = repository.create_step_with_prompt_intent(
             run_id=run_id,
@@ -124,12 +124,12 @@ def test_remote_0013_migration_atomic_intent_review_and_video_sequences(monkeypa
             step_id=first.id,
             response_id="resp-day-1",
             request_hash="c" * 64,
-            provider_output={"theme": "原始导演对象", "slot_briefs": []},
-            normalized_output={"theme": "标准化导演对象", "slot_briefs": []},
+            provider_output={"theme": "原始导演对象", "episodes": {}},
+            normalized_output={"theme": "标准化导演对象", "episodes": {}},
             normalization_warnings=("机械归一化示例",),
         )
         trace = repository.step_trace(first.id)
-        assert trace["inputSummary"]["output_contract"] == "DayBrief"
+        assert trace["inputSummary"]["output_contract"] == "ProjectOutlineV3"
         assert "provider_output" not in trace["inputSummary"]
         assert trace["providerOutput"]["theme"] == "原始导演对象"
         assert trace["normalizedOutput"]["theme"] == "标准化导演对象"

@@ -14,7 +14,7 @@ from typing import Any
 
 import typer
 
-from ..application.planning import DayBriefPause, PlanningReviewRequired
+from ..application.planning import PlanningReviewRequired
 from ..bootstrap import (
     build_diagnostic_container,
     build_local_container,
@@ -22,9 +22,16 @@ from ..bootstrap import (
     build_runtime_container,
 )
 from ..config import RuntimeSettings, load_local_env
-from ..domain.contracts import Slot
+from ..domain.contracts import (
+    EpisodeSources,
+    SceneRoute,
+    Slot,
+    StoryInputMode,
+    StoryProjectInput,
+)
 from ..domain.pipeline import PipelineSettings, PlanningMode
 from .api import create_app, create_full_app
+from .api_helpers import _jsonable
 from .jobs import JobRegistry
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False)
@@ -138,37 +145,72 @@ def reference_import(
 @app.command("plan-day")
 def plan_day(
     target_date: str = typer.Option(..., "--target-date"),
-    context: str = typer.Option(
-        "根据日期、天气和角色习惯设计自然的一天。",
-        "--context",
+    theme: str = typer.Option(..., "--theme"),
+    input_mode: StoryInputMode = typer.Option(
+        StoryInputMode.THEME_EXPAND,
+        "--input-mode",
     ),
-    candidate_count: int | None = typer.Option(None, "--candidate-count"),
+    scene_route: SceneRoute = typer.Option(
+        SceneRoute.ADAPTIVE,
+        "--scene-route",
+    ),
+    morning_script: str | None = typer.Option(None, "--morning-script"),
+    noon_script: str | None = typer.Option(None, "--noon-script"),
+    evening_script: str | None = typer.Option(None, "--evening-script"),
     allow_paid_generation: bool = typer.Option(
         False,
         "--allow-paid-generation",
     ),
     planning_mode: PlanningMode = typer.Option(
-        PlanningMode.AUTO_DAY,
+        PlanningMode.GUIDED_SEQUENTIAL,
         "--planning-mode",
     ),
 ) -> None:
-    """调用Ark导演并保存一份可执行全天方案。"""
+    """创建生活故事项目；已有剧本模式不会调用总导演。"""
 
-    container = build_runtime_container(allow_paid_generation=allow_paid_generation)
+    try:
+        parsed_date = date.fromisoformat(target_date)
+    except ValueError as exc:
+        raise typer.BadParameter("--target-date 必须使用 YYYY-MM-DD") from exc
+    sources = EpisodeSources(
+        morning=morning_script,
+        noon=noon_script,
+        evening=evening_script,
+    )
+    try:
+        project_input = StoryProjectInput(
+            theme=theme,
+            input_mode=input_mode,
+            scene_route=scene_route,
+            episode_sources=sources,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if (
+        input_mode is StoryInputMode.EPISODE_SCRIPTS
+        and planning_mode is PlanningMode.AUTO_DAY
+        and len(sources.populated_slots) != len(Slot)
+    ):
+        raise typer.BadParameter(
+            "episode_scripts配合auto_day时必须提供上午、中午、傍晚三段剧本"
+        )
+    director_required = input_mode is StoryInputMode.THEME_EXPAND or (
+        input_mode is StoryInputMode.EPISODE_SCRIPTS
+        and planning_mode is PlanningMode.AUTO_DAY
+    )
+    if director_required and not allow_paid_generation:
+        raise typer.BadParameter(
+            "主题扩写或auto_day镜头化会调用付费导演，必须提供--allow-paid-generation"
+        )
+    container = build_runtime_container(
+        allow_paid_generation=allow_paid_generation,
+        require_paid_permission=director_required,
+    )
     try:
         try:
-            parsed_date = date.fromisoformat(target_date)
-        except ValueError as exc:
-            raise typer.BadParameter("--target-date 必须使用 YYYY-MM-DD") from exc
-        try:
-            result = container.planning.plan_day(
+            result = container.planning.create_project(
                 target_date=parsed_date,
-                planning_context=context,
-                candidate_count=(
-                    candidate_count
-                    if candidate_count is not None
-                    else container.runtime_settings.candidate_count
-                ),
+                project_input=project_input,
                 allow_paid_generation=allow_paid_generation,
                 pipeline_settings=PipelineSettings(
                     planningMode=planning_mode,
@@ -177,23 +219,7 @@ def plan_day(
             )
         except PlanningReviewRequired as exc:
             _emit_planning_review(exc)
-        if isinstance(result, DayBriefPause):
-            _echo(
-                {
-                    "runId": str(result.run_id),
-                    "pausedAt": "dayBrief",
-                    "dayBrief": result.day_brief.model_dump(mode="json"),
-                }
-            )
-        else:
-            _echo(
-                {
-                    "runId": str(result.run_id),
-                    "selectedCandidate": result.selected_candidate,
-                    "candidateCount": result.candidate_count,
-                    "plan": result.plan.model_dump(mode="json"),
-                }
-            )
+        _echo(_jsonable(result))
     finally:
         container.close()
 
@@ -208,7 +234,7 @@ def replan_episode(
         "--allow-paid-generation",
     ),
 ) -> None:
-    """只重新调用一个时段导演，保留DayBrief和其他时段。"""
+    """只重新镜头化一个时段，保留项目输入和其他时段。"""
 
     container = build_runtime_container(allow_paid_generation=allow_paid_generation)
     try:
@@ -221,14 +247,7 @@ def replan_episode(
             )
         except PlanningReviewRequired as exc:
             _emit_planning_review(exc)
-        _echo(
-            {
-                "runId": str(result.run_id),
-                "slot": result.slot.value,
-                "attempt": result.attempt,
-                "episode": result.episode.model_dump(mode="json"),
-            }
-        )
+        _echo(_jsonable(result))
     finally:
         container.close()
 
@@ -241,7 +260,7 @@ def resume_planning(
         "--allow-paid-generation",
     ),
 ) -> None:
-    """复用已完成的DayBrief，继续失败或未生成的时段导演。"""
+    """复用已确认项目大纲或用户原始剧本，继续未完成的时段导演。"""
 
     container = build_runtime_container(allow_paid_generation=allow_paid_generation)
     try:
@@ -252,14 +271,7 @@ def resume_planning(
             )
         except PlanningReviewRequired as exc:
             _emit_planning_review(exc)
-        _echo(
-            {
-                "runId": str(result.run_id),
-                "selectedCandidate": result.selected_candidate,
-                "candidateCount": result.candidate_count,
-                "plan": result.plan.model_dump(mode="json"),
-            }
-        )
+        _echo(_jsonable(result))
     finally:
         container.close()
 

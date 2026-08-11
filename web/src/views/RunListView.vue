@@ -21,8 +21,8 @@ onMounted(() => {
 <template>
   <div class="page">
     <div style="display: flex; justify-content: space-between; margin-bottom: 16px">
-      <h2 style="margin: 0">生产运行</h2>
-      <el-button type="primary" @click="dialog?.open()">新建计划</el-button>
+      <h2 style="margin: 0">生活故事项目</h2>
+      <el-button type="primary" @click="dialog?.open()">新建项目</el-button>
     </div>
     <el-table
       v-loading="runs.loading"
@@ -61,7 +61,7 @@ onMounted(() => {
         </template>
       </el-table-column>
       <template #empty>
-        <span class="muted">暂无运行，点击右上角"新建计划"开始一天的生产</span>
+        <span class="muted">暂无项目，点击右上角“新建项目”开始创作</span>
       </template>
     </el-table>
     <PlanCreateDialog ref="dialog" @created="runs.fetchRuns()" />

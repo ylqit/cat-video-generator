@@ -13,6 +13,7 @@ const draft = reactive<EpisodeScript>(structuredClone(toRaw(props.episode.script
 const loaded = ref("");
 const saving = ref(false);
 const errors = ref<string[]>([]);
+const suggestions = ref<string[]>([]);
 const promptPreview = ref<EpisodePromptPreview | null>(null);
 const previewLoading = ref(false);
 const previewError = ref("");
@@ -41,6 +42,20 @@ function removeShot(index: number) {
     constraint.shot_orders = constraint.shot_orders
       .filter((order) => order !== removedOrder)
       .map((order) => order > removedOrder ? order - 1 : order);
+  });
+}
+
+function moveShot(index: number, direction: -1 | 1) {
+  const target = index + direction;
+  if (target < 0 || target >= draft.shots.length) return;
+  const currentOrder = draft.shots[index].order;
+  const targetOrder = draft.shots[target].order;
+  [draft.shots[index], draft.shots[target]] = [draft.shots[target], draft.shots[index]];
+  draft.shots.forEach((shot, shotIndex) => { shot.order = shotIndex + 1; });
+  draft.hard_constraints.forEach((constraint) => {
+    constraint.shot_orders = constraint.shot_orders.map((order) =>
+      order === currentOrder ? targetOrder : order === targetOrder ? currentOrder : order,
+    ).sort((left, right) => left - right);
   });
 }
 
@@ -96,14 +111,23 @@ const durationBand = computed(() =>
 async function save() {
   saving.value = true;
   errors.value = [];
+  suggestions.value = [];
   try {
     const result = await api.updateScript(props.episode.id, structuredClone(toRaw(draft)));
     loaded.value = snapshot();
+    suggestions.value = result.suggestions;
     ElMessage.success(
       result.promptOverrideStale
         ? "剧本已保存；旧的高级Prompt覆盖已失效，请重新检查后确认"
         : "剧本已保存，视觉锚点和视频Prompt会按新内容编译",
     );
+    if (result.suggestions.length) {
+      ElMessage.warning({
+        message: `创作建议：${result.suggestions.join("；")}`,
+        duration: 8000,
+        showClose: true,
+      });
+    }
     emit("saved");
   } catch (error) {
     if (error instanceof ApiError) {
@@ -160,13 +184,20 @@ async function save() {
 
     <el-divider content-position="left">文字镜头设计</el-divider>
     <el-form-item v-for="(shot, index) in draft.shots" :key="shot.order" :label="`镜头${shot.order}`">
-      <el-input
-        v-model="shot.direction"
-        type="textarea"
-        :rows="5"
-        placeholder="完整写出景别、机位、唯一运镜、角色站位、实际动作主体、肢体路径、接触对象、可见结果和稳定切点。"
-      />
-      <el-button v-if="editable && draft.shots.length > 1" type="danger" text @click="removeShot(index)">删除镜头</el-button>
+      <div class="shot-card">
+        <div class="shot-actions">
+          <el-tag>Prompt片段 {{ shot.order }}</el-tag>
+          <el-button text :disabled="index === 0" @click="moveShot(index, -1)">上移</el-button>
+          <el-button text :disabled="index === draft.shots.length - 1" @click="moveShot(index, 1)">下移</el-button>
+          <el-button v-if="editable && draft.shots.length > 1" type="danger" text @click="removeShot(index)">删除</el-button>
+        </div>
+        <el-input
+          v-model="shot.direction"
+          type="textarea"
+          :rows="5"
+          placeholder="完整写出景别、机位、唯一运镜、角色站位、实际动作主体、肢体路径、接触对象、可见结果和稳定切点。"
+        />
+      </div>
     </el-form-item>
     <el-form-item v-if="editable && draft.shots.length < 3">
       <el-button plain @click="addShot">增加镜头</el-button>
@@ -230,6 +261,15 @@ async function save() {
     <el-alert v-if="errors.length" type="error" :closable="false" style="margin-bottom: 10px">
       <div v-for="(item, index) in errors" :key="index">{{ item }}</div>
     </el-alert>
+    <el-alert
+      v-if="suggestions.length"
+      type="warning"
+      :closable="false"
+      title="创作建议（不阻断生成）"
+      style="margin-bottom: 10px"
+    >
+      <div v-for="(item, index) in suggestions" :key="index">{{ item }}</div>
+    </el-alert>
     <el-form-item v-if="editable">
       <el-button type="primary" :loading="saving" @click="save">保存时段脚本</el-button>
       <span class="muted" style="margin-left: 10px">长片会按8～15秒区段使用官方视频延展。</span>
@@ -253,4 +293,6 @@ async function save() {
   font-size: 12px;
   line-height: 1.6;
 }
+.shot-card { width: 100%; border: 1px solid var(--el-border-color); border-radius: 8px; padding: 10px; }
+.shot-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; margin-bottom: 8px; }
 </style>

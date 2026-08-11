@@ -144,6 +144,7 @@ class SqlAlchemyWorkflowRepository(
             "input_snapshot_json": snapshot,
         }
         with self._sessions.begin() as session:
+            ensure_current_contract(required_record(session, ProductionRun, run_id))
             # operation_key是正式关系列；同一业务操作和输入只允许存在一个收费意图。
             compatible = select(WorkflowStep.id).where(
                 WorkflowStep.production_run_id == run_id,
@@ -214,6 +215,9 @@ class SqlAlchemyWorkflowRepository(
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
         with self._sessions.begin() as session:
             step = required_record(session, WorkflowStep, step_id)
+            ensure_current_contract(
+                required_record(session, ProductionRun, step.production_run_id)
+            )
             validate_prompt_purpose(StepKind(step.kind), purpose)
             return self._ensure_prompt_record(
                 session,
@@ -286,6 +290,9 @@ class SqlAlchemyWorkflowRepository(
         target = StepStatus.SUBMISSION_UNKNOWN if submission_unknown else StepStatus.FAILED
         with self._sessions.begin() as session:
             row = required_record(session, WorkflowStep, step_id)
+            ensure_current_contract(
+                required_record(session, ProductionRun, row.production_run_id)
+            )
             row.status = transition_step(StepStatus(row.status), target).value
             row.error_json = {
                 "code": code,
@@ -304,7 +311,14 @@ class SqlAlchemyWorkflowRepository(
         phase: str,
         slot: Slot | None,
     ) -> int:
-        operation_key = "director:day" if slot is None else f"director:episode:{slot.value}"
+        if phase == "project_outline":
+            operation_key = "director:day"
+        elif phase == "connection" and slot is not None:
+            operation_key = f"director:connection:{slot.value}"
+        elif phase == "episode" and slot is not None:
+            operation_key = f"director:episode:{slot.value}"
+        else:
+            raise ValueError(f"不支持的导演阶段与时段组合：phase={phase}, slot={slot}")
         statement = select(func.max(WorkflowStep.attempt)).where(
             WorkflowStep.production_run_id == run_id,
             WorkflowStep.kind == StepKind.DIRECTOR.value,
@@ -341,11 +355,14 @@ class SqlAlchemyWorkflowRepository(
                     .order_by(Episode.sort_order)
                 ).scalars()
             )
-            day_brief = row.planning_json.get("dayBrief")
+            raw_input = row.planning_json.get("projectInput")
+            raw_outline = row.planning_json.get("projectOutline")
             plan = None
-            if day_brief is not None and len(episode_rows) == 3:
+            if isinstance(raw_input, dict) and len(episode_rows) == 3:
                 plan = DailyProductionPlan(
-                    day_brief=day_brief,
+                    content_date=row.content_date,
+                    project_input=raw_input,
+                    outline=raw_outline if isinstance(raw_outline, dict) else None,
                     episodes=[stored_episode(item).plan for item in episode_rows],
                 )
             return StoredRun(row.id, row.content_date, row.status, plan)
@@ -375,7 +392,11 @@ class SqlAlchemyWorkflowRepository(
 
     def get_step(self, step_id: uuid.UUID) -> StoredStep:
         with self._sessions() as session:
-            return stored_step(required_record(session, WorkflowStep, step_id))
+            row = required_record(session, WorkflowStep, step_id)
+            ensure_current_contract(
+                required_record(session, ProductionRun, row.production_run_id)
+            )
+            return stored_step(row)
 
     def find_step_by_provider_task_id(
         self,
@@ -387,7 +408,12 @@ class SqlAlchemyWorkflowRepository(
             row = session.execute(
                 select(WorkflowStep).where(WorkflowStep.provider_task_id == provider_task_id)
             ).scalar_one_or_none()
-            return None if row is None else stored_step(row)
+            if row is None:
+                return None
+            ensure_current_contract(
+                required_record(session, ProductionRun, row.production_run_id)
+            )
+            return stored_step(row)
 
     def latest_retryable_step(
         self,
@@ -425,8 +451,13 @@ class SqlAlchemyWorkflowRepository(
             StepStatus.QUEUED.value,
             StepStatus.RUNNING.value,
         )
-        statement: Select[tuple[WorkflowStep]] = select(WorkflowStep).where(
-            WorkflowStep.status.in_(statuses)
+        statement: Select[tuple[WorkflowStep]] = (
+            select(WorkflowStep)
+            .join(ProductionRun, WorkflowStep.production_run_id == ProductionRun.id)
+            .where(
+                WorkflowStep.status.in_(statuses),
+                ProductionRun.contract_version == CURRENT_CONTRACT_VERSION,
+            )
         )
         if run_id is not None:
             statement = statement.where(WorkflowStep.production_run_id == run_id)
@@ -567,7 +598,7 @@ class SqlAlchemyWorkflowRepository(
         step_id: uuid.UUID,
         patch: dict[str, Any],
     ) -> None:
-        """不改变生命周期状态地记录轮询、自动重试或对账事实。"""
+        """不改变生命周期状态地记录轮询、恢复或对账事实。"""
 
         if not patch:
             return

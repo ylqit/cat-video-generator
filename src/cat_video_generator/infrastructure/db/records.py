@@ -100,8 +100,35 @@ def stored_asset(row: Asset) -> StoredAsset:
 
 
 def run_dict(row: ProductionRun) -> dict[str, Any]:
-    ensure_current_contract(row)
-    settings = PipelineSettings.model_validate(row.pipeline_settings_json)
+    compatible = row.contract_version == CURRENT_CONTRACT_VERSION
+    settings = (
+        PipelineSettings.model_validate(row.pipeline_settings_json)
+        if compatible
+        else None
+    )
+    project_input = row.planning_json.get("projectInput")
+    legacy_brief = row.planning_json.get("dayBrief")
+    theme = (
+        project_input.get("theme")
+        if isinstance(project_input, dict)
+        else legacy_brief.get("theme")
+        if isinstance(legacy_brief, dict)
+        else None
+    )
+    if not compatible:
+        return {
+            "id": str(row.id),
+            "contentDate": row.content_date.isoformat(),
+            "contractVersion": row.contract_version,
+            "compatible": False,
+            "theme": theme,
+            "status": row.status,
+            "pipelineSettings": None,
+            "createdAt": row.created_at.isoformat(),
+            "updatedAt": row.updated_at.isoformat(),
+            "availableActions": [],
+            "nextAction": "该项目使用旧生产契约，仅可查看历史摘要，不能继续生产",
+        }
     available_actions = (
         [{"type": "deliver", "label": "构建交付包", "paid": False}] if row.status == "ready" else []
     )
@@ -109,7 +136,8 @@ def run_dict(row: ProductionRun) -> dict[str, Any]:
         "id": str(row.id),
         "contentDate": row.content_date.isoformat(),
         "contractVersion": row.contract_version,
-        "theme": row.planning_json.get("dayBrief", {}).get("theme"),
+        "compatible": True,
+        "theme": theme,
         "status": row.status,
         "pipelineSettings": settings.model_dump(mode="json", by_alias=True),
         "createdAt": row.created_at.isoformat(),

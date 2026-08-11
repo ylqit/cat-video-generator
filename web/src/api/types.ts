@@ -6,11 +6,41 @@ export type PlanningMode = "guided_sequential" | "auto_day";
 export type ActivityFocus = "cat_lead" | "person_lead" | "balanced";
 export type ActivityFocusMode = ActivityFocus | "inherit" | "adaptive";
 export type DurationMode = "short" | "medium" | "long" | "adaptive";
+export type StoryInputMode = "theme_expand" | "episode_scripts";
+export type SceneRoute = "adaptive" | "progressive_locations" | "single_location";
+export type StoryConnectionMode = "independent" | "selected_link" | "direct_continue";
+export type CrossSlotReferenceRole = "identity" | "prop" | "scene" | "composition" | "motion";
+export type CrossSlotReferenceTarget = "opening_anchor" | "video" | "both";
+
+export interface StoryConnectionDto {
+  useForDirector: boolean;
+  mode: StoryConnectionMode;
+  brief: string;
+  confirmedAt?: string | null;
+}
+
+export interface CrossSlotReferenceDto {
+  assetId: string;
+  role: CrossSlotReferenceRole;
+  applyTo: CrossSlotReferenceTarget;
+}
+
+export interface EligibleCrossSlotAssetDto {
+  assetId: string;
+  episodeId: string;
+  sourceSlot: Slot;
+  role: string;
+  mediaType: "image" | "video";
+  semanticKey?: string | null;
+  sha256: string;
+  suggestedRole: CrossSlotReferenceRole;
+  recommendationReason: string;
+}
 
 export interface PipelineSettings {
   planningMode: PlanningMode;
   allowPaidGeneration: boolean;
-  dayBrief: StageMode;
+  projectOutline: StageMode;
   script: StageMode;
   visual: StageMode;
   video: StageMode;
@@ -28,21 +58,29 @@ export interface RunCreativeControlsDto {
   slot_controls: SlotCreativeControlDto[];
 }
 
-export interface SlotBriefDto {
-  slot: Slot;
-  narrative_role: string;
-  event_direction: string;
-  appearance_intent: string;
-  activity_focus: ActivityFocus;
-  duration_band: Exclude<DurationMode, "adaptive">;
-  decision_reason: string;
+export interface EpisodeSourcesDto {
+  morning: string | null;
+  noon: string | null;
+  evening: string | null;
 }
 
-export interface DayBriefDto {
+export interface StoryProjectInputDto {
+  theme: string;
+  input_mode: StoryInputMode;
+  scene_route: SceneRoute;
+  episode_sources: EpisodeSourcesDto;
+}
+
+export interface OutlineEpisodeDto {
+  scene: string;
+  direction: string;
+}
+
+export interface ProjectOutlineDto {
   content_date: string;
   theme: string;
   day_arc: string;
-  slot_briefs: SlotBriefDto[];
+  episodes: Record<Slot, OutlineEpisodeDto>;
   handoffs: Array<{
     name: string;
     from_slot: Slot;
@@ -62,16 +100,25 @@ export interface RunSummary {
   pipelineSettings?: PipelineSettings;
   createdAt: string;
   updatedAt: string;
-  dayBrief?: DayBriefDto | null;
+  compatible?: boolean;
+  incompatibilityReason?: string | null;
+  projectInput?: StoryProjectInputDto | null;
+  projectOutline?: ProjectOutlineDto | null;
   planningMetadata?: {
     creativeControls?: RunCreativeControlsDto;
     seriesProfile?: Record<string, unknown>;
     storyPatterns?: Record<string, Record<string, unknown>>;
   };
   currentStage?: string;
-  dayBriefConfirmed?: boolean;
+  projectOutlineConfirmed?: boolean;
   planningMode?: PlanningMode;
   acceptedOutcomes?: Partial<Record<Slot, AcceptedOutcomeDto>>;
+  storyConnections?: Partial<Record<Slot, StoryConnectionDto>>;
+  crossSlotReferences?: Partial<Record<Slot, CrossSlotReferenceDto[]>>;
+  activeSlot?: Slot | null;
+  nextSlot?: Slot | null;
+  slotAvailability?: Partial<Record<Slot, "locked" | "ready" | "active" | "completed">>;
+  connectionStatus?: Partial<Record<Slot, string>>;
   slotPlanning?: SlotPlanningStateDto[];
 }
 
@@ -269,7 +316,9 @@ export interface WorkflowNodeDto {
     | "video"
     | "content_review"
     | "accepted_outcome"
-    | "day_confirmation"
+    | "story_connection"
+    | "project_input"
+    | "project_confirmation"
     | "delivery";
   slot: Slot | null;
   label: string;
@@ -327,9 +376,15 @@ export interface RunGraph {
   prompts: PromptDto[];
   assets: AssetDto[];
   reviews: ReviewDto[];
-  episodeDrafts?: Record<string, EpisodeScript>;
   workflowNodes?: WorkflowNodeDto[];
   videoSequences?: VideoSequenceDto[];
+}
+
+export interface StoryProjectPreview {
+  theme: string;
+  episodeSources: EpisodeSourcesDto;
+  issues: string[];
+  canConfirm: boolean;
 }
 
 export interface ReconciliationCandidateDto {

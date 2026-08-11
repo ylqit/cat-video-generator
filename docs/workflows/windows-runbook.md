@@ -22,19 +22,17 @@ ARK_REVIEW_MODEL
 ARK_VIDEO_RESOLUTION=480p|720p
 ARK_DIRECTOR_REQUEST_TIMEOUT_SECONDS=240
 ARK_IMAGE_REQUEST_TIMEOUT_SECONDS=600
-ARK_IMAGE_TIMEOUT_AUTO_RETRIES=1
-ARK_IMAGE_RETRY_DELAY_SECONDS=15
 ARK_REVIEW_REQUEST_TIMEOUT_SECONDS=240
 ARK_VIDEO_API_TIMEOUT_SECONDS=120
 ARK_TASK_TIMEOUT_SECONDS=1800
 ARK_POLL_INTERVAL_SECONDS=10
-IMAGE_REVIEW_MODE=semantic_auto|manual
+IMAGE_REVIEW_MODE=advisory|manual
 MEDIA_WORK_ROOT / MEDIA_ASSET_ROOT / DELIVERY_OUTPUT_ROOT
 ```
 
-## 2. 迁移到0013
+## 2. 数据库迁移
 
-0012启用极简混合导演契约版本2，且不转换旧Episode JSON，因此要求旧生产Run为空。
+0014启用生活故事项目契约版本3；旧契约Run保持只读，不进入新生产路径。
 先预览并保存诊断清单：
 
 ```powershell
@@ -53,7 +51,8 @@ uv run cvg doctor
 语义键的最新批准Canon；仍被保留Canon引用的文件路径永远不会被删除。
 升级0012后继续执行`uv run alembic upgrade head`。0013只新增非破坏性
 `video_sequences`表，不清理Canon或生产媒体。Doctor最终必须报告
-`0013_canvas_video_sequences`。
+`0014_story_project_v3`。0014不改写V2 JSON，只允许旧契约记录继续只读，并把新Run
+默认版本提升到3。旧V2 Run不能继续规划、生成或重试。
 
 ## 3. Canon
 
@@ -92,10 +91,15 @@ uv run cvg api --static-dir web/dist
 
 ## 5. 创建与生成
 
-Web新建Run时先选择规划方式。默认“顺序人工确认”：总导演后保存并确认DayBrief，
-只规划上午；上午视频人工批准并确认实际结果卡后才解锁中午，傍晚同理。“全自动全天”
-保留原批量行为。两种模式均可配置全天默认活动焦点、早中晚覆盖及short、medium、long
-或adaptive；总导演只解析全天容量，时段导演在档位内确定精确秒数。
+Web新建“生活故事项目”时先选择剧情来源和规划方式：
+
+- 主题扩写：调用总导演，人工确认Project Outline后进入逐集生产。
+- 已有剧本：一次粘贴三集并预览拆分，或在顺序模式下分别填写；创建项目不调用Ark。
+
+默认“顺序逐集确认”只规划上午；上午视频人工批准并确认实际结果卡后才解锁中午，
+傍晚同理。“全自动三集”保留批量行为，已有剧本模式必须先填写完整三集。两种模式均
+可配置场景路线、全天活动焦点、早中晚覆盖及short、medium、long或adaptive；时段
+导演在档位内确定精确秒数。主题扩写总导演不重复输出这些用户控制项。
 
 “三集导演”默认编辑极简混合脚本：完整长剧情、关系弧、1～3段完整镜头描述和少量
 关键硬约束。每个镜头段落自然表达镜头目的、机位、运镜、人物与猫咪站位、动作路径、
@@ -106,7 +110,7 @@ Web新建Run时先选择规划方式。默认“顺序人工确认”：总导�
 CLI核心入口仍可使用：
 
 ```powershell
-uv run cvg plan-day --target-date 2026-08-10 --planning-mode auto_day --allow-paid-generation
+uv run cvg plan-day --target-date 2026-08-10 --theme "出去钓鱼" --planning-mode auto_day --allow-paid-generation
 uv run cvg status <runId>
 uv run cvg run-day <runId> --slot morning --allow-paid-generation
 ```
@@ -137,7 +141,7 @@ uv run cvg deliver <runId>
 - `retry-step`创建新attempt，不覆盖原Prompt、Task ID或错误。
 - 已有视频Task ID使用resume继续查询，不产生第二次POST。
 - 视频`submission_unknown`在Web节点列出候选并人工对账。
-- 图片同步超时按配置最多自动重试一次，可能重复计费。
+- 图片同步超时不会自动重试；确认原请求可能已经计费后才能显式创建新attempt。
 - 最终视频必须人工批准；顺序模式还需确认傍晚实际结果卡，Run才会进入ready并允许交付1/2/3。
 
 ## 7. 常见故障
@@ -146,7 +150,7 @@ uv run cvg deliver <runId>
 | --- | --- |
 | 迁移落后 | 先生成清理Manifest并按口令清理，再`alembic upgrade head` |
 | 长视频收费前失败 | 当前模型不支持官方延展；换用已开通完整模型或把该时段改为short |
-| 图片语义失败 | 在具体图片Step显式重试，不覆盖拒绝结论 |
+| AI图片建议提示风险 | 人工查看媒体后决定批准、拒绝或显式创建新attempt |
 | 视频监看窗口结束 | 继续查询已有Task ID |
 | `submission_unknown` | 视频人工对账；图片需确认重复计费后新attempt |
 | 交付不可用 | 确认早中晚最终`video`资产均已人工批准；顺序模式再确认傍晚结果卡 |

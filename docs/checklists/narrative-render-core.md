@@ -1,6 +1,7 @@
 # 极简混合导演契约与JSON收敛 Checklist
 
-> 本清单只记录当前契约版本2的实施事实。开发阶段不运行Ruff、pytest、Web构建、
+> 历史归档：本清单记录契约版本2的实施事实，已由V3生活故事项目和
+> `single-slot-optional-links.md`替代。开发阶段不运行Ruff、pytest、Web构建、
 > 数据库验证或真实Ark；全部功能、清理工具和文档落盘后，才统一执行检查并进行
 > 一次真实Web全链路验证。
 

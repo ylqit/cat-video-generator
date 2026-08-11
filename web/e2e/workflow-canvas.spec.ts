@@ -39,8 +39,9 @@ function node(
 }
 
 const workflowNodes = [
+  node("run:project-input", "project_input", "生活故事项目输入", "completed"),
   node("run:day-director", "director", "全天总导演", "completed"),
-  node("run:day-confirmation", "day_confirmation", "DayBrief人工确认", "completed"),
+  node("run:project-confirmation", "project_confirmation", "项目大纲确认", "completed"),
   node("morning:director", "director", "Morning导演", "completed", "morning"),
   node("morning:look", "look", "Morning定妆图", "completed", "morning"),
   node("morning:opening-anchor", "opening_anchor", "Morning开场锚点", "completed", "morning"),
@@ -107,7 +108,7 @@ const episode = {
 const graph = {
   run: {
     id: runId,
-    contractVersion: 2,
+    contractVersion: 3,
     contentDate: "2026-08-12",
     theme: "池塘边钓鱼",
     status: "generating",
@@ -116,7 +117,7 @@ const graph = {
     pipelineSettings: {
       planningMode: "guided_sequential",
       allowPaidGeneration: true,
-      dayBrief: "manual",
+      projectOutline: "manual",
       script: "manual",
       visual: "manual",
       video: "manual",
@@ -125,6 +126,25 @@ const graph = {
     createdAt: "2026-08-12T08:00:00Z",
     updatedAt: "2026-08-12T08:00:00Z",
     currentStage: "video",
+    compatible: true,
+    projectOutlineConfirmed: true,
+    projectInput: {
+      theme: "池塘边钓鱼",
+      input_mode: "theme_expand",
+      scene_route: "progressive_locations",
+      episode_sources: { morning: null, noon: null, evening: null },
+    },
+    projectOutline: {
+      content_date: "2026-08-12",
+      theme: "池塘边钓鱼",
+      day_arc: "准备钓具、河边观察，最后带着收获归家。",
+      episodes: {
+        morning: { scene: "池塘边", direction: "猫咪先发现浮标信号。" },
+        noon: { scene: "河边", direction: "人物回应水面变化。" },
+        evening: { scene: "归家小路", direction: "人猫带着收获回家。" },
+      },
+      handoffs: [],
+    },
     acceptedOutcomes: {},
     slotPlanning: [
       { slot: "morning", planned: true, unlocked: true, blockReason: null, outcomeConfirmed: false },
@@ -181,8 +201,8 @@ test.beforeEach(async ({ page }) => {
     json: {
       database: "test",
       user: "test",
-      alembicRevision: "0013_canvas_video_sequences",
-      expectedAlembicRevision: "0013_canvas_video_sequences",
+      alembicRevision: "0014_story_project_v3",
+      expectedAlembicRevision: "0014_story_project_v3",
       ready: true,
     },
   }));
