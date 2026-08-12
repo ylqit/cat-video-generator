@@ -7,12 +7,18 @@ import type {
   ReferenceBinding,
   ReferenceRole,
   ReferenceUsage,
+  SceneLookDraftDto,
+  SceneLookDraftEnvelope,
   SceneDto,
   SceneLookPlan,
+  SceneLookPromptPreview,
+  SceneLookVersion,
   SequenceDto,
   ShotDto,
   ShotSuggestion,
   ShotSuggestionOutput,
+  VisualProfileDraft,
+  VisualProfileRevisionDto,
 } from "./types";
 
 const BASE = "/api/v1";
@@ -63,6 +69,10 @@ export const api = {
       "PUT",
       { references },
     ),
+  visualProfile: (projectId: string) =>
+    request<VisualProfileRevisionDto>(`/projects/${projectId}/visual-profile`),
+  updateVisualProfile: (projectId: string, draft: VisualProfileDraft) =>
+    json<VisualProfileRevisionDto>(`/projects/${projectId}/visual-profile`, "PUT", draft),
   addScene: (projectId: string, body: Record<string, unknown>) =>
     json<SceneDto>(`/projects/${projectId}/scenes`, "POST", body),
   updateScene: (sceneId: string, body: Record<string, unknown>) =>
@@ -95,6 +105,20 @@ export const api = {
     json<ShotDto>(`/shots/${shotId}/references`, "PUT", { references }),
   selectSceneLook: (sceneId: string, assetId: string | null) =>
     json<SceneDto>(`/scenes/${sceneId}/look-asset`, "PUT", { assetId }),
+  sceneLookDraft: (sceneId: string) =>
+    request<SceneLookDraftEnvelope>(`/scenes/${sceneId}/look-draft`),
+  saveSceneLookDraft: (
+    sceneId: string,
+    expectedRevision: number,
+    draft: SceneLookDraftDto,
+  ) => json<SceneLookDraftEnvelope>(`/scenes/${sceneId}/look-draft`, "PUT", {
+    expectedRevision,
+    draft,
+  }),
+  previewSceneLookPrompt: (sceneId: string) =>
+    json<SceneLookPromptPreview>(`/scenes/${sceneId}/look-prompt-preview`, "POST"),
+  sceneLookVersions: (sceneId: string) =>
+    request<SceneLookVersion[]>(`/scenes/${sceneId}/look-versions`),
   uploadReference: async (
     projectId: string,
     usage: ReferenceUsage,
@@ -113,9 +137,15 @@ export const api = {
       regenerate,
       reason,
     }),
-  generateSceneLook: (sceneId: string, regenerate = false, reason?: string) =>
+  generateSceneLook: (
+    sceneId: string,
+    draftRevision: number,
+    regenerate = false,
+    reason?: string,
+  ) =>
     json<{ jobId: string }>(`/scenes/${sceneId}/look-images`, "POST", {
       allowPaidGeneration: true,
+      draftRevision,
       regenerate,
       reason,
     }),

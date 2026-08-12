@@ -22,6 +22,7 @@ import type {
   StoryMode,
 } from "../api/types";
 import VideoTimeline from "../components/VideoTimeline.vue";
+import SceneLookWorkbench from "../components/SceneLookWorkbench.vue";
 
 const route = useRoute();
 const router = useRouter();
@@ -46,6 +47,11 @@ function emptyLookPlan(): SceneLookPlan {
     personAccessories: "",
     catAppearance: "",
     keyProps: "",
+    environmentStyle: "outdoor",
+    personPose: "",
+    catPose: "",
+    composition: "",
+    additionalInstructions: "",
     imageRecommended: false,
     recommendationReason: null,
   };
@@ -537,60 +543,6 @@ async function toggleProjectDefault(asset: AssetDto) {
   });
 }
 
-function sceneLookAssets(scene: SceneDto): AssetDto[] {
-  return graph.value?.assets.filter(
-    (item) => item.mediaType === "image"
-      && item.contentReady
-      && ["approved", "ready"].includes(item.status)
-      && (item.scope === "canon" || item.scope === "project" || item.sceneId === scene.id),
-  ) ?? [];
-}
-
-function sceneLookCandidates(scene: SceneDto): AssetDto[] {
-  return graph.value?.assets.filter(
-    (item) => item.role === "scene_look"
-      && item.sceneId === scene.id
-      && item.contentReady
-      && item.status === "candidate",
-  ) ?? [];
-}
-
-function assetById(assetId: string | null | undefined): AssetDto | null {
-  return graph.value?.assets.find((item) => item.id === assetId) ?? null;
-}
-
-async function chooseSceneLook(scene: SceneDto, assetId: string | null) {
-  await act(async () => {
-    await api.selectSceneLook(scene.id, assetId || null);
-    await loadGraph();
-  });
-}
-
-async function generateSceneLook(scene: SceneDto) {
-  const prior = scene.attempts.filter((item) => item.operationKey === "image:scene-look");
-  const regenerate = prior.length > 0;
-  let reason = "生成场景定妆参考";
-  if (regenerate) {
-    const answer = await ElMessageBox.prompt(
-      "请填写本次定妆图需要修正的一项问题，旧版本会保留。",
-      "填写重做目标",
-      { inputPlaceholder: "例如：人物外套改为米白色，猫咪保持Canon外观且不增加服饰" },
-    );
-    reason = answer.value.trim();
-    if (!reason) return;
-  }
-  await ElMessageBox.confirm(
-    `${regenerate ? "重新生成" : "生成"}场景定妆图会产生一次 Seedream 费用，是否继续？`,
-    "付费确认",
-  );
-  await act(async () => {
-    const accepted = await api.generateSceneLook(scene.id, regenerate, reason);
-    const job = await waitJob(accepted.jobId);
-    if (job.status === "failed") throw new Error(String(job.error?.message ?? "定妆图生成失败"));
-    await loadGraph();
-  });
-}
-
 async function bindReference() {
   if (!selectedShot.value || !referenceForm.assetId) return;
   const bindings = selectedShot.value.referenceBindings.filter((item) => item.assetId !== referenceForm.assetId);
@@ -798,39 +750,20 @@ onBeforeUnmount(() => window.clearInterval(polling));
               <span>人物配件：{{ scene.lookPlan.personAccessories || '无新增' }}</span>
               <span>猫咪外观：{{ scene.lookPlan.catAppearance || '保持 Canon 外观' }}</span>
               <span>关键道具：{{ scene.lookPlan.keyProps || '无新增' }}</span>
+              <span>环境与姿态：{{ scene.lookPlan.environmentStyle === 'indoor' ? '室内' : '户外' }} · {{ scene.lookPlan.personPose || '人物自然准备姿态' }} · {{ scene.lookPlan.catPose || '猫咪自然四足姿态' }}</span>
+              <span>构图：{{ scene.lookPlan.composition || '稳定展示人猫关系、服饰与道具' }}</span>
               <el-alert
                 v-if="scene.lookPlan.imageRecommended"
                 type="warning"
                 :closable="false"
                 :title="`建议生成定妆图：${scene.lookPlan.recommendationReason || '造型或互动关系需要视觉确认'}`"
               />
-              <div class="look-actions">
-                <el-button size="small" @click="generateSceneLook(scene)">生成场景定妆图</el-button>
-                <el-select
-                  :model-value="scene.selectedLookAssetId ?? ''"
-                  clearable
-                  filterable
-                  size="small"
-                  placeholder="选择已批准图片作为定妆"
-                  @change="(value) => chooseSceneLook(scene, value || null)"
-                >
-                  <el-option v-for="asset in sceneLookAssets(scene)" :key="asset.id" :label="asset.semanticKey || asset.role" :value="asset.id" />
-                </el-select>
-              </div>
-              <img
-                v-if="assetById(scene.selectedLookAssetId)?.contentReady"
-                class="selected-look-preview"
-                :src="assetContentUrl(scene.selectedLookAssetId!)"
-                alt="当前场景定妆"
+              <SceneLookWorkbench
+                :project-id="graph.project.id"
+                :scene="scene"
+                :assets="graph.assets"
+                @refreshed="loadGraph()"
               />
-              <div v-for="asset in sceneLookCandidates(scene)" :key="asset.id" class="look-candidate">
-                <img :src="assetContentUrl(asset.id)" alt="待审核场景定妆" />
-                <div>
-                  <b>待审核定妆候选</b>
-                  <el-button size="small" type="success" @click="review(asset, 'approved')">批准并设为场景定妆</el-button>
-                  <el-button size="small" type="danger" @click="review(asset, 'rejected')">拒绝</el-button>
-                </div>
-              </div>
             </div>
             <div class="scene-actions">
               <el-button type="primary" plain @click="suggest(scene)">AI 建议视频片段</el-button>
@@ -1085,7 +1018,12 @@ onBeforeUnmount(() => window.clearInterval(polling));
           <el-form-item label="人物配件"><el-input v-model="sceneForm.lookPlan.personAccessories" /></el-form-item>
           <el-form-item label="猫咪外观/配件"><el-input v-model="sceneForm.lookPlan.catAppearance" placeholder="默认保持 Canon 外观，不添加服饰" /></el-form-item>
           <el-form-item label="关键道具"><el-input v-model="sceneForm.lookPlan.keyProps" /></el-form-item>
+          <el-form-item label="人物姿态"><el-input v-model="sceneForm.lookPlan.personPose" /></el-form-item>
+          <el-form-item label="猫咪姿态"><el-input v-model="sceneForm.lookPlan.catPose" /></el-form-item>
+          <el-form-item label="环境画风"><el-radio-group v-model="sceneForm.lookPlan.environmentStyle"><el-radio-button value="outdoor">户外</el-radio-button><el-radio-button value="indoor">室内</el-radio-button></el-radio-group></el-form-item>
         </div>
+        <el-form-item label="构图与人猫空间关系"><el-input v-model="sceneForm.lookPlan.composition" type="textarea" :rows="2" /></el-form-item>
+        <el-form-item label="补充生成要求"><el-input v-model="sceneForm.lookPlan.additionalInstructions" type="textarea" :rows="2" /></el-form-item>
         <el-form-item label="定妆图建议"><el-switch v-model="sceneForm.lookPlan.imageRecommended" active-text="建议生成（只提醒，不阻断）" /></el-form-item>
         <el-form-item label="建议原因"><el-input v-model="sceneForm.lookPlan.recommendationReason" type="textarea" :rows="2" /></el-form-item>
       </el-form>
@@ -1122,7 +1060,12 @@ onBeforeUnmount(() => window.clearInterval(polling));
           <el-form-item label="人物配件"><el-input v-model="suggestion.output.lookPlan.personAccessories" /></el-form-item>
           <el-form-item label="猫咪外观/配件"><el-input v-model="suggestion.output.lookPlan.catAppearance" /></el-form-item>
           <el-form-item label="关键道具"><el-input v-model="suggestion.output.lookPlan.keyProps" /></el-form-item>
+          <el-form-item label="人物姿态"><el-input v-model="suggestion.output.lookPlan.personPose" /></el-form-item>
+          <el-form-item label="猫咪姿态"><el-input v-model="suggestion.output.lookPlan.catPose" /></el-form-item>
+          <el-form-item label="环境画风"><el-radio-group v-model="suggestion.output.lookPlan.environmentStyle"><el-radio-button value="outdoor">户外</el-radio-button><el-radio-button value="indoor">室内</el-radio-button></el-radio-group></el-form-item>
         </div>
+        <el-form-item label="构图与人猫空间关系"><el-input v-model="suggestion.output.lookPlan.composition" type="textarea" :rows="2" /></el-form-item>
+        <el-form-item label="补充生成要求"><el-input v-model="suggestion.output.lookPlan.additionalInstructions" type="textarea" :rows="2" /></el-form-item>
         <el-form-item label="定妆图建议"><el-switch v-model="suggestion.output.lookPlan.imageRecommended" active-text="建议（不阻断视频生成）" /></el-form-item>
         <el-form-item label="建议原因"><el-input v-model="suggestion.output.lookPlan.recommendationReason" type="textarea" :rows="2" /></el-form-item>
         <el-divider content-position="left">可编辑视频片段</el-divider>

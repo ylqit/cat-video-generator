@@ -14,10 +14,13 @@ from typing import Any
 
 from ..domain.contracts import (
     AnchorMode,
+    LookReferenceBinding,
+    LookReferencePurpose,
     ReferenceBinding,
     ReferenceRole,
     ReferenceTarget,
     ReferenceUsage,
+    SceneLookDraft,
     SceneLookPlan,
     ShotCardDraft,
     ShotPromptContext,
@@ -52,9 +55,11 @@ from .ports import (
     RuntimePreflight,
     ShotQueueStore,
     StoredAsset,
+    StoredScene,
     StoredSequence,
     StoredShot,
     StoredStep,
+    StoredVisualProfileRevision,
     VideoTaskResult,
 )
 
@@ -63,6 +68,21 @@ from .ports import (
 class SuggestionResult:
     step_id: uuid.UUID
     output: ShotSuggestionOutput
+
+
+class RevisionConflictError(ValueError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class SceneLookInputSet:
+    scene: StoredScene
+    profile: StoredVisualProfileRevision
+    draft: SceneLookDraft
+    bindings: tuple[LookReferenceBinding, ...]
+    assets: tuple[StoredAsset, ...]
+    descriptions: tuple[str, ...]
+    warnings: tuple[str, ...]
 
 
 class ProjectEditingService:
@@ -309,8 +329,83 @@ class ShotProductionService:
             metadata={"usage": usage, "referenceRole": role, "qc": qc},
         )
 
+    def get_scene_look_draft(self, scene_id: uuid.UUID) -> dict[str, Any]:
+        scene = self._repository.get_scene_look_draft(scene_id)
+        draft = scene.look_draft or self._default_scene_look_draft(scene)
+        return {
+            "sceneId": str(scene.id),
+            "revision": scene.look_draft_revision,
+            "draft": draft.model_dump(mode="json", by_alias=True),
+        }
+
+    def save_scene_look_draft(
+        self,
+        scene_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        draft: SceneLookDraft,
+    ) -> dict[str, Any]:
+        scene = self._repository.save_scene_look_draft(
+            scene_id,
+            expected_revision=expected_revision,
+            draft=draft,
+        )
+        if scene.look_draft is None:
+            raise RuntimeError("saved scene look draft was not returned")
+        return {
+            "sceneId": str(scene.id),
+            "revision": scene.look_draft_revision,
+            "draft": scene.look_draft.model_dump(mode="json", by_alias=True),
+        }
+
+    def preview_scene_look_prompt(self, scene_id: uuid.UUID) -> dict[str, Any]:
+        inputs = self._scene_look_inputs(scene_id, strict=False)
+        project = self._repository.get_project(inputs.scene.project_id)
+        prompt = compile_scene_look_prompt(
+            project_title=project.title,
+            scene_title=inputs.scene.draft.title,
+            scene_text=inputs.scene.draft.source_text,
+            look_plan=inputs.draft.look_plan,
+            visual_profile=inputs.profile.draft,
+            reference_descriptions=inputs.descriptions,
+        )
+        return {
+            "prompt": prompt.text,
+            "charCount": prompt.char_count,
+            "utf8Bytes": prompt.utf8_bytes,
+            "referenceCount": len(inputs.assets),
+            "references": [
+                {
+                    "index": index,
+                    "assetId": str(asset.id),
+                    "sha256": asset.sha256,
+                    "semanticKey": asset.semantic_key,
+                    "purpose": binding.purpose.value,
+                    "instruction": binding.instruction,
+                    "contentReady": asset.content_ready,
+                }
+                for index, (binding, asset) in enumerate(
+                    zip(inputs.bindings, inputs.assets, strict=True),
+                    1,
+                )
+            ],
+            "warnings": list(inputs.warnings),
+            "visualProfileRevisionId": str(inputs.profile.id),
+            "visualProfileRevision": inputs.profile.revision,
+            "draftRevision": inputs.scene.look_draft_revision,
+        }
+
+    def validate_scene_look_request(self, scene_id: uuid.UUID, draft_revision: int) -> None:
+        scene = self._repository.get_scene(scene_id)
+        if scene.look_draft is None:
+            raise RevisionConflictError("请先保存场景定妆草稿再生成")
+        if scene.look_draft_revision != draft_revision:
+            raise RevisionConflictError("场景定妆草稿已更新，请重新预览后再生成")
+        self._scene_look_inputs(scene_id, strict=True)
+
     def preview_shot_prompt(self, shot_id: uuid.UUID) -> dict[str, Any]:
         shot = self._repository.get_shot(shot_id)
+        profile = self._repository.get_visual_profile(shot.project_id)
         context = self._prompt_context(shot)
         anchor, references, descriptions = self._resolve_video_inputs(
             shot,
@@ -326,6 +421,7 @@ class ShotProductionService:
             context,
             plan,
             binding_descriptions=descriptions,
+            visual_profile=profile.draft,
         )
         return {
             "prompt": prompt.text,
@@ -346,20 +442,24 @@ class ShotProductionService:
         if shot.draft.anchor_mode is not AnchorMode.GENERATE:
             raise ValueError("the shot anchor mode is not generate")
         self._require_paid_gateway(allow_paid_generation)
-        references = self._reference_assets(shot, target=ReferenceTarget.ANCHOR)
+        reference_pairs = self._resolved_reference_pairs(
+            shot,
+            target=ReferenceTarget.ANCHOR,
+        )
+        references = tuple(asset for _binding, asset in reference_pairs)
         if len(references) > 14:
             raise ValueError("Seedream最多允许14张参考图")
         context = self._prompt_context(shot)
         descriptions = tuple(
-            f"@图片{index}只负责{binding.role.value}"
-            for index, binding in enumerate(
-                self._reference_bindings(shot, target=ReferenceTarget.ANCHOR), 1
-            )
+            _video_reference_description(index, binding)
+            for index, (binding, _asset) in enumerate(reference_pairs, 1)
         )
+        profile = self._repository.get_visual_profile(shot.project_id)
         prompt = compile_anchor_prompt(
             context,
             reference_descriptions=descriptions,
             regeneration_instruction=reason if regenerate else None,
+            visual_profile=profile.draft,
         )
         snapshot = {
             "shotCardId": str(shot.id),
@@ -396,7 +496,7 @@ class ShotProductionService:
         try:
             result = self._gateway.generate_image(
                 prompt=prompt.text,
-                reference_paths=tuple(item.path for item in references),
+                reference_paths=tuple(item.require_path() for item in references),
             )
             landed = self._asset_store.download(result.url, suffix=".png")
             qc = self._media_probe.inspect_image(landed.path)
@@ -444,45 +544,43 @@ class ShotProductionService:
         scene_id: uuid.UUID,
         *,
         allow_paid_generation: bool,
+        draft_revision: int,
         regenerate: bool = False,
         reason: str | None = None,
     ) -> dict[str, Any]:
+        self.validate_scene_look_request(scene_id, draft_revision)
         self._require_paid_gateway(allow_paid_generation)
-        scene = self._repository.get_scene(scene_id)
-        if scene.draft.look_plan is None:
-            raise ValueError("请先保存场景造型方案")
+        inputs = self._scene_look_inputs(scene_id, strict=True)
+        scene = inputs.scene
         project = self._repository.get_project(scene.project_id)
-        bindings = tuple(
-            item
-            for item in project.default_reference_bindings
-            if item.usage is ReferenceUsage.GENERATION_REFERENCE
-            and item.apply_to in {ReferenceTarget.ANCHOR, ReferenceTarget.BOTH}
-        )
-        if len(bindings) > 14:
-            raise ValueError("Seedream最多允许14张参考图")
-        references = tuple(self._repository.get_asset(item.asset_id) for item in bindings)
-        if any(
-            item.media_type != "image"
-            or item.status not in {"approved", "ready"}
-            or not item.path.is_file()
-            for item in references
-        ):
-            raise ValueError("场景定妆引用包含不可用图片")
-        descriptions = tuple(
-            f"@图片{index}只负责{binding.role.value}"
-            for index, binding in enumerate(bindings, 1)
-        )
+        references = inputs.assets
         prompt = compile_scene_look_prompt(
             project_title=project.title,
             scene_title=scene.draft.title,
             scene_text=scene.draft.source_text,
-            look_plan=scene.draft.look_plan,
-            reference_descriptions=descriptions,
+            look_plan=inputs.draft.look_plan,
+            visual_profile=inputs.profile.draft,
+            reference_descriptions=inputs.descriptions,
+            regeneration_instruction=reason if regenerate else None,
         )
         snapshot = {
             "sceneId": str(scene.id),
-            "lookPlan": scene.draft.look_plan.model_dump(mode="json", by_alias=True),
+            "lookDraftRevision": scene.look_draft_revision,
+            "visualProfileRevisionId": str(inputs.profile.id),
+            "visualProfileRevision": inputs.profile.revision,
+            "lookPlan": inputs.draft.look_plan.model_dump(mode="json", by_alias=True),
+            "references": [
+                {
+                    "assetId": str(asset.id),
+                    "sha256": asset.sha256,
+                    "semanticKey": asset.semantic_key,
+                    "purpose": binding.purpose.value,
+                    "instruction": binding.instruction,
+                }
+                for binding, asset in zip(inputs.bindings, references, strict=True)
+            ],
             "referenceAssetIds": [str(item.id) for item in references],
+            "promptSha256": hashlib.sha256(prompt.text.encode("utf-8")).hexdigest(),
         }
         operation_key = "image:scene-look"
         input_hash = _hash_json({"prompt": prompt.text, "snapshot": snapshot})
@@ -568,7 +666,7 @@ class ShotProductionService:
         try:
             result = self._gateway.generate_image(
                 prompt=prompt.text,
-                reference_paths=tuple(item.path for item in references),
+                reference_paths=tuple(item.require_path() for item in references),
             )
             landed = self._asset_store.download(result.url, suffix=".png")
             qc = self._media_probe.inspect_image(landed.path)
@@ -583,7 +681,15 @@ class ShotProductionService:
                 shot_id=None,
                 step_id=step.id,
                 semantic_key=f"scene:{scene.id}:look:{step.attempt}",
-                metadata={"qc": qc, "providerUrl": result.url},
+                metadata={
+                    "qc": qc,
+                    "providerUrl": result.url,
+                    "visualProfileRevisionId": str(inputs.profile.id),
+                    "visualProfileRevision": inputs.profile.revision,
+                    "lookDraftRevision": scene.look_draft_revision,
+                    "promptSha256": snapshot["promptSha256"],
+                    "referenceAssetIds": snapshot["referenceAssetIds"],
+                },
             )
             self._repository.update_step(step.id, status=StepStatus.AWAITING_REVIEW)
             return {
@@ -617,6 +723,7 @@ class ShotProductionService:
             )
         self._require_paid_gateway(allow_paid_generation)
         shot = self._repository.get_shot(shot_id)
+        profile = self._repository.get_visual_profile(shot.project_id)
         context = self._prompt_context(shot)
         anchor, references, descriptions = self._resolve_video_inputs(shot)
         plan = build_shot_input_plan(
@@ -630,12 +737,23 @@ class ShotProductionService:
             plan,
             binding_descriptions=descriptions,
             regeneration_instruction=reason if regenerate else None,
+            visual_profile=profile.draft,
         )
         sources = (() if anchor is None else (anchor,)) + references
         snapshot = {
             "shotCardId": str(shot.id),
+            "visualProfileRevisionId": str(profile.id),
+            "visualProfileRevision": profile.revision,
             "inputPlan": plan.model_dump(mode="json"),
             "sourceAssetIds": [str(item.id) for item in sources],
+            "sourceAssets": [
+                {
+                    "assetId": str(item.id),
+                    "sha256": item.sha256,
+                    "semanticKey": item.semantic_key,
+                }
+                for item in sources
+            ],
         }
         step, _ = self._new_paid_step(
             shot,
@@ -655,7 +773,7 @@ class ShotProductionService:
             task = self._gateway.submit_video(
                 prompt=prompt.text,
                 input_plan=plan,
-                input_sources=tuple(item.path for item in sources),
+                input_sources=tuple(item.require_path() for item in sources),
             )
         except GatewayError as exc:
             status = StepStatus.SUBMISSION_UNKNOWN if exc.submission_unknown else StepStatus.FAILED
@@ -879,7 +997,11 @@ class ShotProductionService:
             task = self._gateway.submit_video(
                 prompt=prompt.text,
                 input_plan=plan,
-                input_sources=(provider_url, boundary_assets[0].path, boundary_assets[1].path),
+                input_sources=(
+                    provider_url,
+                    boundary_assets[0].require_path(),
+                    boundary_assets[1].require_path(),
+                ),
             )
         except GatewayError as exc:
             status = StepStatus.SUBMISSION_UNKNOWN if exc.submission_unknown else StepStatus.FAILED
@@ -931,7 +1053,7 @@ class ShotProductionService:
             if replacement_duration_ms <= 0:
                 raise ValueError("range edit provider result has no measurable duration")
             landed = self._asset_store.render_range_replacement(
-                base_path=source.path,
+                base_path=source.require_path(),
                 replacement_path=landed.path,
                 replacement_duration_ms=replacement_duration_ms,
                 start_ms=int(step.input_snapshot["startMs"]),
@@ -1163,48 +1285,55 @@ class ShotProductionService:
         if anchor is not None and (
             anchor.media_type != "image"
             or anchor.status not in {"approved", "ready"}
-            or not anchor.path.is_file()
+            or not anchor.content_ready
         ):
             raise ValueError("the selected anchor is missing, damaged, or not approved")
-        generation_bindings = self._reference_bindings(shot, target=ReferenceTarget.VIDEO)
-        references = tuple(
-            self._repository.get_asset(binding.asset_id) for binding in generation_bindings
+        generation_pairs = list(
+            self._resolved_reference_pairs(shot, target=ReferenceTarget.VIDEO)
         )
-        if any(
-            item.media_type != "image"
-            or item.status not in {"approved", "ready"}
-            or not item.path.is_file()
-            for item in references
-        ):
-            raise ValueError("a selected generation reference is unavailable or not an image")
+        if anchor is not None:
+            generation_pairs = [
+                pair
+                for pair in generation_pairs
+                if pair[1].id != anchor.id and pair[1].sha256 != anchor.sha256
+            ]
+        references = tuple(asset for _binding, asset in generation_pairs)
         ordered = (() if anchor is None else (anchor,)) + references
         if len(ordered) > 9:
             raise ValueError("Seedance最多允许9张图片输入（含锚点）")
-        roles = (() if anchor is None else ("approved_anchor",)) + tuple(
-            binding.role.value for binding in generation_bindings
-        )
-        descriptions = tuple(
-            f"@图片{index}={role}参考，"
-            "只承担已声明职责，不改写其他主体"
-            for index, role in enumerate(roles, 1)
+        descriptions = (() if anchor is None else ("@图片1=批准锚点，锁定本片段开场状态",))
+        descriptions += tuple(
+            _video_reference_description(index, binding)
+            for index, (binding, _asset) in enumerate(
+                generation_pairs,
+                1 if anchor is None else 2,
+            )
         )
         return anchor, references, descriptions
 
-    def _reference_assets(
-        self, shot: StoredShot, *, target: ReferenceTarget
-    ) -> tuple[StoredAsset, ...]:
-        assets = tuple(
-            self._repository.get_asset(item.asset_id)
-            for item in self._reference_bindings(shot, target=target)
-        )
-        if any(
-            item.media_type != "image"
-            or item.status not in {"approved", "ready"}
-            or not item.path.is_file()
-            for item in assets
-        ):
-            raise ValueError("a selected generation reference is unavailable or not an image")
-        return assets
+    def _resolved_reference_pairs(
+        self,
+        shot: StoredShot,
+        *,
+        target: ReferenceTarget,
+    ) -> tuple[tuple[ReferenceBinding, StoredAsset], ...]:
+        resolved: list[tuple[ReferenceBinding, StoredAsset]] = []
+        seen_ids: set[uuid.UUID] = set()
+        seen_hashes: set[str] = set()
+        for binding in self._reference_bindings(shot, target=target):
+            asset = self._repository.get_asset(binding.asset_id)
+            if (
+                asset.media_type != "image"
+                or asset.status not in {"approved", "ready"}
+                or not asset.content_ready
+            ):
+                raise ValueError("a selected generation reference is unavailable or not an image")
+            if asset.id in seen_ids or asset.sha256 in seen_hashes:
+                continue
+            seen_ids.add(asset.id)
+            seen_hashes.add(asset.sha256)
+            resolved.append((binding, asset))
+        return tuple(resolved)
 
     def _reference_bindings(
         self,
@@ -1224,6 +1353,82 @@ class ShotProductionService:
                 use_scene_look=shot.draft.use_scene_look,
             )
             if item.apply_to in {target, ReferenceTarget.BOTH}
+        )
+
+    def _default_scene_look_draft(self, scene: StoredScene) -> SceneLookDraft:
+        profile = self._repository.get_visual_profile(scene.project_id)
+        look_plan = scene.draft.look_plan or SceneLookPlan()
+        bindings: list[LookReferenceBinding] = []
+        for binding in _order_look_bindings(profile.draft.reference_bindings):
+            if binding.purpose is not LookReferencePurpose.STYLE:
+                bindings.append(binding)
+                continue
+            asset = self._repository.get_asset(binding.asset_id)
+            semantic_key = asset.semantic_key or ""
+            if semantic_key in {"style:outdoor", "style:indoor"}:
+                expected = f"style:{look_plan.environment_style.value}"
+                if semantic_key != expected:
+                    continue
+            bindings.append(binding)
+        return SceneLookDraft(
+            visualProfileRevisionId=profile.id,
+            lookPlan=look_plan,
+            referenceBindings=bindings,
+        )
+
+    def _scene_look_inputs(self, scene_id: uuid.UUID, *, strict: bool) -> SceneLookInputSet:
+        scene = self._repository.get_scene(scene_id)
+        draft = scene.look_draft or self._default_scene_look_draft(scene)
+        profile = self._repository.get_visual_profile_revision(
+            draft.visual_profile_revision_id
+        )
+        if profile.project_id != scene.project_id:
+            raise ValueError("场景定妆引用了其他项目的视觉档案")
+        bindings: list[LookReferenceBinding] = []
+        assets: list[StoredAsset] = []
+        warnings: list[str] = []
+        seen_ids: set[uuid.UUID] = set()
+        seen_hashes: set[str] = set()
+        for binding in _order_look_bindings(draft.reference_bindings):
+            asset = self._repository.get_asset(binding.asset_id)
+            if asset.id in seen_ids or asset.sha256 in seen_hashes:
+                continue
+            seen_ids.add(asset.id)
+            seen_hashes.add(asset.sha256)
+            bindings.append(binding)
+            assets.append(asset)
+            if (
+                asset.media_type != "image"
+                or asset.status not in {"approved", "ready"}
+                or not asset.content_ready
+            ):
+                warnings.append(f"{asset.semantic_key or asset.id} 图片内容不可用")
+        purposes = {item.purpose for item in bindings}
+        required = {
+            LookReferencePurpose.PERSON_IDENTITY: "至少选择一张人物身份参考",
+            LookReferencePurpose.CAT_IDENTITY: "至少选择一张猫咪身份参考",
+            LookReferencePurpose.STYLE: "至少选择一张画风参考",
+        }
+        warnings.extend(message for purpose, message in required.items() if purpose not in purposes)
+        if len(assets) > 14:
+            warnings.append("Seedream 最多允许 14 张参考图")
+        if strict and warnings:
+            raise ValueError("；".join(warnings))
+        descriptions = tuple(
+            _scene_look_reference_description(index, binding, asset)
+            for index, (binding, asset) in enumerate(
+                zip(bindings, assets, strict=True),
+                1,
+            )
+        )
+        return SceneLookInputSet(
+            scene=scene,
+            profile=profile,
+            draft=draft,
+            bindings=tuple(bindings),
+            assets=tuple(assets),
+            descriptions=descriptions,
+            warnings=tuple(warnings),
         )
 
     def _prompt_context(self, shot: StoredShot) -> ShotPromptContext:
@@ -1297,7 +1502,9 @@ class SequenceService:
             )
             cursor += duration_ms
         plan = ProjectSequencePlan(duration_ms=cursor, clips=clips)
-        landed = self._asset_store.concatenate_videos(tuple(item[1].path for item in selected))
+        landed = self._asset_store.concatenate_videos(
+            tuple(item[1].require_path() for item in selected)
+        )
         qc = self._media_probe.inspect_video(
             landed.path,
             expected_duration_seconds=round(cursor / 1000),
@@ -1369,6 +1576,65 @@ def _merge_generation_references(
         seen.add(item.asset_id)
         merged.append(item)
     return tuple(merged)
+
+
+def _scene_look_reference_description(
+    index: int,
+    binding: LookReferenceBinding,
+    asset: StoredAsset,
+) -> str:
+    responsibilities = {
+        LookReferencePurpose.PERSON_IDENTITY: "只锁定人物脸型、五官、肤色和发型，忽略旧服装与背景",
+        LookReferencePurpose.PERSON_BODY: "只锁定人物年龄感、身高和头身比例，忽略旧服装与姿态",
+        LookReferencePurpose.CAT_IDENTITY: "只锁定猫咪脸部、毛色分区、虎斑、眼睛、尾巴和体型",
+        LookReferencePurpose.STYLE: "只锁定线条、材质、色彩、自然光和景深，不改写角色身份",
+        LookReferencePurpose.WARDROBE: "只参考本场景服装款式和材质，不替换人物身份",
+        LookReferencePurpose.PROP: "只参考关键道具的外观、结构和比例",
+        LookReferencePurpose.COMPOSITION: "只参考构图、机位和主体空间关系",
+    }
+    semantic = asset.semantic_key or f"asset:{asset.id}"
+    instruction = f"；补充：{binding.instruction}" if binding.instruction else ""
+    return f"@图片{index}={semantic}；{responsibilities[binding.purpose]}{instruction}"
+
+
+def _video_reference_description(index: int, binding: ReferenceBinding) -> str:
+    responsibilities = {
+        ReferenceRole.IDENTITY: "项目角色身份，只锁定人物或猫咪的长期外观",
+        ReferenceRole.STYLE: "项目系列画风，只锁定线条、材质、色彩和光线",
+        ReferenceRole.SCENE: "场景定妆，只锁定本次服装、配件、道具、姿态和构图",
+        ReferenceRole.PROP: "本片段道具外观、结构和比例",
+        ReferenceRole.COMPOSITION: "本片段构图、机位和主体空间关系",
+    }
+    return (
+        f"@图片{index}={responsibilities[binding.role]}；"
+        "只承担已声明职责，不改写其他主体或长期身份"
+    )
+
+
+def _order_look_bindings(
+    bindings: list[LookReferenceBinding],
+) -> tuple[LookReferenceBinding, ...]:
+    purpose_order = {
+        purpose: index
+        for index, purpose in enumerate(
+            (
+                LookReferencePurpose.PERSON_IDENTITY,
+                LookReferencePurpose.PERSON_BODY,
+                LookReferencePurpose.CAT_IDENTITY,
+                LookReferencePurpose.STYLE,
+                LookReferencePurpose.WARDROBE,
+                LookReferencePurpose.PROP,
+                LookReferencePurpose.COMPOSITION,
+            )
+        )
+    }
+    return tuple(
+        binding
+        for _original_order, binding in sorted(
+            enumerate(bindings),
+            key=lambda item: (purpose_order[item[1].purpose], item[0]),
+        )
+    )
 
 
 def _validate_suggestion_count(output: ShotSuggestionOutput, target_count: int) -> None:

@@ -11,10 +11,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from ..domain.contracts import (
     ReferenceBinding,
     SceneDraft,
+    SceneLookDraft,
     SceneLookPlan,
     ShotCardDraft,
     ShotSuggestion,
     StoryProjectInput,
+    VisualProfileDraft,
 )
 
 
@@ -57,8 +59,17 @@ class ReferencesRequest(ApiModel):
     references: list[ReferenceBinding]
 
 
+class VisualProfileRequest(VisualProfileDraft):
+    pass
+
+
 class SelectSceneLookRequest(ApiModel):
     asset_id: UUID | None = Field(alias="assetId")
+
+
+class SaveSceneLookDraftRequest(ApiModel):
+    expected_revision: int = Field(alias="expectedRevision", ge=0)
+    draft: SceneLookDraft
 
 
 class GenerateRequest(ApiModel):
@@ -71,6 +82,10 @@ class GenerateRequest(ApiModel):
         if not self.regenerate:
             return None
         return self.reason or "用户在镜头节点显式重新生成"
+
+
+class GenerateSceneLookRequest(GenerateRequest):
+    draft_revision: int = Field(alias="draftRevision", ge=1)
 
 
 class ReviewRequest(ApiModel):

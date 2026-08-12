@@ -11,24 +11,29 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from ..application.shot_queue import RevisionConflictError
 from ..domain.contracts import CURRENT_CONTRACT_VERSION, ReferenceRole, ReferenceUsage
 from ..domain.rendering import SequenceStatus
 from ..infrastructure.db.repositories import WorkflowConflictError
+from ..infrastructure.db.session import ALEMBIC_HEAD
 from .api_schemas import (
     AcceptSuggestionsRequest,
     CreateProjectRequest,
     GenerateRequest,
+    GenerateSceneLookRequest,
     OrderRequest,
     RangeEditRequest,
     ReconcileRequest,
     ReferencesRequest,
     ReviewRequest,
+    SaveSceneLookDraftRequest,
     SceneRequest,
     SelectSceneLookRequest,
     SelectSequenceRequest,
     ShotRequest,
     SuggestShotsRequest,
     UpdateProjectRequest,
+    VisualProfileRequest,
 )
 from .jobs import JobConflictError, JobRegistry
 
@@ -80,14 +85,19 @@ def create_app(
     async def workflow_conflict(_request: Request, exc: WorkflowConflictError) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
 
+    @app.exception_handler(RevisionConflictError)
+    async def revision_conflict(_request: Request, exc: RevisionConflictError) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
     @app.get("/api/v1/health")
     def health() -> dict[str, Any]:
+        database_ready = container.alembic_revision == ALEMBIC_HEAD
         return {
-            "ready": True,
-            "databaseReady": True,
+            "ready": database_ready,
+            "databaseReady": database_ready,
             "contractVersion": CURRENT_CONTRACT_VERSION,
             "alembicRevision": container.alembic_revision,
-            "expectedAlembicRevision": container.alembic_revision,
+            "expectedAlembicRevision": ALEMBIC_HEAD,
             **container.runtime_settings.preflight_report(),
         }
 
@@ -144,6 +154,23 @@ def create_app(
                 for item in project.default_reference_bindings
             ],
         }
+
+    @app.get("/api/v1/projects/{project_id}/visual-profile")
+    def get_visual_profile(project_id: uuid.UUID) -> dict[str, Any]:
+        return {
+            **_visual_profile_json(repository.get_visual_profile(project_id)),
+            "canonDefaults": repository.get_default_visual_profile(project_id).model_dump(
+                mode="json",
+                by_alias=True,
+            ),
+        }
+
+    @app.put("/api/v1/projects/{project_id}/visual-profile")
+    def update_visual_profile(
+        project_id: uuid.UUID,
+        payload: VisualProfileRequest,
+    ) -> dict[str, Any]:
+        return _visual_profile_json(repository.save_visual_profile(project_id, payload))
 
     @app.post("/api/v1/projects/{project_id}/scenes")
     def add_scene(project_id: uuid.UUID, payload: SceneRequest) -> dict[str, Any]:
@@ -215,6 +242,58 @@ def create_app(
     ) -> dict[str, Any]:
         return _scene_json(repository.select_scene_look_asset(scene_id, payload.asset_id))
 
+    @app.get("/api/v1/scenes/{scene_id}/look-draft")
+    def get_scene_look_draft(scene_id: uuid.UUID) -> dict[str, Any]:
+        return container.production.get_scene_look_draft(scene_id)
+
+    @app.put("/api/v1/scenes/{scene_id}/look-draft")
+    def save_scene_look_draft(
+        scene_id: uuid.UUID,
+        payload: SaveSceneLookDraftRequest,
+    ) -> dict[str, Any]:
+        return container.production.save_scene_look_draft(
+            scene_id,
+            expected_revision=payload.expected_revision,
+            draft=payload.draft,
+        )
+
+    @app.post("/api/v1/scenes/{scene_id}/look-prompt-preview")
+    def preview_scene_look_prompt(scene_id: uuid.UUID) -> dict[str, Any]:
+        return container.production.preview_scene_look_prompt(scene_id)
+
+    @app.get("/api/v1/scenes/{scene_id}/look-versions")
+    def scene_look_versions(scene_id: uuid.UUID) -> list[dict[str, Any]]:
+        scene = repository.get_scene(scene_id)
+        versions: list[dict[str, Any]] = []
+        for asset in repository.list_assets(project_id=scene.project_id):
+            if asset.scene_id != scene_id or asset.role != "scene_look":
+                continue
+            item = {
+                **_asset_json(asset),
+                "selected": asset.id == scene.selected_look_asset_id,
+                "attempt": None,
+                "prompt": None,
+                "inputSnapshot": {},
+            }
+            if asset.step_id is not None:
+                step = repository.get_step(asset.step_id)
+                prompt = repository.get_prompt(step.id)
+                item["attempt"] = step.attempt
+                item["inputSnapshot"] = step.input_snapshot
+                item["prompt"] = (
+                    None
+                    if prompt is None
+                    else {
+                        "id": str(prompt.id),
+                        "purpose": prompt.purpose.value,
+                        "model": prompt.model,
+                        "text": prompt.text,
+                        "sha256": prompt.sha256,
+                    }
+                )
+            versions.append(item)
+        return sorted(versions, key=lambda item: int(item["attempt"] or 0), reverse=True)
+
     @app.get("/api/v1/shots/{shot_id}")
     def shot_trace(shot_id: uuid.UUID) -> dict[str, Any]:
         return repository.shot_trace(shot_id)
@@ -271,7 +350,14 @@ def create_app(
         )
 
     @app.post("/api/v1/scenes/{scene_id}/look-images")
-    def generate_scene_look(scene_id: uuid.UUID, payload: GenerateRequest) -> dict[str, Any]:
+    def generate_scene_look(
+        scene_id: uuid.UUID,
+        payload: GenerateSceneLookRequest,
+    ) -> dict[str, Any]:
+        container.production.validate_scene_look_request(
+            scene_id,
+            payload.draft_revision,
+        )
         return _submit(
             job_registry,
             kind="generate_scene_look",
@@ -279,6 +365,7 @@ def create_app(
             fn=lambda: container.production.generate_scene_look(
                 scene_id,
                 allow_paid_generation=payload.allow_paid_generation,
+                draft_revision=payload.draft_revision,
                 regenerate=payload.regenerate,
                 reason=payload.retry_reason,
             ),
@@ -384,6 +471,8 @@ def create_app(
     @app.get("/api/v1/assets/{asset_id}/content")
     def asset_content(asset_id: uuid.UUID) -> FileResponse:
         asset = repository.get_asset(asset_id)
+        if asset.path is None:
+            raise HTTPException(status_code=404, detail="asset content requires repair")
         resolved = asset.path.expanduser().resolve()
         if not any(resolved.is_relative_to(root) for root in roots):
             raise HTTPException(status_code=403, detail="asset is outside configured media roots")
@@ -393,7 +482,11 @@ def create_app(
 
     @app.get("/api/v1/canon")
     def list_canon() -> list[dict[str, Any]]:
-        return [_asset_json(item) for item in repository.list_assets()]
+        return [
+            _asset_json(item)
+            for item in repository.list_assets()
+            if item.scope == "canon" and item.status == "approved"
+        ]
 
     @app.get("/api/v1/jobs")
     def list_jobs() -> list[dict[str, Any]]:
@@ -431,12 +524,14 @@ def _scene_json(item: Any) -> dict[str, Any]:
         "projectId": str(item.project_id),
         "order": item.order,
         **item.draft.model_dump(mode="json", by_alias=True),
+        "referenceSnapshot": list(item.reference_snapshot),
         "status": item.status.value,
         "selectedLookAssetId": (
             None
             if item.selected_look_asset_id is None
             else str(item.selected_look_asset_id)
         ),
+        "lookDraftRevision": item.look_draft_revision,
     }
 
 
@@ -470,7 +565,24 @@ def _asset_json(item: Any) -> dict[str, Any]:
         "sha256": item.sha256,
         "semanticKey": item.semantic_key,
         "metadata": item.metadata,
-        "contentReady": item.path.is_file(),
+        "contentReady": item.content_ready,
+        "displayName": item.display_name,
+        "referencePurpose": item.reference_purpose,
+        "visualProfileRevisionId": item.metadata.get("visualProfileRevisionId"),
+        "lookDraftRevision": item.metadata.get("lookDraftRevision"),
+        "createdAt": None if item.created_at is None else item.created_at.isoformat(),
+    }
+
+
+def _visual_profile_json(item: Any) -> dict[str, Any]:
+    return {
+        "id": str(item.id),
+        "projectId": str(item.project_id),
+        "revision": item.revision,
+        "profileHash": item.profile_hash,
+        "sourceProfileId": item.source_profile_id,
+        **item.draft.model_dump(mode="json", by_alias=True),
+        "createdAt": None if item.created_at is None else item.created_at.isoformat(),
     }
 
 

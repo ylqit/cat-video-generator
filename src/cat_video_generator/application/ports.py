@@ -11,9 +11,11 @@ from typing import Any, Protocol
 from ..domain.contracts import (
     ReferenceBinding,
     SceneDraft,
+    SceneLookDraft,
     SceneLookPlan,
     ShotCardDraft,
     StoryProjectInput,
+    VisualProfileDraft,
 )
 from ..domain.rendering import ProjectSequencePlan, SequenceStatus, VideoInputPlan
 from ..domain.workflow import (
@@ -97,6 +99,19 @@ class StoredProject:
     status: RunStatus
     selected_sequence_id: uuid.UUID | None = None
     default_reference_bindings: tuple[ReferenceBinding, ...] = ()
+    visual_profile_revision_id: uuid.UUID | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StoredVisualProfileRevision:
+    id: uuid.UUID
+    project_id: uuid.UUID
+    revision: int
+    profile_hash: str
+    source_profile_id: str
+    draft: VisualProfileDraft
+    reference_snapshot: tuple[dict[str, Any], ...] = ()
+    created_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +122,8 @@ class StoredScene:
     draft: SceneDraft
     status: SceneStatus
     selected_look_asset_id: uuid.UUID | None = None
+    look_draft: SceneLookDraft | None = None
+    look_draft_revision: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,10 +177,54 @@ class StoredAsset:
     media_type: str
     scope: str
     status: str
-    path: Path
+    path: Path | None
     sha256: str
     metadata: dict[str, Any]
     semantic_key: str | None = None
+    created_at: datetime | None = None
+
+    @property
+    def content_ready(self) -> bool:
+        return self.path is not None and self.path.is_file()
+
+    def require_path(self) -> Path:
+        if not self.content_ready or self.path is None:
+            raise ValueError(f"asset {self.id} content is unavailable")
+        return self.path
+
+    @property
+    def display_name(self) -> str:
+        value = self.metadata.get("displayName")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        names = {
+            "person:headshot": "人物大头照",
+            "person:fullbody": "人物全身",
+            "person:front": "人物正面",
+            "person:side": "人物侧面",
+            "person:back": "人物背面",
+            "cat:front": "猫咪正面",
+            "cat:side": "猫咪侧面",
+            "cat:back": "猫咪背面",
+            "style:line_texture": "线条与材质",
+            "style:outdoor": "户外画风",
+            "style:indoor": "室内画风",
+        }
+        return names.get(self.semantic_key or "", self.semantic_key or self.role)
+
+    @property
+    def reference_purpose(self) -> str | None:
+        semantic_key = self.semantic_key or ""
+        if semantic_key == "person:headshot":
+            return "person_identity"
+        if semantic_key.startswith("person:"):
+            return "person_body"
+        if semantic_key.startswith("cat:"):
+            return "cat_identity"
+        if semantic_key.startswith("style:"):
+            return "style"
+        value = self.metadata.get("referencePurpose")
+        return value if isinstance(value, str) else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,6 +369,21 @@ class ShotQueueStore(Protocol):
         bindings: list[ReferenceBinding],
     ) -> StoredProject: ...
 
+    def get_visual_profile(self, project_id: uuid.UUID) -> StoredVisualProfileRevision: ...
+
+    def get_default_visual_profile(self, project_id: uuid.UUID) -> VisualProfileDraft: ...
+
+    def get_visual_profile_revision(
+        self,
+        revision_id: uuid.UUID,
+    ) -> StoredVisualProfileRevision: ...
+
+    def save_visual_profile(
+        self,
+        project_id: uuid.UUID,
+        draft: VisualProfileDraft,
+    ) -> StoredVisualProfileRevision: ...
+
     def add_scene(self, project_id: uuid.UUID, draft: SceneDraft) -> StoredScene: ...
 
     def update_scene(self, scene_id: uuid.UUID, draft: SceneDraft) -> StoredScene: ...
@@ -324,6 +400,16 @@ class ShotQueueStore(Protocol):
         self,
         scene_id: uuid.UUID,
         asset_id: uuid.UUID | None,
+    ) -> StoredScene: ...
+
+    def get_scene_look_draft(self, scene_id: uuid.UUID) -> StoredScene: ...
+
+    def save_scene_look_draft(
+        self,
+        scene_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        draft: SceneLookDraft,
     ) -> StoredScene: ...
 
     def add_shot(self, scene_id: uuid.UUID, draft: ShotCardDraft) -> StoredShot: ...

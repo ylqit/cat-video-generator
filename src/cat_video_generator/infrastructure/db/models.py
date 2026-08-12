@@ -74,6 +74,15 @@ class ProductionRun(Base):
         default=list,
         server_default="[]",
     )
+    current_visual_profile_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            f"{SCHEMA_NAME}.visual_profile_revisions.id",
+            name="fk_production_runs_visual_profile_revision",
+            use_alter=True,
+            ondelete="SET NULL",
+        ),
+    )
     selected_sequence_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey(
@@ -91,6 +100,55 @@ class ProductionRun(Base):
         nullable=False,
         server_default=func.now(),
         onupdate=func.now(),
+    )
+
+
+class VisualProfileRevision(Base):
+    __tablename__ = "visual_profile_revisions"
+    __table_args__ = (
+        CheckConstraint("revision >= 1", name="ck_visual_profile_revisions_revision"),
+        UniqueConstraint(
+            "production_run_id",
+            "revision",
+            name="uq_visual_profile_revisions_run_revision",
+        ),
+        UniqueConstraint(
+            "production_run_id",
+            "profile_hash",
+            name="uq_visual_profile_revisions_run_hash",
+        ),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    profile_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_profile_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    person_identity: Mapped[str] = mapped_column(Text, nullable=False)
+    person_hair: Mapped[str] = mapped_column(Text, nullable=False)
+    person_body: Mapped[str] = mapped_column(Text, nullable=False)
+    cat_identity: Mapped[str] = mapped_column(Text, nullable=False)
+    style_positive_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    style_negative_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    reference_bindings_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default="[]",
+    )
+    reference_snapshot_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default="[]",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
 
@@ -127,6 +185,18 @@ class Scene(Base):
         SmallInteger, nullable=False, default=1, server_default="1"
     )
     look_plan_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    look_draft_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
+    look_draft_revision: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
     selected_look_asset_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey(

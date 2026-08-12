@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .contracts import SceneLookPlan, ShotPromptContext
+from .contracts import SceneLookPlan, ShotPromptContext, VisualProfileDraft
 from .rendering import VideoInputPlan
 from .visual_profiles import (
     DEFAULT_SERIES_VISUAL_PROFILE,
@@ -71,6 +71,7 @@ def compile_shot_suggestion_prompt(
 5. 不虚构用户原文没有的第二个事件，不输出数据库或生命周期术语。
 6. 每个片段建议8至15秒；suggestedDurationSeconds填写整数，但不得在direction中编造精确秒点。
 7. 同时给出lookPlan：personWardrobe、personAccessories、catAppearance、keyProps、
+   environmentStyle、personPose、catPose、composition、additionalInstructions、
    imageRecommended、recommendationReason。只有服饰、配件、关键道具或双主体关系需要视觉确认时才建议定妆图。
 8. 只输出sceneTitle、lookPlan和shots；每个shot只有title、direction、suggestedDurationSeconds。
 """.strip()
@@ -83,7 +84,16 @@ def compile_anchor_prompt(
     regeneration_instruction: str | None = None,
     series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
+    visual_profile: VisualProfileDraft | None = None,
 ) -> CompiledPrompt:
+    profile = visual_profile or VisualProfileDraft(
+        personIdentity=series_profile.person_identity,
+        personHair=series_profile.person_hair,
+        personBody=series_profile.person_body,
+        catIdentity=series_profile.cat_identity,
+        stylePositive=style_profile.positive_features,
+        styleNegative=style_profile.excluded_features,
+    )
     refs = "；".join(reference_descriptions) or "没有附加参考图，严格按文字设定生成。"
     retry = (
         ""
@@ -92,8 +102,8 @@ def compile_anchor_prompt(
     )
     return _compiled(
         f"""【任务】生成一张无字9:16竖屏开场锚点，只表现当前镜头动作开始前的稳定状态。
-【主体】{series_profile.person_identity}；{series_profile.person_hair}；{series_profile.person_body}；{series_profile.cat_identity}。全图人物与猫咪数量准确，不复制角色。
-【定稿画风】{style_profile.prompt_positive()}；排除{style_profile.prompt_negative()}。
+【主体】{profile.person_identity}；{profile.person_hair}；{profile.person_body}；{profile.cat_identity}。全图人物与猫咪数量准确，不复制角色。
+【定稿画风】{'、'.join(profile.style_positive)}；排除{'、'.join(profile.style_negative)}。
 【素材职责】{refs}任何画风或道具参考不得改写人物和猫咪身份。
 【场景】{context.scene_title}。{context.scene_text}
 【当前镜头】{context.shot_title}：{context.direction}
@@ -108,21 +118,36 @@ def compile_scene_look_prompt(
     scene_text: str,
     look_plan: SceneLookPlan,
     reference_descriptions: tuple[str, ...],
-    series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
-    style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
+    visual_profile: VisualProfileDraft | None = None,
+    regeneration_instruction: str | None = None,
 ) -> CompiledPrompt:
+    profile = visual_profile or VisualProfileDraft()
     refs = "；".join(reference_descriptions) or "没有附加参考图，严格按Canon文字设定生成。"
+    retry = (
+        ""
+        if not regeneration_instruction
+        else f"\n【本次单项修正】{regeneration_instruction.strip()}。其他已锁定内容保持不变。"
+    )
     return _compiled(
         f"""【任务】为项目“{project_title}”的场景“{scene_title}”生成一张无字9:16竖屏场景定妆图，作为该场景所有视频片段共享的服装、配件、道具和人猫比例参考。
-【Canon身份】{series_profile.person_identity}；{series_profile.person_hair}；{series_profile.person_body}；{series_profile.cat_identity}。参考图职责：{refs}；不得改写Canon身份、复制人物或复制猫咪。
+【人物身份锁定】{profile.person_identity}；{profile.person_hair}；{profile.person_body}。人物可以按本场景换装，但脸型、五官、发型、年龄感和头身比例必须保持。
+【猫咪身份锁定】{profile.cat_identity}。猫咪保持同一只，服饰或场景不得改写脸部、毛色分区、虎斑、眼睛、尾巴和体型。
+【参考图职责】{refs}；每张图只承担声明职责，不得改写Canon身份，不得互相改写角色、服装、道具或画风。
 【场景原文】{scene_text}
 【人物服装】{look_plan.person_wardrobe or '沿用Canon基础服装'}。
 【人物配件】{look_plan.person_accessories or '无新增配件'}。
 【猫咪外观】猫咪{look_plan.cat_appearance or '保持Canon外观且不增加服饰'}。
 【关键道具】{look_plan.key_props or '无新增关键道具'}。
-【画风】{style_profile.prompt_positive()}；排除{style_profile.prompt_negative()}。
-【构图】人物与猫咪同处一个可读的稳定准备状态，完整展示服饰、配件、关键道具和相对比例；不表现后续动作高潮。
-【限制】不要字幕、编号、分格、边框、UI、Logo或水印。"""
+【姿态】人物{
+            look_plan.person_pose or '自然站立或蹲坐，双手处于稳定准备状态'
+        }；猫咪{look_plan.cat_pose or '保持自然四足站立或坐姿'}。
+【画风锁定】{'、'.join(profile.style_positive)}；排除{'、'.join(profile.style_negative)}。当前环境采用{look_plan.environment_style.value}画风变体。
+【构图】{
+            look_plan.composition
+            or '人物与猫咪同处一个可读的稳定准备状态，完整展示服饰、配件、关键道具和相对比例'
+        }；不表现后续动作高潮。
+【补充要求】{look_plan.additional_instructions or '无'}。
+【限制】不要字幕、编号、分格、边框、UI、Logo或水印。{retry}"""
     )
 
 
@@ -134,7 +159,16 @@ def compile_shot_video_prompt(
     regeneration_instruction: str | None = None,
     series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
+    visual_profile: VisualProfileDraft | None = None,
 ) -> CompiledPrompt:
+    profile = visual_profile or VisualProfileDraft(
+        personIdentity=series_profile.person_identity,
+        personHair=series_profile.person_hair,
+        personBody=series_profile.person_body,
+        catIdentity=series_profile.cat_identity,
+        stylePositive=style_profile.positive_features,
+        styleNegative=style_profile.excluded_features,
+    )
     aliases = {item.prompt_alias for item in input_plan.bindings}
     for description in binding_descriptions:
         alias = description.split("=", 1)[0].strip()
@@ -147,7 +181,7 @@ def compile_shot_video_prompt(
         else f"\n【本次重做目标】{regeneration_instruction.strip()}"
     )
     return _compiled(
-        f"""【主体、画风和素材职责】输出{input_plan.resolution}、9:16竖屏、{context.duration_seconds}秒的一个完整视频片段，使用原生环境声和动作声。{series_profile.person_identity}；{series_profile.person_hair}；{series_profile.person_body}；{series_profile.cat_identity}。采用{style_profile.prompt_positive()}，排除{style_profile.prompt_negative()}。素材：{binding_text}
+        f"""【主体、画风和素材职责】输出{input_plan.resolution}、9:16竖屏、{context.duration_seconds}秒的一个完整视频片段，使用原生环境声和动作声。{profile.person_identity}；{profile.person_hair}；{profile.person_body}；{profile.cat_identity}。采用{'、'.join(profile.style_positive)}，排除{'、'.join(profile.style_negative)}。项目视觉档案负责长期人物和猫咪身份及系列画风；场景定妆只负责本场服装、配件、道具、姿态和构图，不得反向改写长期身份。素材：{binding_text}
 
 【片段内子镜头、动作路径和结果】项目“{context.project_title}”，场景“{context.scene_title}”，视频片段“{context.shot_title}”。严格按下列编号子镜头的顺序、空间连续性和因果关系执行：{context.direction}
 

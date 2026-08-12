@@ -3,6 +3,15 @@ export type ReferenceUsage = "approved_anchor" | "generation_reference";
 export type ReferenceRole = "identity" | "style" | "scene" | "prop" | "composition";
 export type ReferenceTarget = "anchor" | "video" | "both";
 export type StoryMode = "single" | "multi";
+export type EnvironmentStyle = "outdoor" | "indoor";
+export type LookReferencePurpose =
+  | "person_identity"
+  | "person_body"
+  | "cat_identity"
+  | "style"
+  | "wardrobe"
+  | "prop"
+  | "composition";
 
 export interface ReferenceBinding {
   assetId: string;
@@ -32,6 +41,38 @@ export interface AssetDto {
   semanticKey?: string | null;
   metadata: Record<string, unknown>;
   contentReady: boolean;
+  displayName: string;
+  referencePurpose?: LookReferencePurpose | null;
+  visualProfileRevisionId?: string | null;
+  lookDraftRevision?: number | null;
+  createdAt?: string | null;
+}
+
+export interface LookReferenceBinding {
+  assetId: string;
+  purpose: LookReferencePurpose;
+  instruction: string;
+}
+
+export interface VisualProfileDraft {
+  personIdentity: string;
+  personHair: string;
+  personBody: string;
+  catIdentity: string;
+  stylePositive: string[];
+  styleNegative: string[];
+  referenceBindings: LookReferenceBinding[];
+}
+
+export interface VisualProfileRevisionDto extends VisualProfileDraft {
+  id: string;
+  projectId: string;
+  revision: number;
+  profileHash: string;
+  sourceProfileId: string;
+  createdAt?: string | null;
+  canonDefaults?: VisualProfileDraft;
+  referenceSnapshot: Array<LookReferenceBinding & { semanticKey?: string | null; sha256: string }>;
 }
 
 export interface SceneLookPlan {
@@ -39,8 +80,52 @@ export interface SceneLookPlan {
   personAccessories: string;
   catAppearance: string;
   keyProps: string;
+  environmentStyle: EnvironmentStyle;
+  personPose: string;
+  catPose: string;
+  composition: string;
+  additionalInstructions: string;
   imageRecommended: boolean;
   recommendationReason?: string | null;
+}
+
+export interface SceneLookDraftDto {
+  visualProfileRevisionId: string;
+  lookPlan: SceneLookPlan;
+  referenceBindings: LookReferenceBinding[];
+}
+
+export interface SceneLookDraftEnvelope {
+  sceneId: string;
+  revision: number;
+  draft: SceneLookDraftDto;
+}
+
+export interface SceneLookPromptPreview {
+  prompt: string;
+  charCount: number;
+  utf8Bytes: number;
+  referenceCount: number;
+  references: Array<{
+    index: number;
+    assetId: string;
+    sha256: string;
+    semanticKey?: string | null;
+    purpose: LookReferencePurpose;
+    instruction: string;
+    contentReady: boolean;
+  }>;
+  warnings: string[];
+  visualProfileRevisionId: string;
+  visualProfileRevision: number;
+  draftRevision: number;
+}
+
+export interface SceneLookVersion extends AssetDto {
+  selected: boolean;
+  attempt?: number | null;
+  prompt?: PromptDto | null;
+  inputSnapshot: Record<string, unknown>;
 }
 
 export interface ShotSuggestion {
@@ -114,6 +199,7 @@ export interface SceneDto {
   targetShotCount: number;
   lookPlan?: SceneLookPlan | null;
   selectedLookAssetId?: string | null;
+  lookDraftRevision: number;
   status: string;
   attempts: AttemptDto[];
   shots: ShotDto[];
@@ -137,6 +223,7 @@ export interface ProjectGraph {
     selectedSequenceId?: string | null;
     contractVersion: number;
     defaultReferenceBindings: ReferenceBinding[];
+    visualProfileRevisionId?: string | null;
   };
   assets: AssetDto[];
   scenes: SceneDto[];

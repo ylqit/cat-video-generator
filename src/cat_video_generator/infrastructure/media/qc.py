@@ -58,12 +58,13 @@ class FfmpegFrameExtractor:
         pattern = self._work_root / f".review-{token}-%02d.png"
         sample_count = min(30, max(count * 2, count))
         frame_rate = sample_count / (duration_ms / 1000)
+        source_path = source.require_path()
         try:
             _run_ffmpeg(
                 self._ffmpeg_path,
                 [
                     "-i",
-                    str(source.path),
+                    str(source_path),
                     "-vf",
                     f"fps={frame_rate:.8f}",
                     "-frames:v",
@@ -123,6 +124,7 @@ class FfmpegFrameExtractor:
         self._work_root.mkdir(parents=True, exist_ok=True)
         token = uuid.uuid4().hex
         frames: list[Path] = []
+        source_path = source.require_path()
         try:
             for index, timestamp_ms in enumerate(timestamps_ms, 1):
                 output = self._work_root / f".boundary-{token}-{index}.png"
@@ -132,7 +134,7 @@ class FfmpegFrameExtractor:
                         "-ss",
                         f"{timestamp_ms / 1000:.3f}",
                         "-i",
-                        str(source.path),
+                        str(source_path),
                         "-frames:v",
                         "1",
                         str(output),

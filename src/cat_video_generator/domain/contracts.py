@@ -13,6 +13,7 @@ from uuid import UUID
 from pydantic import Field, model_validator
 
 from .contract_base import StrictModel
+from .visual_profiles import DEFAULT_SERIES_VISUAL_PROFILE, DEFAULT_STYLE_PROFILE
 
 CURRENT_CONTRACT_VERSION = 5
 
@@ -47,11 +48,77 @@ class ReferenceTarget(StrEnum):
     BOTH = "both"
 
 
+class EnvironmentStyle(StrEnum):
+    OUTDOOR = "outdoor"
+    INDOOR = "indoor"
+
+
+class LookReferencePurpose(StrEnum):
+    PERSON_IDENTITY = "person_identity"
+    PERSON_BODY = "person_body"
+    CAT_IDENTITY = "cat_identity"
+    STYLE = "style"
+    WARDROBE = "wardrobe"
+    PROP = "prop"
+    COMPOSITION = "composition"
+
+
 class ReferenceBinding(StrictModel):
     asset_id: Annotated[UUID, Field(alias="assetId")]
     usage: ReferenceUsage
     role: ReferenceRole
     apply_to: Annotated[ReferenceTarget, Field(alias="applyTo")]
+
+
+class LookReferenceBinding(StrictModel):
+    asset_id: Annotated[UUID, Field(alias="assetId")]
+    purpose: LookReferencePurpose
+    instruction: Annotated[str, Field(max_length=1_000)] = ""
+
+
+class VisualProfileDraft(StrictModel):
+    person_identity: Annotated[
+        str,
+        Field(alias="personIdentity", min_length=8, max_length=600),
+    ] = DEFAULT_SERIES_VISUAL_PROFILE.person_identity
+    person_hair: Annotated[
+        str,
+        Field(alias="personHair", min_length=4, max_length=300),
+    ] = DEFAULT_SERIES_VISUAL_PROFILE.person_hair
+    person_body: Annotated[
+        str,
+        Field(alias="personBody", min_length=4, max_length=300),
+    ] = DEFAULT_SERIES_VISUAL_PROFILE.person_body
+    cat_identity: Annotated[
+        str,
+        Field(alias="catIdentity", min_length=8, max_length=600),
+    ] = DEFAULT_SERIES_VISUAL_PROFILE.cat_identity
+    style_positive: Annotated[
+        tuple[str, ...],
+        Field(alias="stylePositive", min_length=3, max_length=10),
+    ] = DEFAULT_STYLE_PROFILE.positive_features
+    style_negative: Annotated[
+        tuple[str, ...],
+        Field(alias="styleNegative", min_length=2, max_length=10),
+    ] = DEFAULT_STYLE_PROFILE.excluded_features
+    reference_bindings: list[LookReferenceBinding] = Field(
+        default_factory=list,
+        alias="referenceBindings",
+        max_length=14,
+    )
+
+    @model_validator(mode="after")
+    def validate_profile_references(self) -> VisualProfileDraft:
+        allowed = {
+            LookReferencePurpose.PERSON_IDENTITY,
+            LookReferencePurpose.PERSON_BODY,
+            LookReferencePurpose.CAT_IDENTITY,
+            LookReferencePurpose.STYLE,
+        }
+        if any(item.purpose not in allowed for item in self.reference_bindings):
+            raise ValueError("项目视觉档案只允许人物、猫咪和画风参考")
+        _validate_unique_look_assets(self.reference_bindings)
+        return self
 
 
 class StoryProjectInput(StrictModel):
@@ -83,11 +150,37 @@ class SceneLookPlan(StrictModel):
         str,
         Field(alias="keyProps", max_length=1_000),
     ] = ""
+    environment_style: EnvironmentStyle = Field(
+        default=EnvironmentStyle.OUTDOOR,
+        alias="environmentStyle",
+    )
+    person_pose: Annotated[str, Field(alias="personPose", max_length=1_000)] = ""
+    cat_pose: Annotated[str, Field(alias="catPose", max_length=1_000)] = ""
+    composition: Annotated[str, Field(max_length=1_500)] = ""
+    additional_instructions: Annotated[
+        str,
+        Field(alias="additionalInstructions", max_length=2_000),
+    ] = ""
     image_recommended: bool = Field(default=False, alias="imageRecommended")
     recommendation_reason: Annotated[
         str | None,
         Field(alias="recommendationReason", max_length=2_000),
     ] = None
+
+
+class SceneLookDraft(StrictModel):
+    visual_profile_revision_id: Annotated[UUID, Field(alias="visualProfileRevisionId")]
+    look_plan: SceneLookPlan = Field(alias="lookPlan")
+    reference_bindings: list[LookReferenceBinding] = Field(
+        default_factory=list,
+        alias="referenceBindings",
+        max_length=14,
+    )
+
+    @model_validator(mode="after")
+    def validate_reference_assets(self) -> SceneLookDraft:
+        _validate_unique_look_assets(self.reference_bindings)
+        return self
 
 
 class SceneDraft(StrictModel):
@@ -175,3 +268,9 @@ class ShotPromptContext(StrictModel):
     shot_title: str
     direction: str
     duration_seconds: int
+
+
+def _validate_unique_look_assets(bindings: list[LookReferenceBinding]) -> None:
+    asset_ids = [item.asset_id for item in bindings]
+    if len(asset_ids) != len(set(asset_ids)):
+        raise ValueError("同一素材不能在定妆参考中重复绑定")

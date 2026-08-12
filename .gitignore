@@ -20,6 +20,7 @@ docs/LibTV
 !/docs/checklists/
 /docs/checklists/*
 !/docs/checklists/shot-queue-production-core.md
+!/docs/checklists/v5-creation-flow-upgrade.md
 
 # Web frontend
 web/node_modules/

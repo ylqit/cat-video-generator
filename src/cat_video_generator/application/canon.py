@@ -27,7 +27,10 @@ class CanonManifestEntry(StrictModel):
 class CanonRepository(Protocol):
     def list_assets(self) -> tuple[StoredAsset, ...]: ...
 
-    def repair_canon_asset(self, asset_id: uuid.UUID, landed: LandedAsset) -> StoredAsset: ...
+    def repair_canon_assets(
+        self,
+        repairs: tuple[tuple[uuid.UUID, LandedAsset], ...],
+    ) -> tuple[StoredAsset, ...]: ...
 
 
 class CanonRepairService:
@@ -58,7 +61,7 @@ class CanonRepairService:
             for item in self._repository.list_assets()
             if item.scope == "canon" and item.status == "approved" and item.semantic_key
         }
-        repaired: list[StoredAsset] = []
+        repairs: list[tuple[uuid.UUID, LandedAsset]] = []
         root = source_root.expanduser().resolve()
         for entry in manifest:
             asset = database_assets.get(entry.semantic_key)
@@ -73,5 +76,5 @@ class CanonRepairService:
             landed = self._asset_store.import_local(source)
             if landed.sha256 != digest:
                 raise ValueError(f"Canon imported hash mismatch: {entry.semantic_key}")
-            repaired.append(self._repository.repair_canon_asset(asset.id, landed))
-        return tuple(repaired)
+            repairs.append((asset.id, landed))
+        return self._repository.repair_canon_assets(tuple(repairs))

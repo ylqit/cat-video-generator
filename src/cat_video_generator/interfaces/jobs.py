@@ -25,6 +25,7 @@ PAID_KINDS = frozenset(
     {
         "shot_suggestions",
         "generate_anchor",
+        "generate_scene_look",
         "generate_video",
         "range_edit",
     }

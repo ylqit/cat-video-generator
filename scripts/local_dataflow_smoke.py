@@ -17,8 +17,10 @@ import uuid
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+from fastapi.testclient import TestClient
 from PIL import Image
 
 from cat_video_generator.application.ports import (
@@ -34,6 +36,7 @@ from cat_video_generator.application.ports import (
     StoredSequence,
     StoredShot,
     StoredStep,
+    StoredVisualProfileRevision,
     VideoDiagnosticResult,
     VideoTaskResult,
 )
@@ -46,15 +49,18 @@ from cat_video_generator.bootstrap import build_runtime_container
 from cat_video_generator.config import load_local_env
 from cat_video_generator.domain.contracts import (
     AnchorMode,
+    LookReferenceBinding,
     ReferenceBinding,
     ReferenceRole,
     ReferenceTarget,
     ReferenceUsage,
     SceneDraft,
+    SceneLookDraft,
     SceneLookPlan,
     ShotCardDraft,
     StoryMode,
     StoryProjectInput,
+    VisualProfileDraft,
 )
 from cat_video_generator.domain.rendering import (
     ProjectSequencePlan,
@@ -76,6 +82,8 @@ from cat_video_generator.infrastructure.media.qc import (
     FfprobeMediaProbe,
 )
 from cat_video_generator.infrastructure.media.storage import LocalAssetStore
+from cat_video_generator.interfaces.api import create_app
+from cat_video_generator.interfaces.jobs import JobRegistry
 
 
 class MemoryStore:
@@ -88,10 +96,19 @@ class MemoryStore:
         self.assets: dict[uuid.UUID, StoredAsset] = {}
         self.reviews: dict[uuid.UUID, StoredReview] = {}
         self.sequences: dict[uuid.UUID, StoredSequence] = {}
+        self.visual_profiles: dict[uuid.UUID, StoredVisualProfileRevision] = {}
         self._idempotency: dict[str, uuid.UUID] = {}
 
     def create_project(self, source: StoryProjectInput, *, content_date: date) -> StoredProject:
-        project = StoredProject(uuid.uuid4(), source.title, content_date, RunStatus.ACTIVE)
+        project_id = uuid.uuid4()
+        profile = self._new_visual_profile(project_id, VisualProfileDraft())
+        project = StoredProject(
+            project_id,
+            source.title,
+            content_date,
+            RunStatus.ACTIVE,
+            visual_profile_revision_id=profile.id,
+        )
         self.projects[project.id] = project
         scene = StoredScene(
             uuid.uuid4(),
@@ -133,6 +150,96 @@ class MemoryStore:
             default_reference_bindings=tuple(references),
         )
         return self.projects[project_id]
+
+    def get_visual_profile(self, project_id: uuid.UUID) -> StoredVisualProfileRevision:
+        revision_id = self.projects[project_id].visual_profile_revision_id
+        if revision_id is None:
+            raise ValueError("project has no visual profile")
+        return self.visual_profiles[revision_id]
+
+    def get_default_visual_profile(self, project_id: uuid.UUID) -> VisualProfileDraft:
+        del project_id
+        return VisualProfileDraft()
+
+    def get_visual_profile_revision(
+        self,
+        revision_id: uuid.UUID,
+    ) -> StoredVisualProfileRevision:
+        return self.visual_profiles[revision_id]
+
+    def save_visual_profile(
+        self,
+        project_id: uuid.UUID,
+        draft: VisualProfileDraft,
+    ) -> StoredVisualProfileRevision:
+        encoded = json.dumps(
+            draft.model_dump(mode="json", by_alias=True),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        profile_hash = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        existing = next(
+            (
+                item
+                for item in self.visual_profiles.values()
+                if item.project_id == project_id and item.profile_hash == profile_hash
+            ),
+            None,
+        )
+        profile = existing or self._new_visual_profile(project_id, draft)
+        self.projects[project_id] = replace(
+            self.projects[project_id],
+            visual_profile_revision_id=profile.id,
+            default_reference_bindings=tuple(
+                ReferenceBinding(
+                    assetId=item.asset_id,
+                    usage=ReferenceUsage.GENERATION_REFERENCE,
+                    role=(
+                        ReferenceRole.STYLE
+                        if item.purpose.value == "style"
+                        else ReferenceRole.IDENTITY
+                    ),
+                    applyTo=ReferenceTarget.BOTH,
+                )
+                for item in draft.reference_bindings
+            ),
+        )
+        return profile
+
+    def _new_visual_profile(
+        self,
+        project_id: uuid.UUID,
+        draft: VisualProfileDraft,
+    ) -> StoredVisualProfileRevision:
+        revisions = [
+            item.revision
+            for item in self.visual_profiles.values()
+            if item.project_id == project_id
+        ]
+        encoded = json.dumps(
+            draft.model_dump(mode="json", by_alias=True),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        profile = StoredVisualProfileRevision(
+            id=uuid.uuid4(),
+            project_id=project_id,
+            revision=max(revisions, default=0) + 1,
+            profile_hash=hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+            source_profile_id="fixture-canon",
+            draft=draft,
+            reference_snapshot=tuple(
+                {
+                    **item.model_dump(mode="json", by_alias=True),
+                    "sha256": self.assets[item.asset_id].sha256,
+                }
+                for item in draft.reference_bindings
+                if item.asset_id in self.assets
+            ),
+            created_at=datetime.now(UTC),
+        )
+        self.visual_profiles[profile.id] = profile
+        return profile
 
     def add_scene(self, project_id: uuid.UUID, draft: SceneDraft) -> StoredScene:
         scene = StoredScene(
@@ -178,6 +285,27 @@ class MemoryStore:
         )
         return self.scenes[scene_id]
 
+    def get_scene_look_draft(self, scene_id: uuid.UUID) -> StoredScene:
+        return self.scenes[scene_id]
+
+    def save_scene_look_draft(
+        self,
+        scene_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        draft: SceneLookDraft,
+    ) -> StoredScene:
+        scene = self.scenes[scene_id]
+        if scene.look_draft_revision != expected_revision:
+            raise ValueError("stale look draft")
+        self.scenes[scene_id] = replace(
+            scene,
+            draft=scene.draft.model_copy(update={"look_plan": draft.look_plan}),
+            look_draft=draft,
+            look_draft_revision=expected_revision + 1,
+        )
+        return self.scenes[scene_id]
+
     def add_shot(self, scene_id: uuid.UUID, draft: ShotCardDraft) -> StoredShot:
         scene = self.scenes[scene_id]
         shot = StoredShot(
@@ -214,6 +342,18 @@ class MemoryStore:
         self.scenes[scene.id] = replace(
             scene,
             draft=scene.draft.model_copy(update={"look_plan": look_plan}),
+            look_draft=(
+                scene.look_draft.model_copy(update={"look_plan": look_plan})
+                if scene.look_draft is not None
+                else SceneLookDraft(
+                    visualProfileRevisionId=self.get_visual_profile(scene.project_id).id,
+                    lookPlan=look_plan or SceneLookPlan(),
+                    referenceBindings=self.get_visual_profile(
+                        scene.project_id
+                    ).draft.reference_bindings,
+                )
+            ),
+            look_draft_revision=scene.look_draft_revision + 1,
         )
         self.steps[step_id] = replace(
             step,
@@ -588,6 +728,11 @@ class FixtureDirector:
                     "personAccessories": "帆布包",
                     "catAppearance": "保持Canon外观且不增加服饰",
                     "keyProps": "鱼竿与小水桶",
+                    "environmentStyle": "outdoor",
+                    "personPose": "站在猫咪后侧并稳稳拿住鱼竿",
+                    "catPose": "自然四足站立并看向浮标",
+                    "composition": "人物与猫咪保持前后可读关系，完整展示鱼竿和水桶",
+                    "additionalInstructions": "竹篮与鱼竿尺寸自然",
                     "imageRecommended": True,
                     "recommendationReason": "多片段复用服装和关键道具",
                 },
@@ -607,12 +752,20 @@ class FixtureGateway:
     def __init__(self) -> None:
         self.submissions: list[VideoInputPlan] = []
         self.image_submissions = 0
+        self.image_prompts: list[str] = []
+        self.image_references: list[tuple[Path, ...]] = []
         self.fail_unknown_once = False
 
     def generate_image(self, *, prompt: str, reference_paths: tuple[Path, ...]) -> ImageResult:
-        del prompt, reference_paths
         self.image_submissions += 1
-        return ImageResult("https://fixture.local/anchor.png", self.image_model)
+        self.image_prompts.append(prompt)
+        self.image_references.append(reference_paths)
+        url = (
+            "https://fixture.local/scene-look.png"
+            if "场景定妆图" in prompt
+            else "https://fixture.local/anchor.png"
+        )
+        return ImageResult(url, self.image_model)
 
     def submit_video(
         self,
@@ -781,6 +934,47 @@ def main() -> None:
             repository.get_project(project_id).content_date == date(2026, 8, 13),
             "project settings did not flow through storage",
         )
+        person_reference = production.import_reference(
+            project_id=project_id,
+            path=fixtures["https://fixture.local/person.png"],
+            usage="generation_reference",
+            role="identity",
+        )
+        cat_reference = production.import_reference(
+            project_id=project_id,
+            path=fixtures["https://fixture.local/cat.png"],
+            usage="generation_reference",
+            role="identity",
+        )
+        style_reference = production.import_reference(
+            project_id=project_id,
+            path=fixtures["https://fixture.local/style.png"],
+            usage="generation_reference",
+            role="style",
+        )
+        visual_profile = repository.save_visual_profile(
+            project_id,
+            VisualProfileDraft(
+                referenceBindings=[
+                    LookReferenceBinding(
+                        assetId=person_reference.id,
+                        purpose="person_identity",
+                        instruction="只锁定人物脸型、五官和短发",
+                    ),
+                    LookReferenceBinding(
+                        assetId=cat_reference.id,
+                        purpose="cat_identity",
+                        instruction="只锁定猫咪毛色、纹路、眼睛和体型",
+                    ),
+                    LookReferenceBinding(
+                        assetId=style_reference.id,
+                        purpose="style",
+                        instruction="只锁定二维水彩、自然柔光和色彩",
+                    ),
+                ]
+            ),
+        )
+        _require(visual_profile.revision == 2, "visual profile revision was not created")
         scene = repository.list_scenes(project_id)[0]
         scene = repository.update_scene(
             scene.id,
@@ -848,6 +1042,96 @@ def main() -> None:
             shots=single_suggestion.output.shots,
         )
         _require(len(single_shots) == 1, "single mode did not create exactly one clip")
+        saved_single_scene = repository.get_scene(single_scene.id)
+        _require(
+            saved_single_scene.look_draft is not None,
+            "accepted look plan did not initialize a scene look draft",
+        )
+        look_draft = saved_single_scene.look_draft.model_copy(
+            update={
+                "look_plan": saved_single_scene.look_draft.look_plan.model_copy(
+                    update={
+                        "person_wardrobe": "人工编辑后的浅色采茶服",
+                        "key_props": "竹篮",
+                        "composition": "人物站在猫咪后侧，稳定展示服装与竹篮",
+                    }
+                )
+            }
+        )
+        saved_single_scene = repository.save_scene_look_draft(
+            single_scene.id,
+            expected_revision=saved_single_scene.look_draft_revision,
+            draft=look_draft,
+        )
+        look_preview = production.preview_scene_look_prompt(single_scene.id)
+        _require(not look_preview["warnings"], "scene look prompt preview has warnings")
+        _require(
+            [item["purpose"] for item in look_preview["references"]]
+            == ["person_identity", "cat_identity", "style"],
+            "scene look references were not ordered by responsibility",
+        )
+        image_calls_before_look = gateway.image_submissions
+        look_result = production.generate_scene_look(
+            single_scene.id,
+            allow_paid_generation=True,
+            draft_revision=saved_single_scene.look_draft_revision,
+        )
+        _require(
+            gateway.image_submissions == image_calls_before_look + 1,
+            "fake Seedream did not receive the scene look request",
+        )
+        _require(
+            tuple(path.read_bytes() for path in gateway.image_references[-1])
+            == tuple(
+                item.require_path().read_bytes()
+                for item in (person_reference, cat_reference, style_reference)
+            ),
+            "fake Seedream received the wrong reference order",
+        )
+        look_asset_id = uuid.UUID(look_result["assetId"])
+        api_container = SimpleNamespace(
+            repository=repository,
+            editing=editing,
+            production=production,
+            sequences=sequences,
+            runtime_settings=SimpleNamespace(
+                work_root=root.resolve(),
+                asset_root=(root / "assets").resolve(),
+            ),
+        )
+        with TestClient(
+            create_app(
+                api_container,  # type: ignore[arg-type]
+                job_registry=JobRegistry(inline=True),
+            )
+        ) as api_client:
+            versions_response = api_client.get(
+                f"/api/v1/scenes/{single_scene.id}/look-versions"
+            )
+            _require(versions_response.status_code == 200, "look versions API failed")
+            versions = versions_response.json()
+            _require(
+                versions and versions[0]["id"] == str(look_asset_id),
+                "look candidate was absent from the versions API",
+            )
+            content_response = api_client.get(f"/api/v1/assets/{look_asset_id}/content")
+            _require(
+                content_response.status_code == 200 and content_response.content,
+                "look candidate content was not readable through the API",
+            )
+            review_response = api_client.post(
+                f"/api/v1/assets/{look_asset_id}/review",
+                json={
+                    "decision": "approved",
+                    "reason": "offline Web/API fixture",
+                    "select": True,
+                },
+            )
+            _require(review_response.status_code == 200, "look review API failed")
+        _require(
+            repository.get_scene(single_scene.id).selected_look_asset_id == look_asset_id,
+            "approved look was not selected through the API",
+        )
         third = repository.update_shot(
             single_shots[0].id,
             single_shots[0].draft.model_copy(update={"anchor_mode": AnchorMode.GENERATE}),
@@ -874,29 +1158,11 @@ def main() -> None:
             }
         )
         shots[1] = repository.update_shot(shots[1].id, existing_draft)
-        generation_reference = production.import_reference(
-            project_id=project_id,
-            path=fixtures["https://fixture.local/anchor.png"],
-            usage="generation_reference",
-            role="identity",
-        )
-        repository.update_project_default_references(
-            project_id,
-            (
-                ReferenceBinding(
-                    assetId=generation_reference.id,
-                    usage=ReferenceUsage.GENERATION_REFERENCE,
-                    role=ReferenceRole.IDENTITY,
-                    applyTo=ReferenceTarget.BOTH,
-                ),
-            ),
-        )
-        repository.select_scene_look_asset(single_scene.id, approved_anchor.id)
         generated_draft = shots[2].draft.model_copy(
             update={
                 "reference_bindings": [
                     ReferenceBinding(
-                        assetId=generation_reference.id,
+                        assetId=person_reference.id,
                         usage=ReferenceUsage.GENERATION_REFERENCE,
                         role=ReferenceRole.IDENTITY,
                         applyTo=ReferenceTarget.BOTH,
@@ -931,15 +1197,15 @@ def main() -> None:
         modes = [item.operation for item in gateway.submissions[:3]]
         _require(modes == [RenderOperation.SHOT] * 3, "shot requests used a wrong operation")
         _require(
-            len(gateway.submissions[0].bindings) == 1,
-            "project default reference was not inherited",
+            len(gateway.submissions[0].bindings) == 3,
+            "project visual identity/style references were not inherited",
         )
         _require(
-            len(gateway.submissions[1].bindings) == 2,
-            "existing anchor and project reference were not both sent",
+            len(gateway.submissions[1].bindings) == 4,
+            "existing anchor and project visual references were not all sent",
         )
         _require(
-            len(gateway.submissions[2].bindings) == 3,
+            len(gateway.submissions[2].bindings) == 5,
             "generated anchor/custom-scene-project reference order or deduplication failed",
         )
 
@@ -1030,14 +1296,23 @@ def main() -> None:
             raise AssertionError("submission_unknown created a paid retry")
         _require(len(gateway.submissions) == before + 1, "unknown submit was posted twice")
 
+        limit_sources: list[Path] = []
+        for index in range(15):
+            source = root / f"limit-{index:02d}.png"
+            Image.new(
+                "RGB",
+                (64, 64),
+                ((index * 13) % 255, (index * 29) % 255, (index * 47) % 255),
+            ).save(source)
+            limit_sources.append(source)
         limit_assets = tuple(
             production.import_reference(
                 project_id=project_id,
-                path=fixtures["https://fixture.local/anchor.png"],
+                path=source,
                 usage="generation_reference",
                 role="identity",
             )
-            for _index in range(15)
+            for source in limit_sources
         )
         limit_scene = repository.add_scene(
             project_id,
@@ -1120,8 +1395,7 @@ def main() -> None:
             "project graph did not expose both sequence revisions",
         )
 
-        print(
-            {
+        report = {
                 "projectId": str(project_id),
                 "sceneCount": len(repository.list_scenes(project_id)),
                 "shotCount": len(repository.list_shots(scene.id)),
@@ -1132,15 +1406,35 @@ def main() -> None:
                 "sequenceRevisions": len(repository.list_sequences(project_id)),
                 "singleAndMultiSuggestions": True,
                 "providerAndAcceptedOutputRetained": True,
+                "visualProfileRevision": visual_profile.revision,
+                "sceneLookDraftRevision": saved_single_scene.look_draft_revision,
+                "sceneLookPromptPreviewNoArk": True,
+                "lookCandidateWebApiReadReviewSelect": True,
+                "fakeSeedreamReferenceOrder": [
+                    "person_identity",
+                    "cat_identity",
+                    "style",
+                ],
                 "referencePrecedenceAndLimits": True,
                 "sampleInput": str(sample_path),
                 "sampleCompositeSha256": sample_master.sha256,
                 "databaseCanon": database_canon,
                 "rangeEditPreservedSource": True,
                 "submissionUnknownFrozen": True,
+                "previousSmokeFailuresResolved": [
+                    "migration/runtime visual-profile JSON canonicalization mismatch",
+                    "legacy four-image Seedance input cap conflicting with V5 nine-image contract",
+                ],
                 "realArkCalls": 0,
-            }
+        }
+        diagnostics = Path(__file__).parents[1] / "var" / "diagnostics"
+        diagnostics.mkdir(parents=True, exist_ok=True)
+        report_path = diagnostics / "v5-local-dataflow.json"
+        report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
+        print(json.dumps({**report, "reportPath": str(report_path)}, ensure_ascii=False))
 
 
 def _verify_database_canon() -> dict[str, Any]:
@@ -1157,12 +1451,61 @@ def _verify_database_canon() -> dict[str, Any]:
         assets = container.repository.list_assets()
         _require(len(assets) == 11, "database does not expose exactly 11 Canon assets")
         for asset in assets:
-            _require(asset.path.is_file(), f"Canon content is missing: {asset.semantic_key}")
-            digest = hashlib.sha256(asset.path.read_bytes()).hexdigest()
+            _require(asset.content_ready, f"Canon content is missing: {asset.semantic_key}")
+            digest = hashlib.sha256(asset.require_path().read_bytes()).hexdigest()
             _require(digest == asset.sha256, f"Canon content hash drifted: {asset.semantic_key}")
         projects = container.repository.list_projects()
         _require(projects, "Canon project-default verification requires one local project")
         project = projects[0]
+        current_profile = container.repository.get_visual_profile(project.id)
+        original_profile = container.repository.save_visual_profile(
+            project.id,
+            current_profile.draft,
+        )
+        edited_profile = original_profile.draft.model_copy(
+            update={
+                "person_body": (
+                    f"{original_profile.draft.person_body}；本地验收临时 Revision"
+                )
+            }
+        )
+        new_profile = container.repository.save_visual_profile(project.id, edited_profile)
+        _require(
+            new_profile.id != original_profile.id
+            and new_profile.revision > original_profile.revision,
+            "visual profile edit did not create an immutable revision",
+        )
+        _require(
+            container.repository.get_visual_profile_revision(original_profile.id).profile_hash
+            == original_profile.profile_hash,
+            "old visual profile revision changed",
+        )
+        restored_profile = container.repository.save_visual_profile(
+            project.id,
+            original_profile.draft,
+        )
+        _require(
+            restored_profile.id == original_profile.id,
+            "restoring identical visual profile content did not reuse the old revision",
+        )
+        scenes = container.repository.list_scenes(project.id)
+        _require(scenes, "visual profile project has no scene for look-draft round trip")
+        scene = scenes[0]
+        draft = scene.look_draft or SceneLookDraft(
+            visualProfileRevisionId=original_profile.id,
+            lookPlan=scene.draft.look_plan or SceneLookPlan(),
+            referenceBindings=original_profile.draft.reference_bindings,
+        )
+        saved_scene = container.repository.save_scene_look_draft(
+            scene.id,
+            expected_revision=scene.look_draft_revision,
+            draft=draft,
+        )
+        _require(
+            saved_scene.look_draft is not None
+            and saved_scene.look_draft_revision == scene.look_draft_revision + 1,
+            "database scene look draft did not round trip",
+        )
         original = project.default_reference_bindings
         selected = tuple(
             ReferenceBinding(
@@ -1193,6 +1536,8 @@ def _verify_database_canon() -> dict[str, Any]:
         return {
             "assetsReadable": len(assets),
             "recommendedDefaultsRoundTrip": len(selected),
+            "visualProfileRevisionRoundTrip": new_profile.revision,
+            "sceneLookDraftRevision": saved_scene.look_draft_revision,
             "projectId": str(project.id),
         }
     finally:
@@ -1260,7 +1605,15 @@ def _normalize_sample(ffmpeg: str, source: Path, output: Path) -> Path:
 
 def _fixtures(root: Path, ffmpeg: str) -> dict[str, Path]:
     anchor = root / "anchor.png"
+    person = root / "person.png"
+    cat = root / "cat.png"
+    style = root / "style.png"
+    scene_look = root / "scene-look.png"
     Image.new("RGB", (480, 854), (205, 222, 198)).save(anchor)
+    Image.new("RGB", (480, 854), (214, 190, 164)).save(person)
+    Image.new("RGB", (480, 854), (155, 165, 173)).save(cat)
+    Image.new("RGB", (480, 854), (129, 175, 121)).save(style)
+    Image.new("RGB", (480, 854), (194, 205, 151)).save(scene_look)
     shot = root / "shot.mp4"
     edit = root / "edit.mp4"
     # The edited fixture suggestions span 9–11 seconds; a 10-second substitute
@@ -1269,6 +1622,10 @@ def _fixtures(root: Path, ffmpeg: str) -> dict[str, Path]:
     _video_fixture(ffmpeg, edit, duration=4, color="0xd4aa78", frequency=520)
     return {
         "https://fixture.local/anchor.png": anchor,
+        "https://fixture.local/person.png": person,
+        "https://fixture.local/cat.png": cat,
+        "https://fixture.local/style.png": style,
+        "https://fixture.local/scene-look.png": scene_look,
         "https://fixture.local/shot.mp4": shot,
         "https://fixture.local/edit.mp4": edit,
     }

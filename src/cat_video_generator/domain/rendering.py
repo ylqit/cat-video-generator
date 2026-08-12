@@ -39,7 +39,7 @@ class MediaBinding(StrictModel):
     semantic_key: Annotated[str, Field(min_length=3, max_length=160)]
     modality: MediaModality
     provider_role: ProviderMediaRole
-    ordinal: Annotated[int, Field(ge=1, le=4)]
+    ordinal: Annotated[int, Field(ge=1, le=9)]
     sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
     @property
@@ -52,7 +52,7 @@ class VideoInputPlan(StrictModel):
     operation: RenderOperation
     resolution: Literal["480p", "720p"]
     duration_seconds: Annotated[int, Field(ge=4, le=15)]
-    bindings: list[MediaBinding] = Field(default_factory=list, max_length=4)
+    bindings: list[MediaBinding] = Field(default_factory=list, max_length=9)
 
     @model_validator(mode="after")
     def validate_bindings(self) -> VideoInputPlan:
@@ -145,7 +145,10 @@ def build_shot_input_plan(
 ) -> VideoInputPlan:
     if resolution not in {"480p", "720p"}:
         raise ValueError(f"不支持的视频分辨率{resolution}")
-    maximum_references = 3 if anchor is not None else 4
+    # V5 treats the Seedance allowance as nine image inputs in total.  A
+    # selected anchor occupies the first slot; the remaining slots are regular
+    # references.  Resolution changes output quality, not this input contract.
+    maximum_references = 8 if anchor is not None else 9
     if len(references) > maximum_references:
         raise ValueError(f"当前模型输入档案最多允许{maximum_references}项附加参考素材")
     sources = (() if anchor is None else (anchor,)) + references

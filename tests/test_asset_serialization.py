@@ -27,3 +27,24 @@ def test_asset_dtos_expose_stored_shot_card_id_as_shot_id() -> None:
 
     assert _json_asset(asset)["shotId"] == str(shot_card_id)
     assert _asset_json(asset)["shotId"] == str(shot_card_id)
+
+
+def test_asset_dtos_report_missing_content_without_dereferencing_a_path() -> None:
+    asset = StoredAsset(
+        id=uuid.uuid4(),
+        project_id=None,
+        scene_id=None,
+        shot_card_id=None,
+        step_id=None,
+        role="identity",
+        media_type="image",
+        scope="canon",
+        status="approved",
+        path=None,
+        sha256="0" * 64,
+        metadata={},
+        semantic_key="person:headshot",
+    )
+
+    assert _json_asset(asset)["contentReady"] is False
+    assert _asset_json(asset)["contentReady"] is False

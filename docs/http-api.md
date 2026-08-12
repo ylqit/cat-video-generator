@@ -7,13 +7,19 @@ POST   /api/v1/projects
 GET    /api/v1/projects/{id}
 PATCH  /api/v1/projects/{id}
 PUT    /api/v1/projects/{id}/default-references
+GET    /api/v1/projects/{id}/visual-profile
+PUT    /api/v1/projects/{id}/visual-profile
 
 POST   /api/v1/projects/{id}/scenes
 PATCH  /api/v1/scenes/{id}
 DELETE /api/v1/scenes/{id}
 PUT    /api/v1/projects/{id}/scene-order
 PUT    /api/v1/scenes/{id}/look-asset
+GET    /api/v1/scenes/{id}/look-draft
+PUT    /api/v1/scenes/{id}/look-draft
+POST   /api/v1/scenes/{id}/look-prompt-preview
 POST   /api/v1/scenes/{id}/look-images
+GET    /api/v1/scenes/{id}/look-versions
 
 POST   /api/v1/scenes/{id}/shot-suggestions
 POST   /api/v1/steps/{id}/accept-suggestions
@@ -55,3 +61,8 @@ GET    /api/v1/jobs/{id}
 `shots`；单片段场景严格为 1 个，多片段场景严格等于场景设置的 2～6 个。原始
 `providerOutput` 不变，服务端另存 `acceptedOutput` 与 `acceptedAt`。已有图片或视频
 Provider 历史时，整批覆盖返回 409。
+
+视觉档案 `PUT` 按文本、参考资产 ID 和参考内容 SHA-256 计算内容哈希：相同内容复用
+revision，不同内容创建不可变 revision。`PUT /look-draft` 使用 `expectedRevision` 乐观锁；
+`POST /look-images` 必须携带刚保存的 `draftRevision`。实际付费提交前要求人物身份、猫咪
+身份和画风三类参考齐全、内容可读且去重后不超过 14 张。Prompt 预览不调用 Ark。

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -22,16 +23,23 @@ from ...application.ports import (
     StoredSequence,
     StoredShot,
     StoredStep,
+    StoredVisualProfileRevision,
 )
 from ...domain.contracts import (
     CURRENT_CONTRACT_VERSION,
     AnchorMode,
+    LookReferenceBinding,
+    LookReferencePurpose,
     ReferenceBinding,
+    ReferenceRole,
+    ReferenceTarget,
     ReferenceUsage,
     SceneDraft,
+    SceneLookDraft,
     SceneLookPlan,
     ShotCardDraft,
     StoryProjectInput,
+    VisualProfileDraft,
 )
 from ...domain.rendering import ProjectSequencePlan, SequenceStatus
 from ...domain.workflow import (
@@ -52,6 +60,7 @@ from .models import (
     Scene,
     ShotCard,
     VideoSequence,
+    VisualProfileRevision,
     WorkflowStep,
 )
 
@@ -86,6 +95,14 @@ class SqlAlchemyWorkflowRepository:
             )
             session.add(row)
             session.flush()
+            profile = _default_visual_profile(session)
+            revision = self._create_visual_profile_revision(
+                session,
+                project=row,
+                draft=profile,
+            )
+            row.current_visual_profile_revision_id = revision.id
+            row.default_reference_bindings_json = _project_reference_bindings(profile)
             scene = Scene(
                 production_run_id=row.id,
                 sort_order=1,
@@ -143,6 +160,66 @@ class SqlAlchemyWorkflowRepository:
             ]
             return _project(row)
 
+    def get_visual_profile(self, project_id: uuid.UUID) -> StoredVisualProfileRevision:
+        with self._sessions() as session:
+            project = self._require_project(session, project_id)
+            if project.current_visual_profile_revision_id is None:
+                raise RecordNotFoundError(f"project {project_id} has no visual profile")
+            row = _required(
+                session,
+                VisualProfileRevision,
+                project.current_visual_profile_revision_id,
+            )
+            return _visual_profile(row)
+
+    def get_default_visual_profile(self, project_id: uuid.UUID) -> VisualProfileDraft:
+        with self._sessions() as session:
+            self._require_project(session, project_id)
+            return _default_visual_profile(session)
+
+    def get_visual_profile_revision(
+        self,
+        revision_id: uuid.UUID,
+    ) -> StoredVisualProfileRevision:
+        with self._sessions() as session:
+            return _visual_profile(_required(session, VisualProfileRevision, revision_id))
+
+    def save_visual_profile(
+        self,
+        project_id: uuid.UUID,
+        draft: VisualProfileDraft,
+    ) -> StoredVisualProfileRevision:
+        with self._sessions.begin() as session:
+            project = self._require_project(session, project_id)
+            normalized_bindings = self._normalize_look_reference_bindings(
+                session,
+                project_id=project_id,
+                bindings=draft.reference_bindings,
+                profile_only=True,
+            )
+            draft = draft.model_copy(update={"reference_bindings": normalized_bindings})
+            reference_snapshot = _reference_snapshot(session, normalized_bindings)
+            profile_hash = _profile_hash(draft, reference_snapshot=reference_snapshot)
+            existing = session.scalar(
+                select(VisualProfileRevision).where(
+                    VisualProfileRevision.production_run_id == project_id,
+                    VisualProfileRevision.profile_hash == profile_hash,
+                )
+            )
+            row = (
+                existing
+                if existing is not None
+                else self._create_visual_profile_revision(
+                    session,
+                    project=project,
+                    draft=draft,
+                    reference_snapshot=reference_snapshot,
+                )
+            )
+            project.current_visual_profile_revision_id = row.id
+            project.default_reference_bindings_json = _project_reference_bindings(draft)
+            return _visual_profile(row)
+
     def get_project(self, project_id: uuid.UUID) -> StoredProject:
         with self._sessions() as session:
             return _project_checked(_required(session, ProductionRun, project_id))
@@ -183,6 +260,12 @@ class SqlAlchemyWorkflowRepository:
         with self._sessions.begin() as session:
             row = _required(session, Scene, scene_id)
             self._require_project(session, row.production_run_id)
+            serialized_look_plan = (
+                None
+                if draft.look_plan is None
+                else draft.look_plan.model_dump(mode="json", by_alias=True)
+            )
+            look_plan_changed = row.look_plan_json != serialized_look_plan
             changed = (
                 row.title,
                 row.source_text,
@@ -198,9 +281,7 @@ class SqlAlchemyWorkflowRepository:
                 draft.context_note,
                 draft.story_mode.value,
                 draft.target_shot_count,
-                None
-                if draft.look_plan is None
-                else draft.look_plan.model_dump(mode="json", by_alias=True),
+                serialized_look_plan,
             )
             row.title = draft.title
             row.source_text = draft.source_text
@@ -208,11 +289,13 @@ class SqlAlchemyWorkflowRepository:
             row.context_note = draft.context_note
             row.story_mode = draft.story_mode.value
             row.target_shot_count = draft.target_shot_count
-            row.look_plan_json = (
-                None
-                if draft.look_plan is None
-                else draft.look_plan.model_dump(mode="json", by_alias=True)
-            )
+            row.look_plan_json = serialized_look_plan
+            if look_plan_changed and row.look_draft_json and draft.look_plan is not None:
+                look_draft = SceneLookDraft.model_validate(row.look_draft_json).model_copy(
+                    update={"look_plan": draft.look_plan}
+                )
+                row.look_draft_json = look_draft.model_dump(mode="json", by_alias=True)
+                row.look_draft_revision += 1
             if changed:
                 shots = session.execute(
                     select(ShotCard).where(ShotCard.scene_id == scene_id)
@@ -238,7 +321,45 @@ class SqlAlchemyWorkflowRepository:
                     raise ValueError("scene look must be Canon or belong to the current project")
                 if asset.media_type != "image" or asset.status not in {"ready", "approved"}:
                     raise ValueError("scene look must be an available image")
+                if not _asset(asset, self._asset_root).content_ready:
+                    raise ValueError("scene look content is missing; repair or upload it first")
             scene.selected_look_asset_id = asset_id
+            return _scene(scene)
+
+    def get_scene_look_draft(self, scene_id: uuid.UUID) -> StoredScene:
+        return self.get_scene(scene_id)
+
+    def save_scene_look_draft(
+        self,
+        scene_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        draft: SceneLookDraft,
+    ) -> StoredScene:
+        with self._sessions.begin() as session:
+            scene = _required(session, Scene, scene_id)
+            self._require_project(session, scene.production_run_id)
+            if scene.look_draft_revision != expected_revision:
+                raise WorkflowConflictError(
+                    "场景定妆草稿已被更新，请重新加载后再保存"
+                )
+            profile = _required(
+                session,
+                VisualProfileRevision,
+                draft.visual_profile_revision_id,
+            )
+            if profile.production_run_id != scene.production_run_id:
+                raise ValueError("定妆草稿的视觉档案不属于当前项目")
+            normalized_bindings = self._normalize_look_reference_bindings(
+                session,
+                project_id=scene.production_run_id,
+                bindings=draft.reference_bindings,
+                profile_only=False,
+            )
+            draft = draft.model_copy(update={"reference_bindings": normalized_bindings})
+            scene.look_plan_json = draft.look_plan.model_dump(mode="json", by_alias=True)
+            scene.look_draft_json = draft.model_dump(mode="json", by_alias=True)
+            scene.look_draft_revision += 1
             return _scene(scene)
 
     def delete_scene(self, scene_id: uuid.UUID) -> None:
@@ -368,6 +489,31 @@ class SqlAlchemyWorkflowRepository:
                 if look_plan is None
                 else look_plan.model_dump(mode="json", by_alias=True)
             )
+            if look_plan is not None:
+                if scene.look_draft_json:
+                    look_draft = SceneLookDraft.model_validate(
+                        scene.look_draft_json
+                    ).model_copy(update={"look_plan": look_plan})
+                else:
+                    project = self._require_project(session, scene.production_run_id)
+                    if project.current_visual_profile_revision_id is None:
+                        raise ValueError("项目尚未建立视觉档案")
+                    profile = _required(
+                        session,
+                        VisualProfileRevision,
+                        project.current_visual_profile_revision_id,
+                    )
+                    look_draft = SceneLookDraft(
+                        visualProfileRevisionId=profile.id,
+                        lookPlan=look_plan,
+                        referenceBindings=_environment_profile_bindings(
+                            session,
+                            profile.reference_bindings_json,
+                            look_plan,
+                        ),
+                    )
+                scene.look_draft_json = look_draft.model_dump(mode="json", by_alias=True)
+                scene.look_draft_revision += 1
             snapshot = dict(step.input_snapshot_json)
             snapshot["acceptedOutput"] = accepted_output
             snapshot["acceptedAt"] = datetime.now(timezone.utc).isoformat()
@@ -666,16 +812,27 @@ class SqlAlchemyWorkflowRepository:
         with self._sessions() as session:
             return _asset(_required(session, Asset, asset_id), self._asset_root)
 
-    def repair_canon_asset(self, asset_id: uuid.UUID, landed: LandedAsset) -> StoredAsset:
+    def repair_canon_assets(
+        self,
+        repairs: tuple[tuple[uuid.UUID, LandedAsset], ...],
+    ) -> tuple[StoredAsset, ...]:
         with self._sessions.begin() as session:
-            row = _required(session, Asset, asset_id)
-            if row.scope != "canon" or row.status != "approved":
-                raise ValueError("only approved Canon assets can be repaired")
-            if row.sha256 != landed.sha256:
-                raise ValueError("Canon repair cannot change the approved asset hash")
-            row.storage_key = _storage_key_for(landed.path, self._asset_root)
-            row.byte_size = landed.byte_size
-            return _asset(row, self._asset_root)
+            rows: list[tuple[Asset, LandedAsset]] = []
+            seen: set[uuid.UUID] = set()
+            for asset_id, landed in repairs:
+                if asset_id in seen:
+                    raise ValueError("Canon repair contains a duplicate asset ID")
+                seen.add(asset_id)
+                row = _required(session, Asset, asset_id)
+                if row.scope != "canon" or row.status != "approved":
+                    raise ValueError("only approved Canon assets can be repaired")
+                if row.sha256 != landed.sha256:
+                    raise ValueError("Canon repair cannot change the approved asset hash")
+                rows.append((row, landed))
+            for row, landed in rows:
+                row.storage_key = _storage_key_for(landed.path, self._asset_root)
+                row.byte_size = landed.byte_size
+            return tuple(_asset(row, self._asset_root) for row, _landed in rows)
 
     def list_assets(
         self,
@@ -937,6 +1094,48 @@ class SqlAlchemyWorkflowRepository:
             )
         return row
 
+    def _create_visual_profile_revision(
+        self,
+        session: Session,
+        *,
+        project: ProductionRun,
+        draft: VisualProfileDraft,
+        reference_snapshot: list[dict[str, Any]] | None = None,
+    ) -> VisualProfileRevision:
+        snapshot = (
+            _reference_snapshot(session, draft.reference_bindings)
+            if reference_snapshot is None
+            else reference_snapshot
+        )
+        revision = (
+            session.scalar(
+                select(func.coalesce(func.max(VisualProfileRevision.revision), 0)).where(
+                    VisualProfileRevision.production_run_id == project.id
+                )
+            )
+            + 1
+        )
+        row = VisualProfileRevision(
+            production_run_id=project.id,
+            revision=revision,
+            profile_hash=_profile_hash(draft, reference_snapshot=snapshot),
+            source_profile_id="canon-v1-short-hair-gray-cat-sample-style",
+            person_identity=draft.person_identity,
+            person_hair=draft.person_hair,
+            person_body=draft.person_body,
+            cat_identity=draft.cat_identity,
+            style_positive_json=list(draft.style_positive),
+            style_negative_json=list(draft.style_negative),
+            reference_bindings_json=[
+                item.model_dump(mode="json", by_alias=True)
+                for item in draft.reference_bindings
+            ],
+            reference_snapshot_json=snapshot,
+        )
+        session.add(row)
+        session.flush()
+        return row
+
     @staticmethod
     def _compact_scene_order(session: Session, project_id: uuid.UUID) -> None:
         rows = list(
@@ -991,8 +1190,8 @@ class SqlAlchemyWorkflowRepository:
         project = _required(session, ProductionRun, project_id)
         project.selected_sequence_id = None
 
-    @staticmethod
     def _validate_reference_bindings(
+        self,
         session: Session,
         *,
         project_id: uuid.UUID,
@@ -1004,8 +1203,45 @@ class SqlAlchemyWorkflowRepository:
                 raise ValueError("a reference must be Canon or belong to the current project")
             if asset.media_type != "image" or asset.status not in {"ready", "approved"}:
                 raise ValueError("a reference must be an available image")
+            if not _asset(asset, self._asset_root).content_ready:
+                raise ValueError("a reference file is unavailable; repair or upload it first")
             if binding.usage.value == "approved_anchor" and asset.status != "approved":
                 raise ValueError("an approved_anchor binding requires an approved image")
+
+    def _normalize_look_reference_bindings(
+        self,
+        session: Session,
+        *,
+        project_id: uuid.UUID,
+        bindings: list[LookReferenceBinding],
+        profile_only: bool,
+    ) -> list[LookReferenceBinding]:
+        allowed = {
+            LookReferencePurpose.PERSON_IDENTITY,
+            LookReferencePurpose.PERSON_BODY,
+            LookReferencePurpose.CAT_IDENTITY,
+            LookReferencePurpose.STYLE,
+        }
+        result: list[LookReferenceBinding] = []
+        hashes: set[str] = set()
+        for binding in bindings:
+            if profile_only and binding.purpose not in allowed:
+                raise ValueError("项目视觉档案只允许人物、猫咪和画风参考")
+            asset = _required(session, Asset, binding.asset_id)
+            if asset.scope != "canon" and asset.production_run_id != project_id:
+                raise ValueError("定妆参考必须是 Canon 或属于当前项目")
+            stored = _asset(asset, self._asset_root)
+            if (
+                asset.media_type != "image"
+                or asset.status not in {"ready", "approved"}
+                or not stored.content_ready
+            ):
+                raise ValueError("定妆参考图片不可用；请先修复或重新上传")
+            if asset.sha256 in hashes:
+                continue
+            hashes.add(asset.sha256)
+            result.append(binding)
+        return result
 
 
 def _required(session: Session, model: type[Any], record_id: uuid.UUID) -> Any:
@@ -1048,6 +1284,103 @@ def _resolve_storage_key(storage_key: str, asset_root: Path) -> Path:
     return resolved
 
 
+def _default_visual_profile(session: Session) -> VisualProfileDraft:
+    ordered = (
+        ("person:headshot", LookReferencePurpose.PERSON_IDENTITY, "锁定人物脸型、五官和短发"),
+        (
+            "person:fullbody",
+            LookReferencePurpose.PERSON_BODY,
+            "锁定人物年龄感和头身比例，忽略旧服装",
+        ),
+        ("cat:front", LookReferencePurpose.CAT_IDENTITY, "锁定猫咪脸部、眼睛和正面毛色分区"),
+        ("cat:side", LookReferencePurpose.CAT_IDENTITY, "锁定猫咪体型、侧面虎斑和环纹尾巴"),
+        ("style:line_texture", LookReferencePurpose.STYLE, "只参考线条、水彩材质和细节表现"),
+        ("style:outdoor", LookReferencePurpose.STYLE, "只参考户外色彩、自然光和空气透视"),
+        ("style:indoor", LookReferencePurpose.STYLE, "只参考室内材质、窗光和低对比色彩"),
+    )
+    keys = [item[0] for item in ordered]
+    rows = session.execute(
+        select(Asset).where(
+            Asset.scope == "canon",
+            Asset.status == "approved",
+            Asset.semantic_key.in_(keys),
+        )
+    ).scalars()
+    by_key = {row.semantic_key: row for row in rows}
+    bindings = [
+        LookReferenceBinding(assetId=by_key[key].id, purpose=purpose, instruction=instruction)
+        for key, purpose, instruction in ordered
+        if key in by_key
+    ]
+    return VisualProfileDraft(referenceBindings=bindings)
+
+
+def _reference_snapshot(
+    session: Session,
+    bindings: list[LookReferenceBinding],
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for item in bindings:
+        asset = _required(session, Asset, item.asset_id)
+        result.append(
+            {
+                **item.model_dump(mode="json", by_alias=True),
+                "semanticKey": asset.semantic_key,
+                "sha256": asset.sha256,
+            }
+        )
+    return result
+
+
+def _profile_hash(
+    draft: VisualProfileDraft,
+    *,
+    reference_snapshot: list[dict[str, Any]] | None = None,
+) -> str:
+    payload = {
+        **draft.model_dump(mode="json", by_alias=True),
+        "referenceSnapshot": reference_snapshot or [],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _project_reference_bindings(draft: VisualProfileDraft) -> list[dict[str, Any]]:
+    return [
+        ReferenceBinding(
+            assetId=item.asset_id,
+            usage=ReferenceUsage.GENERATION_REFERENCE,
+            role=(
+                ReferenceRole.STYLE
+                if item.purpose is LookReferencePurpose.STYLE
+                else ReferenceRole.IDENTITY
+            ),
+            applyTo=ReferenceTarget.BOTH,
+        ).model_dump(mode="json", by_alias=True)
+        for item in draft.reference_bindings
+    ]
+
+
+def _environment_profile_bindings(
+    session: Session,
+    raw_bindings: list[dict[str, Any]],
+    look_plan: SceneLookPlan,
+) -> list[LookReferenceBinding]:
+    expected_style_key = f"style:{look_plan.environment_style.value}"
+    result: list[LookReferenceBinding] = []
+    for raw in raw_bindings:
+        binding = LookReferenceBinding.model_validate(raw)
+        if binding.purpose is LookReferencePurpose.STYLE:
+            asset = _required(session, Asset, binding.asset_id)
+            if (
+                asset.semantic_key in {"style:outdoor", "style:indoor"}
+                and asset.semantic_key != expected_style_key
+            ):
+                continue
+        result.append(binding)
+    return result
+
+
 def _project(row: ProductionRun) -> StoredProject:
     return StoredProject(
         id=row.id,
@@ -1059,6 +1392,28 @@ def _project(row: ProductionRun) -> StoredProject:
             ReferenceBinding.model_validate(item)
             for item in row.default_reference_bindings_json
         ),
+        visual_profile_revision_id=row.current_visual_profile_revision_id,
+    )
+
+
+def _visual_profile(row: VisualProfileRevision) -> StoredVisualProfileRevision:
+    return StoredVisualProfileRevision(
+        id=row.id,
+        project_id=row.production_run_id,
+        revision=row.revision,
+        profile_hash=row.profile_hash,
+        source_profile_id=row.source_profile_id,
+        draft=VisualProfileDraft(
+            personIdentity=row.person_identity,
+            personHair=row.person_hair,
+            personBody=row.person_body,
+            catIdentity=row.cat_identity,
+            stylePositive=row.style_positive_json,
+            styleNegative=row.style_negative_json,
+            referenceBindings=row.reference_bindings_json,
+        ),
+        reference_snapshot=tuple(row.reference_snapshot_json),
+        created_at=row.created_at,
     )
 
 
@@ -1090,6 +1445,12 @@ def _scene(row: Scene) -> StoredScene:
         ),
         status=SceneStatus(row.status),
         selected_look_asset_id=row.selected_look_asset_id,
+        look_draft=(
+            None
+            if not row.look_draft_json
+            else SceneLookDraft.model_validate(row.look_draft_json)
+        ),
+        look_draft_revision=row.look_draft_revision,
     )
 
 
@@ -1164,6 +1525,11 @@ def _prompt(row: PromptRecord) -> StoredPrompt:
 
 
 def _asset(row: Asset, asset_root: Path) -> StoredAsset:
+    path = (
+        None
+        if row.storage_key.startswith("legacy:")
+        else _resolve_storage_key(row.storage_key, asset_root)
+    )
     return StoredAsset(
         id=row.id,
         project_id=row.production_run_id,
@@ -1174,10 +1540,11 @@ def _asset(row: Asset, asset_root: Path) -> StoredAsset:
         media_type=row.media_type,
         scope=row.scope,
         status=row.status,
-        path=_resolve_storage_key(row.storage_key, asset_root),
+        path=path,
         sha256=row.sha256,
         metadata=dict(row.metadata_json),
         semantic_key=row.semantic_key,
+        created_at=getattr(row, "created_at", None),
     )
 
 
@@ -1217,6 +1584,11 @@ def _json_project(row: StoredProject) -> dict[str, Any]:
         if row.selected_sequence_id is None
         else str(row.selected_sequence_id),
         "contractVersion": CURRENT_CONTRACT_VERSION,
+        "visualProfileRevisionId": (
+            None
+            if row.visual_profile_revision_id is None
+            else str(row.visual_profile_revision_id)
+        ),
         "defaultReferenceBindings": [
             item.model_dump(mode="json", by_alias=True)
             for item in row.default_reference_bindings
@@ -1235,6 +1607,7 @@ def _json_scene(row: StoredScene) -> dict[str, Any]:
             if row.selected_look_asset_id is None
             else str(row.selected_look_asset_id)
         ),
+        "lookDraftRevision": row.look_draft_revision,
     }
 
 
@@ -1283,7 +1656,12 @@ def _json_asset(row: StoredAsset) -> dict[str, Any]:
         "sha256": row.sha256,
         "semanticKey": row.semantic_key,
         "metadata": row.metadata,
-        "contentReady": row.path.is_file(),
+        "contentReady": row.content_ready,
+        "displayName": row.display_name,
+        "referencePurpose": row.reference_purpose,
+        "visualProfileRevisionId": row.metadata.get("visualProfileRevisionId"),
+        "lookDraftRevision": row.metadata.get("lookDraftRevision"),
+        "createdAt": None if row.created_at is None else row.created_at.isoformat(),
     }
 
 

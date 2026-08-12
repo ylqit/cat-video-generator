@@ -23,9 +23,10 @@ def doctor() -> None:
     """Report database revision, Ark configuration and local media tools."""
 
     load_local_env()
-    container = build_diagnostic_container()
+    runtime = RuntimeSettings.from_env().preflight_report()
+    container = None
     try:
-        runtime = RuntimeSettings.from_env().preflight_report()
+        container = build_diagnostic_container()
         database_ready = container.alembic_revision == ALEMBIC_HEAD
         _echo(
             {
@@ -42,8 +43,27 @@ def doctor() -> None:
                 "runtime": runtime,
             }
         )
+    except Exception as exc:
+        _echo(
+            {
+                "database": None,
+                "alembicRevision": None,
+                "expectedAlembicRevision": ALEMBIC_HEAD,
+                "ready": False,
+                "databaseReady": False,
+                "databaseError": type(exc).__name__,
+                "arkReady": runtime["arkReady"],
+                "ffmpegAvailable": runtime["ffmpegAvailable"],
+                "ffprobeAvailable": runtime["ffprobeAvailable"],
+                "videoGenerationReady": runtime["videoGenerationReady"],
+                "localCompositionReady": runtime["localCompositionReady"],
+                "runtime": runtime,
+            }
+        )
+        raise typer.Exit(code=1) from exc
     finally:
-        container.close()
+        if container is not None:
+            container.close()
 
 
 @app.command("api")
@@ -94,7 +114,7 @@ def repair_canon(
                         "id": str(item.id),
                         "semanticKey": item.semantic_key,
                         "sha256": item.sha256,
-                        "path": str(item.path),
+                        "path": None if item.path is None else str(item.path),
                     }
                     for item in repaired
                 ],
