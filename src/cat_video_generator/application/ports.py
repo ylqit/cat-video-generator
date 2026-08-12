@@ -1,4 +1,4 @@
-"""Boundaries used by the V4 shot queue application services."""
+"""Boundaries used by the V5 creation-flow application services."""
 
 from __future__ import annotations
 
@@ -8,7 +8,13 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from ..domain.contracts import SceneDraft, ShotCardDraft, StoryProjectInput
+from ..domain.contracts import (
+    ReferenceBinding,
+    SceneDraft,
+    SceneLookPlan,
+    ShotCardDraft,
+    StoryProjectInput,
+)
 from ..domain.rendering import ProjectSequencePlan, SequenceStatus, VideoInputPlan
 from ..domain.workflow import (
     PromptPurpose,
@@ -90,6 +96,7 @@ class StoredProject:
     content_date: date
     status: RunStatus
     selected_sequence_id: uuid.UUID | None = None
+    default_reference_bindings: tuple[ReferenceBinding, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +106,7 @@ class StoredScene:
     order: int
     draft: SceneDraft
     status: SceneStatus
+    selected_look_asset_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,6 +237,14 @@ class MediaGateway(Protocol):
     ) -> VideoDiagnosticResult: ...
 
 
+class RuntimePreflight(Protocol):
+    def validate_for_video_generation(self, *, allow_paid_generation: bool) -> None: ...
+
+    def validate_for_range_edit(self, *, allow_paid_generation: bool) -> None: ...
+
+    def validate_for_local_composition(self) -> None: ...
+
+
 class AssetStore(Protocol):
     def download(self, url: str, *, suffix: str) -> LandedAsset: ...
 
@@ -286,6 +302,12 @@ class ShotQueueStore(Protocol):
 
     def get_project(self, project_id: uuid.UUID) -> StoredProject: ...
 
+    def update_project_default_references(
+        self,
+        project_id: uuid.UUID,
+        bindings: list[ReferenceBinding],
+    ) -> StoredProject: ...
+
     def add_scene(self, project_id: uuid.UUID, draft: SceneDraft) -> StoredScene: ...
 
     def update_scene(self, scene_id: uuid.UUID, draft: SceneDraft) -> StoredScene: ...
@@ -298,10 +320,25 @@ class ShotQueueStore(Protocol):
 
     def get_scene(self, scene_id: uuid.UUID) -> StoredScene: ...
 
+    def select_scene_look_asset(
+        self,
+        scene_id: uuid.UUID,
+        asset_id: uuid.UUID | None,
+    ) -> StoredScene: ...
+
     def add_shot(self, scene_id: uuid.UUID, draft: ShotCardDraft) -> StoredShot: ...
 
     def replace_shots(
         self, scene_id: uuid.UUID, drafts: tuple[ShotCardDraft, ...]
+    ) -> tuple[StoredShot, ...]: ...
+
+    def accept_scene_suggestions(
+        self,
+        *,
+        step_id: uuid.UUID,
+        drafts: tuple[ShotCardDraft, ...],
+        look_plan: SceneLookPlan | None,
+        accepted_output: dict[str, Any],
     ) -> tuple[StoredShot, ...]: ...
 
     def update_shot(self, shot_id: uuid.UUID, draft: ShotCardDraft) -> StoredShot: ...

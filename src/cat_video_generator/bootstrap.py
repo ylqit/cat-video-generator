@@ -1,4 +1,4 @@
-"""Composition root for the V4 shot queue monolith."""
+"""Composition root for the V5 video-clip workflow monolith."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from sqlalchemy import Engine, text
 
+from .application.canon import CanonRepairService
 from .application.shot_queue import ProjectEditingService, SequenceService, ShotProductionService
 from .config import DatabaseOperation, DatabaseSettings, RuntimeSettings, load_local_env
 from .infrastructure.ark.gateway import ArkGateway
@@ -27,6 +28,7 @@ class RuntimeContainer:
     editing: ProjectEditingService
     production: ShotProductionService
     sequences: SequenceService
+    canon: CanonRepairService
     runtime_settings: RuntimeSettings
     alembic_revision: str
 
@@ -56,7 +58,10 @@ def build_runtime_container() -> RuntimeContainer:
     database = DatabaseSettings.from_env()
     runtime = RuntimeSettings.from_env()
     engine = _ready_engine(database)
-    repository = SqlAlchemyWorkflowRepository(create_session_factory(engine))
+    repository = SqlAlchemyWorkflowRepository(
+        create_session_factory(engine),
+        asset_root=runtime.asset_root,
+    )
     gateway = _optional_gateway(runtime)
     store = LocalAssetStore(
         work_root=runtime.work_root,
@@ -85,6 +90,7 @@ def build_runtime_container() -> RuntimeContainer:
             frame_extractor=extractor,
             provider_name=runtime.provider_profile,
             resolution=runtime.ark_video_resolution,
+            runtime_preflight=runtime,
             enable_video_advice=runtime.video_semantic_review_mode == "diagnostic",
             poll_interval_seconds=runtime.ark_poll_interval_seconds,
             task_timeout_seconds=runtime.ark_task_timeout_seconds,
@@ -94,7 +100,9 @@ def build_runtime_container() -> RuntimeContainer:
             asset_store=store,
             media_probe=probe,
             resolution=runtime.ark_video_resolution,
+            runtime_preflight=runtime,
         ),
+        canon=CanonRepairService(repository=repository, asset_store=store),
         runtime_settings=runtime,
         alembic_revision=ALEMBIC_HEAD,
     )

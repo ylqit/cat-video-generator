@@ -1,4 +1,4 @@
-"""FastAPI surface for the V4 arbitrary scene and shot queue studio."""
+"""FastAPI surface for the V5 scene and video-clip creation studio."""
 
 from __future__ import annotations
 
@@ -11,9 +11,11 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from ..domain.contracts import ReferenceRole, ReferenceUsage
+from ..domain.contracts import CURRENT_CONTRACT_VERSION, ReferenceRole, ReferenceUsage
 from ..domain.rendering import SequenceStatus
+from ..infrastructure.db.repositories import WorkflowConflictError
 from .api_schemas import (
+    AcceptSuggestionsRequest,
     CreateProjectRequest,
     GenerateRequest,
     OrderRequest,
@@ -22,6 +24,7 @@ from .api_schemas import (
     ReferencesRequest,
     ReviewRequest,
     SceneRequest,
+    SelectSceneLookRequest,
     SelectSequenceRequest,
     ShotRequest,
     SuggestShotsRequest,
@@ -55,7 +58,7 @@ def create_app(
     job_registry: JobRegistry,
     static_dir: Path | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="Cat Video Shot Queue", version="4.0.0", redoc_url=None)
+    app = FastAPI(title="Cat Video Shot Queue", version="5.0.0", redoc_url=None)
     repository = container.repository
     roots = tuple(
         item.expanduser().resolve()
@@ -73,11 +76,16 @@ def create_app(
     async def invalid_request(_request: Request, exc: ValueError) -> JSONResponse:
         return JSONResponse(status_code=422, content={"detail": str(exc)})
 
+    @app.exception_handler(WorkflowConflictError)
+    async def workflow_conflict(_request: Request, exc: WorkflowConflictError) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
     @app.get("/api/v1/health")
     def health() -> dict[str, Any]:
         return {
             "ready": True,
-            "contractVersion": 4,
+            "databaseReady": True,
+            "contractVersion": CURRENT_CONTRACT_VERSION,
             "alembicRevision": container.alembic_revision,
             "expectedAlembicRevision": container.alembic_revision,
             **container.runtime_settings.preflight_report(),
@@ -123,6 +131,20 @@ def create_app(
             "status": project.status.value,
         }
 
+    @app.put("/api/v1/projects/{project_id}/default-references")
+    def update_project_default_references(
+        project_id: uuid.UUID,
+        payload: ReferencesRequest,
+    ) -> dict[str, Any]:
+        project = repository.update_project_default_references(project_id, payload.references)
+        return {
+            "projectId": str(project.id),
+            "defaultReferenceBindings": [
+                item.model_dump(mode="json", by_alias=True)
+                for item in project.default_reference_bindings
+            ],
+        }
+
     @app.post("/api/v1/projects/{project_id}/scenes")
     def add_scene(project_id: uuid.UUID, payload: SceneRequest) -> dict[str, Any]:
         return _scene_json(repository.add_scene(project_id, payload))
@@ -156,8 +178,18 @@ def create_app(
         )
 
     @app.post("/api/v1/steps/{step_id}/accept-suggestions")
-    def accept_suggestions(step_id: uuid.UUID) -> list[dict[str, Any]]:
-        return [_shot_json(item) for item in container.editing.accept_suggestions(step_id)]
+    def accept_suggestions(
+        step_id: uuid.UUID,
+        payload: AcceptSuggestionsRequest,
+    ) -> list[dict[str, Any]]:
+        return [
+            _shot_json(item)
+            for item in container.editing.accept_suggestions(
+                step_id,
+                look_plan=payload.look_plan,
+                shots=tuple(payload.shots),
+            )
+        ]
 
     @app.post("/api/v1/scenes/{scene_id}/shots")
     def add_shot(scene_id: uuid.UUID, payload: ShotRequest) -> dict[str, Any]:
@@ -175,6 +207,13 @@ def create_app(
     def reorder_shots(scene_id: uuid.UUID, payload: OrderRequest) -> dict[str, bool]:
         repository.reorder_shots(scene_id, tuple(payload.ids))
         return {"saved": True}
+
+    @app.put("/api/v1/scenes/{scene_id}/look-asset")
+    def select_scene_look_asset(
+        scene_id: uuid.UUID,
+        payload: SelectSceneLookRequest,
+    ) -> dict[str, Any]:
+        return _scene_json(repository.select_scene_look_asset(scene_id, payload.asset_id))
 
     @app.get("/api/v1/shots/{shot_id}")
     def shot_trace(shot_id: uuid.UUID) -> dict[str, Any]:
@@ -229,6 +268,21 @@ def create_app(
                 reason=payload.retry_reason,
             ),
             context={"shotId": shot_id, "operationKey": "image:anchor"},
+        )
+
+    @app.post("/api/v1/scenes/{scene_id}/look-images")
+    def generate_scene_look(scene_id: uuid.UUID, payload: GenerateRequest) -> dict[str, Any]:
+        return _submit(
+            job_registry,
+            kind="generate_scene_look",
+            key=f"scene:{scene_id}:look",
+            fn=lambda: container.production.generate_scene_look(
+                scene_id,
+                allow_paid_generation=payload.allow_paid_generation,
+                regenerate=payload.regenerate,
+                reason=payload.retry_reason,
+            ),
+            context={"sceneId": scene_id, "operationKey": "image:scene-look"},
         )
 
     @app.post("/api/v1/shots/{shot_id}/videos")
@@ -378,6 +432,11 @@ def _scene_json(item: Any) -> dict[str, Any]:
         "order": item.order,
         **item.draft.model_dump(mode="json", by_alias=True),
         "status": item.status.value,
+        "selectedLookAssetId": (
+            None
+            if item.selected_look_asset_id is None
+            else str(item.selected_look_asset_id)
+        ),
     }
 
 
@@ -404,10 +463,14 @@ def _asset_json(item: Any) -> dict[str, Any]:
         "mediaType": item.media_type,
         "scope": item.scope,
         "status": item.status,
+        "projectId": None if item.project_id is None else str(item.project_id),
+        "sceneId": None if item.scene_id is None else str(item.scene_id),
+        "shotId": None if item.shot_card_id is None else str(item.shot_card_id),
         "producingStepId": None if item.step_id is None else str(item.step_id),
         "sha256": item.sha256,
         "semanticKey": item.semantic_key,
         "metadata": item.metadata,
+        "contentReady": item.path.is_file(),
     }
 
 

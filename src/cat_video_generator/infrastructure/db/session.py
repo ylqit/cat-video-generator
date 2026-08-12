@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from ...config import DatabaseOperation, DatabaseSettings
 from .models import SCHEMA_NAME
 
-ALEMBIC_HEAD = "0015_shot_queue_core"
+ALEMBIC_HEAD = "0016_v5_creation_flow"
 
 
 def create_database_engine(

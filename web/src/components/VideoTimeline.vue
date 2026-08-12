@@ -92,7 +92,7 @@ async function submit() {
   <section class="timeline" v-loading="busy">
     <div class="timeline-head">
       <div>
-        <h3>单镜头时间轴与区间重拍</h3>
+        <h3>视频片段时间轴与区间重拍</h3>
         <p>只重新生成选中区间；区间外沿用原视频素材。精确区间合成可能产生轻微编码差异。</p>
       </div>
       <span>{{ durationSeconds.toFixed(2) }}s</span>

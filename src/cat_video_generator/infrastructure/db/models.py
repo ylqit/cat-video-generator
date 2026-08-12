@@ -1,4 +1,4 @@
-"""V4任意场景镜头队列的PostgreSQL模型。"""
+"""V5场景、视频片段、造型与相对资产存储的PostgreSQL模型。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     Date,
     DateTime,
@@ -52,7 +53,7 @@ class ProductionRun(Base):
     __tablename__ = "production_runs"
     __table_args__ = (
         CheckConstraint(_check("status", _values(RunStatus)), name="ck_production_runs_status"),
-        CheckConstraint("contract_version = 4", name="ck_production_runs_contract_version"),
+        CheckConstraint("contract_version = 5", name="ck_production_runs_contract_version"),
         Index("ix_production_runs_queue", "status", "content_date", "created_at"),
         {"schema": SCHEMA_NAME},
     )
@@ -67,6 +68,12 @@ class ProductionRun(Base):
         server_default=text(str(CURRENT_CONTRACT_VERSION)),
     )
     status: Mapped[str] = mapped_column(String(32), nullable=False, default=RunStatus.ACTIVE.value)
+    default_reference_bindings_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default="[]",
+    )
     selected_sequence_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey(
@@ -92,6 +99,11 @@ class Scene(Base):
     __table_args__ = (
         CheckConstraint(_check("status", _values(SceneStatus)), name="ck_scenes_status"),
         CheckConstraint("sort_order >= 1", name="ck_scenes_sort_order"),
+        CheckConstraint(
+            "(story_mode = 'single' AND target_shot_count = 1) OR "
+            "(story_mode = 'multi' AND target_shot_count BETWEEN 2 AND 6)",
+            name="ck_scenes_story_shape",
+        ),
         UniqueConstraint("production_run_id", "sort_order", name="uq_scenes_run_order"),
         Index("ix_scenes_run_status", "production_run_id", "status", "sort_order"),
         {"schema": SCHEMA_NAME},
@@ -108,6 +120,22 @@ class Scene(Base):
     source_text: Mapped[str] = mapped_column(Text, nullable=False)
     chapter_label: Mapped[str | None] = mapped_column(String(80))
     context_note: Mapped[str | None] = mapped_column(Text)
+    story_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="single", server_default="single"
+    )
+    target_shot_count: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, default=1, server_default="1"
+    )
+    look_plan_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    selected_look_asset_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            f"{SCHEMA_NAME}.assets.id",
+            name="fk_scenes_selected_look_asset",
+            use_alter=True,
+            ondelete="SET NULL",
+        ),
+    )
     status: Mapped[str] = mapped_column(String(24), nullable=False, default=SceneStatus.DRAFT.value)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -148,6 +176,12 @@ class ShotCard(Base):
     anchor_mode: Mapped[str] = mapped_column(String(24), nullable=False, default="text_only")
     reference_bindings_json: Mapped[list[dict[str, Any]]] = mapped_column(
         JSONB, nullable=False, default=list, server_default="[]"
+    )
+    inherit_project_references: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    use_scene_look: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
     )
     selected_anchor_asset_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
@@ -309,7 +343,7 @@ class Asset(Base):
     scope: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False)
     media_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    local_path: Mapped[str] = mapped_column(Text, nullable=False)
+    storage_key: Mapped[str] = mapped_column(Text, nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     byte_size: Mapped[int | None] = mapped_column(Integer)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)

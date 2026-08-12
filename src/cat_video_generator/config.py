@@ -83,12 +83,16 @@ def _executable(
     configured: str | None,
     command: str,
     search_path: str,
-) -> Path | None:
+) -> tuple[Path | None, str | None]:
     if configured and configured.strip():
         path = Path(configured).expanduser()
-        return path if path.is_file() else None
+        if path.is_file():
+            return path, None
+        warning = f"configured {command} path does not exist: {path}; searched PATH instead"
+    else:
+        warning = None
     discovered = shutil.which(command, path=search_path)
-    return None if discovered is None else Path(discovered)
+    return (None if discovered is None else Path(discovered)), warning
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +118,7 @@ class RuntimeSettings:
     ffprobe_path: Path | None
     work_root: Path
     asset_root: Path
+    configuration_warnings: tuple[str, ...] = ()
 
     @classmethod
     def from_env(
@@ -161,6 +166,16 @@ class RuntimeSettings:
         ).strip()
         if structured_mode not in {"json_schema", "json_object_schema_prompt"}:
             raise ConfigurationError("无效Ark结构化输出模式")
+        ffmpeg_path, ffmpeg_warning = _executable(
+            values.get("FFMPEG_PATH"),
+            "ffmpeg",
+            values.get("PATH", ""),
+        )
+        ffprobe_path, ffprobe_warning = _executable(
+            values.get("FFPROBE_PATH"),
+            "ffprobe",
+            values.get("PATH", ""),
+        )
         return cls(
             ark_api_key=values.get("ARK_API_KEY") or None,
             ark_base_url=values.get("ARK_BASE_URL", _STANDARD_URL).rstrip("/"),
@@ -194,18 +209,15 @@ class RuntimeSettings:
             ark_task_timeout_seconds=timeout,
             ark_image_request_timeout_seconds=image_request_timeout,
             video_semantic_review_mode=video_review_mode,
-            ffmpeg_path=_executable(
-                values.get("FFMPEG_PATH"),
-                "ffmpeg",
-                values.get("PATH", ""),
-            ),
-            ffprobe_path=_executable(
-                values.get("FFPROBE_PATH"),
-                "ffprobe",
-                values.get("PATH", ""),
-            ),
+            ffmpeg_path=ffmpeg_path,
+            ffprobe_path=ffprobe_path,
             work_root=Path(values.get("MEDIA_WORK_ROOT", "var/work")),
             asset_root=Path(values.get("MEDIA_ASSET_ROOT", "var/assets")),
+            configuration_warnings=tuple(
+                warning
+                for warning in (ffmpeg_warning, ffprobe_warning)
+                if warning is not None
+            ),
         )
 
     @property
@@ -240,7 +252,7 @@ class RuntimeSettings:
         if issues:
             raise ConfigurationError("; ".join(issues))
 
-    def validate_for_generation(self, *, allow_paid_generation: bool) -> None:
+    def validate_for_video_generation(self, *, allow_paid_generation: bool) -> None:
         if not allow_paid_generation:
             raise ConfigurationError("Ark调用需要--allow-paid-generation")
         self.validate_for_ark_access()
@@ -249,12 +261,36 @@ class RuntimeSettings:
         if self.video_semantic_review_mode == "diagnostic" and self.ffmpeg_path is None:
             raise ConfigurationError("视频语义诊断要求ffmpeg可用以均匀抽帧")
 
+    def validate_for_range_edit(self, *, allow_paid_generation: bool) -> None:
+        if not allow_paid_generation:
+            raise ConfigurationError("Ark调用需要--allow-paid-generation")
+        self.validate_for_ark_access()
+        if self.ffmpeg_path is None or self.ffprobe_path is None:
+            raise ConfigurationError("区间重拍要求ffmpeg和ffprobe可用")
+
+    def validate_for_local_composition(self) -> None:
+        if self.ffmpeg_path is None or self.ffprobe_path is None:
+            raise ConfigurationError("本地成片合成要求ffmpeg和ffprobe可用")
+
+    def validate_for_generation(self, *, allow_paid_generation: bool) -> None:
+        """Compatibility boundary for callers that predate operation-specific checks."""
+
+        self.validate_for_video_generation(allow_paid_generation=allow_paid_generation)
+
     def preflight_report(self) -> dict[str, object]:
         try:
             self.validate_for_ark_access()
             issues: list[str] = []
         except ConfigurationError as exc:
             issues = [str(exc)]
+        ark_ready = not issues
+        ffmpeg_available = self.ffmpeg_path is not None
+        ffprobe_available = self.ffprobe_path is not None
+        video_ready = (
+            ark_ready
+            and ffprobe_available
+            and (self.video_semantic_review_mode != "diagnostic" or ffmpeg_available)
+        )
         return {
             "provider": self.provider_profile,
             "arkApiKeyConfigured": bool(self.ark_api_key),
@@ -273,6 +309,12 @@ class RuntimeSettings:
             "videoSemanticReviewMode": self.video_semantic_review_mode,
             "generationConfigurationValid": not issues,
             "generationConfigurationIssues": issues,
+            "configurationWarnings": list(self.configuration_warnings),
+            "arkReady": ark_ready,
+            "ffmpegAvailable": ffmpeg_available,
+            "ffprobeAvailable": ffprobe_available,
+            "videoGenerationReady": video_ready,
+            "localCompositionReady": ffmpeg_available and ffprobe_available,
             "ffmpeg": None if self.ffmpeg_path is None else str(self.ffmpeg_path),
             "ffprobe": None if self.ffprobe_path is None else str(self.ffprobe_path),
             "workRoot": str(self.work_root),

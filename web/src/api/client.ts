@@ -8,8 +8,11 @@ import type {
   ReferenceRole,
   ReferenceUsage,
   SceneDto,
+  SceneLookPlan,
   SequenceDto,
   ShotDto,
+  ShotSuggestion,
+  ShotSuggestionOutput,
 } from "./types";
 
 const BASE = "/api/v1";
@@ -54,6 +57,12 @@ export const api = {
   }) => json<{ projectId: string }>("/projects", "POST", body),
   updateProject: (projectId: string, body: { title: string; contentDate: string }) =>
     json<ProjectSummary>(`/projects/${projectId}`, "PATCH", body),
+  updateProjectDefaultReferences: (projectId: string, references: ReferenceBinding[]) =>
+    json<{ projectId: string; defaultReferenceBindings: ReferenceBinding[] }>(
+      `/projects/${projectId}/default-references`,
+      "PUT",
+      { references },
+    ),
   addScene: (projectId: string, body: Record<string, unknown>) =>
     json<SceneDto>(`/projects/${projectId}/scenes`, "POST", body),
   updateScene: (sceneId: string, body: Record<string, unknown>) =>
@@ -65,8 +74,11 @@ export const api = {
     json<{ jobId: string }>(`/scenes/${sceneId}/shot-suggestions`, "POST", {
       allowPaidGeneration: true,
     }),
-  acceptSuggestions: (stepId: string) =>
-    json<ShotDto[]>(`/steps/${stepId}/accept-suggestions`, "POST"),
+  acceptSuggestions: (
+    stepId: string,
+    lookPlan: SceneLookPlan | null,
+    shots: ShotSuggestion[],
+  ) => json<ShotDto[]>(`/steps/${stepId}/accept-suggestions`, "POST", { lookPlan, shots }),
   addShot: (sceneId: string, body: Record<string, unknown>) =>
     json<ShotDto>(`/scenes/${sceneId}/shots`, "POST", body),
   updateShot: (shotId: string, body: Record<string, unknown>) =>
@@ -81,6 +93,8 @@ export const api = {
     ),
   updateReferences: (shotId: string, references: ReferenceBinding[]) =>
     json<ShotDto>(`/shots/${shotId}/references`, "PUT", { references }),
+  selectSceneLook: (sceneId: string, assetId: string | null) =>
+    json<SceneDto>(`/scenes/${sceneId}/look-asset`, "PUT", { assetId }),
   uploadReference: async (
     projectId: string,
     usage: ReferenceUsage,
@@ -95,6 +109,12 @@ export const api = {
   },
   generateAnchor: (shotId: string, regenerate = false, reason?: string) =>
     json<{ jobId: string }>(`/shots/${shotId}/anchors`, "POST", {
+      allowPaidGeneration: true,
+      regenerate,
+      reason,
+    }),
+  generateSceneLook: (sceneId: string, regenerate = false, reason?: string) =>
+    json<{ jobId: string }>(`/scenes/${sceneId}/look-images`, "POST", {
       allowPaidGeneration: true,
       regenerate,
       reason,
@@ -135,6 +155,8 @@ export const api = {
   job: (jobId: string) => request<JobDto>(`/jobs/${jobId}`),
   canon: () => request<AssetDto[]>("/canon"),
 };
+
+export type SuggestionJobResult = { stepId: string; output: ShotSuggestionOutput };
 
 export function assetContentUrl(assetId: string): string {
   return `${BASE}/assets/${assetId}/content`;

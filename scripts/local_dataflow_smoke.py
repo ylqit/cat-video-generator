@@ -1,4 +1,4 @@
-"""Offline V4 shot-queue data-flow smoke test.
+"""Offline V5 creation-flow data-chain smoke test.
 
 The script uses in-memory workflow state, deterministic provider substitutes
 and local FFmpeg fixtures.  It never reads ARK_API_KEY and never sends a
@@ -8,6 +8,8 @@ network request.
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -40,6 +42,8 @@ from cat_video_generator.application.shot_queue import (
     SequenceService,
     ShotProductionService,
 )
+from cat_video_generator.bootstrap import build_runtime_container
+from cat_video_generator.config import load_local_env
 from cat_video_generator.domain.contracts import (
     AnchorMode,
     ReferenceBinding,
@@ -47,7 +51,9 @@ from cat_video_generator.domain.contracts import (
     ReferenceTarget,
     ReferenceUsage,
     SceneDraft,
+    SceneLookPlan,
     ShotCardDraft,
+    StoryMode,
     StoryProjectInput,
 )
 from cat_video_generator.domain.rendering import (
@@ -117,6 +123,17 @@ class MemoryStore:
     def get_project(self, project_id: uuid.UUID) -> StoredProject:
         return self.projects[project_id]
 
+    def update_project_default_references(
+        self,
+        project_id: uuid.UUID,
+        references: list[ReferenceBinding] | tuple[ReferenceBinding, ...],
+    ) -> StoredProject:
+        self.projects[project_id] = replace(
+            self.projects[project_id],
+            default_reference_bindings=tuple(references),
+        )
+        return self.projects[project_id]
+
     def add_scene(self, project_id: uuid.UUID, draft: SceneDraft) -> StoredScene:
         scene = StoredScene(
             uuid.uuid4(),
@@ -150,6 +167,17 @@ class MemoryStore:
     def get_scene(self, scene_id: uuid.UUID) -> StoredScene:
         return self.scenes[scene_id]
 
+    def select_scene_look_asset(
+        self,
+        scene_id: uuid.UUID,
+        asset_id: uuid.UUID | None,
+    ) -> StoredScene:
+        self.scenes[scene_id] = replace(
+            self.scenes[scene_id],
+            selected_look_asset_id=asset_id,
+        )
+        return self.scenes[scene_id]
+
     def add_shot(self, scene_id: uuid.UUID, draft: ShotCardDraft) -> StoredShot:
         scene = self.scenes[scene_id]
         shot = StoredShot(
@@ -169,6 +197,33 @@ class MemoryStore:
         for shot in self.list_shots(scene_id):
             del self.shots[shot.id]
         return tuple(self.add_shot(scene_id, draft) for draft in drafts)
+
+    def accept_scene_suggestions(
+        self,
+        *,
+        step_id: uuid.UUID,
+        drafts: tuple[ShotCardDraft, ...],
+        look_plan: SceneLookPlan | None,
+        accepted_output: dict[str, Any],
+    ) -> tuple[StoredShot, ...]:
+        step = self.steps[step_id]
+        if step.scene_id is None:
+            raise ValueError("suggestion step is not bound to a scene")
+        scene = self.scenes[step.scene_id]
+        shots = self.replace_shots(scene.id, drafts)
+        self.scenes[scene.id] = replace(
+            scene,
+            draft=scene.draft.model_copy(update={"look_plan": look_plan}),
+        )
+        self.steps[step_id] = replace(
+            step,
+            input_snapshot={
+                **step.input_snapshot,
+                "acceptedOutput": accepted_output,
+                "acceptedAt": datetime.now(UTC).isoformat(),
+            },
+        )
+        return shots
 
     def update_shot(self, shot_id: uuid.UUID, draft: ShotCardDraft) -> StoredShot:
         self.shots[shot_id] = replace(self.shots[shot_id], draft=draft, status=ShotStatus.READY)
@@ -510,30 +565,33 @@ class FixtureDirector:
     def generate_structured(
         self, *, prompt: str, schema: dict[str, Any], output_name: str
     ) -> DirectorResult:
-        del prompt, schema, output_name
+        del schema, output_name
+        match = re.search(r"严格输出(\d+)个视频片段", prompt)
+        count = int(match.group(1)) if match else 1
+        suggestions = [
+            {
+                "title": f"猫咪主导的生活片段{index}",
+                "direction": (
+                    "1. 中景固定机位，猫咪位于人物前侧先观察目标，人物保持在后方准备。\n"
+                    "2. 近景轻微跟随猫咪自然四足靠近，人物用手拿取所需道具并配合。\n"
+                    "3. 中景固定收尾，人猫完成同一微事件的因果互动，环境声与接触声同步。"
+                ),
+                "suggestedDurationSeconds": 8 + index,
+            }
+            for index in range(1, count + 1)
+        ]
         return DirectorResult(
             payload={
                 "sceneTitle": "池塘边的小发现",
-                "shots": [
-                    {
-                        "title": "猫咪发现浮标",
-                        "direction": (
-                            "中景固定机位，灰白猫贴近岸边先看见浮标轻晃，"
-                            "人物在后方稳定持竿；猫耳转向水面后停在安全位置，"
-                            "画面在浮标再次下沉时稳定结束。"
-                        ),
-                        "suggestedDurationSeconds": 8,
-                    },
-                    {
-                        "title": "人物回应信号",
-                        "direction": (
-                            "侧面近景缓慢跟随，人物沿竿身方向收紧钓线，"
-                            "灰白猫保持四足站姿观察；鱼线只连接鱼竿和浮标，"
-                            "动作在两者共同看向水面时稳定结束。"
-                        ),
-                        "suggestedDurationSeconds": 8,
-                    },
-                ],
+                "lookPlan": {
+                    "personWardrobe": "浅色户外外套",
+                    "personAccessories": "帆布包",
+                    "catAppearance": "保持Canon外观且不增加服饰",
+                    "keyProps": "鱼竿与小水桶",
+                    "imageRecommended": True,
+                    "recommendationReason": "多片段复用服装和关键道具",
+                },
+                "shots": suggestions,
             },
             response_id="fixture-response",
             model=self.model,
@@ -548,10 +606,12 @@ class FixtureGateway:
 
     def __init__(self) -> None:
         self.submissions: list[VideoInputPlan] = []
+        self.image_submissions = 0
         self.fail_unknown_once = False
 
     def generate_image(self, *, prompt: str, reference_paths: tuple[Path, ...]) -> ImageResult:
         del prompt, reference_paths
+        self.image_submissions += 1
         return ImageResult("https://fixture.local/anchor.png", self.image_model)
 
     def submit_video(
@@ -652,7 +712,11 @@ def main() -> None:
     ffprobe = shutil.which("ffprobe")
     if not ffmpeg or not ffprobe:
         raise RuntimeError("local smoke requires ffmpeg and ffprobe")
-    with tempfile.TemporaryDirectory(prefix="cvg-v4-smoke-") as temporary:
+    sample_path = (Path(__file__).parents[1] / "docs" / "采茶叶.mp4").resolve()
+    if not sample_path.is_file():
+        raise RuntimeError(f"local sample is missing: {sample_path}")
+    database_canon = _verify_database_canon()
+    with tempfile.TemporaryDirectory(prefix="cvg-v5-smoke-") as temporary:
         root = Path(temporary)
         fixtures = _fixtures(root, ffmpeg)
         repository = MemoryStore()
@@ -665,6 +729,19 @@ def main() -> None:
         store = FixtureAssetStore(local_store, fixtures)
         probe = FfprobeMediaProbe(Path(ffprobe))
         extractor = FfmpegFrameExtractor(ffmpeg_path=Path(ffmpeg), work_root=root / "frames")
+        sample_probe = _probe_json(ffprobe, sample_path)
+        _require(
+            any(item.get("codec_type") == "video" for item in sample_probe.get("streams", [])),
+            "采茶叶.mp4 has no readable video stream",
+        )
+        normalized_sample = _normalize_sample(ffmpeg, sample_path, root / "采茶叶-normalized.mp4")
+        sample_master = local_store.concatenate_videos((normalized_sample, normalized_sample))
+        _require(sample_master.path.is_file(), "采茶叶.mp4 local composition was not landed")
+        composed_probe = _probe_json(ffprobe, sample_master.path)
+        _require(
+            any(item.get("codec_type") == "video" for item in composed_probe.get("streams", [])),
+            "composed sample asset is unreadable",
+        )
         editing = ProjectEditingService(
             repository=repository,
             director=FixtureDirector(),
@@ -705,21 +782,75 @@ def main() -> None:
             "project settings did not flow through storage",
         )
         scene = repository.list_scenes(project_id)[0]
+        scene = repository.update_scene(
+            scene.id,
+            scene.draft.model_copy(
+                update={"story_mode": StoryMode.MULTI, "target_shot_count": 2}
+            ),
+        )
         _require(
             not repository.list_steps(project_id=project_id), "project creation created a step"
         )
 
         suggestion = editing.suggest_shots(scene.id, allow_paid_generation=True)
-        shots = list(editing.accept_suggestions(suggestion.step_id))
+        edited_look = suggestion.output.look_plan.model_copy(
+            update={"person_wardrobe": "人工调整后的米白外套"}
+        )
+        edited_suggestions = tuple(
+            item.model_copy(
+                update={
+                    "title": f"人工编辑：{item.title}",
+                    "direction": f"{item.direction}\n人工收尾：猫咪回看人物后稳定结束。",
+                    "suggested_duration_seconds": 10 + index,
+                }
+            )
+            for index, item in enumerate(suggestion.output.shots)
+        )
+        shots = list(
+            editing.accept_suggestions(
+                suggestion.step_id,
+                look_plan=edited_look,
+                shots=edited_suggestions,
+            )
+        )
         _require(len(shots) == 2, "fixture suggestions were not accepted")
-        third = repository.add_shot(
-            scene.id,
-            ShotCardDraft(
-                title="生成锚点的收束镜头",
-                direction="近景固定机位，猫咪回到人物脚边抬头，人物放松鱼竿并轻摸猫咪头顶；钓具保持在人物一侧，动作在安静关系回报中结束。",
-                durationSeconds=8,
-                anchorMode=AnchorMode.GENERATE,
+        accepted_step = repository.get_step(suggestion.step_id)
+        _require(
+            "providerOutput" in accepted_step.input_snapshot,
+            "provider output was overwritten",
+        )
+        _require(
+            "acceptedOutput" in accepted_step.input_snapshot,
+            "accepted output was not audited",
+        )
+        _require("acceptedAt" in accepted_step.input_snapshot, "acceptance timestamp is missing")
+        _require(
+            accepted_step.input_snapshot["providerOutput"]
+            != accepted_step.input_snapshot["acceptedOutput"],
+            "edited suggestion was not distinct from provider output",
+        )
+        single_scene = repository.add_scene(
+            project_id,
+            SceneDraft(
+                title="收束片段",
+                sourceText="猫咪回到人物脚边，人物放下鱼竿并轻摸猫咪头顶。",
+                storyMode="single",
+                targetShotCount=1,
             ),
+        )
+        single_suggestion = editing.suggest_shots(
+            single_scene.id,
+            allow_paid_generation=True,
+        )
+        single_shots = editing.accept_suggestions(
+            single_suggestion.step_id,
+            look_plan=single_suggestion.output.look_plan,
+            shots=single_suggestion.output.shots,
+        )
+        _require(len(single_shots) == 1, "single mode did not create exactly one clip")
+        third = repository.update_shot(
+            single_shots[0].id,
+            single_shots[0].draft.model_copy(update={"anchor_mode": AnchorMode.GENERATE}),
         )
         shots.append(third)
 
@@ -749,6 +880,18 @@ def main() -> None:
             usage="generation_reference",
             role="identity",
         )
+        repository.update_project_default_references(
+            project_id,
+            (
+                ReferenceBinding(
+                    assetId=generation_reference.id,
+                    usage=ReferenceUsage.GENERATION_REFERENCE,
+                    role=ReferenceRole.IDENTITY,
+                    applyTo=ReferenceTarget.BOTH,
+                ),
+            ),
+        )
+        repository.select_scene_look_asset(single_scene.id, approved_anchor.id)
         generated_draft = shots[2].draft.model_copy(
             update={
                 "reference_bindings": [
@@ -787,10 +930,17 @@ def main() -> None:
 
         modes = [item.operation for item in gateway.submissions[:3]]
         _require(modes == [RenderOperation.SHOT] * 3, "shot requests used a wrong operation")
-        _require(len(gateway.submissions[0].bindings) == 0, "text-only shot sent an image")
-        _require(len(gateway.submissions[1].bindings) == 1, "existing anchor was not sent")
         _require(
-            len(gateway.submissions[2].bindings) == 2, "generated anchor/reference order failed"
+            len(gateway.submissions[0].bindings) == 1,
+            "project default reference was not inherited",
+        )
+        _require(
+            len(gateway.submissions[1].bindings) == 2,
+            "existing anchor and project reference were not both sent",
+        )
+        _require(
+            len(gateway.submissions[2].bindings) == 3,
+            "generated anchor/custom-scene-project reference order or deduplication failed",
         )
 
         regenerated = production.generate_video(
@@ -880,6 +1030,72 @@ def main() -> None:
             raise AssertionError("submission_unknown created a paid retry")
         _require(len(gateway.submissions) == before + 1, "unknown submit was posted twice")
 
+        limit_assets = tuple(
+            production.import_reference(
+                project_id=project_id,
+                path=fixtures["https://fixture.local/anchor.png"],
+                usage="generation_reference",
+                role="identity",
+            )
+            for _index in range(15)
+        )
+        limit_scene = repository.add_scene(
+            project_id,
+            SceneDraft(title="引用上限预检", sourceText="只验证本地引用数量，不提交任务。"),
+        )
+        too_many_anchor = repository.add_shot(
+            limit_scene.id,
+            ShotCardDraft(
+                title="图片引用上限",
+                direction="1. 固定中景，猫咪观察人物整理道具并稳定结束。",
+                anchorMode=AnchorMode.GENERATE,
+                inheritProjectReferences=False,
+                referenceBindings=[
+                    ReferenceBinding(
+                        assetId=item.id,
+                        usage=ReferenceUsage.GENERATION_REFERENCE,
+                        role=ReferenceRole.IDENTITY,
+                        applyTo=ReferenceTarget.ANCHOR,
+                    )
+                    for item in limit_assets
+                ],
+            ),
+        )
+        image_calls_before = gateway.image_submissions
+        try:
+            production.generate_anchor(too_many_anchor.id, allow_paid_generation=True)
+        except ValueError as exc:
+            _require("14" in str(exc), "wrong Seedream reference limit error")
+        else:
+            raise AssertionError("15 image references reached the paid gateway")
+        _require(gateway.image_submissions == image_calls_before, "image limit failed after submit")
+
+        too_many_video = repository.add_shot(
+            limit_scene.id,
+            ShotCardDraft(
+                title="视频引用上限",
+                direction="1. 固定中景，猫咪观察人物整理道具并稳定结束。",
+                inheritProjectReferences=False,
+                referenceBindings=[
+                    ReferenceBinding(
+                        assetId=item.id,
+                        usage=ReferenceUsage.GENERATION_REFERENCE,
+                        role=ReferenceRole.IDENTITY,
+                        applyTo=ReferenceTarget.VIDEO,
+                    )
+                    for item in limit_assets[:10]
+                ],
+            ),
+        )
+        video_calls_before = len(gateway.submissions)
+        try:
+            production.generate_video(too_many_video.id, allow_paid_generation=True)
+        except ValueError as exc:
+            _require("9" in str(exc), "wrong Seedance reference limit error")
+        else:
+            raise AssertionError("10 video references reached the paid gateway")
+        _require(len(gateway.submissions) == video_calls_before, "video limit failed after submit")
+
         advisory_reviews = [
             item for item in repository.reviews.values() if item.source == "ark_visual"
         ]
@@ -890,7 +1106,7 @@ def main() -> None:
         )
         _require(
             all(not hasattr(item, "slot") for item in repository.steps.values()),
-            "fixed three-slot data leaked into V4",
+            "fixed three-slot data leaked into V5",
         )
         graph = repository.project_graph(project_id)
         traced_shots = [shot for scene_item in graph["scenes"] for shot in scene_item["shots"]]
@@ -914,6 +1130,12 @@ def main() -> None:
                     [item for item in repository.assets.values() if item.media_type == "video"]
                 ),
                 "sequenceRevisions": len(repository.list_sequences(project_id)),
+                "singleAndMultiSuggestions": True,
+                "providerAndAcceptedOutputRetained": True,
+                "referencePrecedenceAndLimits": True,
+                "sampleInput": str(sample_path),
+                "sampleCompositeSha256": sample_master.sha256,
+                "databaseCanon": database_canon,
                 "rangeEditPreservedSource": True,
                 "submissionUnknownFrozen": True,
                 "realArkCalls": 0,
@@ -921,12 +1143,129 @@ def main() -> None:
         )
 
 
+def _verify_database_canon() -> dict[str, Any]:
+    load_local_env()
+    recommended_keys = {
+        "person:headshot",
+        "person:fullbody",
+        "cat:front",
+        "cat:side",
+        "style:line_texture",
+    }
+    container = build_runtime_container()
+    try:
+        assets = container.repository.list_assets()
+        _require(len(assets) == 11, "database does not expose exactly 11 Canon assets")
+        for asset in assets:
+            _require(asset.path.is_file(), f"Canon content is missing: {asset.semantic_key}")
+            digest = hashlib.sha256(asset.path.read_bytes()).hexdigest()
+            _require(digest == asset.sha256, f"Canon content hash drifted: {asset.semantic_key}")
+        projects = container.repository.list_projects()
+        _require(projects, "Canon project-default verification requires one local project")
+        project = projects[0]
+        original = project.default_reference_bindings
+        selected = tuple(
+            ReferenceBinding(
+                assetId=asset.id,
+                usage=ReferenceUsage.GENERATION_REFERENCE,
+                role=(
+                    ReferenceRole.STYLE
+                    if asset.semantic_key and asset.semantic_key.startswith("style:")
+                    else ReferenceRole.IDENTITY
+                ),
+                applyTo=ReferenceTarget.BOTH,
+            )
+            for asset in assets
+            if asset.semantic_key in recommended_keys
+        )
+        _require(len(selected) == 5, "recommended Canon default set is not exactly five assets")
+        try:
+            saved = container.repository.update_project_default_references(
+                project.id,
+                list(selected),
+            )
+            _require(
+                saved.default_reference_bindings == selected,
+                "project Canon defaults were not persisted",
+            )
+        finally:
+            container.repository.update_project_default_references(project.id, list(original))
+        return {
+            "assetsReadable": len(assets),
+            "recommendedDefaultsRoundTrip": len(selected),
+            "projectId": str(project.id),
+        }
+    finally:
+        container.close()
+
+
+def _probe_json(ffprobe: str, path: Path) -> dict[str, Any]:
+    completed = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    payload = json.loads(completed.stdout)
+    if not isinstance(payload, dict):
+        raise AssertionError(f"ffprobe returned a non-object for {path}")
+    return payload
+
+
+def _normalize_sample(ffmpeg: str, source: Path, output: Path) -> Path:
+    subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(source),
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=48000",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-vf",
+            "scale=480:854:force_original_aspect_ratio=decrease,"
+            "pad=480:854:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(output),
+        ],
+        check=True,
+        timeout=1800,
+    )
+    return output
+
+
 def _fixtures(root: Path, ffmpeg: str) -> dict[str, Path]:
     anchor = root / "anchor.png"
     Image.new("RGB", (480, 854), (205, 222, 198)).save(anchor)
     shot = root / "shot.mp4"
     edit = root / "edit.mp4"
-    _video_fixture(ffmpeg, shot, duration=8, color="0x8fb7a0", frequency=440)
+    # The edited fixture suggestions span 9–11 seconds; a 10-second substitute
+    # stays within the production QC tolerance for every accepted clip.
+    _video_fixture(ffmpeg, shot, duration=10, color="0x8fb7a0", frequency=440)
     _video_fixture(ffmpeg, edit, duration=4, color="0xd4aa78", frequency=520)
     return {
         "https://fixture.local/anchor.png": anchor,

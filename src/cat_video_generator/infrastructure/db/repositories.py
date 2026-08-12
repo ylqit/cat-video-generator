@@ -1,11 +1,11 @@
-"""PostgreSQL repository for V4 projects, scenes, shot cards and media versions."""
+"""PostgreSQL repository for V5 projects, scenes, video clips and media versions."""
 
 from __future__ import annotations
 
 import hashlib
 import uuid
 from datetime import date, datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from sqlalchemy import and_, delete, func, or_, select
@@ -27,7 +27,9 @@ from ...domain.contracts import (
     CURRENT_CONTRACT_VERSION,
     AnchorMode,
     ReferenceBinding,
+    ReferenceUsage,
     SceneDraft,
+    SceneLookPlan,
     ShotCardDraft,
     StoryProjectInput,
 )
@@ -62,11 +64,16 @@ class ContractVersionMismatchError(RuntimeError):
     pass
 
 
+class WorkflowConflictError(ValueError):
+    pass
+
+
 class SqlAlchemyWorkflowRepository:
     """Owns short transactions and concurrency-safe paid intent creation."""
 
-    def __init__(self, sessions: sessionmaker[Session]) -> None:
+    def __init__(self, sessions: sessionmaker[Session], *, asset_root: Path) -> None:
         self._sessions = sessions
+        self._asset_root = asset_root.expanduser().resolve()
 
     def create_project(self, source: StoryProjectInput, *, content_date: date) -> StoredProject:
         with self._sessions.begin() as session:
@@ -75,6 +82,7 @@ class SqlAlchemyWorkflowRepository:
                 content_date=content_date,
                 contract_version=CURRENT_CONTRACT_VERSION,
                 status=RunStatus.ACTIVE.value,
+                default_reference_bindings_json=[],
             )
             session.add(row)
             session.flush()
@@ -83,6 +91,8 @@ class SqlAlchemyWorkflowRepository:
                 sort_order=1,
                 title=source.first_scene_title,
                 source_text=source.first_scene_text,
+                story_mode="single",
+                target_shot_count=1,
                 status=SceneStatus.DRAFT.value,
             )
             session.add(scene)
@@ -114,6 +124,25 @@ class SqlAlchemyWorkflowRepository:
             row.content_date = content_date
             return _project(row)
 
+    def update_project_default_references(
+        self,
+        project_id: uuid.UUID,
+        bindings: list[ReferenceBinding],
+    ) -> StoredProject:
+        if any(binding.usage is not ReferenceUsage.GENERATION_REFERENCE for binding in bindings):
+            raise ValueError("project defaults must be generation_reference bindings")
+        with self._sessions.begin() as session:
+            row = self._require_project(session, project_id)
+            self._validate_reference_bindings(
+                session,
+                project_id=project_id,
+                bindings=bindings,
+            )
+            row.default_reference_bindings_json = [
+                item.model_dump(mode="json", by_alias=True) for item in bindings
+            ]
+            return _project(row)
+
     def get_project(self, project_id: uuid.UUID) -> StoredProject:
         with self._sessions() as session:
             return _project_checked(_required(session, ProductionRun, project_id))
@@ -136,6 +165,13 @@ class SqlAlchemyWorkflowRepository:
                 source_text=draft.source_text,
                 chapter_label=draft.chapter_label,
                 context_note=draft.context_note,
+                story_mode=draft.story_mode.value,
+                target_shot_count=draft.target_shot_count,
+                look_plan_json=(
+                    None
+                    if draft.look_plan is None
+                    else draft.look_plan.model_dump(mode="json", by_alias=True)
+                ),
                 status=SceneStatus.DRAFT.value,
             )
             session.add(row)
@@ -152,16 +188,31 @@ class SqlAlchemyWorkflowRepository:
                 row.source_text,
                 row.chapter_label,
                 row.context_note,
+                row.story_mode,
+                row.target_shot_count,
+                row.look_plan_json,
             ) != (
                 draft.title,
                 draft.source_text,
                 draft.chapter_label,
                 draft.context_note,
+                draft.story_mode.value,
+                draft.target_shot_count,
+                None
+                if draft.look_plan is None
+                else draft.look_plan.model_dump(mode="json", by_alias=True),
             )
             row.title = draft.title
             row.source_text = draft.source_text
             row.chapter_label = draft.chapter_label
             row.context_note = draft.context_note
+            row.story_mode = draft.story_mode.value
+            row.target_shot_count = draft.target_shot_count
+            row.look_plan_json = (
+                None
+                if draft.look_plan is None
+                else draft.look_plan.model_dump(mode="json", by_alias=True)
+            )
             if changed:
                 shots = session.execute(
                     select(ShotCard).where(ShotCard.scene_id == scene_id)
@@ -172,6 +223,23 @@ class SqlAlchemyWorkflowRepository:
                     shot.status = ShotStatus.READY.value
                 self._invalidate_project_sequence(session, row.production_run_id)
             return _scene(row)
+
+    def select_scene_look_asset(
+        self,
+        scene_id: uuid.UUID,
+        asset_id: uuid.UUID | None,
+    ) -> StoredScene:
+        with self._sessions.begin() as session:
+            scene = _required(session, Scene, scene_id)
+            self._require_project(session, scene.production_run_id)
+            if asset_id is not None:
+                asset = _required(session, Asset, asset_id)
+                if asset.scope != "canon" and asset.production_run_id != scene.production_run_id:
+                    raise ValueError("scene look must be Canon or belong to the current project")
+                if asset.media_type != "image" or asset.status not in {"ready", "approved"}:
+                    raise ValueError("scene look must be an available image")
+            scene.selected_look_asset_id = asset_id
+            return _scene(scene)
 
     def delete_scene(self, scene_id: uuid.UUID) -> None:
         with self._sessions.begin() as session:
@@ -266,19 +334,44 @@ class SqlAlchemyWorkflowRepository:
                     project_id=scene.production_run_id,
                     bindings=draft.reference_bindings,
                 )
-            existing_ids = select(ShotCard.id).where(ShotCard.scene_id == scene_id)
-            if session.scalar(
-                select(func.count())
-                .select_from(WorkflowStep)
-                .where(WorkflowStep.shot_card_id.in_(existing_ids))
+            rows = self._replace_shots_locked(session, scene=scene, drafts=drafts)
+            return tuple(_shot(row, scene.production_run_id) for row in rows)
+
+    def accept_scene_suggestions(
+        self,
+        *,
+        step_id: uuid.UUID,
+        drafts: tuple[ShotCardDraft, ...],
+        look_plan: SceneLookPlan | None,
+        accepted_output: dict[str, Any],
+    ) -> tuple[StoredShot, ...]:
+        if not drafts:
+            raise ValueError("accepted suggestions must contain at least one video clip")
+        with self._sessions.begin() as session:
+            step = _required(session, WorkflowStep, step_id)
+            if (
+                StepKind(step.kind) is not StepKind.DIRECTOR
+                or StepStatus(step.status) is not StepStatus.SUCCEEDED
+                or step.scene_id is None
             ):
-                raise ValueError("Generated shots with provider history cannot be replaced")
-            session.execute(delete(ShotCard).where(ShotCard.scene_id == scene_id))
-            rows = [_new_shot(scene_id, order, draft) for order, draft in enumerate(drafts, 1)]
-            session.add_all(rows)
-            self._invalidate_project_sequence(session, scene.production_run_id)
-            scene.status = SceneStatus.READY.value
-            session.flush()
+                raise ValueError("step is not an accepted scene suggestion result")
+            scene = _required(session, Scene, step.scene_id)
+            for draft in drafts:
+                self._validate_reference_bindings(
+                    session,
+                    project_id=scene.production_run_id,
+                    bindings=draft.reference_bindings,
+                )
+            rows = self._replace_shots_locked(session, scene=scene, drafts=drafts)
+            scene.look_plan_json = (
+                None
+                if look_plan is None
+                else look_plan.model_dump(mode="json", by_alias=True)
+            )
+            snapshot = dict(step.input_snapshot_json)
+            snapshot["acceptedOutput"] = accepted_output
+            snapshot["acceptedAt"] = datetime.now(timezone.utc).isoformat()
+            step.input_snapshot_json = snapshot
             return tuple(_shot(row, scene.production_run_id) for row in rows)
 
     def update_shot(self, shot_id: uuid.UUID, draft: ShotCardDraft) -> StoredShot:
@@ -300,6 +393,8 @@ class SqlAlchemyWorkflowRepository:
                 binding.model_dump(mode="json", by_alias=True)
                 for binding in draft.reference_bindings
             ]
+            row.inherit_project_references = draft.inherit_project_references
+            row.use_scene_look = draft.use_scene_look
             if changed:
                 row.selected_anchor_asset_id = None
                 row.selected_video_asset_id = None
@@ -558,18 +653,29 @@ class SqlAlchemyWorkflowRepository:
                 scope=scope,
                 status=status,
                 media_type=media_type,
-                local_path=str(landed.path),
+                storage_key=_storage_key_for(landed.path, self._asset_root),
                 sha256=landed.sha256,
                 byte_size=landed.byte_size,
                 metadata_json=metadata,
             )
             session.add(row)
             session.flush()
-            return _asset(row)
+            return _asset(row, self._asset_root)
 
     def get_asset(self, asset_id: uuid.UUID) -> StoredAsset:
         with self._sessions() as session:
-            return _asset(_required(session, Asset, asset_id))
+            return _asset(_required(session, Asset, asset_id), self._asset_root)
+
+    def repair_canon_asset(self, asset_id: uuid.UUID, landed: LandedAsset) -> StoredAsset:
+        with self._sessions.begin() as session:
+            row = _required(session, Asset, asset_id)
+            if row.scope != "canon" or row.status != "approved":
+                raise ValueError("only approved Canon assets can be repaired")
+            if row.sha256 != landed.sha256:
+                raise ValueError("Canon repair cannot change the approved asset hash")
+            row.storage_key = _storage_key_for(landed.path, self._asset_root)
+            row.byte_size = landed.byte_size
+            return _asset(row, self._asset_root)
 
     def list_assets(
         self,
@@ -595,7 +701,7 @@ class SqlAlchemyWorkflowRepository:
             else:
                 query = query.where(Asset.scope == "canon")
             rows = session.execute(query.order_by(Asset.created_at)).scalars()
-            return tuple(_asset(row) for row in rows)
+            return tuple(_asset(row, self._asset_root) for row in rows)
 
     def select_shot_asset(
         self, shot_id: uuid.UUID, *, kind: str, asset_id: uuid.UUID
@@ -665,7 +771,7 @@ class SqlAlchemyWorkflowRepository:
             step = _required(session, WorkflowStep, asset.producing_step_id)
             if StepStatus(step.status) is not StepStatus.AWAITING_REVIEW:
                 if asset.status == decision:
-                    return _asset(asset)
+                    return _asset(asset, self._asset_root)
                 raise ValueError("asset is not awaiting review")
             asset.status = decision
             step.status = (
@@ -683,7 +789,7 @@ class SqlAlchemyWorkflowRepository:
                     evidence_json={},
                 )
             )
-            return _asset(asset)
+            return _asset(asset, self._asset_root)
 
     def list_reviews(self, step_id: uuid.UUID) -> tuple[StoredReview, ...]:
         with self._sessions() as session:
@@ -853,6 +959,33 @@ class SqlAlchemyWorkflowRepository:
         for order, row in enumerate(rows, 1):
             row.sort_order = order
 
+    def _replace_shots_locked(
+        self,
+        session: Session,
+        *,
+        scene: Scene,
+        drafts: tuple[ShotCardDraft, ...],
+    ) -> list[ShotCard]:
+        existing_ids = select(ShotCard.id).where(ShotCard.scene_id == scene.id)
+        if session.scalar(
+            select(func.count())
+            .select_from(WorkflowStep)
+            .where(WorkflowStep.shot_card_id.in_(existing_ids))
+        ):
+            raise WorkflowConflictError(
+                "已有图片或视频生成历史，不能整批覆盖视频片段"
+            )
+        session.execute(delete(ShotCard).where(ShotCard.scene_id == scene.id))
+        rows = [
+            _new_shot(scene.id, order, draft)
+            for order, draft in enumerate(drafts, 1)
+        ]
+        session.add_all(rows)
+        self._invalidate_project_sequence(session, scene.production_run_id)
+        scene.status = SceneStatus.READY.value
+        session.flush()
+        return rows
+
     @staticmethod
     def _invalidate_project_sequence(session: Session, project_id: uuid.UUID) -> None:
         project = _required(session, ProductionRun, project_id)
@@ -882,6 +1015,39 @@ def _required(session: Session, model: type[Any], record_id: uuid.UUID) -> Any:
     return row
 
 
+def _storage_key_for(path: Path, asset_root: Path) -> str:
+    root = asset_root.expanduser().resolve()
+    resolved = path.expanduser().resolve()
+    try:
+        key = resolved.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ValueError("managed asset path is outside the configured asset root") from exc
+    _resolve_storage_key(key, root)
+    return key
+
+
+def _resolve_storage_key(storage_key: str, asset_root: Path) -> Path:
+    key = storage_key.strip()
+    pure = PurePosixPath(key)
+    if (
+        not key
+        or key.startswith(("/", "\\"))
+        or "\\" in key
+        or pure.is_absolute()
+        or ".." in pure.parts
+        or (pure.parts and pure.parts[0].endswith(":"))
+        or len(pure.parts) < 3
+        or pure.parts[0] not in {"imported", "generated"}
+        or pure.parts[1] != "sha256"
+    ):
+        raise ValueError(f"invalid managed asset storage key: {storage_key!r}")
+    root = asset_root.expanduser().resolve()
+    resolved = root.joinpath(*pure.parts).resolve()
+    if not resolved.is_relative_to(root):
+        raise ValueError(f"managed asset storage key escapes asset root: {storage_key!r}")
+    return resolved
+
+
 def _project(row: ProductionRun) -> StoredProject:
     return StoredProject(
         id=row.id,
@@ -889,6 +1055,10 @@ def _project(row: ProductionRun) -> StoredProject:
         content_date=row.content_date,
         status=RunStatus(row.status),
         selected_sequence_id=row.selected_sequence_id,
+        default_reference_bindings=tuple(
+            ReferenceBinding.model_validate(item)
+            for item in row.default_reference_bindings_json
+        ),
     )
 
 
@@ -910,8 +1080,16 @@ def _scene(row: Scene) -> StoredScene:
             sourceText=row.source_text,
             chapterLabel=row.chapter_label,
             contextNote=row.context_note,
+            storyMode=row.story_mode,
+            targetShotCount=row.target_shot_count,
+            lookPlan=(
+                None
+                if row.look_plan_json is None
+                else SceneLookPlan.model_validate(row.look_plan_json)
+            ),
         ),
         status=SceneStatus(row.status),
+        selected_look_asset_id=row.selected_look_asset_id,
     )
 
 
@@ -926,6 +1104,8 @@ def _new_shot(scene_id: uuid.UUID, order: int, draft: ShotCardDraft) -> ShotCard
         reference_bindings_json=[
             item.model_dump(mode="json", by_alias=True) for item in draft.reference_bindings
         ],
+        inherit_project_references=draft.inherit_project_references,
+        use_scene_look=draft.use_scene_look,
         status=ShotStatus.READY.value,
     )
 
@@ -944,6 +1124,8 @@ def _shot(row: ShotCard, project_id: uuid.UUID) -> StoredShot:
             referenceBindings=[
                 ReferenceBinding.model_validate(item) for item in row.reference_bindings_json
             ],
+            inheritProjectReferences=row.inherit_project_references,
+            useSceneLook=row.use_scene_look,
         ),
         status=ShotStatus(row.status),
         selected_anchor_asset_id=row.selected_anchor_asset_id,
@@ -981,7 +1163,7 @@ def _prompt(row: PromptRecord) -> StoredPrompt:
     )
 
 
-def _asset(row: Asset) -> StoredAsset:
+def _asset(row: Asset, asset_root: Path) -> StoredAsset:
     return StoredAsset(
         id=row.id,
         project_id=row.production_run_id,
@@ -992,7 +1174,7 @@ def _asset(row: Asset) -> StoredAsset:
         media_type=row.media_type,
         scope=row.scope,
         status=row.status,
-        path=Path(row.local_path),
+        path=_resolve_storage_key(row.storage_key, asset_root),
         sha256=row.sha256,
         metadata=dict(row.metadata_json),
         semantic_key=row.semantic_key,
@@ -1035,6 +1217,10 @@ def _json_project(row: StoredProject) -> dict[str, Any]:
         if row.selected_sequence_id is None
         else str(row.selected_sequence_id),
         "contractVersion": CURRENT_CONTRACT_VERSION,
+        "defaultReferenceBindings": [
+            item.model_dump(mode="json", by_alias=True)
+            for item in row.default_reference_bindings
+        ],
     }
 
 
@@ -1044,6 +1230,11 @@ def _json_scene(row: StoredScene) -> dict[str, Any]:
         "order": row.order,
         **row.draft.model_dump(mode="json", by_alias=True),
         "status": row.status.value,
+        "selectedLookAssetId": (
+            None
+            if row.selected_look_asset_id is None
+            else str(row.selected_look_asset_id)
+        ),
     }
 
 
@@ -1085,10 +1276,14 @@ def _json_asset(row: StoredAsset) -> dict[str, Any]:
         "mediaType": row.media_type,
         "scope": row.scope,
         "status": row.status,
+        "projectId": None if row.project_id is None else str(row.project_id),
+        "sceneId": None if row.scene_id is None else str(row.scene_id),
+        "shotId": None if row.shot_card_id is None else str(row.shot_card_id),
         "producingStepId": None if row.step_id is None else str(row.step_id),
         "sha256": row.sha256,
         "semanticKey": row.semantic_key,
         "metadata": row.metadata,
+        "contentReady": row.path.is_file(),
     }
 
 

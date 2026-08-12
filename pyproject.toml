@@ -33,6 +33,9 @@ target-version = "py312"
 select = ["E", "F", "I", "B", "C4", "SIM"]
 ignore = ["B008"]
 
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
 [project.scripts]
 cvg = "cat_video_generator.interfaces.cli:main"
 

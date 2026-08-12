@@ -1,4 +1,4 @@
-"""V4任意场景、镜头卡和人工参考素材契约。
+"""V5任意场景、视频片段和人工参考素材契约。
 
 创作事实只保存项目标题、场景原文和完整镜头描述。供应商输入、数据库状态和
 审核结果属于各自边界，不重复塞进剧情JSON。
@@ -14,7 +14,12 @@ from pydantic import Field, model_validator
 
 from .contract_base import StrictModel
 
-CURRENT_CONTRACT_VERSION = 4
+CURRENT_CONTRACT_VERSION = 5
+
+
+class StoryMode(StrEnum):
+    SINGLE = "single"
+    MULTI = "multi"
 
 
 class AnchorMode(StrEnum):
@@ -61,6 +66,30 @@ class StoryProjectInput(StrictModel):
     ]
 
 
+class SceneLookPlan(StrictModel):
+    person_wardrobe: Annotated[
+        str,
+        Field(alias="personWardrobe", max_length=1_000),
+    ] = ""
+    person_accessories: Annotated[
+        str,
+        Field(alias="personAccessories", max_length=1_000),
+    ] = ""
+    cat_appearance: Annotated[
+        str,
+        Field(alias="catAppearance", max_length=1_000),
+    ] = ""
+    key_props: Annotated[
+        str,
+        Field(alias="keyProps", max_length=1_000),
+    ] = ""
+    image_recommended: bool = Field(default=False, alias="imageRecommended")
+    recommendation_reason: Annotated[
+        str | None,
+        Field(alias="recommendationReason", max_length=2_000),
+    ] = None
+
+
 class SceneDraft(StrictModel):
     title: Annotated[str, Field(min_length=1, max_length=120)]
     source_text: Annotated[str, Field(alias="sourceText", min_length=1, max_length=12_000)]
@@ -72,6 +101,20 @@ class SceneDraft(StrictModel):
         str | None,
         Field(alias="contextNote", max_length=2_000),
     ] = None
+    story_mode: StoryMode = Field(default=StoryMode.SINGLE, alias="storyMode")
+    target_shot_count: Annotated[
+        int,
+        Field(default=1, alias="targetShotCount", ge=1, le=6),
+    ]
+    look_plan: SceneLookPlan | None = Field(default=None, alias="lookPlan")
+
+    @model_validator(mode="after")
+    def validate_story_mode(self) -> SceneDraft:
+        if self.story_mode is StoryMode.SINGLE and self.target_shot_count != 1:
+            raise ValueError("single模式必须只生成一个视频片段")
+        if self.story_mode is StoryMode.MULTI and self.target_shot_count < 2:
+            raise ValueError("multi模式必须生成2到6个视频片段")
+        return self
 
 
 class ShotSuggestion(StrictModel):
@@ -88,7 +131,8 @@ class ShotSuggestionOutput(StrictModel):
         str,
         Field(alias="sceneTitle", min_length=1, max_length=120),
     ]
-    shots: list[ShotSuggestion] = Field(min_length=1)
+    look_plan: SceneLookPlan = Field(default_factory=SceneLookPlan, alias="lookPlan")
+    shots: list[ShotSuggestion] = Field(min_length=1, max_length=6)
 
 
 class ShotCardDraft(StrictModel):
@@ -100,6 +144,11 @@ class ShotCardDraft(StrictModel):
         default_factory=list,
         alias="referenceBindings",
     )
+    inherit_project_references: bool = Field(
+        default=True,
+        alias="inheritProjectReferences",
+    )
+    use_scene_look: bool = Field(default=True, alias="useSceneLook")
 
     @model_validator(mode="after")
     def validate_references(self) -> ShotCardDraft:

@@ -8,8 +8,10 @@ from .contracts import (
     ReferenceTarget,
     ReferenceUsage,
     SceneDraft,
+    SceneLookPlan,
     ShotCardDraft,
     ShotSuggestionOutput,
+    StoryMode,
     StoryProjectInput,
 )
 
@@ -21,7 +23,9 @@ __all__ = [
     "ReferenceTarget",
     "ReferenceUsage",
     "SceneDraft",
+    "SceneLookPlan",
     "ShotCardDraft",
     "ShotSuggestionOutput",
     "StoryProjectInput",
+    "StoryMode",
 ]

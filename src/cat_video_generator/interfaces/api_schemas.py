@@ -1,4 +1,4 @@
-"""HTTP request contracts for the V4 shot queue API."""
+"""HTTP request contracts for the V5 video-clip workflow API."""
 
 from __future__ import annotations
 
@@ -8,7 +8,14 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..domain.contracts import ReferenceBinding, SceneDraft, ShotCardDraft, StoryProjectInput
+from ..domain.contracts import (
+    ReferenceBinding,
+    SceneDraft,
+    SceneLookPlan,
+    ShotCardDraft,
+    ShotSuggestion,
+    StoryProjectInput,
+)
 
 
 class ApiModel(BaseModel):
@@ -41,8 +48,17 @@ class SuggestShotsRequest(ApiModel):
     allow_paid_generation: bool = Field(alias="allowPaidGeneration")
 
 
+class AcceptSuggestionsRequest(ApiModel):
+    look_plan: SceneLookPlan | None = Field(alias="lookPlan")
+    shots: list[ShotSuggestion] = Field(min_length=1, max_length=6)
+
+
 class ReferencesRequest(ApiModel):
     references: list[ReferenceBinding]
+
+
+class SelectSceneLookRequest(ApiModel):
+    asset_id: UUID | None = Field(alias="assetId")
 
 
 class GenerateRequest(ApiModel):

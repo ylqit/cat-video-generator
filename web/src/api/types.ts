@@ -2,6 +2,7 @@ export type AnchorMode = "text_only" | "existing" | "generate";
 export type ReferenceUsage = "approved_anchor" | "generation_reference";
 export type ReferenceRole = "identity" | "style" | "scene" | "prop" | "composition";
 export type ReferenceTarget = "anchor" | "video" | "both";
+export type StoryMode = "single" | "multi";
 
 export interface ReferenceBinding {
   assetId: string;
@@ -23,10 +24,35 @@ export interface AssetDto {
   mediaType: "image" | "video";
   scope: string;
   status: string;
+  projectId?: string | null;
+  sceneId?: string | null;
+  shotId?: string | null;
   producingStepId?: string | null;
   sha256: string;
   semanticKey?: string | null;
   metadata: Record<string, unknown>;
+  contentReady: boolean;
+}
+
+export interface SceneLookPlan {
+  personWardrobe: string;
+  personAccessories: string;
+  catAppearance: string;
+  keyProps: string;
+  imageRecommended: boolean;
+  recommendationReason?: string | null;
+}
+
+export interface ShotSuggestion {
+  title: string;
+  direction: string;
+  suggestedDurationSeconds: number;
+}
+
+export interface ShotSuggestionOutput {
+  sceneTitle: string;
+  lookPlan: SceneLookPlan;
+  shots: ShotSuggestion[];
 }
 
 export interface PromptDto {
@@ -68,6 +94,8 @@ export interface ShotDto {
   durationSeconds: number;
   anchorMode: AnchorMode;
   referenceBindings: ReferenceBinding[];
+  inheritProjectReferences: boolean;
+  useSceneLook: boolean;
   status: string;
   selectedAnchorAssetId?: string | null;
   selectedVideoAssetId?: string | null;
@@ -82,6 +110,10 @@ export interface SceneDto {
   sourceText: string;
   chapterLabel?: string | null;
   contextNote?: string | null;
+  storyMode: StoryMode;
+  targetShotCount: number;
+  lookPlan?: SceneLookPlan | null;
+  selectedLookAssetId?: string | null;
   status: string;
   attempts: AttemptDto[];
   shots: ShotDto[];
@@ -104,6 +136,7 @@ export interface ProjectGraph {
   project: ProjectSummary & {
     selectedSequenceId?: string | null;
     contractVersion: number;
+    defaultReferenceBindings: ReferenceBinding[];
   };
   assets: AssetDto[];
   scenes: SceneDto[];
@@ -121,10 +154,17 @@ export interface JobDto {
 
 export interface HealthDto {
   ready: boolean;
+  databaseReady: boolean;
   contractVersion: number;
   alembicRevision: string;
   expectedAlembicRevision: string;
   arkImageModel?: string;
   arkVideoModel?: string;
+  arkReady?: boolean;
+  ffmpegAvailable?: boolean;
+  ffprobeAvailable?: boolean;
+  videoGenerationReady?: boolean;
+  localCompositionReady?: boolean;
+  configurationWarnings?: string[];
   generationConfigurationValid?: boolean;
 }

@@ -1,4 +1,4 @@
-# Windows 运行手册（V4）
+# Windows 运行手册（V5）
 
 ## 配置与启动
 
@@ -18,30 +18,33 @@ npm --prefix web run dev
 访问 `http://localhost:5173/studio`。生产单服务可先构建前端，再执行
 `uv run cvg api --static-dir web/dist`。
 
-## 升级到 0015
+FFmpeg 与 FFprobe 推荐安装到系统 PATH；`.env` 中的 `FFMPEG_PATH`、`FFPROBE_PATH`
+可以留空。有效显式路径优先，失效显式路径会报告警告并回退 PATH。
 
-V4 不兼容旧生产结构。先归档并清理旧业务数据，再迁移；脚本不删除 Canon 或已交付
-本地文件：
+## 升级到 0016 并修复 Canon
+
+从现有 V4 直接迁移到 V5，然后按清单校验并重链 11 张批准 Canon。命令重复执行幂等，
+任何源文件哈希不一致都会拒绝修改数据库：
 
 ```powershell
-uv run python scripts/archive_v3_and_clear.py
 uv run alembic upgrade head
+uv run cvg canon-repair --source-dir "风格定稿/Canon-v1"
 uv run cvg doctor
 ```
 
-归档 Manifest 与整体 SHA-256 位于 `var/diagnostics/`。迁移最终应显示
-`0015_shot_queue_core`，且只保留批准 Canon。
+迁移最终应显示 `0016_v5_creation_flow`；`doctor` 分别报告数据库、Ark、FFmpeg、
+FFprobe、视频生成和本地合成状态。
 
 ## Web 操作
 
 1. 创建项目并填写第一场景原文。
-2. 手工添加镜头，或点击“AI 建议镜头卡”并确认一次文本模型费用。
-3. 编辑镜头描述和 8～15 秒时长。
-4. 选择纯文本、已有图片或生成新锚点；按职责绑定必要素材。
-5. 查看最终 Prompt，显式确认 Seedance 费用并生成片段。
-6. 人工观看后批准或拒绝；AI 抽帧结果只是建议。
-7. 重做只影响当前镜头，旧 attempt 和媒体保留。
-8. 多个批准镜头可本地合成总片；局部问题可在底部时间轴发起区间重拍。
+2. 选择单片段或填写 2～6 个多片段目标数，点击“AI 建议视频片段”。
+3. 在表单中编辑造型、片段标题、2～4 个编号子镜头和 8～15 秒时长后接受。
+4. 按建议可选生成、上传或选择场景定妆；该建议不阻断视频生成。
+5. 在 Canon 页面保存项目默认参考；片段可切换项目继承、场景定妆和自定义素材。
+6. 选择纯文本、已有图片或生成新锚点，查看最终 Prompt 后确认 Seedance 费用。
+7. 人工观看后批准或拒绝；AI 抽帧结果只是建议。
+8. 重做只影响当前片段，旧 attempt 和媒体保留；批准片段可合成总片或区间重拍。
 
 ## 恢复边界
 
