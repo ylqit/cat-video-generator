@@ -57,9 +57,11 @@ def downgrade() -> None:
         sa.column("contract_version", sa.SmallInteger()),
         schema=schema,
     )
-    v3_count = op.get_bind().execute(
-        sa.select(sa.func.count()).select_from(runs).where(runs.c.contract_version == 3)
-    ).scalar_one()
+    v3_count = (
+        op.get_bind()
+        .execute(sa.select(sa.func.count()).select_from(runs).where(runs.c.contract_version == 3))
+        .scalar_one()
+    )
     if v3_count:
         raise RuntimeError("存在V3生活故事项目，不能降级为仅支持V2的契约")
     op.drop_constraint(

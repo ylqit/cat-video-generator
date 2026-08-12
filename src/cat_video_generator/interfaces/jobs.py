@@ -1,6 +1,6 @@
 """本地HTTP接口的进程内后台任务登记。
 
-视频与规划都是分钟级长任务，HTTP请求必须立即返回；真实状态由
+视频、图片与镜头建议都是长任务，HTTP请求必须立即返回；真实状态由
 PostgreSQL工作流表持有，这里只登记任务句柄用于去重、进度展示和错误呈现。
 付费任务经过进程级串行门，避免并发提交造成重复扣费。进程重启后任务列表
 清空，恢复语义仍由数据库中的provider task ID与resume用例兜底。
@@ -23,24 +23,15 @@ logger = logging.getLogger(__name__)
 
 PAID_KINDS = frozenset(
     {
-        "plan_day",
-        "create_project",
-        "plan_slot",
-        "suggest_story_connection",
-        "run_day",
-        "resume_planning",
-        "replan_episode",
-        "retry_step",
-        "regenerate_step",
-        "video_range_edit",
-        "prepare_visuals",
-        "continue_media",
-        "continue_pipeline",
+        "shot_suggestions",
+        "generate_anchor",
+        "generate_video",
+        "range_edit",
     }
 )
 
 _ACTIVE_STATUSES = frozenset({"queued", "running"})
-_CONTEXT_KEYS = frozenset({"runId", "episodeId", "slot", "operationKey"})
+_CONTEXT_KEYS = frozenset({"projectId", "sceneId", "shotId", "stepId", "operationKey"})
 
 
 class JobConflictError(RuntimeError):
@@ -194,8 +185,6 @@ def _classify_error(
 
     if isinstance(exc, GatewayError):
         code = exc.code
-    elif all(hasattr(exc, name) for name in ("run_id", "slot", "errors")):
-        code = "planning_review_required"
     elif isinstance(exc, ValueError):
         code = "invalid_request"
     elif isinstance(exc, TimeoutError):
@@ -207,14 +196,6 @@ def _classify_error(
         "message": str(exc) or exc.__class__.__name__,
     }
     payload.update(context or {})
-    # 规划审核异常已经在PostgreSQL留下可恢复Run。把稳定标识返回给Web，
-    # 让用户直接进入失败现场，而不是回到一张看似什么都没发生的空表单。
-    run_id = getattr(exc, "run_id", None)
-    if run_id is not None:
-        payload["runId"] = str(run_id)
-    slot = getattr(exc, "slot", None)
-    if slot is not None:
-        payload["slot"] = getattr(slot, "value", str(slot))
     errors = getattr(exc, "errors", None)
     if errors is not None:
         # Pydantic ValidationError 暴露的是 errors() 方法；业务规划异常则

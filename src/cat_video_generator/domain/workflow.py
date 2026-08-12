@@ -1,8 +1,4 @@
-"""工作流状态及唯一合法转换入口。
-
-Application Service 只能通过本模块推进状态；CLI、Repository和Ark Gateway
-都不能绕过这里直接决定业务状态。
-"""
+"""V4项目、场景、镜头和供应商步骤状态。"""
 
 from __future__ import annotations
 
@@ -15,25 +11,19 @@ class WorkflowTransitionError(ValueError):
 
 
 class RunStatus(StrEnum):
+    ACTIVE = "active"
+    FAILED = "failed"
+
+
+class SceneStatus(StrEnum):
     DRAFT = "draft"
-    PLANNING_REVIEW = "planning_review"
-    PLANNED = "planned"
-    GENERATING = "generating"
-    REVIEWING = "reviewing"
     READY = "ready"
-    DELIVERED = "delivered"
-    FAILED = "failed"
 
 
-class EpisodeStatus(StrEnum):
-    PLANNED = "planned"
-    PREPARING_VISUALS = "preparing_visuals"
+class ShotStatus(StrEnum):
+    READY = "ready"
     VIDEO_PENDING = "video_pending"
-    VIDEO_GENERATING = "video_generating"
-    MEDIA_QC = "media_qc"
-    CONTENT_REVIEW = "content_review"
-    READY = "ready"
-    FAILED = "failed"
+    APPROVED = "approved"
 
 
 class StepKind(StrEnum):
@@ -43,8 +33,6 @@ class StepKind(StrEnum):
 
 
 class PromptPurpose(StrEnum):
-    """供应商调用及其审核使用的稳定Prompt用途。"""
-
     DIRECTOR = "director"
     IMAGE = "image"
     VIDEO = "video"
@@ -70,12 +58,6 @@ _PROMPT_PURPOSES_BY_STEP_KIND = {
     StepKind.VIDEO: frozenset({PromptPurpose.VIDEO, PromptPurpose.REVIEW}),
 }
 
-_GENERATION_PROMPTS_BY_STEP_KIND = {
-    StepKind.DIRECTOR: frozenset({PromptPurpose.DIRECTOR}),
-    StepKind.IMAGE: frozenset({PromptPurpose.IMAGE}),
-    StepKind.VIDEO: frozenset({PromptPurpose.VIDEO}),
-}
-
 
 def validate_prompt_purpose(
     kind: StepKind,
@@ -83,112 +65,21 @@ def validate_prompt_purpose(
     *,
     generation_intent: bool = False,
 ) -> PromptPurpose:
-    """校验Step和Prompt用途的对应关系。
-
-    生成意图只能绑定该Step的主Prompt；审核Prompt在供应商媒体落盘后追加，
-    防止把审核文本误当成一次新的收费生成输入。
-    """
-
     allowed = _PROMPT_PURPOSES_BY_STEP_KIND[kind]
     if purpose not in allowed:
         raise ValueError(f"{kind.value}步骤不允许purpose={purpose.value}")
-    generation_purposes = _GENERATION_PROMPTS_BY_STEP_KIND[kind]
-    if generation_intent and purpose not in generation_purposes:
-        expected = ", ".join(sorted(item.value for item in generation_purposes))
-        raise ValueError(f"{kind.value}步骤的生成Prompt必须是{expected}")
+    if generation_intent and purpose is PromptPurpose.REVIEW:
+        raise ValueError("审核Prompt不能作为收费生成意图")
     return purpose
 
 
 _RUN_TRANSITIONS = {
-    RunStatus.DRAFT: {
-        RunStatus.PLANNING_REVIEW,
-        RunStatus.PLANNED,
-        RunStatus.FAILED,
-    },
-    RunStatus.PLANNING_REVIEW: {
-        RunStatus.DRAFT,
-        RunStatus.PLANNED,
-        RunStatus.FAILED,
-    },
-    RunStatus.PLANNED: {
-        RunStatus.PLANNING_REVIEW,
-        RunStatus.GENERATING,
-        RunStatus.FAILED,
-    },
-    RunStatus.GENERATING: {
-        RunStatus.PLANNING_REVIEW,
-        RunStatus.REVIEWING,
-        RunStatus.READY,
-        RunStatus.FAILED,
-    },
-    RunStatus.REVIEWING: {
-        RunStatus.PLANNING_REVIEW,
-        RunStatus.GENERATING,
-        RunStatus.READY,
-        RunStatus.FAILED,
-    },
-    RunStatus.READY: {
-        # 非破坏性视频版本可能在交付前撤销已确认结果卡；此时回到生成态，
-        # 重新确认结果后才能再次ready，已经交付的Run仍保持终态不可改写。
-        RunStatus.GENERATING,
-        RunStatus.DELIVERED,
-        RunStatus.FAILED,
-    },
-    RunStatus.DELIVERED: set(),
-    # 初始导演链失败后可复用已成功的ProjectOutlineV3继续补齐Episode，再回到planned。
-    RunStatus.FAILED: {
-        RunStatus.PLANNING_REVIEW,
-        RunStatus.PLANNED,
-        RunStatus.GENERATING,
-    },
-}
-
-_EPISODE_TRANSITIONS = {
-    EpisodeStatus.PLANNED: {
-        EpisodeStatus.PREPARING_VISUALS,
-        EpisodeStatus.VIDEO_PENDING,
-        EpisodeStatus.FAILED,
-    },
-    EpisodeStatus.PREPARING_VISUALS: {
-        EpisodeStatus.VIDEO_PENDING,
-        EpisodeStatus.FAILED,
-    },
-    EpisodeStatus.VIDEO_PENDING: {
-        EpisodeStatus.VIDEO_GENERATING,
-        EpisodeStatus.FAILED,
-    },
-    EpisodeStatus.VIDEO_GENERATING: {
-        EpisodeStatus.MEDIA_QC,
-        EpisodeStatus.FAILED,
-    },
-    EpisodeStatus.MEDIA_QC: {
-        EpisodeStatus.CONTENT_REVIEW,
-        EpisodeStatus.FAILED,
-    },
-    EpisodeStatus.CONTENT_REVIEW: {
-        EpisodeStatus.READY,
-        EpisodeStatus.FAILED,
-    },
-    # 已完成Episode只有在用户明确撤销既有结果并重做时才会回到FAILED；
-    # Repository会先确认没有活动中的收费或审核Step，并永久保留旧媒体与审核记录。
-    EpisodeStatus.READY: {EpisodeStatus.FAILED},
-    EpisodeStatus.FAILED: {
-        EpisodeStatus.PLANNED,
-        EpisodeStatus.PREPARING_VISUALS,
-        EpisodeStatus.VIDEO_PENDING,
-        # 已落盘的视频可能因为同一Episode后来发起的无关图片尝试而遗留为failed。
-        # 只有Repository在锁定候选视频和AWAITING_REVIEW步骤后才会使用此恢复边，
-        # 让已有成片重新进入审核，而不是伪造一次新的收费生成过程。
-        EpisodeStatus.CONTENT_REVIEW,
-    },
+    RunStatus.ACTIVE: {RunStatus.FAILED},
+    RunStatus.FAILED: {RunStatus.ACTIVE},
 }
 
 _STEP_TRANSITIONS = {
-    StepStatus.PENDING: {
-        StepStatus.SUBMITTING,
-        StepStatus.RUNNING,
-        StepStatus.FAILED,
-    },
+    StepStatus.PENDING: {StepStatus.SUBMITTING, StepStatus.RUNNING, StepStatus.FAILED},
     StepStatus.SUBMITTING: {
         StepStatus.SUBMISSION_UNKNOWN,
         StepStatus.QUEUED,
@@ -205,6 +96,7 @@ _STEP_TRANSITIONS = {
     },
     StepStatus.QUEUED: {
         StepStatus.RUNNING,
+        StepStatus.AWAITING_REVIEW,
         StepStatus.SUCCEEDED,
         StepStatus.FAILED,
         StepStatus.EXPIRED,
@@ -217,19 +109,14 @@ _STEP_TRANSITIONS = {
         StepStatus.EXPIRED,
         StepStatus.CANCELLED,
     },
-    StepStatus.AWAITING_REVIEW: {
-        StepStatus.SUCCEEDED,
-        StepStatus.FAILED,
-    },
+    StepStatus.AWAITING_REVIEW: {StepStatus.SUCCEEDED, StepStatus.FAILED},
     StepStatus.SUCCEEDED: set(),
-    # 供应商任务已经成功、但本地下载/QC/封装失败时，可以在同一attempt内重新进入RUNNING。
-    # 该边只供Repository的受约束恢复入口使用，不允许借此重新POST收费任务。
-    StepStatus.FAILED: {StepStatus.RUNNING},
+    StepStatus.FAILED: set(),
     StepStatus.EXPIRED: set(),
     StepStatus.CANCELLED: set(),
 }
 
-StatusT = TypeVar("StatusT", RunStatus, EpisodeStatus, StepStatus)
+StatusT = TypeVar("StatusT", RunStatus, StepStatus)
 
 
 def _transition(
@@ -237,7 +124,7 @@ def _transition(
     target: StatusT,
     transitions: dict[StatusT, set[StatusT]],
 ) -> StatusT:
-    if target == current:
+    if target is current:
         return current
     if target not in transitions[current]:
         raise WorkflowTransitionError(f"非法状态转换: {current.value} -> {target.value}")
@@ -245,25 +132,8 @@ def _transition(
 
 
 def transition_run(current: RunStatus, target: RunStatus) -> RunStatus:
-    """校验并返回Run目标状态，不产生数据库副作用。"""
-
     return _transition(current, target, _RUN_TRANSITIONS)
 
 
-def transition_episode(
-    current: EpisodeStatus,
-    target: EpisodeStatus,
-) -> EpisodeStatus:
-    """校验并返回Episode目标状态，不产生数据库副作用。"""
-
-    return _transition(current, target, _EPISODE_TRANSITIONS)
-
-
 def transition_step(current: StepStatus, target: StepStatus) -> StepStatus:
-    """校验并返回Step目标状态。
-
-    `submission_unknown`不能回到`submitting`，因为响应未知时再次POST可能
-    产生第二次付费任务；恢复流程必须先通过供应商任务列表完成对账。
-    """
-
     return _transition(current, target, _STEP_TRANSITIONS)

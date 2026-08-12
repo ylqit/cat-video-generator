@@ -8,8 +8,6 @@ services:
     environment:
       MEDIA_WORK_ROOT: /data/work
       MEDIA_ASSET_ROOT: /data/assets
-      DELIVERY_OUTPUT_ROOT: /data/output
-      CAT_VIDEO_EVENT_SEED_ROOT: /app/content/events
       FFMPEG_PATH: /usr/bin/ffmpeg
       FFPROBE_PATH: /usr/bin/ffprobe
     ports:
@@ -17,7 +15,7 @@ services:
     volumes:
       - ./docker-data/work:/data/work
       - ./docker-data/assets:/data/assets
-      - ./docker-data/output:/data/output
+      - ./docker-data/diagnostics:/app/var/diagnostics
     restart: unless-stopped
     init: true
     stop_grace_period: 30s

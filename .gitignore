@@ -19,8 +19,7 @@ docs/LibTV
 /docs/*
 !/docs/checklists/
 /docs/checklists/*
-!/docs/checklists/narrative-render-core.md
-!/docs/checklists/workflow-canvas-range-edit.md
+!/docs/checklists/shot-queue-production-core.md
 
 # Web frontend
 web/node_modules/

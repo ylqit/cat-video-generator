@@ -1,7 +1,4 @@
-"""数据库Engine和Session生命周期。
-
-连接参数集中在此处，避免CLI、HTTP或Repository各自建立不同的连接池。
-"""
+"""Shared PostgreSQL engine and migration gate."""
 
 from __future__ import annotations
 
@@ -11,7 +8,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from ...config import DatabaseOperation, DatabaseSettings
 from .models import SCHEMA_NAME
 
-ALEMBIC_HEAD = "0014_story_project_v3"
+ALEMBIC_HEAD = "0015_shot_queue_core"
 
 
 def create_database_engine(
@@ -21,11 +18,6 @@ def create_database_engine(
     pool_size: int = 3,
     max_overflow: int = 2,
 ) -> Engine:
-    """创建带明文安全门、超时和健康检查的共享Engine。
-
-    后台生成线程与前端轮询并发的API模式应显式调大连接池。
-    """
-
     settings.validate_for(operation)
     engine = create_engine(
         settings.url,
@@ -48,31 +40,24 @@ def create_database_engine(
 
 
 def create_session_factory(engine: Engine) -> sessionmaker[Session]:
-    """创建短事务Session工厂；外部Ark调用期间不持有Session。"""
-
     return sessionmaker(bind=engine, expire_on_commit=False)
 
 
-def ensure_database_ready(
-    engine: Engine,
-    settings: DatabaseSettings,
-) -> None:
-    """在运行用例前校验数据库身份、版本和迁移版本。
-
-    该检查位于组合根创建 Service 之前，因此配置误连或迁移落后时不会产生任何
-    Ark 收费意图，也不会让 Repository 在未知表结构上写入。
-    """
+def ensure_database_ready(engine: Engine, settings: DatabaseSettings) -> None:
+    """Reject writes against the wrong database or an older schema."""
 
     with engine.connect() as connection:
-        row = connection.execute(
+        database, server_version = connection.execute(
             text("SELECT current_database(), current_setting('server_version_num')::int")
         ).one()
-        if row[0] != settings.database:
-            raise RuntimeError(f"实际数据库{row[0]!r}与配置{settings.database!r}不一致")
-        if row[1] < settings.minimum_server_version:
-            raise RuntimeError("PostgreSQL版本必须不低于14")
+        if database != settings.database:
+            raise RuntimeError(
+                f"connected database {database!r} does not match {settings.database!r}"
+            )
+        if server_version < settings.minimum_server_version:
+            raise RuntimeError("PostgreSQL 14 or newer is required")
         revision = connection.execute(
             text(f"SELECT version_num FROM {settings.schema}.alembic_version")
         ).scalar_one_or_none()
         if revision != ALEMBIC_HEAD:
-            raise RuntimeError(f"数据库迁移版本为{revision!r}，期望{ALEMBIC_HEAD!r}")
+            raise RuntimeError(f"database revision is {revision!r}; expected {ALEMBIC_HEAD!r}")

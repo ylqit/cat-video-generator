@@ -3,892 +3,914 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
-import { api, ApiError } from "../api/client";
+import { api, assetContentUrl } from "../api/client";
 import type {
+  AnchorMode,
   AssetDto,
-  EpisodeDto,
-  EpisodePromptPreview,
-  PipelineSettings,
-  PromptOverrides,
-  Slot,
-  WorkflowNodeDto,
-  JobAccepted,
+  JobDto,
+  ProjectGraph,
+  ProjectSummary,
+  ReferenceBinding,
+  ReferenceRole,
+  ReferenceTarget,
+  ReferenceUsage,
+  SceneDto,
+  SequenceDto,
+  ShotDto,
 } from "../api/types";
-import AssetReviewPanel from "../components/AssetReviewPanel.vue";
-import CrossSlotReferencesPanel from "../components/CrossSlotReferencesPanel.vue";
-import EpisodeSourcePanel from "../components/EpisodeSourcePanel.vue";
-import DeliveryPanel from "../components/DeliveryPanel.vue";
-import PlanCreateDialog from "../components/PlanCreateDialog.vue";
-import ProjectOutlinePanel from "../components/ProjectOutlinePanel.vue";
-import ScriptEditorPanel from "../components/ScriptEditorPanel.vue";
-import StoryConnectionPanel from "../components/StoryConnectionPanel.vue";
-import StatusBadge from "../components/StatusBadge.vue";
-import WorkflowNodeDrawer from "../components/WorkflowNodeDrawer.vue";
-import WorkflowCanvas from "../components/WorkflowCanvas.vue";
 import VideoTimeline from "../components/VideoTimeline.vue";
-import { useJobsStore } from "../stores/jobs";
-import { useRunsStore } from "../stores/runs";
-
-type Stage = "projectOutline" | "script" | "visual" | "video" | "review";
-const STAGES: Array<{ key: Stage; label: string }> = [
-  { key: "projectOutline", label: "项目大纲" },
-  { key: "script", label: "当前时段" },
-  { key: "visual", label: "视觉锚点" },
-  { key: "video", label: "视频成片" },
-  { key: "review", label: "审核交付" },
-];
-const AUTO_STAGE_KEYS: Array<"script" | "visual" | "video"> = [
-  "script",
-  "visual",
-  "video",
-];
-const SLOT_LABEL: Record<Slot, string> = { morning: "上午", noon: "中午", evening: "傍晚" };
-const SLOT_ORDER: Slot[] = ["morning", "noon", "evening"];
-const FOCUS_LABEL = { cat_lead: "猫咪主活动", person_lead: "人物主活动", balanced: "人猫平衡" };
 
 const route = useRoute();
 const router = useRouter();
-const runs = useRunsStore();
-const jobs = useJobsStore();
-const createDialog = ref<InstanceType<typeof PlanCreateDialog>>();
-const loading = ref(false);
-const drawerOpen = ref(false);
-const selectedNode = ref<WorkflowNodeDto | null>(null);
-const previews = reactive<Record<string, EpisodePromptPreview>>({});
-const drafts = reactive<Record<string, PromptOverrides>>({});
-const overrideEnabled = reactive<Record<string, boolean>>({});
-type OutcomeForm = { summary: string; carryForwardText: string; doNotCarryForwardText: string };
-const emptyOutcomeForm = (): OutcomeForm => ({
-  summary: "",
-  carryForwardText: "",
-  doNotCarryForwardText: "",
-});
-const outcomeForms = reactive<Record<Slot, OutcomeForm>>({
-  morning: emptyOutcomeForm(),
-  noon: emptyOutcomeForm(),
-  evening: emptyOutcomeForm(),
-});
-const outcomeLoaded = reactive<Record<Slot, boolean>>({
-  morning: false,
-  noon: false,
-  evening: false,
-});
-let poller: number | undefined;
+const projects = ref<ProjectSummary[]>([]);
+const graph = ref<ProjectGraph | null>(null);
+const selectedShotId = ref<string | null>(null);
+const selectedSequenceId = ref<string | null>(null);
+const busy = ref(false);
+const persistentError = ref("");
+const createVisible = ref(false);
+const projectSettingsVisible = ref(false);
+const sceneVisible = ref(false);
+const shotVisible = ref(false);
+const suggestion = ref<{ stepId: string; output: { sceneTitle: string; shots: unknown[] } } | null>(null);
+const promptPreview = ref<{ prompt: string; charCount: number; utf8Bytes: number } | null>(null);
+const createReferenceFile = ref<File | null>(null);
+let polling: number | undefined;
 
-const runId = computed(() => String(route.query.run ?? ""));
-const graph = computed(() => (runId.value ? runs.graphs[runId.value] : undefined));
-const episodes = computed(() => graph.value?.episodes ?? []);
-const activeStage = computed<Stage>(() => {
-  const value = String(route.query.stage ?? "");
-  return STAGES.some((item) => item.key === value) ? (value as Stage) : "projectOutline";
+const createForm = reactive({ title: "", sceneTitle: "第一场景", sourceText: "" });
+const projectSettingsForm = reactive({ title: "", contentDate: "" });
+const sceneForm = reactive({
+  id: "",
+  title: "",
+  sourceText: "",
+  chapterLabel: "",
+  contextNote: "",
 });
-const selectedSlot = computed<Slot | null>(() => {
-  const value = String(route.query.slot ?? "");
-  return ["morning", "noon", "evening"].includes(value) ? (value as Slot) : null;
+const shotForm = reactive({
+  id: "",
+  sceneId: "",
+  title: "",
+  direction: "",
+  durationSeconds: 8,
+  anchorMode: "text_only" as AnchorMode,
+  referenceBindings: [] as ReferenceBinding[],
 });
-const failedNodes = computed(() =>
-  (graph.value?.workflowNodes ?? []).filter((item) => item.error || ["failed", "planning_rejected", "rejected"].includes(item.status)),
-);
-const settings = computed<PipelineSettings | null>(() => graph.value?.run.pipelineSettings ?? null);
-const readOnlyProject = computed(
-  () => graph.value?.run.compatible === false || Number(graph.value?.run.contractVersion ?? 0) < 3,
-);
-const canDeliver = computed(() => !readOnlyProject.value && graph.value?.run.status === "ready");
-const guided = computed(() => settings.value?.planningMode === "guided_sequential");
-const slotCards = computed(() =>
-  SLOT_ORDER.map((slot) => ({
-    slot,
-    episode: episodes.value.find((item) => item.slot === slot),
-    state: graph.value?.run.slotPlanning?.find((item) => item.slot === slot),
-    directorNode: graph.value?.workflowNodes?.find(
-      (item) => item.semanticNodeId === `${slot}:director`,
-    ),
-  })),
-);
-const workspaceSlot = computed<Slot>(() =>
-  selectedSlot.value ?? graph.value?.run.activeSlot ?? "morning",
-);
-const activeCard = computed(() =>
-  slotCards.value.find((item) => item.slot === workspaceSlot.value),
-);
-const activeEpisode = computed(() => activeCard.value?.episode);
-const connectionSuggestion = computed(() => {
-  const step = [...(graph.value?.steps ?? [])]
-    .reverse()
-    .find(
-      (item) =>
-        item.operationKey === `director:connection:${workspaceSlot.value}` &&
-        item.status === "succeeded",
-    );
-  if (!step) return null;
-  const value = (step.inputSnapshot.normalized_output ?? step.inputSnapshot.provider_output) as
-    | { mode?: "independent" | "selected_link" | "direct_continue"; brief?: string }
-    | undefined;
-  return value?.mode && value.brief ? { mode: value.mode, brief: value.brief } : null;
+const referenceForm = reactive({
+  assetId: "",
+  usage: "generation_reference" as ReferenceUsage,
+  role: "identity" as ReferenceRole,
+  applyTo: "both" as ReferenceTarget,
+});
+const uploadForm = reactive({
+  usage: "generation_reference" as ReferenceUsage,
+  role: "identity" as ReferenceRole,
+  file: null as File | null,
 });
 
-const selectedVideoEpisode = computed(() => {
-  if (selectedNode.value?.type !== "video" || !selectedNode.value.slot) return undefined;
-  return episodes.value.find((item) => item.slot === selectedNode.value?.slot);
+const selectedShot = computed<ShotDto | null>(() => {
+  if (!graph.value || !selectedShotId.value) return null;
+  for (const scene of graph.value.scenes) {
+    const shot = scene.shots.find((item) => item.id === selectedShotId.value);
+    if (shot) return shot;
+  }
+  return null;
 });
-const selectedVideoSequences = computed(() => {
-  const episode = selectedVideoEpisode.value;
-  return episode
-    ? (graph.value?.videoSequences ?? []).filter((item) => item.episodeId === episode.id)
+const selectedVideo = computed(() => {
+  const shot = selectedShot.value;
+  if (!shot) return null;
+  return shot.assets.find((item) => item.id === shot.selectedVideoAssetId)
+    ?? [...shot.assets].reverse().find((item) => item.mediaType === "video")
+    ?? null;
+});
+const selectableAssets = computed(() => graph.value?.assets.filter((item) => item.mediaType === "image") ?? []);
+const selectedVideoDurationMs = computed(() => {
+  if (!selectedVideo.value || !selectedShot.value) return 0;
+  const qc = selectedVideo.value.metadata.qc as Record<string, unknown> | undefined;
+  return Number(qc?.durationMs ?? selectedShot.value.durationSeconds * 1000);
+});
+const selectedVideoFrames = computed(() => {
+  if (!selectedShot.value || !selectedVideo.value) return [];
+  return selectedShot.value.assets
+    .filter(
+      (item) => item.role === "review_frame"
+        && item.metadata.sourceVideoAssetId === selectedVideo.value?.id,
+    )
+    .sort((left, right) => Number(left.metadata.ordinal) - Number(right.metadata.ordinal))
+    .map((item) => ({
+      src: assetContentUrl(item.id),
+      label: `${String(item.metadata.ordinal)}/${String(item.metadata.frameCount)}`,
+      timestampMs: Math.round(
+        ((Number(item.metadata.ordinal) - 1)
+          / Math.max(1, Number(item.metadata.frameCount) - 1))
+          * selectedVideoDurationMs.value,
+      ),
+    }));
+});
+const selectedVideoMarkersMs = computed(() => {
+  if (!selectedShot.value || !selectedVideo.value?.producingStepId) return [];
+  const attempt = selectedShot.value.attempts.find(
+    (item) => item.id === selectedVideo.value?.producingStepId,
+  );
+  const review = attempt?.reviews.find(
+    (item) => Array.isArray(item.evidence.shotBoundariesSeconds),
+  );
+  if (!review) return [];
+  const boundaries = Array.isArray(review.evidence.shotBoundariesSeconds)
+    ? review.evidence.shotBoundariesSeconds.map((item) => Number(item) * 1000)
     : [];
+  const findings = Array.isArray(review.evidence.evidence)
+    ? review.evidence.evidence.flatMap((item) => {
+        if (!item || typeof item !== "object") return [];
+        const raw = String((item as Record<string, unknown>).timestamp ?? "").trim();
+        const clock = raw.match(/^(?:(\d+):)?(\d+(?:\.\d+)?)s?$/);
+        if (!clock) return [];
+        return [((Number(clock[1] ?? 0) * 60) + Number(clock[2])) * 1000];
+      })
+    : [];
+  return [...new Set([...boundaries, ...findings]
+    .map((item) => Math.round(item))
+    .filter((item) => Number.isFinite(item) && item >= 0 && item <= selectedVideoDurationMs.value))]
+    .sort((left, right) => left - right);
+});
+const selectedSequence = computed<SequenceDto | null>(() => {
+  if (!graph.value || !selectedSequenceId.value) return null;
+  return graph.value.sequences.find((item) => item.id === selectedSequenceId.value) ?? null;
+});
+const selectedSequenceAsset = computed(() => {
+  if (!graph.value || !selectedSequence.value?.renderedAssetId) return null;
+  return graph.value.assets.find((item) => item.id === selectedSequence.value?.renderedAssetId) ?? null;
 });
 
-function setLocation(
-  stage: Stage,
-  slot: Slot | null = selectedSlot.value,
-  node?: string,
-  sequence?: string | null,
-) {
-  router.replace({
-    path: "/studio",
-    query: {
-      run: runId.value || undefined,
-      stage,
-      slot: slot ?? undefined,
-      node: node ?? undefined,
-      sequence: sequence === null ? undefined : sequence ?? route.query.sequence ?? undefined,
-    },
-  });
+function localDateText(): string {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
-async function refresh() {
-  if (!runId.value) {
-    await runs.fetchRuns();
+async function loadProjects() {
+  projects.value = await api.projects();
+}
+
+async function loadGraph(projectId?: string) {
+  const id = projectId ?? String(route.query.project ?? "");
+  if (!id) {
+    graph.value = null;
     return;
   }
-  loading.value = true;
-  try {
-    await runs.fetchGraph(runId.value);
-    if (!route.query.stage) {
-      const backend = runs.graphs[runId.value]?.run.currentStage as Stage | undefined;
-      setLocation(
-        backend && STAGES.some((item) => item.key === backend) ? backend : "projectOutline",
-        runs.graphs[runId.value]?.run.activeSlot ?? null,
-      );
+  graph.value = await api.project(id);
+  const requestedSequence = String(route.query.sequence ?? "");
+  if (graph.value.sequences.some((item) => item.id === requestedSequence)) {
+    selectedSequenceId.value = requestedSequence;
+    selectedShotId.value = null;
+    return;
+  }
+  selectedSequenceId.value = null;
+  const requestedShot = String(route.query.shot ?? "");
+  const allShots = graph.value.scenes.flatMap((scene) => scene.shots);
+  selectedShotId.value = allShots.some((item) => item.id === requestedShot)
+    ? requestedShot
+    : selectedShotId.value && allShots.some((item) => item.id === selectedShotId.value)
+      ? selectedShotId.value
+      : allShots[0]?.id ?? null;
+}
+
+async function selectProject(id: string) {
+  await router.replace({ path: "/studio", query: { project: id } });
+  await loadGraph(id);
+}
+
+async function selectShot(id: string) {
+  selectedShotId.value = id;
+  selectedSequenceId.value = null;
+  await router.replace({
+    path: "/studio",
+    query: { project: graph.value?.project.id, shot: id },
+  });
+  promptPreview.value = null;
+}
+
+async function showSequence(id: string) {
+  selectedSequenceId.value = id;
+  selectedShotId.value = null;
+  await router.replace({
+    path: "/studio",
+    query: { project: graph.value?.project.id, sequence: id },
+  });
+}
+
+async function createProject() {
+  if (!createForm.title.trim() || !createForm.sourceText.trim()) {
+    ElMessage.warning("请填写项目标题和第一场景原始剧本");
+    return;
+  }
+  await act(async () => {
+    const result = await api.createProject({
+      project: {
+        title: createForm.title,
+        firstSceneTitle: createForm.sceneTitle,
+        firstSceneText: createForm.sourceText,
+      },
+      contentDate: localDateText(),
+    });
+    if (createReferenceFile.value) {
+      await api.uploadReference(result.projectId, "generation_reference", "identity", createReferenceFile.value);
     }
+    createVisible.value = false;
+    Object.assign(createForm, { title: "", sceneTitle: "第一场景", sourceText: "" });
+    createReferenceFile.value = null;
+    await loadProjects();
+    await selectProject(result.projectId);
+  });
+}
+
+function editProjectSettings() {
+  if (!graph.value) return;
+  Object.assign(projectSettingsForm, {
+    title: graph.value.project.title,
+    contentDate: graph.value.project.contentDate,
+  });
+  projectSettingsVisible.value = true;
+}
+
+async function saveProjectSettings() {
+  if (!graph.value || !projectSettingsForm.title.trim() || !projectSettingsForm.contentDate) {
+    ElMessage.warning("请填写项目标题和日期");
+    return;
+  }
+  await act(async () => {
+    await api.updateProject(graph.value!.project.id, {
+      title: projectSettingsForm.title,
+      contentDate: projectSettingsForm.contentDate,
+    });
+    projectSettingsVisible.value = false;
+    await loadProjects();
+    await loadGraph();
+  });
+}
+
+function editScene(scene?: SceneDto) {
+  Object.assign(sceneForm, scene
+    ? {
+        id: scene.id,
+        title: scene.title,
+        sourceText: scene.sourceText,
+        chapterLabel: scene.chapterLabel ?? "",
+        contextNote: scene.contextNote ?? "",
+      }
+    : { id: "", title: "新场景", sourceText: "", chapterLabel: "", contextNote: "" });
+  sceneVisible.value = true;
+}
+
+async function saveScene() {
+  const payload = {
+    title: sceneForm.title,
+    sourceText: sceneForm.sourceText,
+    chapterLabel: sceneForm.chapterLabel || null,
+    contextNote: sceneForm.contextNote || null,
+  };
+  await act(async () => {
+    if (sceneForm.id) await api.updateScene(sceneForm.id, payload);
+    else if (graph.value) await api.addScene(graph.value.project.id, payload);
+    sceneVisible.value = false;
+    await loadGraph();
+  });
+}
+
+async function removeScene(scene: SceneDto) {
+  await ElMessageBox.confirm(`删除场景“${scene.title}”？已有 Provider 历史的场景不会被允许删除。`, "确认");
+  await act(async () => {
+    await api.deleteScene(scene.id);
+    await loadGraph();
+  });
+}
+
+function editShot(sceneId: string, shot?: ShotDto) {
+  Object.assign(shotForm, shot
+    ? {
+        id: shot.id,
+        sceneId,
+        title: shot.title,
+        direction: shot.direction,
+        durationSeconds: shot.durationSeconds,
+        anchorMode: shot.anchorMode,
+        referenceBindings: shot.referenceBindings.map((item) => ({ ...item })),
+      }
+    : {
+        id: "",
+        sceneId,
+        title: "新镜头",
+        direction: "中景固定机位，人物与灰白猫处于清晰相对位置；主体完成一个连续动作并在稳定状态结束。",
+        durationSeconds: 8,
+        anchorMode: "text_only",
+        referenceBindings: [],
+      });
+  shotVisible.value = true;
+}
+
+async function saveShot() {
+  const payload = {
+    title: shotForm.title,
+    direction: shotForm.direction,
+    durationSeconds: shotForm.durationSeconds,
+    anchorMode: shotForm.anchorMode,
+    referenceBindings: shotForm.referenceBindings,
+  };
+  await act(async () => {
+    const saved = shotForm.id
+      ? await api.updateShot(shotForm.id, payload)
+      : await api.addShot(shotForm.sceneId, payload);
+    shotVisible.value = false;
+    await loadGraph();
+    await selectShot(saved.id);
+  });
+}
+
+async function removeShot(shot: ShotDto) {
+  await ElMessageBox.confirm(`删除镜头“${shot.title}”？已有生成历史的镜头不会被允许删除。`, "确认");
+  await act(async () => {
+    await api.deleteShot(shot.id);
+    await loadGraph();
+  });
+}
+
+async function moveScene(index: number, delta: number) {
+  if (!graph.value) return;
+  const ids = graph.value.scenes.map((item) => item.id);
+  const target = index + delta;
+  if (target < 0 || target >= ids.length) return;
+  [ids[index], ids[target]] = [ids[target], ids[index]];
+  await act(async () => {
+    await api.reorderScenes(graph.value!.project.id, ids);
+    await loadGraph();
+  });
+}
+
+async function moveShot(scene: SceneDto, index: number, delta: number) {
+  const ids = scene.shots.map((item) => item.id);
+  const target = index + delta;
+  if (target < 0 || target >= ids.length) return;
+  [ids[index], ids[target]] = [ids[target], ids[index]];
+  await act(async () => {
+    await api.reorderShots(scene.id, ids);
+    await loadGraph();
+  });
+}
+
+async function suggest(scene: SceneDto) {
+  await ElMessageBox.confirm("AI 镜头建议会产生一次规划模型费用，是否继续？", "付费确认");
+  await act(async () => {
+    const accepted = await api.suggestShots(scene.id);
+    const job = await waitJob(accepted.jobId);
+    if (job.status === "failed") throw new Error(String(job.error?.message ?? "镜头建议失败"));
+    suggestion.value = job.result as typeof suggestion.value;
+  });
+}
+
+async function acceptSuggestion() {
+  if (!suggestion.value) return;
+  await act(async () => {
+    await api.acceptSuggestions(suggestion.value!.stepId);
+    suggestion.value = null;
+    await loadGraph();
+  });
+}
+
+async function showPrompt() {
+  if (!selectedShot.value) return;
+  await act(async () => { promptPreview.value = await api.promptPreview(selectedShot.value!.id); });
+}
+
+async function generate(kind: "anchor" | "video") {
+  if (!selectedShot.value) return;
+  const operationKey = kind === "anchor" ? "image:anchor" : "video:shot";
+  const priorAttempts = selectedShot.value.attempts.filter(
+    (item) => item.operationKey === operationKey,
+  );
+  const regenerate = priorAttempts.length > 0;
+  const action = regenerate ? "重新生成并保留旧版本" : "生成";
+  let reason = kind === "anchor" ? "生成镜头开场锚点" : "生成单镜头视频";
+  if (regenerate) {
+    const answer = await ElMessageBox.prompt(
+      "请只写本次需要修正的一项问题。该说明会进入本次实际调用Prompt，旧Prompt不会被覆盖。",
+      "填写重做目标",
+      { inputPlaceholder: "例如：保持猫咪四足着地，钓线只连接人物手中的鱼竿与浮标" },
+    );
+    reason = answer.value.trim();
+    if (!reason) {
+      ElMessage.warning("重新生成必须填写修正目标");
+      return;
+    }
+  }
+  await ElMessageBox.confirm(
+    kind === "anchor"
+      ? `${action}锚点会产生一次 Seedream 费用，是否继续？`
+      : `${action}本镜头片段会产生一次 Seedance 费用，是否继续？`,
+    "付费确认",
+  );
+  await act(async () => {
+    const accepted = kind === "anchor"
+      ? await api.generateAnchor(selectedShot.value!.id, regenerate, reason)
+      : await api.generateVideo(selectedShot.value!.id, regenerate, reason);
+    const job = await waitJob(accepted.jobId);
+    if (job.status === "failed") throw new Error(String(job.error?.message ?? "生成失败"));
+    await loadGraph();
+  });
+}
+
+async function resumeAttempt(stepId: string) {
+  await act(async () => {
+    const accepted = await api.resumeStep(stepId);
+    const job = await waitJob(accepted.jobId);
+    if (job.status === "failed") throw new Error(String(job.error?.message ?? "继续查询失败"));
+    await loadGraph();
+  });
+}
+
+async function reconcileAttempt(stepId: string) {
+  await act(async () => {
+    const candidates = await api.reconciliationCandidates(stepId);
+    if (!candidates.length) throw new Error("Ark任务列表中没有匹配候选，请稍后再次查询");
+    const lines = candidates.map((item) => String(item.taskId)).join("\n");
+    const answer = await ElMessageBox.prompt(
+      `候选Task ID：\n${lines}\n请输入确认绑定的Task ID`,
+      "对账供应商任务",
+      { inputValue: candidates.length === 1 ? String(candidates[0].taskId) : "" },
+    );
+    await api.reconcileStep(stepId, answer.value);
+    await loadGraph();
+  });
+}
+
+async function review(asset: AssetDto, decision: "approved" | "rejected") {
+  const reason = decision === "approved" ? "人工观看通过" : "人工观看未通过";
+  await act(async () => {
+    await api.reviewAsset(asset.id, decision, reason);
+    await loadGraph();
+  });
+}
+
+async function uploadReference() {
+  if (!graph.value || !uploadForm.file) return;
+  await act(async () => {
+    await api.uploadReference(graph.value!.project.id, uploadForm.usage, uploadForm.role, uploadForm.file!);
+    uploadForm.file = null;
+    await loadGraph();
+  });
+}
+
+async function bindReference() {
+  if (!selectedShot.value || !referenceForm.assetId) return;
+  const bindings = selectedShot.value.referenceBindings.filter((item) => item.assetId !== referenceForm.assetId);
+  bindings.push({ ...referenceForm });
+  const draft = {
+    title: selectedShot.value.title,
+    direction: selectedShot.value.direction,
+    durationSeconds: selectedShot.value.durationSeconds,
+    anchorMode: referenceForm.usage === "approved_anchor"
+      ? "existing"
+      : selectedShot.value.anchorMode,
+    referenceBindings: bindings,
+  };
+  await act(async () => {
+    await api.updateShot(selectedShot.value!.id, draft);
+    await loadGraph();
+  });
+}
+
+async function removeBinding(assetId: string) {
+  if (!selectedShot.value) return;
+  const removed = selectedShot.value.referenceBindings.find((item) => item.assetId === assetId);
+  const references = selectedShot.value.referenceBindings.filter(
+    (item) => item.assetId !== assetId,
+  );
+  await act(async () => {
+    if (removed?.usage === "approved_anchor") {
+      await api.updateShot(selectedShot.value!.id, {
+        title: selectedShot.value!.title,
+        direction: selectedShot.value!.direction,
+        durationSeconds: selectedShot.value!.durationSeconds,
+        anchorMode: "text_only",
+        referenceBindings: references,
+      });
+    } else {
+      await api.updateReferences(selectedShot.value!.id, references);
+    }
+    await loadGraph();
+  });
+}
+
+function chooseUploadFile(event: Event) {
+  uploadForm.file = (event.target as HTMLInputElement).files?.[0] ?? null;
+}
+
+function chooseCreateReference(event: Event) {
+  createReferenceFile.value = (event.target as HTMLInputElement).files?.[0] ?? null;
+}
+
+function closeSuggestion(value: boolean) {
+  if (!value) suggestion.value = null;
+}
+
+async function buildSequence() {
+  if (!graph.value) return;
+  await act(async () => {
+    const accepted = await api.buildSequence(graph.value!.project.id);
+    const job = await waitJob(accepted.jobId);
+    if (job.status === "failed") throw new Error(String(job.error?.message ?? "总片合成失败"));
+    await loadGraph();
+  });
+}
+
+async function decideSequence(sequence: SequenceDto, approve: boolean) {
+  if (!graph.value) return;
+  await act(async () => {
+    await api.selectSequence(graph.value!.project.id, sequence.id, approve);
+    await loadGraph();
+    if (approve) await showSequence(sequence.id);
+  });
+}
+
+async function selectVideoVersion(asset: AssetDto) {
+  if (!selectedShot.value) return;
+  await act(async () => {
+    await api.selectVersion(selectedShot.value!.id, asset.id);
+    await loadGraph();
+  });
+}
+
+async function waitJob(id: string): Promise<JobDto> {
+  for (;;) {
+    const job = await api.job(id);
+    if (job.status === "succeeded" || job.status === "failed") return job;
+    await new Promise((resolve) => window.setTimeout(resolve, 1200));
+  }
+}
+
+async function act(fn: () => Promise<void>) {
+  busy.value = true;
+  persistentError.value = "";
+  try {
+    await fn();
   } catch (error) {
-    ElMessage.error(error instanceof ApiError ? error.message : String(error));
+    persistentError.value = error instanceof Error ? error.message : String(error);
   } finally {
-    loading.value = false;
+    busy.value = false;
   }
 }
 
-async function refreshAll() {
-  const settled = await jobs.refreshActive();
-  if (runId.value) await runs.fetchGraph(runId.value);
-  if (settled) await runs.fetchRuns();
-}
-
-watch(runId, () => {
-  Object.keys(previews).forEach((key) => delete previews[key]);
-  Object.keys(drafts).forEach((key) => delete drafts[key]);
-  Object.keys(overrideEnabled).forEach((key) => delete overrideEnabled[key]);
-  SLOT_ORDER.forEach((slot) => {
-    outcomeForms[slot] = emptyOutcomeForm();
-    outcomeLoaded[slot] = false;
+watch(() => route.query.project, () => void loadGraph());
+onMounted(async () => {
+  await act(async () => {
+    await loadProjects();
+    if (route.query.project) await loadGraph();
   });
-  void refresh();
+  polling = window.setInterval(() => {
+    if (route.query.project && !busy.value) void loadGraph();
+  }, 10000);
 });
-
-watch(
-  [graph, () => route.query.node],
-  () => {
-    const nodeId = String(route.query.node ?? "");
-    if (!nodeId || !graph.value) return;
-    const node = graph.value.workflowNodes?.find((item) => item.semanticNodeId === nodeId);
-    if (node) {
-      const changedNode = selectedNode.value?.semanticNodeId !== node.semanticNodeId;
-      selectedNode.value = node;
-      // 轮询会替换Graph对象，但不应把用户刚关闭的详情抽屉重新打开。
-      // 只有URL实际切换到另一个语义节点时才自动展开；重复点击仍由openNode显式打开。
-      if (changedNode) drawerOpen.value = true;
-    }
-  },
-  { immediate: true },
-);
-
-function nodeFor(id: string) {
-  return graph.value?.workflowNodes?.find((item) => item.semanticNodeId === id);
-}
-
-function openNode(node: WorkflowNodeDto | undefined) {
-  if (!node || !graph.value) return;
-  selectedNode.value = node;
-  drawerOpen.value = true;
-  const stage: Stage = node.type === "director" || node.type === "story_connection" || node.type === "project_input" || node.type === "project_confirmation"
-    ? (node.slot ? "script" : "projectOutline")
-    : node.type === "look" || node.type === "opening_anchor"
-    ? "visual"
-    : node.type === "video"
-    ? "video"
-    : "review";
-  setLocation(
-    stage,
-    node.slot,
-    node.semanticNodeId,
-    node.type === "video" ? undefined : null,
-  );
-}
-
-function trackCanvasJob(job: JobAccepted) {
-  jobs.track(job);
-  ElMessage.info("节点任务已提交，旧版本保持不变");
-}
-
-function setDrawerOpen(value: boolean) {
-  drawerOpen.value = value;
-  // 关闭详情抽屉不等于取消语义节点选择。视频时间轴依赖当前节点与版本，
-  // 若在这里清空URL，用户刚关闭抽屉就会同时失去时间轴和未提交的选区。
-  // 节点选择只在点击另一个节点、切换Run或显式导航时改变。
-}
-
-function assetsFor(episode: EpisodeDto, roles: string[]): AssetDto[] {
-  return (graph.value?.assets ?? []).filter(
-    (asset) => asset.episodeId === episode.id && roles.includes(asset.role),
-  );
-}
-
-function reviewsFor(asset: AssetDto) {
-  return (graph.value?.reviews ?? []).filter((review) => review.assetId === asset.id);
-}
-
-async function uploadEpisodeReference(episode: EpisodeDto, role: "element" | "scene") {
-  try {
-    const prefix = `${role}:`;
-    const { value } = await ElMessageBox.prompt(
-      `填写${role === "element" ? "关键道具" : "场景"}语义键，例如 ${prefix}red_kite。`,
-      `添加${SLOT_LABEL[episode.slot]}参考素材`,
-      {
-        inputValue: prefix,
-        inputValidator: (text) =>
-          new RegExp(`^${role}:[a-z0-9][a-z0-9_-]{1,80}$`).test(text.trim())
-          || `必须使用 ${prefix}英文标识`,
-      },
-    );
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = ".png,.jpg,.jpeg,.webp";
-    const file = await new Promise<File | null>((resolve) => {
-      input.onchange = () => resolve(input.files?.[0] ?? null);
-      input.oncancel = () => resolve(null);
-      input.click();
-    });
-    if (!file) return;
-    await api.uploadReference(episode.id, role, value.trim(), file);
-    ElMessage.success("参考素材已导入；后续视觉attempt会按语义键重新选择素材");
-    await refresh();
-  } catch (error) {
-    if (!isDialogCancellation(error)) {
-      ElMessage.error(error instanceof ApiError ? error.message : String(error));
-    }
-  }
-}
-
-function planningStateFor(slot: Slot) {
-  return graph.value?.run.slotPlanning?.find((item) => item.slot === slot);
-}
-
-async function planSlot(slot: Slot, generateFromTheme = false) {
-  try {
-    const usesConnection = Boolean(graph.value?.run.storyConnections?.[slot]?.useForDirector);
-    await confirmPaid(
-      `调用${SLOT_LABEL[slot]}时段导演？${usesConnection ? "本次只会加载已启用的关联卡正文。" : "本次不会加载前序结果。"}`,
-    );
-    const accepted = await api.planSlot(runId.value, slot, true, generateFromTheme);
-    jobs.track(accepted);
-    ElMessage.info(`${SLOT_LABEL[slot]}导演任务已提交`);
-  } catch (error) {
-    if (!isDialogCancellation(error)) {
-      ElMessage.error(error instanceof ApiError ? error.message : String(error));
-    }
-  }
-}
-
-async function replanSlot(slot: Slot) {
-  try {
-    const { value } = await ElMessageBox.prompt(
-      "请说明上一候选的具体问题；新导演会读取该原因并重新输出完整时段脚本。",
-      `重规划${SLOT_LABEL[slot]}`,
-      {
-        inputPlaceholder: "例如：关系汇合不清楚，或镜头没有稳定切点",
-        inputValidator: (text) => text.trim().length >= 4 || "请至少填写4个字符",
-        confirmButtonText: "继续",
-        cancelButtonText: "取消",
-      },
-    );
-    await confirmPaid(`重新调用${SLOT_LABEL[slot]}时段导演？原失败attempt会永久保留。`);
-    const accepted = await api.replanEpisode(
-      runId.value,
-      slot,
-      value.trim(),
-      true,
-      true,
-    );
-    jobs.track(accepted);
-    ElMessage.info(`${SLOT_LABEL[slot]}重规划任务已提交`);
-  } catch (error) {
-    if (!isDialogCancellation(error)) {
-      ElMessage.error(error instanceof ApiError ? error.message : String(error));
-    }
-  }
-}
-
-async function loadOutcome(slot: Slot) {
-  const result = await api.outcome(runId.value, slot);
-  outcomeForms[slot] = {
-    summary: result.summary,
-    carryForwardText: result.carryForward.join("\n"),
-    doNotCarryForwardText: result.doNotCarryForward.join("\n"),
-  };
-  outcomeLoaded[slot] = true;
-}
-
-function outcomeLines(value: string) {
-  return value
-    .split(/\r?\n/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-async function confirmOutcome(slot: Slot) {
-  const form = outcomeForms[slot];
-  try {
-    await ElMessageBox.confirm(
-      `确认${SLOT_LABEL[slot]}实际结果？它用于审计、解锁和可选关联建议，不会自动写入后续导演Prompt。`,
-      "锁定结果卡",
-      { confirmButtonText: "确认并解锁下一时段", cancelButtonText: "继续编辑", type: "warning" },
-    );
-    await api.confirmOutcome(runId.value, slot, {
-      summary: form.summary.trim(),
-      carryForward: outcomeLines(form.carryForwardText),
-      doNotCarryForward: outcomeLines(form.doNotCarryForwardText),
-    });
-    ElMessage.success(`${SLOT_LABEL[slot]}结果卡已确认`);
-    await refresh();
-    if (slot !== "evening") {
-      const nextSlot = SLOT_ORDER[SLOT_ORDER.indexOf(slot) + 1];
-      setLocation("script", nextSlot);
-    }
-  } catch (error) {
-    if (!isDialogCancellation(error)) {
-      ElMessage.error(error instanceof ApiError ? error.message : String(error));
-    }
-  }
-}
-
-async function onProjectConfirmed() {
-  await refresh();
-  setLocation("script", "morning");
-}
-
-async function loadPreview(episode: EpisodeDto) {
-  if (previews[episode.id]) return;
-  const preview = await api.getPromptPreview(episode.id);
-  previews[episode.id] = preview;
-  const saved = preview.overrideState.values;
-  overrideEnabled[episode.id] = preview.overrideState.enabled;
-  drafts[episode.id] = {
-    look: saved.look ?? preview.look,
-    opening_anchor: saved.opening_anchor ?? preview.openingAnchor,
-    video: saved.video ?? preview.videoSections[0]?.prompt ?? "",
-  };
-}
-
-async function saveOverrides(episode: EpisodeDto) {
-  const preview = previews[episode.id];
-  const draft = drafts[episode.id];
-  if (!preview || !draft) return;
-  const overrides: PromptOverrides = {};
-  if (draft.look?.trim() && draft.look !== preview.look) overrides.look = draft.look.trim();
-  if (draft.opening_anchor?.trim() && draft.opening_anchor !== preview.openingAnchor) {
-    overrides.opening_anchor = draft.opening_anchor.trim();
-  }
-  if (draft.video?.trim() && draft.video !== preview.videoSections[0]?.prompt) overrides.video = draft.video.trim();
-  await api.savePromptOverrides(episode.id, overrides, overrideEnabled[episode.id] ?? false);
-  ElMessage.success(
-    overrideEnabled[episode.id]
-      ? "高级Prompt覆盖已重新确认；只有尚未提交的节点会使用它"
-      : "已关闭高级Prompt覆盖，后续节点将使用结构化脚本编译结果",
-  );
-  delete previews[episode.id];
-  delete drafts[episode.id];
-  delete overrideEnabled[episode.id];
-  await refresh();
-  await loadPreview(episode);
-}
-
-async function onScriptSaved(episodeId: string) {
-  delete previews[episodeId];
-  delete drafts[episodeId];
-  delete overrideEnabled[episodeId];
-  await refresh();
-}
-
-async function confirmPaid(message: string) {
-  if (readOnlyProject.value) {
-    throw new Error("旧生产契约仅供查看，请新建V3生活故事项目");
-  }
-  await ElMessageBox.confirm(message, "确认Ark付费调用", {
-    confirmButtonText: "确认生成",
-    cancelButtonText: "取消",
-    type: "warning",
-  });
-}
-
-function isDialogCancellation(error: unknown) {
-  return error === "cancel" || error === "close";
-}
-
-async function generateVisuals(episode: EpisodeDto) {
-  try {
-    await confirmPaid(`生成${SLOT_LABEL[episode.slot]}定妆图和开场锚点？`);
-    const accepted = await api.generateVisuals(episode.id, true);
-    jobs.track(accepted);
-    ElMessage.info("视觉任务已提交");
-  } catch (error) {
-    if (!isDialogCancellation(error)) ElMessage.error(error instanceof ApiError ? error.message : String(error));
-  }
-}
-
-async function generateVideo(episode: EpisodeDto) {
-  try {
-    const count = episode.renderPlan.sections.length;
-    await confirmPaid(
-      `生成${SLOT_LABEL[episode.slot]}${episode.script.duration_seconds}秒视频？预计${count}次Seedance任务（含官方延展）。`,
-    );
-    const accepted = await api.generate(episode.runId, { slot: episode.slot, allowPaidGeneration: true });
-    jobs.track(accepted);
-    ElMessage.info("视频任务已提交");
-  } catch (error) {
-    if (!isDialogCancellation(error)) ElMessage.error(error instanceof ApiError ? error.message : String(error));
-  }
-}
-
-async function continuePipeline() {
-  if (!runId.value) return;
-  try {
-    await confirmPaid("继续当前Run会按自动设置调用尚未完成的Ark节点，是否继续？");
-    const accepted = await api.continueRun(runId.value);
-    jobs.track(accepted);
-  } catch (error) {
-    if (!isDialogCancellation(error)) ElMessage.error(error instanceof ApiError ? error.message : String(error));
-  }
-}
-
-async function saveSettings(next: PipelineSettings) {
-  if (!runId.value) return;
-  await api.savePipelineSettings(runId.value, next);
-  await refresh();
-}
-
-function updateStageMode(
-  key: "script" | "visual" | "video",
-  value: string | number | boolean,
-) {
-  if (!settings.value) return;
-  void saveSettings({
-    ...settings.value,
-    [key]: value ? "auto" : "manual",
-  });
-}
-
-onMounted(() => {
-  void refresh();
-  poller = window.setInterval(() => void refreshAll(), 5000);
-});
-onBeforeUnmount(() => window.clearInterval(poller));
+onBeforeUnmount(() => window.clearInterval(polling));
 </script>
 
 <template>
-  <div class="page studio-page" v-loading="loading">
-    <template v-if="!runId">
-      <div class="page-header">
-        <div><h2>生活故事生产工作台</h2><p class="muted">项目方向 → 逐集导演 → 视觉锚点 → 视频成片 → 审核交付</p></div>
-        <el-button type="primary" @click="createDialog?.open()">新建生活故事项目</el-button>
+  <div class="studio" v-loading="busy">
+    <header class="studio-header">
+      <div>
+        <h1>镜头片段工作台</h1>
+        <p>任意场景、逐镜确认、独立版本；生成前的文字和素材均可修改。</p>
       </div>
-      <el-empty v-if="!runs.runs.length" description="还没有生活故事项目" />
-      <el-card v-for="item in runs.runs" :key="item.id" class="run-card" shadow="hover" @click="router.push(`/studio?run=${item.id}`)">
-        <div class="row"><strong>{{ item.contentDate }} · {{ item.theme ?? "未命名生活故事" }}</strong><StatusBadge :status="item.status" /></div>
-        <div class="muted">{{ item.nextAction }}</div>
-      </el-card>
-    </template>
+      <el-button type="primary" @click="createVisible = true">新建项目</el-button>
+    </header>
 
-    <template v-else-if="graph">
-      <el-alert
-        v-if="graph.run.compatible === false || graph.run.contractVersion < 3"
-        type="warning"
-        :closable="false"
-        title="旧生产契约，仅供只读查看"
-        :description="graph.run.incompatibilityReason ?? '该项目不能继续生成，请新建V3生活故事项目。'"
-        style="margin-bottom: 12px"
-      />
-      <div class="page-header">
+    <el-alert v-if="persistentError" type="error" :closable="false" show-icon class="persistent-alert">
+      <template #title>操作未完成</template>
+      {{ persistentError }}
+    </el-alert>
+
+    <div class="workspace-grid">
+      <aside class="project-rail panel">
+        <div class="panel-title">项目</div>
+        <button
+          v-for="project in projects"
+          :key="project.id"
+          class="project-item"
+          :class="{ active: graph?.project.id === project.id }"
+          @click="selectProject(project.id)"
+        >
+          <strong>{{ project.title }}</strong>
+          <span>{{ project.contentDate }}</span>
+        </button>
+        <template v-if="graph">
+          <div class="panel-title reference-title">参考素材</div>
+          <el-select v-model="uploadForm.usage" size="small">
+            <el-option label="生成参考" value="generation_reference" />
+            <el-option label="最终锚点" value="approved_anchor" />
+          </el-select>
+          <el-select v-model="uploadForm.role" size="small">
+            <el-option v-for="item in ['identity','style','scene','prop','composition']" :key="item" :label="item" :value="item" />
+          </el-select>
+          <input type="file" accept="image/*" @change="chooseUploadFile" />
+          <el-button size="small" :disabled="!uploadForm.file" @click="uploadReference">上传</el-button>
+          <div class="asset-strip">
+            <img v-for="asset in graph.assets.filter(item => item.mediaType === 'image')" :key="asset.id" :src="assetContentUrl(asset.id)" :title="`${String(asset.metadata.referenceRole ?? asset.role)} / ${String(asset.metadata.usage ?? asset.status)}`" />
+          </div>
+        </template>
+      </aside>
+
+      <main class="queue panel">
+        <div v-if="!graph" class="empty-state">
+          <h2>从一段场景剧本开始</h2>
+          <p>不需要先设计全天结构，也不会预建上午、中午、傍晚节点。</p>
+          <el-button type="primary" @click="createVisible = true">创建第一个项目</el-button>
+        </div>
+        <template v-else>
+          <div class="queue-heading">
+            <div><h2>{{ graph.project.title }}</h2><span>V4 · {{ graph.project.contentDate }} · {{ graph.scenes.length }} 个场景</span></div>
+            <div><el-button @click="editProjectSettings">项目设置</el-button><el-button @click="editScene()">添加场景</el-button><el-button type="success" @click="buildSequence">合成已批准片段</el-button></div>
+          </div>
+          <section v-for="(scene, sceneIndex) in graph.scenes" :key="scene.id" class="scene-card">
+            <header>
+              <div>
+                <span class="order-chip">场景 {{ scene.order }}</span>
+                <strong>{{ scene.title }}</strong>
+                <small v-if="scene.chapterLabel">{{ scene.chapterLabel }}</small>
+              </div>
+              <div>
+                <el-button text @click="moveScene(sceneIndex, -1)">上移</el-button>
+                <el-button text @click="moveScene(sceneIndex, 1)">下移</el-button>
+                <el-button text @click="editScene(scene)">编辑</el-button>
+                <el-button text type="danger" @click="removeScene(scene)">删除</el-button>
+              </div>
+            </header>
+            <p class="source-text">{{ scene.sourceText }}</p>
+            <div class="scene-actions">
+              <el-button type="primary" plain @click="suggest(scene)">AI 建议镜头卡</el-button>
+              <el-button @click="editShot(scene.id)">手工添加镜头</el-button>
+            </div>
+            <el-collapse v-if="scene.attempts.length" class="scene-attempts">
+              <el-collapse-item title="AI 镜头建议历史" name="suggestions">
+                <div v-for="attempt in scene.attempts" :key="attempt.id" class="attempt">
+                  <b>#{{ attempt.attempt }} {{ attempt.status }}</b>
+                  <span>{{ attempt.model || "未记录模型" }}</span>
+                  <pre v-if="attempt.prompt">{{ attempt.prompt.text }}</pre>
+                  <details>
+                    <summary>Provider 输入与原始输出</summary>
+                    <pre>{{ JSON.stringify(attempt.inputSnapshot, null, 2) }}</pre>
+                  </details>
+                  <el-alert
+                    v-if="attempt.error"
+                    type="error"
+                    :title="String(attempt.error.message ?? attempt.error.code)"
+                    :closable="false"
+                  />
+                </div>
+              </el-collapse-item>
+            </el-collapse>
+            <div class="shots">
+              <article
+                v-for="(shot, shotIndex) in scene.shots"
+                :key="shot.id"
+                class="shot-card"
+                :class="{ selected: selectedShotId === shot.id }"
+                @click="selectShot(shot.id)"
+              >
+                <div class="shot-head"><b>{{ shot.order }}. {{ shot.title }}</b><el-tag size="small">{{ shot.durationSeconds }}s</el-tag></div>
+                <p>{{ shot.direction }}</p>
+                <footer>
+                  <span>{{ shot.anchorMode }} · {{ shot.status }}</span>
+                  <span>
+                    <el-button text size="small" @click.stop="moveShot(scene, shotIndex, -1)">↑</el-button>
+                    <el-button text size="small" @click.stop="moveShot(scene, shotIndex, 1)">↓</el-button>
+                    <el-button text size="small" @click.stop="editShot(scene.id, shot)">编辑</el-button>
+                    <el-button text size="small" type="danger" @click.stop="removeShot(shot)">删除</el-button>
+                  </span>
+                </footer>
+              </article>
+            </div>
+          </section>
+        </template>
+      </main>
+
+      <aside class="inspector panel">
+        <template v-if="selectedShot">
+          <div class="panel-title">镜头详情</div>
+          <h3>{{ selectedShot.title }}</h3>
+          <p class="direction">{{ selectedShot.direction }}</p>
+          <el-descriptions :column="1" size="small" border>
+            <el-descriptions-item label="时长">{{ selectedShot.durationSeconds }} 秒</el-descriptions-item>
+            <el-descriptions-item label="锚点">{{ selectedShot.anchorMode }}</el-descriptions-item>
+            <el-descriptions-item label="状态">{{ selectedShot.status }}</el-descriptions-item>
+          </el-descriptions>
+          <div class="inspector-actions">
+            <el-button @click="showPrompt">查看最终 Prompt</el-button>
+            <el-button v-if="selectedShot.anchorMode === 'generate'" @click="generate('anchor')">生成锚点</el-button>
+            <el-button type="primary" @click="generate('video')">生成视频片段</el-button>
+          </div>
+          <el-collapse>
+            <el-collapse-item title="素材绑定" name="refs">
+              <el-select v-model="referenceForm.assetId" filterable placeholder="选择素材">
+                <el-option v-for="asset in selectableAssets" :key="asset.id" :label="`${String(asset.metadata.referenceRole ?? asset.role)} · ${String(asset.metadata.usage ?? asset.status)} · ${asset.semanticKey ?? asset.id.slice(0,8)}`" :value="asset.id" />
+              </el-select>
+              <div class="binding-row">
+                <el-select v-model="referenceForm.usage"><el-option label="生成参考" value="generation_reference" /><el-option label="最终锚点" value="approved_anchor" /></el-select>
+                <el-select v-model="referenceForm.role"><el-option v-for="item in ['identity','style','scene','prop','composition']" :key="item" :label="item" :value="item" /></el-select>
+                <el-select v-model="referenceForm.applyTo"><el-option label="锚点" value="anchor" /><el-option label="视频" value="video" /><el-option label="两者" value="both" /></el-select>
+              </div>
+              <el-button size="small" @click="bindReference">加入镜头</el-button>
+              <ul>
+                <li v-for="item in selectedShot.referenceBindings" :key="item.assetId">
+                  {{ item.usage }} / {{ item.role }} / {{ item.applyTo }}
+                  <el-button text type="danger" size="small" @click="removeBinding(item.assetId)">移除</el-button>
+                </li>
+              </ul>
+            </el-collapse-item>
+            <el-collapse-item title="Prompt 与 Provider 尝试" name="trace">
+              <div v-for="attempt in selectedShot.attempts" :key="attempt.id" class="attempt">
+                <b>#{{ attempt.attempt }} {{ attempt.operationKey }}</b>
+                <span>{{ attempt.status }} · {{ attempt.provider || '本地' }} · {{ attempt.providerTaskId || '未创建 Task' }}</span>
+                <pre v-if="attempt.prompt">{{ attempt.prompt.text }}</pre>
+                <details>
+                  <summary>输入快照</summary>
+                  <pre>{{ JSON.stringify(attempt.inputSnapshot, null, 2) }}</pre>
+                </details>
+                <details v-if="attempt.reviews.length">
+                  <summary>AI建议与人工审核证据</summary>
+                  <pre>{{ JSON.stringify(attempt.reviews, null, 2) }}</pre>
+                </details>
+                <el-alert v-if="attempt.error" type="error" :title="String(attempt.error.message ?? attempt.error.code)" :closable="false" />
+                <el-button
+                  v-if="['queued','running'].includes(attempt.status) && attempt.providerTaskId"
+                  size="small"
+                  @click="resumeAttempt(attempt.id)"
+                >继续查询原任务</el-button>
+                <el-button
+                  v-if="attempt.status === 'submission_unknown' && attempt.kind === 'video'"
+                  size="small"
+                  type="warning"
+                  @click="reconcileAttempt(attempt.id)"
+                >查询候选并对账</el-button>
+                <el-alert
+                  v-else-if="attempt.status === 'submission_unknown'"
+                  type="warning"
+                  title="同步请求结果未知，不能查询原任务或直接重提；请先在供应商账单中人工核对。"
+                  :closable="false"
+                />
+              </div>
+            </el-collapse-item>
+          </el-collapse>
+          <div v-if="promptPreview" class="prompt-preview"><b>当前编译 Prompt · {{ promptPreview.charCount }} 字</b><pre>{{ promptPreview.prompt }}</pre></div>
+          <div class="versions">
+            <h4>媒体版本</h4>
+            <div
+              v-for="asset in selectedShot.assets.filter(item => ['shot_anchor','shot_video','shot_video_edit'].includes(item.role))"
+              :key="asset.id"
+              class="version-card"
+            >
+              <img v-if="asset.mediaType === 'image'" :src="assetContentUrl(asset.id)" />
+              <video v-else controls :src="assetContentUrl(asset.id)" />
+              <span>{{ asset.role }} · {{ asset.status }}</span>
+              <div v-if="asset.status === 'candidate'">
+                <el-button size="small" type="success" @click="review(asset, 'approved')">批准并选择</el-button>
+                <el-button size="small" type="danger" @click="review(asset, 'rejected')">拒绝</el-button>
+              </div>
+              <el-button
+                v-else-if="asset.mediaType === 'video' && asset.status === 'approved' && asset.id !== selectedShot.selectedVideoAssetId"
+                size="small"
+                @click="selectVideoVersion(asset)"
+              >选择此历史版本</el-button>
+            </div>
+          </div>
+        </template>
+        <div v-else class="empty-state"><p>选择一个镜头卡查看 Prompt、素材、任务和版本。</p></div>
+      </aside>
+    </div>
+
+    <section v-if="graph?.sequences.length" class="sequence-panel panel">
+      <div class="sequence-heading">
         <div>
-          <div class="row"><h2>{{ graph.run.contentDate }} · {{ graph.run.theme ?? "生活故事项目" }}</h2><StatusBadge :status="graph.run.status" /></div>
-          <p class="muted">{{ graph.run.nextAction }}</p>
-        </div>
-        <div class="row">
-          <el-tag v-if="guided" type="success">顺序人工确认</el-tag>
-          <el-button @click="router.push('/studio')">切换Run</el-button>
-          <el-button v-if="!guided && !readOnlyProject" type="primary" @click="continuePipeline">继续流程</el-button>
+          <h3>项目总片版本</h3>
+          <p>总片只引用已批准镜头片段；每次合成创建新的 EDL Revision，不覆盖镜头原文件。</p>
         </div>
       </div>
-
-      <el-alert
-        v-for="node in failedNodes"
-        :key="node.semanticNodeId"
-        type="error"
-        :closable="false"
-        show-icon
-        class="persistent-error"
-        @click="openNode(node)"
-      >
-        <template #title>{{ node.label }}：{{ node.error?.message ?? node.nextAction ?? "节点未通过" }}</template>
-      </el-alert>
-
-      <div class="canvas-workspace">
-        <aside class="canvas-sidebar">
-          <strong>当前生产</strong>
-          <span class="mono">{{ runId.slice(0, 8) }}</span>
-          <el-tag :type="guided ? 'success' : 'info'">
-            {{ guided ? "顺序生产" : "自动全天" }}
-          </el-tag>
-          <el-divider />
-          <strong>素材入口</strong>
-          <el-button text @click="router.push('/canon')">Canon资产</el-button>
-          <div v-for="episode in episodes" :key="episode.id" class="sidebar-slot">
-            <div>{{ SLOT_LABEL[episode.slot] }} · {{ assetsFor(episode, ['element', 'scene']).length }} 项参考</div>
-            <div class="sidebar-reference-actions">
-              <el-button text size="small" @click="uploadEpisodeReference(episode, 'element')">+ 道具</el-button>
-              <el-button text size="small" @click="uploadEpisodeReference(episode, 'scene')">+ 场景</el-button>
-            </div>
-          </div>
-          <el-divider />
-          <strong>画布说明</strong>
-          <span class="muted">锁定节点仅为路线投影，不会提前创建收费Step。</span>
-        </aside>
-        <main class="canvas-main">
-          <WorkflowCanvas
-            :nodes="graph.workflowNodes ?? []"
-            :selected-id="selectedNode?.semanticNodeId"
-            :planning-mode="graph.run.planningMode ?? settings?.planningMode"
-            @select="openNode"
-          />
-        </main>
-      </div>
-
-      <div class="slot-navigator">
-        <el-button
-          v-for="slot in SLOT_ORDER"
-          :key="slot"
-          :type="workspaceSlot === slot ? 'primary' : 'default'"
-          :disabled="graph.run.slotAvailability?.[slot] === 'locked'"
-          @click="setLocation(activeStage, slot)"
+      <div class="sequence-grid">
+        <article
+          v-for="sequence in graph.sequences"
+          :key="sequence.id"
+          class="sequence-card"
+          :class="{ selected: selectedSequenceId === sequence.id || graph.project.selectedSequenceId === sequence.id }"
         >
-          {{ SLOT_LABEL[slot] }}
-          · {{ graph.run.slotAvailability?.[slot] ?? 'ready' }}
-        </el-button>
-      </div>
-
-      <el-steps :active="STAGES.findIndex((item) => item.key === graph.run.currentStage)" finish-status="success" align-center class="workflow-steps">
-        <el-step v-for="stage in STAGES" :key="stage.key" :title="stage.label" />
-      </el-steps>
-      <el-tabs :model-value="activeStage" @tab-change="(name) => setLocation(name as Stage, null)">
-        <el-tab-pane v-for="stage in STAGES" :key="stage.key" :label="stage.label" :name="stage.key" />
-      </el-tabs>
-
-      <section v-if="activeStage === 'projectOutline'" class="stage-panel">
-        <div class="section-title">
-          <h3>生活故事项目大纲</h3>
-          <el-button
-            v-if="graph.run.projectOutline && nodeFor('run:day-director')"
-            @click="openNode(nodeFor('run:day-director'))"
-          >查看总导演实际Prompt与任务</el-button>
-        </div>
-        <ProjectOutlinePanel
-          v-if="graph.run.projectInput"
-          :run-id="runId"
-          :project-input="graph.run.projectInput"
-          :project-outline="graph.run.projectOutline ?? null"
-          :editable="!readOnlyProject && Boolean(graph.run.projectOutline) && !graph.run.projectOutlineConfirmed"
-          @saved="onProjectConfirmed"
-        />
-        <el-empty v-else description="项目输入尚未保存" />
-        <el-card v-if="settings && !readOnlyProject" shadow="never" class="settings-card">
-          <template #header><strong>自动推进设置</strong></template>
-          <el-alert
-            v-if="guided"
-            type="info"
-            :closable="false"
-            title="顺序逐集确认模式"
-            description="已有剧本项目无需总导演；确认项目输入后只规划上午，结果卡确认后再解锁中午。"
-          />
-          <div v-else class="row wrap">
-            <span v-for="key in AUTO_STAGE_KEYS" :key="key">
-              {{ STAGES.find((item) => item.key === key)?.label }}
-              <el-switch
-                :model-value="settings[key] === 'auto'"
-                inline-prompt active-text="自动" inactive-text="人工"
-                @change="(value) => updateStageMode(key, value)"
-              />
-            </span>
-          </div>
-        </el-card>
-      </section>
-
-      <section v-else-if="activeStage === 'script'" class="stage-panel">
-        <div class="section-title"><h3>{{ SLOT_LABEL[workspaceSlot] }}完整生产 · 原始剧本与导演镜头卡</h3><span class="muted">一次只专注当前时段；后续时段保持锁定且不会创建收费Step。</span></div>
-        <StoryConnectionPanel
-          v-if="workspaceSlot !== 'morning' && graph.run.slotAvailability?.[workspaceSlot] !== 'locked'"
-          :run-id="runId"
-          :slot="workspaceSlot"
-          :value="graph.run.storyConnections?.[workspaceSlot]"
-          :suggestion="connectionSuggestion"
-          :disabled="Boolean(activeEpisode)"
-          @job="trackCanvasJob"
-          @saved="refresh"
-        />
-        <div
-          v-if="workspaceSlot !== 'morning' && nodeFor(`${workspaceSlot}:connection`)"
-          class="node-links"
-        >
-          <el-button
-            size="small"
-            @click="openNode(nodeFor(`${workspaceSlot}:connection`))"
-          >查看关联建议Prompt与尝试</el-button>
-        </div>
-        <el-card v-if="activeCard" class="episode-card" shadow="never">
-          <template #header>
-            <div class="row">
-              <strong>{{ SLOT_LABEL[activeCard.slot] }} · {{ activeCard.episode?.title ?? "尚未规划" }}</strong>
-              <template v-if="activeCard.episode">
-                <el-tag>{{ FOCUS_LABEL[activeCard.episode.activityFocus] }}</el-tag>
-                <el-tag type="info">{{ activeCard.episode.script.duration_seconds }}秒 · {{ activeCard.episode.renderPlan.sections.length }}个任务</el-tag>
-              </template>
-              <el-tag v-else :type="activeCard.state?.unlocked ? 'warning' : 'info'">
-                {{ activeCard.state?.unlocked ? "已解锁" : "锁定" }}
-              </el-tag>
-              <el-button text type="primary" @click="openNode(nodeFor(`${activeCard.slot}:director`))">导演节点</el-button>
-            </div>
-          </template>
-          <template v-if="activeCard.episode">
-            <EpisodeSourcePanel
-              v-if="graph.run.projectInput"
-              :run-id="runId"
-              :slot="activeCard.slot"
-              :source-text="graph.run.projectInput.episode_sources[activeCard.slot]"
-              :planned="true"
-              :unlocked="Boolean(activeCard.state?.unlocked)"
-              :read-only="readOnlyProject"
-            />
-            <el-descriptions :column="1" border size="small" style="margin-bottom: 12px">
-              <el-descriptions-item label="原始场景">{{ graph.run.projectOutline?.episodes[activeCard.slot]?.scene ?? activeCard.episode.script.visual_context }}</el-descriptions-item>
-              <el-descriptions-item label="关系弧">{{ activeCard.episode.relationshipArc }}</el-descriptions-item>
-              <el-descriptions-item v-if="activeCard.slot !== 'morning'" label="已启用关联卡">
-                {{ graph.run.storyConnections?.[activeCard.slot]?.useForDirector ? graph.run.storyConnections?.[activeCard.slot]?.brief : '未加载，当前时段独立镜头化' }}
-              </el-descriptions-item>
-            </el-descriptions>
-            <ScriptEditorPanel :episode="activeCard.episode" :editable="!readOnlyProject && ['planned', 'video_pending', 'failed'].includes(activeCard.episode.status)" @saved="onScriptSaved(activeCard.episode.id)" />
-          </template>
-          <template v-else>
-            <el-alert
-              v-if="!activeCard.state?.unlocked"
-              type="info"
-              :closable="false"
-              :title="`${SLOT_LABEL[activeCard.slot]}导演尚未解锁`"
-              :description="activeCard.state?.blockReason ?? '先完成前一时段视频审核和结果卡确认'"
-              style="margin-bottom: 12px"
-            />
-            <EpisodeSourcePanel
-              v-if="graph.run.projectInput"
-              :run-id="runId"
-              :slot="activeCard.slot"
-              :source-text="graph.run.projectInput.episode_sources[activeCard.slot]"
-              :planned="false"
-              :unlocked="Boolean(activeCard.state?.unlocked)"
-              :read-only="readOnlyProject"
-              @saved="refresh"
-              @plan="(generateFromTheme) => planSlot(activeCard.slot, generateFromTheme)"
-            />
-            <div v-if="activeCard.state?.unlocked && activeCard.directorNode?.status === 'planning_rejected'">
-              <el-button type="warning" @click="replanSlot(activeCard.slot)">按原因重规划{{ SLOT_LABEL[activeCard.slot] }}</el-button>
-            </div>
+          <button class="sequence-open" @click="showSequence(sequence.id)">
+            <b>Revision {{ sequence.revision }}</b>
+            <span>{{ (sequence.plan.duration_ms / 1000).toFixed(2) }}s · {{ sequence.status }}</span>
+          </button>
+          <div>
             <el-button
-              v-else-if="activeCard.state?.unlocked && ['failed', 'submission_unknown'].includes(activeCard.directorNode?.status ?? '')"
+              v-if="sequence.status === 'content_review'"
+              size="small"
+              type="success"
+              @click="decideSequence(sequence, true)"
+            >批准并设为总片</el-button>
+            <el-button
+              v-if="sequence.status === 'content_review'"
+              size="small"
               type="danger"
-              @click="openNode(activeCard.directorNode)"
-            >查看失败与恢复操作</el-button>
-          </template>
-        </el-card>
-      </section>
-
-      <section v-else-if="activeStage === 'visual'" class="stage-panel">
-        <div class="section-title"><h3>{{ SLOT_LABEL[workspaceSlot] }} · 定妆图与开场锚点</h3><span class="muted">每次只准备当前时段；AI检查只提供建议，批准权属于人工。</span></div>
-        <CrossSlotReferencesPanel
-          v-if="workspaceSlot !== 'morning' && activeEpisode"
-          :run-id="runId"
-          :slot="workspaceSlot"
-          :disabled="assetsFor(activeEpisode, ['video']).length > 0"
-          @saved="refresh"
-        />
-        <el-card v-if="activeEpisode" :key="activeEpisode.id" class="episode-card" shadow="never">
-          <template #header><div class="row"><strong>{{ SLOT_LABEL[activeEpisode.slot] }} · {{ activeEpisode.title }}</strong><el-button @click="loadPreview(activeEpisode)">查看编译Prompt</el-button><el-button v-if="!readOnlyProject" type="primary" @click="generateVisuals(activeEpisode)">生成视觉锚点</el-button></div></template>
-          <el-collapse v-if="previews[activeEpisode.id]">
-            <el-collapse-item title="编译Prompt与高级覆盖" name="prompt">
-              <el-alert
-                v-if="previews[activeEpisode.id].overrideState.stale"
-                type="warning"
-                :closable="false"
-                title="上游结构化脚本已经变化，旧Prompt覆盖已过期"
-                description="只有重新检查并保存后，覆盖才允许用于下一次收费调用。"
-                style="margin-bottom: 10px"
-              />
-              <div class="advanced-toggle">
-                <span>高级Prompt覆盖</span>
-                <el-switch v-model="overrideEnabled[activeEpisode.id]" active-text="启用" inactive-text="关闭" />
-              </div>
-              <div class="prompt-label">定妆图Prompt</div><el-input v-model="drafts[activeEpisode.id].look" type="textarea" :rows="7" :readonly="!overrideEnabled[activeEpisode.id]" />
-              <div class="prompt-label">开场锚点Prompt</div><el-input v-model="drafts[activeEpisode.id].opening_anchor" type="textarea" :rows="7" :readonly="!overrideEnabled[activeEpisode.id]" />
-              <el-button style="margin-top: 8px" @click="saveOverrides(activeEpisode)">{{ overrideEnabled[activeEpisode.id] ? '确认并启用覆盖' : '确认使用编译Prompt' }}</el-button>
-            </el-collapse-item>
-          </el-collapse>
-          <div class="media-grid">
-            <div v-for="asset in assetsFor(activeEpisode, ['look_reference', 'opening_anchor'])" :key="asset.id">
-              <AssetReviewPanel :asset="asset" :reviews="reviewsFor(asset)" :read-only="readOnlyProject" @reviewed="refresh" />
-            </div>
+              @click="decideSequence(sequence, false)"
+            >拒绝</el-button>
+            <el-button
+              v-if="sequence.status === 'approved' && graph.project.selectedSequenceId !== sequence.id"
+              size="small"
+              @click="decideSequence(sequence, true)"
+            >回退到此版本</el-button>
           </div>
-          <div class="node-links"><el-button size="small" @click="openNode(nodeFor(`${activeEpisode.slot}:look`))">定妆节点</el-button><el-button size="small" @click="openNode(nodeFor(`${activeEpisode.slot}:opening-anchor`))">开场锚点节点</el-button></div>
-        </el-card>
-        <el-empty v-else description="请先完成当前时段导演镜头卡" />
-      </section>
+        </article>
+      </div>
+    </section>
 
-      <section v-else-if="activeStage === 'video'" class="stage-panel">
-        <div class="section-title"><h3>{{ SLOT_LABEL[workspaceSlot] }} · Seedance视频与版本</h3><span class="muted">生成前可修改镜头卡和素材引用；生成后可整条重做或在时间轴选择区间重拍。</span></div>
-        <el-card v-if="activeEpisode" :key="activeEpisode.id" class="episode-card" shadow="never">
-          <template #header><div class="row"><strong>{{ SLOT_LABEL[activeEpisode.slot] }} · {{ activeEpisode.script.duration_seconds }}秒</strong><el-tag>{{ activeEpisode.renderPlan.mode }}</el-tag><el-button @click="loadPreview(activeEpisode)">查看Prompt与RenderPlan</el-button><el-button v-if="!readOnlyProject" type="primary" @click="generateVideo(activeEpisode)">生成视频</el-button></div></template>
-          <el-collapse v-if="previews[activeEpisode.id]">
-            <el-collapse-item title="RenderPlan与视频Prompt" name="video-prompt">
-              <pre class="json-view">{{ JSON.stringify(previews[activeEpisode.id].renderPlan, null, 2) }}</pre>
-              <el-alert
-                v-if="previews[activeEpisode.id].overrideState.stale"
-                type="warning"
-                :closable="false"
-                title="上游结构化脚本已经变化，旧Prompt覆盖已过期"
-                description="请重新检查后再显式确认；未经确认的覆盖不会进入收费请求。"
-                style="margin-bottom: 10px"
-              />
-              <div class="advanced-toggle">
-                <span>高级Prompt覆盖</span>
-                <el-switch v-model="overrideEnabled[activeEpisode.id]" active-text="启用" inactive-text="关闭" />
-              </div>
-              <el-input v-model="drafts[activeEpisode.id].video" type="textarea" :rows="12" :readonly="!overrideEnabled[activeEpisode.id]" />
-              <div class="muted">覆盖只作用于初始区段；延展区段根据对应镜头重新编译。</div>
-              <el-button style="margin-top: 8px" @click="saveOverrides(activeEpisode)">{{ overrideEnabled[activeEpisode.id] ? '确认并启用覆盖' : '确认使用编译Prompt' }}</el-button>
-              <div v-for="section in previews[activeEpisode.id].videoSections.slice(1)" :key="section.order" class="extension-prompt">
-                <strong>延展{{ section.order }} · {{ section.durationSeconds }}秒</strong><pre>{{ section.prompt }}</pre>
-              </div>
-            </el-collapse-item>
-          </el-collapse>
-          <div class="media-grid">
-            <AssetReviewPanel v-for="asset in assetsFor(activeEpisode, ['video_intermediate', 'video'])" :key="asset.id" :asset="asset" :reviews="reviewsFor(asset)" :read-only="readOnlyProject" @reviewed="refresh" />
-          </div>
-          <div class="node-links"><el-button size="small" @click="openNode(nodeFor(`${activeEpisode.slot}:video`))">视频节点与全部版本</el-button></div>
-        </el-card>
-        <el-empty v-else description="请先完成当前时段导演与视觉锚点" />
-      </section>
+    <VideoTimeline
+      v-if="selectedShot && selectedVideo && !selectedSequence"
+      :shot-id="selectedShot.id"
+      :asset-id="selectedVideo.id"
+      :src="assetContentUrl(selectedVideo.id)"
+      :duration-ms="selectedVideoDurationMs"
+      :frames="selectedVideoFrames"
+      :markers-ms="selectedVideoMarkersMs"
+      @completed="loadGraph()"
+    />
+    <section v-else-if="selectedSequence && selectedSequenceAsset" class="master-timeline panel">
+      <div>
+        <h3>总片 Revision {{ selectedSequence.revision }}</h3>
+        <p>单轨 EDL 由已批准镜头片段依序组成；需要修改某段时，请返回对应镜头卡重做或区间重拍后重新合成。</p>
+      </div>
+      <video controls :src="assetContentUrl(selectedSequenceAsset.id)" />
+      <details>
+        <summary>查看 EDL</summary>
+        <pre>{{ JSON.stringify(selectedSequence.plan, null, 2) }}</pre>
+      </details>
+    </section>
 
-      <section v-else class="stage-panel">
-        <div class="section-title"><h3>{{ SLOT_LABEL[workspaceSlot] }} · AI建议、人工审核与结果卡</h3><span class="muted">AI发现只作为提示；最终是否接受画面、剧情和轻微接缝差异由你决定。</span></div>
-        <el-card v-if="activeEpisode" :key="activeEpisode.id" class="episode-card" shadow="never">
-          <template #header><div class="row"><strong>{{ SLOT_LABEL[activeEpisode.slot] }} · {{ activeEpisode.title }}</strong><StatusBadge :status="activeEpisode.status" /><el-button text @click="openNode(nodeFor(`${activeEpisode.slot}:review`))">审核节点</el-button></div></template>
-          <AssetReviewPanel v-for="asset in assetsFor(activeEpisode, ['video'])" :key="asset.id" :asset="asset" :reviews="reviewsFor(asset)" :max-width="360" :read-only="readOnlyProject" @reviewed="refresh" />
-          <el-divider />
-          <div class="section-title">
-            <h4>实际结果卡</h4>
-            <el-tag v-if="planningStateFor(activeEpisode.slot)?.outcomeConfirmed" type="success">已确认</el-tag>
-          </div>
-          <template v-if="planningStateFor(activeEpisode.slot)?.outcomeConfirmed">
-            <el-descriptions :column="1" border size="small">
-              <el-descriptions-item label="实际结果">{{ graph.run.acceptedOutcomes?.[activeEpisode.slot]?.summary }}</el-descriptions-item>
-              <el-descriptions-item label="可供关联建议参考">{{ graph.run.acceptedOutcomes?.[activeEpisode.slot]?.carryForward.join('；') || '无' }}</el-descriptions-item>
-              <el-descriptions-item label="关联建议应排除">{{ graph.run.acceptedOutcomes?.[activeEpisode.slot]?.doNotCarryForward.join('；') || '无' }}</el-descriptions-item>
-            </el-descriptions>
-          </template>
-          <template v-else-if="outcomeLoaded[activeEpisode.slot]">
-            <el-form label-position="top">
-              <el-form-item label="实际成片结果"><el-input v-model="outcomeForms[activeEpisode.slot].summary" type="textarea" :rows="3" /></el-form-item>
-              <el-form-item label="可供关联建议参考（每行一项）"><el-input v-model="outcomeForms[activeEpisode.slot].carryForwardText" type="textarea" :rows="3" /></el-form-item>
-              <el-form-item label="关联建议应排除的偶发错误（每行一项）"><el-input v-model="outcomeForms[activeEpisode.slot].doNotCarryForwardText" type="textarea" :rows="3" /></el-form-item>
-              <el-button v-if="!readOnlyProject" type="primary" @click="confirmOutcome(activeEpisode.slot)">确认结果卡</el-button>
-            </el-form>
-          </template>
-          <el-button
-            v-else
-            :disabled="activeEpisode.status !== 'ready'"
-            @click="loadOutcome(activeEpisode.slot)"
-          >{{ activeEpisode.status === 'ready' ? '读取诊断并编辑结果卡' : '批准视频后才能确认结果卡' }}</el-button>
-        </el-card>
-        <el-empty v-else description="当前时段尚无可审核视频" />
-        <DeliveryPanel v-if="canDeliver" :run-id="runId" :can-deliver="canDeliver" />
-      </section>
+    <el-dialog v-model="createVisible" title="新建镜头片段项目" width="620px">
+      <el-form label-position="top">
+        <el-form-item label="项目标题"><el-input v-model="createForm.title" placeholder="例如：池塘边钓鱼" /></el-form-item>
+        <el-form-item label="第一场景标题"><el-input v-model="createForm.sceneTitle" /></el-form-item>
+        <el-form-item label="第一段原始剧本"><el-input v-model="createForm.sourceText" type="textarea" :rows="8" placeholder="直接粘贴一段完整场景故事。创建项目本身不会调用 Ark。" /></el-form-item>
+        <el-form-item label="可选参考图片"><input type="file" accept="image/*" @change="chooseCreateReference" /></el-form-item>
+      </el-form>
+      <template #footer><el-button @click="createVisible = false">取消</el-button><el-button type="primary" @click="createProject">创建项目</el-button></template>
+    </el-dialog>
 
-      <VideoTimeline
-        v-if="selectedVideoEpisode && selectedNode"
-        :episode="selectedVideoEpisode"
-        :node="selectedNode"
-        :sequences="selectedVideoSequences"
-        :assets="graph.assets"
-        :reviews="graph.reviews"
-        :outcome-confirmed="Boolean(graph.run.acceptedOutcomes?.[selectedVideoEpisode.slot])"
-        :sequence-id="String(route.query.sequence ?? '') || undefined"
-        @job="trackCanvasJob"
-        @changed="refresh"
-        @sequence-selected="(id) => setLocation('video', selectedVideoEpisode?.slot ?? null, selectedNode?.semanticNodeId, id)"
-      />
+    <el-dialog v-model="projectSettingsVisible" title="项目设置" width="520px">
+      <el-form label-position="top">
+        <el-form-item label="项目标题"><el-input v-model="projectSettingsForm.title" /></el-form-item>
+        <el-form-item label="内容日期"><el-date-picker v-model="projectSettingsForm.contentDate" type="date" value-format="YYYY-MM-DD" /></el-form-item>
+      </el-form>
+      <template #footer><el-button @click="projectSettingsVisible = false">取消</el-button><el-button type="primary" @click="saveProjectSettings">保存</el-button></template>
+    </el-dialog>
 
-      <WorkflowNodeDrawer
-        :model-value="drawerOpen"
-        :node="selectedNode"
-        :graph="graph"
-        @update:model-value="setDrawerOpen"
-        @job="trackCanvasJob"
-        @changed="refresh"
-        @replan="replanSlot"
-      />
-    </template>
-    <PlanCreateDialog ref="createDialog" @created="runs.fetchRuns()" />
+    <el-dialog v-model="sceneVisible" :title="sceneForm.id ? '编辑场景' : '添加场景'" width="620px">
+      <el-form label-position="top">
+        <el-form-item label="场景标题"><el-input v-model="sceneForm.title" /></el-form-item>
+        <el-form-item label="可选章节标签"><el-input v-model="sceneForm.chapterLabel" placeholder="例如：上午、河边、归家；仅作为文字标签" /></el-form-item>
+        <el-form-item label="原始剧本"><el-input v-model="sceneForm.sourceText" type="textarea" :rows="7" /></el-form-item>
+        <el-form-item label="可选上下文备注"><el-input v-model="sceneForm.contextNote" type="textarea" :rows="3" /></el-form-item>
+      </el-form>
+      <template #footer><el-button @click="sceneVisible = false">取消</el-button><el-button type="primary" @click="saveScene">保存</el-button></template>
+    </el-dialog>
+
+    <el-dialog v-model="shotVisible" :title="shotForm.id ? '编辑镜头卡' : '手工添加镜头卡'" width="720px">
+      <el-form label-position="top">
+        <el-form-item label="镜头标题"><el-input v-model="shotForm.title" /></el-form-item>
+        <el-form-item label="完整镜头描述"><el-input v-model="shotForm.direction" type="textarea" :rows="9" /></el-form-item>
+        <div class="binding-row">
+          <el-form-item label="时长"><el-input-number v-model="shotForm.durationSeconds" :min="8" :max="15" /></el-form-item>
+          <el-form-item label="锚点方式"><el-select v-model="shotForm.anchorMode"><el-option label="纯文本直出" value="text_only" /><el-option label="使用已有图片（先在右侧绑定最终锚点）" value="existing" :disabled="!shotForm.referenceBindings.some(item => item.usage === 'approved_anchor')" /><el-option label="生成新锚点" value="generate" /></el-select></el-form-item>
+        </div>
+      </el-form>
+      <template #footer><el-button @click="shotVisible = false">取消</el-button><el-button type="primary" @click="saveShot">保存镜头卡</el-button></template>
+    </el-dialog>
+
+    <el-dialog :model-value="Boolean(suggestion)" title="AI 镜头建议（确认后才写入场景）" width="720px" @update:model-value="closeSuggestion">
+      <div v-if="suggestion">
+        <p>场景：{{ suggestion.output.sceneTitle }}</p>
+        <pre>{{ JSON.stringify(suggestion.output.shots, null, 2) }}</pre>
+      </div>
+      <template #footer><el-button @click="suggestion = null">取消</el-button><el-button type="primary" @click="acceptSuggestion">接受并建立镜头卡</el-button></template>
+    </el-dialog>
   </div>
 </template>
 
 <style scoped>
-.studio-page { max-width: 1500px; margin: 0 auto; }
-.page-header, .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.page-header h2 { margin: 0; }
-.wrap { flex-wrap: wrap; }
-.slot-navigator { display: flex; justify-content: center; gap: 10px; margin: 16px 0; }
-.run-card { margin-bottom: 10px; cursor: pointer; background: #16181d; border-color: #2b2d33; }
-.workflow-steps { margin: 24px 0 14px; }
-.canvas-workspace { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 12px; margin-top: 18px; }
-.canvas-sidebar { display: flex; flex-direction: column; align-items: flex-start; gap: 9px; padding: 14px; border: 1px solid #2b2d33; border-radius: 12px; background: #16181d; }
-.canvas-sidebar .el-divider { margin: 4px 0; }
-.sidebar-slot { color: #9ca3af; font-size: 12px; }
-.sidebar-reference-actions { display: flex; gap: 2px; }
-.sidebar-reference-actions .el-button { margin: 0; padding: 2px 3px; }
-.canvas-main { min-width: 0; }
-.stage-panel { padding: 4px 0 28px; }
-.section-title { display: flex; align-items: baseline; gap: 14px; margin-bottom: 12px; }
-.section-title h3 { margin: 0; }
-.episode-card, .settings-card { margin-bottom: 14px; background: #16181d; border-color: #2b2d33; }
-.persistent-error { margin-bottom: 8px; cursor: pointer; }
-.media-grid { display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start; }
-.node-links { margin-top: 12px; }
-.prompt-label { margin: 8px 0 4px; color: #9ca3af; font-size: 12px; }
-.advanced-toggle { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
-.json-view, .extension-prompt pre { white-space: pre-wrap; word-break: break-word; background: #111318; padding: 10px; border-radius: 6px; max-height: 320px; overflow: auto; font-size: 12px; }
-.extension-prompt { margin-top: 12px; }
+.studio { min-height: 100%; background: #0d1016; color: #e8eaf0; padding: 22px; }
+.studio-header, .queue-heading, .scene-card > header, .shot-head, .shot-card footer { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.studio-header h1, .queue-heading h2 { margin: 0; }.studio-header p { color: #9299a8; margin: 6px 0 0; }
+.persistent-alert { margin: 16px 0; }.workspace-grid { display: grid; grid-template-columns: 220px minmax(520px, 1fr) 390px; gap: 14px; margin-top: 18px; align-items: start; }
+.panel { background: #151922; border: 1px solid #292f3b; border-radius: 12px; }.project-rail, .inspector { padding: 14px; position: sticky; top: 12px; max-height: calc(100vh - 40px); overflow: auto; }.queue { padding: 18px; min-height: 650px; }
+.panel-title { color: #8c95a7; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 10px; }.reference-title { margin-top: 22px; }
+.project-item { display: flex; flex-direction: column; width: 100%; color: #d9dde7; background: transparent; border: 0; border-radius: 8px; text-align: left; padding: 10px; cursor: pointer; }.project-item:hover, .project-item.active { background: #232a36; }.project-item span { color: #80899a; font-size: 12px; margin-top: 4px; }
+.scene-card { border-top: 1px solid #2b313d; padding: 18px 0; }.scene-card small { color: #7d8798; margin-left: 8px; }.order-chip { color: #68a8ff; margin-right: 10px; }.source-text { color: #aeb5c3; line-height: 1.7; white-space: pre-wrap; }.scene-actions { margin: 12px 0; }
+.shots { display: grid; gap: 10px; }.shot-card { padding: 14px; background: #10141b; border: 1px solid #292f3b; border-radius: 10px; cursor: pointer; }.shot-card.selected { border-color: #4d96ff; box-shadow: 0 0 0 1px #4d96ff55; }.shot-card p, .direction { color: #b6bdca; font-size: 13px; line-height: 1.65; white-space: pre-wrap; }.shot-card footer { color: #768092; font-size: 12px; }
+.inspector h3 { margin: 4px 0 8px; }.inspector-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }.binding-row { display: flex; gap: 8px; margin: 8px 0; }.attempt { padding: 10px 0; border-bottom: 1px solid #292f3b; display: grid; gap: 5px; }.attempt span { color: #8992a3; font-size: 12px; } pre { white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto; background: #0c0f15; padding: 10px; border-radius: 8px; color: #cdd3dd; }
+.asset-strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; margin-top: 10px; }.asset-strip img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 5px; }.version-card { border: 1px solid #2b313d; border-radius: 8px; padding: 8px; margin: 8px 0; display: grid; gap: 6px; }.version-card img, .version-card video { width: 100%; max-height: 240px; object-fit: contain; background: #090b0f; }.empty-state { text-align: center; color: #8f98a7; padding: 80px 20px; }
+.scene-attempts { margin: 10px 0; }.attempt details summary, .master-timeline summary { color: #8fa7c9; cursor: pointer; font-size: 12px; }.sequence-panel, .master-timeline { margin-top: 16px; padding: 16px; }.sequence-heading h3, .master-timeline h3 { margin: 0; }.sequence-heading p, .master-timeline p { color: #9299a8; }.sequence-grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }.sequence-card { border: 1px solid #2b313d; border-radius: 9px; padding: 10px; display: grid; gap: 8px; }.sequence-card.selected { border-color: #4d96ff; }.sequence-open { border: 0; background: transparent; color: #e8eaf0; text-align: left; cursor: pointer; display: grid; gap: 4px; }.sequence-open span { color: #8490a3; font-size: 12px; }.master-timeline video { width: 100%; max-height: 560px; background: #080a0e; }
+@media (max-width: 1280px) { .workspace-grid { grid-template-columns: 190px 1fr; }.inspector { position: static; grid-column: 1 / -1; max-height: none; } }
 </style>

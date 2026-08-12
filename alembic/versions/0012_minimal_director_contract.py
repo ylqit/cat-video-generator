@@ -30,9 +30,7 @@ def _assert_production_history_cleared() -> None:
     runs = sa.table("production_runs", sa.column("id", sa.Uuid()), schema=_schema())
     count = op.get_bind().execute(sa.select(sa.func.count()).select_from(runs)).scalar_one()
     if count:
-        raise RuntimeError(
-            "0012不转换旧导演JSON；请先运行clear_production_history.py并保留Canon"
-        )
+        raise RuntimeError("0012不转换旧导演JSON；请先运行clear_production_history.py并保留Canon")
 
 
 def upgrade() -> None:
@@ -64,4 +62,3 @@ def downgrade() -> None:
         schema=_schema(),
     )
     op.drop_column("production_runs", "contract_version", schema=_schema())
-

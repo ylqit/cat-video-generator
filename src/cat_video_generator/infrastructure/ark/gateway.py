@@ -1,6 +1,6 @@
 """火山Ark导演、Seedream和Seedance网关。
 
-本模块只负责协议映射、错误分类和供应商返回值，不修改Run或Episode状态。
+本模块只负责协议映射、错误分类和供应商返回值，不修改项目、场景或镜头状态。
 调用意图、幂等和恢复由Application Service与Repository共同负责。
 """
 
@@ -24,13 +24,12 @@ from ...application.ports import (
     DirectorResult,
     GatewayError,
     ImageResult,
-    ImageReviewResult,
     VideoDiagnosticResult,
     VideoTaskResult,
 )
 from ...config import RuntimeSettings
 from ...domain.rendering import VideoInputPlan
-from .review_schemas import IMAGE_REVIEW_SCHEMA, VIDEO_DIAGNOSTIC_SCHEMA
+from .review_schemas import VIDEO_DIAGNOSTIC_SCHEMA
 
 
 class ArkGatewayError(GatewayError):
@@ -170,15 +169,19 @@ class ArkGateway:
         """生成一张定妆图或开场视觉锚点。"""
 
         try:
+            request: dict[str, Any] = {
+                "model": self.image_model,
+                "prompt": prompt,
+                "response_format": "url",
+                "size": "2K",
+                "watermark": False,
+                "output_format": "png",
+                "timeout": self._settings.ark_image_request_timeout_seconds,
+            }
+            if reference_paths:
+                request["image"] = [_asset_data_url(path) for path in reference_paths]
             response = self._client.images.generate(
-                model=self.image_model,
-                prompt=prompt,
-                image=[_asset_data_url(path) for path in reference_paths],
-                response_format="url",
-                size="2K",
-                watermark=False,
-                output_format="png",
-                timeout=self._settings.ark_image_request_timeout_seconds,
+                **request,
             )
         except ArkAPIError as exc:
             raise _provider_error(exc, submission=True) from exc
@@ -198,88 +201,6 @@ class ArkGateway:
             url=response.data[0].url,
             model=getattr(response, "model", self.image_model),
         )
-
-    def review_image(
-        self,
-        *,
-        prompt: str,
-        image_path: Path,
-        reference_paths: tuple[Path, ...],
-    ) -> ImageReviewResult:
-        """执行定妆图或开场锚点的身份、画风、构图审核。"""
-
-        schema = IMAGE_REVIEW_SCHEMA
-        instructions, text_format = self._structured_output(prompt, schema, "ImageSemanticReview")
-        ordered_paths = (*reference_paths, image_path)
-        request_hash = _json_hash(
-            {
-                "model": self.review_model,
-                "instructions": instructions,
-                "schema": schema,
-                "orderedImageSha256": [
-                    hashlib.sha256(path.read_bytes()).hexdigest() for path in ordered_paths
-                ],
-            }
-        )
-        try:
-            response = self._client.responses.create(
-                model=self.review_model,
-                instructions=instructions,
-                input=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": "按Prompt声明的顺序审核最后一张生产图片。",
-                            },
-                            *(
-                                {
-                                    "type": "input_image",
-                                    "image_url": _asset_data_url(path),
-                                }
-                                for path in ordered_paths
-                            ),
-                        ],
-                    }
-                ],
-                text={"format": text_format},
-                temperature=0,
-                max_output_tokens=1200,
-                thinking={"type": "disabled"},
-                store=False,
-                timeout=self._settings.ark_review_request_timeout_seconds,
-            )
-        except ArkAPIError as exc:
-            raise _provider_error(exc, submission=True) from exc
-        if response.status != "completed":
-            raise ArkGatewayError(
-                f"Ark图片审核状态为{response.status!r}",
-                code="image_review_not_completed",
-                retryable=False,
-            )
-        try:
-            payload = json.loads(_response_text(response))
-            return ImageReviewResult(
-                identity_ok=bool(payload["identityOk"]),
-                style_ok=bool(payload["styleOk"]),
-                appearance_ok=bool(payload["appearanceOk"]),
-                composition_ok=bool(payload["compositionOk"]),
-                constraints_ok=bool(payload["constraintsOk"]),
-                confidence=float(payload["confidence"]),
-                violations=tuple(str(item) for item in payload["violations"]),
-                warnings=tuple(str(item) for item in payload["warnings"]),
-                evidence=tuple(str(item) for item in payload["evidence"]),
-                response_id=response.id,
-                model=response.model,
-                request_hash=request_hash,
-            )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ArkGatewayError(
-                "Ark图片审核没有返回合法结构。",
-                code="invalid_image_review_output",
-                retryable=False,
-            ) from exc
 
     def diagnose_video_frames(
         self,
@@ -353,20 +274,13 @@ class ArkGateway:
                 narrative_order_ok=bool(payload["narrativeOrderOk"]),
                 confidence=float(payload["confidence"]),
                 violations=tuple(str(item) for item in payload["violations"]),
-                actual_outcome=str(payload["actualOutcome"]),
-                carry_forward=tuple(str(item) for item in payload["carryForward"]),
-                do_not_carry_forward=tuple(
-                    str(item) for item in payload["doNotCarryForward"]
-                ),
                 evidence=tuple(
                     {
                         "timestamp": str(item["timestamp"]),
                         "object": str(item["object"]),
                         "observation": str(item["observation"]),
                         "relationError": (
-                            None
-                            if item["relationError"] is None
-                            else str(item["relationError"])
+                            None if item["relationError"] is None else str(item["relationError"])
                         ),
                     }
                     for item in payload["evidence"]
@@ -392,23 +306,20 @@ class ArkGateway:
         input_plan: VideoInputPlan,
         input_sources: tuple[Path | str, ...],
     ) -> VideoTaskResult:
-        if not input_sources:
-            raise ArkGatewayError(
-                "视频输入不能为空",
-                code="invalid_visual_input_source",
-                retryable=False,
-            )
         if len(input_plan.bindings) != len(input_sources):
             raise ArkGatewayError(
                 "多模态输入计划与实际素材数量不一致",
                 code="invalid_visual_input_count",
                 retryable=False,
             )
-        if sum(
-            source.stat().st_size
-            for source in input_sources
-            if isinstance(source, Path) and source.is_file()
-        ) > 64 * 1024 * 1024:
+        if (
+            sum(
+                source.stat().st_size
+                for source in input_sources
+                if isinstance(source, Path) and source.is_file()
+            )
+            > 64 * 1024 * 1024
+        ):
             raise ArkGatewayError(
                 "多模态请求素材总大小超过64MB",
                 code="reference_payload_too_large",
@@ -509,7 +420,7 @@ class ArkGateway:
                 "type": "json_schema",
                 "json_schema": {
                     "name": output_name,
-                    "description": "三时段视频系统的结构化导演对象",
+                    "description": "镜头队列中的结构化镜头建议",
                     "schema": schema,
                     "strict": True,
                 },
@@ -669,6 +580,11 @@ def _video_task_result(task: Any) -> VideoTaskResult:
     content = getattr(task, "content", None)
     error = getattr(task, "error", None)
     created_at = getattr(task, "created_at", None)
+    raw_duration = getattr(task, "duration", None)
+    try:
+        duration_seconds = None if raw_duration is None else int(raw_duration)
+    except (TypeError, ValueError):
+        duration_seconds = None
     return VideoTaskResult(
         task_id=str(task.id),
         status=str(task.status),
@@ -681,7 +597,7 @@ def _video_task_result(task: Any) -> VideoTaskResult:
             if isinstance(created_at, int | float)
             else None
         ),
-        duration_seconds=getattr(task, "duration", None),
+        duration_seconds=duration_seconds,
         ratio=getattr(task, "ratio", None),
         resolution=getattr(task, "resolution", None),
         generate_audio=getattr(task, "generate_audio", None),

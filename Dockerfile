@@ -27,10 +27,10 @@ RUN uv sync --frozen --no-dev
 
 COPY alembic.ini ./
 COPY alembic/ ./alembic/
-COPY content/ ./content/
+COPY scripts/archive_v3_and_clear.py ./scripts/archive_v3_and_clear.py
 COPY --from=web-builder /build/web/dist ./web-dist/
 
-RUN mkdir -p /data/work /data/assets /data/output \
+RUN mkdir -p /data/work /data/assets \
     && chown -R catvideo:catvideo /app /data
 
 USER catvideo

@@ -1,7 +1,7 @@
 import { createRouter, createWebHistory } from "vue-router";
 
 import CanonView from "./views/CanonView.vue";
-import RunListView from "./views/RunListView.vue";
+import ProjectListView from "./views/ProjectListView.vue";
 import StudioView from "./views/StudioView.vue";
 
 export const router = createRouter({
@@ -9,14 +9,7 @@ export const router = createRouter({
   routes: [
     { path: "/", redirect: "/studio" },
     { path: "/studio", component: StudioView },
-    { path: "/runs", component: RunListView },
-    {
-      path: "/runs/:id",
-      redirect: (to) => ({
-        path: "/studio",
-        query: { ...to.query, run: String(to.params.id) },
-      }),
-    },
+    { path: "/projects", component: ProjectListView },
     { path: "/canon", component: CanonView },
   ],
 });

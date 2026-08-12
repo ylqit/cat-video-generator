@@ -1,172 +1,63 @@
-# Windows 运行手册
+# Windows 运行手册（V4）
 
-## 1. 环境与配置
+## 配置与启动
 
 ```powershell
-uv sync --extra test
+uv sync --extra dev
 uv run cvg doctor
-```
-
-需要Python 3.12/3.13、uv、ffmpeg、ffprobe、PostgreSQL 14+和Ark标准API Key。
-`.env`保存本机配置，PowerShell环境变量优先；不要提交`.env`。
-
-```text
-CAT_VIDEO_DB_HOST / PORT / NAME / USER / PASSWORD / SSLMODE / SCHEMA
-CAT_VIDEO_ALLOW_INSECURE_RUNTIME
-ARK_API_KEY
-ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
-ARK_PLANNING_MODEL
-ARK_IMAGE_MODEL=doubao-seedream-5-0-260128
-ARK_VIDEO_MODEL
-ARK_REVIEW_MODEL
-ARK_VIDEO_RESOLUTION=480p|720p
-ARK_DIRECTOR_REQUEST_TIMEOUT_SECONDS=240
-ARK_IMAGE_REQUEST_TIMEOUT_SECONDS=600
-ARK_REVIEW_REQUEST_TIMEOUT_SECONDS=240
-ARK_VIDEO_API_TIMEOUT_SECONDS=120
-ARK_TASK_TIMEOUT_SECONDS=1800
-ARK_POLL_INTERVAL_SECONDS=10
-IMAGE_REVIEW_MODE=advisory|manual
-MEDIA_WORK_ROOT / MEDIA_ASSET_ROOT / DELIVERY_OUTPUT_ROOT
-```
-
-## 2. 数据库迁移
-
-0014启用生活故事项目契约版本3；旧契约Run保持只读，不进入新生产路径。
-先预览并保存诊断清单：
-
-```powershell
-uv run python scripts/clear_production_history.py
-```
-
-核对`var/diagnostics/`中的Run、资产路径和SHA-256，再使用程序打印的精确口令：
-
-```powershell
-uv run python scripts/clear_production_history.py --confirm DELETE-<Run数量>-RUNS-AND-<旧Canon数量>-OLD-CANON
-uv run alembic upgrade head
-uv run cvg doctor
-```
-
-清理删除带Run外键的业务记录和已验证位于媒体根下的历史文件，同时只保留当前正式
-语义键的最新批准Canon；仍被保留Canon引用的文件路径永远不会被删除。
-升级0012后继续执行`uv run alembic upgrade head`。0013只新增非破坏性
-`video_sequences`表，不清理Canon或生产媒体。Doctor最终必须报告
-`0014_story_project_v3`。0014不改写V2 JSON，只允许旧契约记录继续只读，并把新Run
-默认版本提升到3。旧V2 Run不能继续规划、生成或重试。
-
-## 3. Canon
-
-生产至少需要当前批准版本：
-
-```text
-person:headshot
-person:front / person:side / person:back（按现有系列档案）
-cat:front / cat:side / cat:back
-style:line_texture
-style:indoor
-style:outdoor
-```
-
-新Run只选择精确semantic_key的最新已批准资产；`legacy:*`、候选和拒绝资产不会自动复用。
-
-## 4. 本地Web
-
-开发模式使用两个进程：
-
-```powershell
-# 终端一
 uv run cvg api
+```
 
-# 终端二
+另一个终端启动前端：
+
+```powershell
 npm --prefix web install
 npm --prefix web run dev
 ```
 
-访问`http://localhost:5173/studio`。生产构建可由同一个后端托管：
+访问 `http://localhost:5173/studio`。生产单服务可先构建前端，再执行
+`uv run cvg api --static-dir web/dist`。
+
+## 升级到 0015
+
+V4 不兼容旧生产结构。先归档并清理旧业务数据，再迁移；脚本不删除 Canon 或已交付
+本地文件：
 
 ```powershell
-npm --prefix web run build
-uv run cvg api --static-dir web/dist
-```
-
-## 5. 创建与生成
-
-Web新建“生活故事项目”时先选择剧情来源和规划方式：
-
-- 主题扩写：调用总导演，人工确认Project Outline后进入逐集生产。
-- 已有剧本：一次粘贴三集并预览拆分，或在顺序模式下分别填写；创建项目不调用Ark。
-
-默认“顺序逐集确认”只规划上午；上午视频人工批准并确认实际结果卡后才解锁中午，
-傍晚同理。“全自动三集”保留批量行为，已有剧本模式必须先填写完整三集。两种模式均
-可配置场景路线、全天活动焦点、早中晚覆盖及short、medium、long或adaptive；时段
-导演在档位内确定精确秒数。主题扩写总导演不重复输出这些用户控制项。
-
-“三集导演”默认编辑极简混合脚本：完整长剧情、关系弧、1～3段完整镜头描述和少量
-关键硬约束。每个镜头段落自然表达镜头目的、机位、运镜、人物与猫咪站位、动作路径、
-接触结果和稳定切点。页面实时编译定妆图、开场锚点及视频Prompt；预览不会保存数据
-或调用Ark。高级Prompt覆盖必须显式开启，脚本变化后会标记为过期，重新确认前不会
-进入下一次收费请求。
-
-CLI核心入口仍可使用：
-
-```powershell
-uv run cvg plan-day --target-date 2026-08-10 --theme "出去钓鱼" --planning-mode auto_day --allow-paid-generation
-uv run cvg status <runId>
-uv run cvg run-day <runId> --slot morning --allow-paid-generation
-```
-
-`run-day`依次确保定妆图、开场锚点和RenderPlan视频任务。8～15秒一个任务；中长
-视频按模型能力使用官方延展。延展返回的新增尾段会在各自QC通过后，通过FFmpeg
-`stream copy`与前序区段顺序封装；不会生成故事板组图、逐镜视频，也不会转码。
-
-点击任一工作流节点会按需读取Trace。Prompt链路依次展示输入摘要、当前结构化结果、
-当前编译Prompt、各attempt实际调用Prompt、Ark原始结构化JSON、可选归一化结果和警告；
-Provider、媒体、审核与尝试历史分别展示，页面轮询不会改变当前stage、slot或node。
-
-中央固定语义画布会完整展示未来锁定路线；锁定节点不对应收费Step。选中视频节点后，
-页面底部展示非破坏性单轨时间轴、版本对比、镜头边界、精确选区、整条重生成和区间
-重生成。区间需0.5～13秒且不能跨来源Clip；来源必须保有可查询Ark task URL。新版本
-批准前不会替换Episode正式视频，原视频完整音轨会保留。
-
-## 6. 恢复、审核和交付
-
-```powershell
-uv run cvg retry-step <stepId> --reason "明确原因" --allow-paid-generation
-uv run cvg resume <runId>
-uv run cvg replan-episode <runId> --slot noon --reason "调整剧情原因" --allow-paid-generation
-uv run cvg review <assetId> --approve --reason "人工观看通过"
-uv run cvg deliver <runId>
-```
-
-- `retry-step`创建新attempt，不覆盖原Prompt、Task ID或错误。
-- 已有视频Task ID使用resume继续查询，不产生第二次POST。
-- 视频`submission_unknown`在Web节点列出候选并人工对账。
-- 图片同步超时不会自动重试；确认原请求可能已经计费后才能显式创建新attempt。
-- 最终视频必须人工批准；顺序模式还需确认傍晚实际结果卡，Run才会进入ready并允许交付1/2/3。
-
-## 7. 常见故障
-
-| 现象 | 处理 |
-| --- | --- |
-| 迁移落后 | 先生成清理Manifest并按口令清理，再`alembic upgrade head` |
-| 长视频收费前失败 | 当前模型不支持官方延展；换用已开通完整模型或把该时段改为short |
-| AI图片建议提示风险 | 人工查看媒体后决定批准、拒绝或显式创建新attempt |
-| 视频监看窗口结束 | 继续查询已有Task ID |
-| `submission_unknown` | 视频人工对账；图片需确认重复计费后新attempt |
-| 交付不可用 | 确认早中晚最终`video`资产均已人工批准；顺序模式再确认傍晚结果卡 |
-
-## 8. 最终验证
-
-```powershell
-uv run ruff check .
-uv run pytest -q
-$env:CAT_VIDEO_POSTGRES_TEST_MODE='remote-schema'
-uv run pytest -m postgres -q
-Remove-Item Env:CAT_VIDEO_POSTGRES_TEST_MODE
-npm --prefix web run build
-npm --prefix web run test:e2e
-git diff --check
+uv run python scripts/archive_v3_and_clear.py
+uv run alembic upgrade head
 uv run cvg doctor
 ```
 
-远程PostgreSQL测试只创建唯一临时Schema，禁止在正式`cat_video`中执行破坏性测试。
+归档 Manifest 与整体 SHA-256 位于 `var/diagnostics/`。迁移最终应显示
+`0015_shot_queue_core`，且只保留批准 Canon。
+
+## Web 操作
+
+1. 创建项目并填写第一场景原文。
+2. 手工添加镜头，或点击“AI 建议镜头卡”并确认一次文本模型费用。
+3. 编辑镜头描述和 8～15 秒时长。
+4. 选择纯文本、已有图片或生成新锚点；按职责绑定必要素材。
+5. 查看最终 Prompt，显式确认 Seedance 费用并生成片段。
+6. 人工观看后批准或拒绝；AI 抽帧结果只是建议。
+7. 重做只影响当前镜头，旧 attempt 和媒体保留。
+8. 多个批准镜头可本地合成总片；局部问题可在底部时间轴发起区间重拍。
+
+## 恢复边界
+
+- 已有视频 Task ID：点击“继续查询原任务”。
+- `submission_unknown`：点击“查询候选并对账”，不得直接重做。
+- 图片同步超时：供应商无持久 Task ID；再次生成前需接受潜在重复计费。
+- 编辑或 Prompt 预览不收费；生成、重新生成和区间重拍均逐次确认费用。
+
+## 最终本地验收
+
+```powershell
+uv run ruff check .
+npm --prefix web run build
+git diff --check
+uv run cvg doctor
+uv run python scripts/local_dataflow_smoke.py
+```
+
+烟测使用替身 Provider，不读取 Ark Key、不访问网络。真实画面质量由用户在 Web 中验证。

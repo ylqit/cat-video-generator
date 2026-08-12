@@ -1,7 +1,7 @@
 """环境配置与安全门。
 
-配置只负责解析、路径发现和连接准入，不加载业务Schema，也不判断Episode
-内容。PowerShell环境变量始终优先于本地`.env`。
+配置只负责解析、路径发现和连接准入，不加载业务Schema，也不判断镜头内容。
+PowerShell环境变量始终优先于本地`.env`。
 """
 
 from __future__ import annotations
@@ -27,13 +27,6 @@ class DatabaseOperation(StrEnum):
     MIGRATION = "migration"
     RUNTIME = "runtime"
     TEST = "test"
-
-
-class ImageReviewMode(StrEnum):
-    """定妆图和开场锚点的AI建议或纯人工审核模式。"""
-
-    ADVISORY = "advisory"
-    MANUAL = "manual"
 
 
 _STANDARD_URL = "https://ark.cn-beijing.volces.com/api/v3"
@@ -116,22 +109,16 @@ class RuntimeSettings:
     ark_poll_interval_seconds: float
     ark_task_timeout_seconds: float
     ark_image_request_timeout_seconds: float
-    image_review_mode: ImageReviewMode
     video_semantic_review_mode: str
-    configuration_warnings: tuple[str, ...]
     ffmpeg_path: Path | None
     ffprobe_path: Path | None
     work_root: Path
     asset_root: Path
-    delivery_root: Path
-    event_seed_root: Path
 
     @classmethod
     def from_env(
         cls,
         environ: Mapping[str, str] | None = None,
-        *,
-        config_root: Path | None = None,
     ) -> RuntimeSettings:
         values = os.environ if environ is None else environ
         director_request_timeout = float(
@@ -158,19 +145,6 @@ class RuntimeSettings:
             )
         ):
             raise ConfigurationError("Ark轮询间隔和请求超时必须大于0")
-        configuration_warnings: list[str] = []
-        review_mode_value = (
-            values.get(
-                "IMAGE_REVIEW_MODE",
-                "advisory",
-            )
-            .strip()
-            .lower()
-        )
-        try:
-            image_review_mode = ImageReviewMode(review_mode_value)
-        except ValueError as exc:
-            raise ConfigurationError("IMAGE_REVIEW_MODE必须是advisory或manual") from exc
         video_review_mode = (
             values.get(
                 "VIDEO_SEMANTIC_REVIEW_MODE",
@@ -187,21 +161,6 @@ class RuntimeSettings:
         ).strip()
         if structured_mode not in {"json_schema", "json_object_schema_prompt"}:
             raise ConfigurationError("无效Ark结构化输出模式")
-        resolved_config_root = (
-            _config_root() if config_root is None else config_root.expanduser().resolve()
-        )
-        configured_seed_root = Path(
-            values.get("CAT_VIDEO_EVENT_SEED_ROOT", "content/events")
-        ).expanduser()
-        event_seed_root = (
-            configured_seed_root.resolve()
-            if configured_seed_root.is_absolute()
-            else (resolved_config_root / configured_seed_root).resolve()
-        )
-        if not event_seed_root.is_dir():
-            configuration_warnings.append(
-                f"事件种子目录不存在：{event_seed_root}；导演将使用原创模式"
-            )
         return cls(
             ark_api_key=values.get("ARK_API_KEY") or None,
             ark_base_url=values.get("ARK_BASE_URL", _STANDARD_URL).rstrip("/"),
@@ -234,9 +193,7 @@ class RuntimeSettings:
             ark_poll_interval_seconds=poll_interval,
             ark_task_timeout_seconds=timeout,
             ark_image_request_timeout_seconds=image_request_timeout,
-            image_review_mode=image_review_mode,
             video_semantic_review_mode=video_review_mode,
-            configuration_warnings=tuple(configuration_warnings),
             ffmpeg_path=_executable(
                 values.get("FFMPEG_PATH"),
                 "ffmpeg",
@@ -249,8 +206,6 @@ class RuntimeSettings:
             ),
             work_root=Path(values.get("MEDIA_WORK_ROOT", "var/work")),
             asset_root=Path(values.get("MEDIA_ASSET_ROOT", "var/assets")),
-            delivery_root=Path(values.get("DELIVERY_OUTPUT_ROOT", "output")),
-            event_seed_root=event_seed_root,
         )
 
     @property
@@ -306,7 +261,6 @@ class RuntimeSettings:
             "arkBaseUrlProfile": ("standard" if self.ark_base_url == _STANDARD_URL else "unknown"),
             "arkImageModel": self.ark_image_model,
             "arkVideoModel": self.ark_video_model,
-            "supportsVideoExtension": self.ark_video_model == "doubao-seedance-2-0-260128",
             "arkPlanningModel": self.ark_planning_model,
             "arkReviewModel": self.ark_review_model,
             "arkVideoResolution": self.ark_video_resolution,
@@ -316,18 +270,13 @@ class RuntimeSettings:
             "arkPollIntervalSeconds": self.ark_poll_interval_seconds,
             "arkTaskTimeoutSeconds": self.ark_task_timeout_seconds,
             "arkImageRequestTimeoutSeconds": self.ark_image_request_timeout_seconds,
-            "imageReviewMode": self.image_review_mode.value,
             "videoSemanticReviewMode": self.video_semantic_review_mode,
-            "configurationWarnings": list(self.configuration_warnings),
-            "eventSeedRoot": str(self.event_seed_root),
-            "eventSeedRootAvailable": self.event_seed_root.is_dir(),
             "generationConfigurationValid": not issues,
             "generationConfigurationIssues": issues,
             "ffmpeg": None if self.ffmpeg_path is None else str(self.ffmpeg_path),
             "ffprobe": None if self.ffprobe_path is None else str(self.ffprobe_path),
             "workRoot": str(self.work_root),
             "assetRoot": str(self.asset_root),
-            "deliveryRoot": str(self.delivery_root),
         }
 
 

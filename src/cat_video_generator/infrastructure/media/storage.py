@@ -1,42 +1,35 @@
-"""供应商临时URL到本地内容寻址资产的原子落盘。"""
+"""Immutable local media storage and non-destructive FFmpeg operations."""
 
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import shutil
 import subprocess
 import uuid
-from datetime import date
 from pathlib import Path
 
 import httpx
 from PIL import Image
 
-from ...application.ports import DeliveryBuild, LandedAsset, StoredAsset
-from ...domain.contracts import Slot
+from ...application.ports import LandedAsset
 
 
 class AssetStorageError(RuntimeError):
-    """媒体下载或原子落盘失败。"""
+    pass
 
 
 class LocalAssetStore:
-    """同盘`.part`下载和SHA-256内容寻址存储。"""
-
     def __init__(
         self,
         *,
         work_root: Path,
         asset_root: Path,
-        delivery_root: Path,
         ffmpeg_path: Path | None = None,
         max_bytes: int = 2_000_000_000,
     ) -> None:
         self._work_root = work_root.expanduser().resolve()
         self._asset_root = asset_root.expanduser().resolve()
-        self._delivery_root = delivery_root.expanduser().resolve()
         self._ffmpeg_path = None if ffmpeg_path is None else ffmpeg_path.expanduser().resolve()
         self._max_bytes = max_bytes
         if (
@@ -44,7 +37,7 @@ class LocalAssetStore:
             and self._asset_root.drive
             and self._work_root.drive.lower() != self._asset_root.drive.lower()
         ):
-            raise AssetStorageError("工作目录和资产目录必须位于同一磁盘")
+            raise AssetStorageError("work and asset roots must be on the same volume")
 
     def download(self, url: str, *, suffix: str) -> LandedAsset:
         self._work_root.mkdir(parents=True, exist_ok=True)
@@ -54,8 +47,7 @@ class LocalAssetStore:
         try:
             with (
                 httpx.Client(
-                    follow_redirects=True,
-                    timeout=httpx.Timeout(120.0, connect=15.0),
+                    follow_redirects=True, timeout=httpx.Timeout(120, connect=15)
                 ) as client,
                 client.stream("GET", url) as response,
             ):
@@ -68,132 +60,105 @@ class LocalAssetStore:
                         digest.update(chunk)
                         byte_size += len(chunk)
                         if byte_size > self._max_bytes:
-                            raise AssetStorageError("供应商媒体超过大小上限")
+                            raise AssetStorageError("provider media exceeds configured size limit")
                     output.flush()
                     os.fsync(output.fileno())
             if byte_size == 0:
-                raise AssetStorageError("供应商返回了空文件")
-            sha256 = digest.hexdigest()
+                raise AssetStorageError("provider returned an empty media file")
             extension = suffix if suffix.startswith(".") else f".{suffix}"
-            destination = (
-                self._asset_root
-                / "generated"
-                / "sha256"
-                / sha256[:2]
-                / f"{sha256}{extension.lower()}"
-            )
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if destination.exists():
-                temporary.unlink()
-            else:
-                # 只有完整下载并fsync后才原子改名，任何中断都不会留下看似
-                # 完整的正式资产。
-                os.replace(temporary, destination)
-            return LandedAsset(destination, sha256, byte_size)
+            return self._land_temp(temporary, digest.hexdigest(), byte_size, extension)
         except (OSError, httpx.HTTPError) as exc:
-            raise AssetStorageError(f"媒体下载失败: {exc}") from exc
+            raise AssetStorageError(f"media download failed: {exc}") from exc
         finally:
-            if temporary.exists():
-                temporary.unlink()
+            temporary.unlink(missing_ok=True)
 
     def import_local(self, path: Path) -> LandedAsset:
         source = path.expanduser().resolve()
         if not source.is_file():
-            raise AssetStorageError(f"本地素材不存在: {source}")
+            raise AssetStorageError(f"local media does not exist: {source}")
         digest = hashlib.sha256(source.read_bytes()).hexdigest()
-        suffix = source.suffix.lower()
-        destination = self._asset_root / "imported" / "sha256" / digest[:2] / f"{digest}{suffix}"
+        destination = (
+            self._asset_root
+            / "imported"
+            / "sha256"
+            / digest[:2]
+            / f"{digest}{source.suffix.lower()}"
+        )
         destination.parent.mkdir(parents=True, exist_ok=True)
         if not destination.exists():
             temporary = destination.with_suffix(destination.suffix + ".part")
             shutil.copy2(source, temporary)
             if hashlib.sha256(temporary.read_bytes()).hexdigest() != digest:
-                temporary.unlink()
-                raise AssetStorageError("本地素材复制后哈希不一致")
+                temporary.unlink(missing_ok=True)
+                raise AssetStorageError("copied media hash does not match source")
             os.replace(temporary, destination)
         return LandedAsset(destination, digest, destination.stat().st_size)
 
-    def crop_local(
-        self,
-        path: Path,
-        *,
-        box: tuple[int, int, int, int],
-    ) -> LandedAsset:
-        """按像素确定性裁剪Canon，不调用生成模型也不改变主体身份。"""
-
+    def crop_local(self, path: Path, *, box: tuple[int, int, int, int]) -> LandedAsset:
         source = path.expanduser().resolve()
-        if not source.is_file():
-            raise AssetStorageError(f"本地素材不存在: {source}")
         self._work_root.mkdir(parents=True, exist_ok=True)
         temporary = self._work_root / f".crop-{uuid.uuid4().hex}.png"
         try:
             with Image.open(source) as image:
-                width, height = image.size
                 left, top, right, bottom = box
-                if not (0 <= left < right <= width and 0 <= top < bottom <= height):
-                    raise AssetStorageError(f"裁剪框{box}超出素材尺寸{width}x{height}")
+                if not (0 <= left < right <= image.width and 0 <= top < bottom <= image.height):
+                    raise AssetStorageError("crop box is outside the source image")
                 image.crop(box).save(temporary, format="PNG")
             return self.import_local(temporary)
         finally:
             temporary.unlink(missing_ok=True)
 
     def concatenate_videos(self, paths: tuple[Path, ...]) -> LandedAsset:
-        """顺序合并Ark续写尾段，不重新编码画面或声音。
+        """Build an arbitrary-length single-track master with native clip audio.
 
-        标准Ark接口把reference_video续写结果作为新的尾段返回。这里只负责把同规格的原片与
-        尾段封装为一个交付MP4；任何编码不兼容都会显式失败，不会偷偷转码或掩盖断点。
+        Video uses stable hard cuts.  Each source audio stream receives an 80ms
+        edge fade before concat, avoiding clicks without changing EDL duration.
         """
 
-        if self._ffmpeg_path is None:
-            raise AssetStorageError("视频续写成片需要配置ffmpeg")
-        if len(paths) not in {2, 3}:
-            raise AssetStorageError("视频续写只允许合并2或3个连续区段")
+        ffmpeg = self._require_ffmpeg()
+        if not paths:
+            raise AssetStorageError("a project sequence needs at least one clip")
         resolved = tuple(path.expanduser().resolve() for path in paths)
         if any(not path.is_file() for path in resolved):
-            raise AssetStorageError("视频续写区段文件缺失")
+            raise AssetStorageError("a project sequence source clip is missing")
         self._work_root.mkdir(parents=True, exist_ok=True)
-        token = uuid.uuid4().hex
-        manifest = self._work_root / f".concat-{token}.txt"
-        output = self._work_root / f".concat-{token}.mp4"
+        output = self._work_root / f".sequence-{uuid.uuid4().hex}.mp4"
+        command = [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y"]
+        for path in resolved:
+            command.extend(("-i", str(path)))
+        filters: list[str] = []
+        inputs: list[str] = []
+        for index in range(len(resolved)):
+            filters.append(f"[{index}:v]setpts=PTS-STARTPTS,setsar=1,format=yuv420p[v{index}]")
+            filters.append(
+                f"[{index}:a]asetpts=PTS-STARTPTS,afade=t=in:st=0:d=0.08,"
+                f"areverse,afade=t=in:st=0:d=0.08,areverse[a{index}]"
+            )
+            inputs.append(f"[v{index}][a{index}]")
+        filters.append(f"{''.join(inputs)}concat=n={len(resolved)}:v=1:a=1[vout][aout]")
+        command.extend(
+            (
+                "-filter_complex",
+                ";".join(filters),
+                "-map",
+                "[vout]",
+                "-map",
+                "[aout]",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                str(output),
+            )
+        )
         try:
-            lines = []
-            for path in resolved:
-                value = path.as_posix().replace("'", "'\\''")
-                lines.append(f"file '{value}'")
-            manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            subprocess.run(
-                [
-                    str(self._ffmpeg_path),
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-y",
-                    "-f",
-                    "concat",
-                    "-safe",
-                    "0",
-                    "-i",
-                    str(manifest),
-                    "-c",
-                    "copy",
-                    str(output),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                timeout=600,
-            )
+            _run(command, timeout=1800, label="project sequence")
             return self.import_local(output)
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            detail = (
-                exc.stderr.strip()[-1000:]
-                if isinstance(exc, subprocess.CalledProcessError)
-                else str(exc)
-            )
-            raise AssetStorageError(f"视频续写区段合并失败: {detail}") from exc
         finally:
-            manifest.unlink(missing_ok=True)
             output.unlink(missing_ok=True)
 
     def render_range_replacement(
@@ -205,33 +170,30 @@ class LocalAssetStore:
         start_ms: int,
         end_ms: int,
     ) -> LandedAsset:
-        """替换单个视频区间并完整继承基础视频音轨。"""
+        """Replace image content for one interval and preserve the base audio track."""
 
-        if self._ffmpeg_path is None:
-            raise AssetStorageError("视频区间替换需要配置ffmpeg")
+        ffmpeg = self._require_ffmpeg()
         base = base_path.expanduser().resolve()
         replacement = replacement_path.expanduser().resolve()
         if not base.is_file() or not replacement.is_file():
-            raise AssetStorageError("区间替换的基础视频或生成片段不存在")
+            raise AssetStorageError("range edit source or replacement is missing")
         if not 0 <= start_ms < end_ms or replacement_duration_ms <= 0:
-            raise AssetStorageError("区间替换时间参数不合法")
+            raise AssetStorageError("range edit timing is invalid")
         self._work_root.mkdir(parents=True, exist_ok=True)
         output = self._work_root / f".range-edit-{uuid.uuid4().hex}.mp4"
         target_seconds = (end_ms - start_ms) / 1000
         replacement_seconds = replacement_duration_ms / 1000
-        ratio = target_seconds / replacement_seconds
         filters: list[str] = []
         inputs: list[str] = []
         if start_ms > 0:
             filters.append(
-                f"[0:v]trim=start=0:end={start_ms / 1000:.3f},setpts=PTS-STARTPTS,"
+                f"[0:v]trim=0:{start_ms / 1000:.3f},setpts=PTS-STARTPTS,"
                 "settb=AVTB,fps=30,setsar=1,format=yuv420p[vpre]"
             )
             inputs.append("[vpre]")
+        ratio = target_seconds / replacement_seconds
         filters.append(
-            "[1:v]"
-            f"trim=start=0:end={replacement_seconds:.3f},"
-            f"setpts={ratio:.9f}*(PTS-STARTPTS),"
+            f"[1:v]trim=0:{replacement_seconds:.3f},setpts={ratio:.9f}*(PTS-STARTPTS),"
             "settb=AVTB,fps=30,setsar=1,format=yuv420p[vreplace]"
         )
         inputs.append("[vreplace]")
@@ -241,159 +203,71 @@ class LocalAssetStore:
         )
         inputs.append("[vpost]")
         filters.append(f"{''.join(inputs)}concat=n={len(inputs)}:v=1:a=0[vout]")
+        command = [
+            str(ffmpeg),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(base),
+            "-i",
+            str(replacement),
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            "[vout]",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(output),
+        ]
         try:
-            subprocess.run(
-                [
-                    str(self._ffmpeg_path),
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-y",
-                    "-i",
-                    str(base),
-                    "-i",
-                    str(replacement),
-                    "-filter_complex",
-                    ";".join(filters),
-                    "-map",
-                    "[vout]",
-                    "-map",
-                    "0:a?",
-                    "-c:v",
-                    "libx264",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-c:a",
-                    "copy",
-                    "-movflags",
-                    "+faststart",
-                    str(output),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                timeout=900,
-            )
+            _run(command, timeout=900, label="range edit")
             return self.import_local(output)
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            detail = (
-                exc.stderr.strip()[-1000:]
-                if isinstance(exc, subprocess.CalledProcessError)
-                else str(exc)
-            )
-            raise AssetStorageError(f"视频区间替换失败: {detail}") from exc
         finally:
             output.unlink(missing_ok=True)
 
-    def extract_video_range(
-        self,
-        *,
-        source_path: Path,
-        start_ms: int,
-        end_ms: int,
+    def _land_temp(
+        self, temporary: Path, sha256: str, byte_size: int, extension: str
     ) -> LandedAsset:
-        """精确截取供应商编辑结果中的替换片段，不保留其音轨。"""
-
-        if self._ffmpeg_path is None:
-            raise AssetStorageError("视频区间截取需要配置ffmpeg")
-        source = source_path.expanduser().resolve()
-        if not source.is_file() or not 0 <= start_ms < end_ms:
-            raise AssetStorageError("视频区间截取参数不合法")
-        self._work_root.mkdir(parents=True, exist_ok=True)
-        output = self._work_root / f".range-clip-{uuid.uuid4().hex}.mp4"
-        try:
-            subprocess.run(
-                [
-                    str(self._ffmpeg_path),
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-y",
-                    "-ss",
-                    f"{start_ms / 1000:.3f}",
-                    "-to",
-                    f"{end_ms / 1000:.3f}",
-                    "-i",
-                    str(source),
-                    "-an",
-                    "-c:v",
-                    "libx264",
-                    "-pix_fmt",
-                    "yuv420p",
-                    str(output),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                timeout=600,
-            )
-            return self.import_local(output)
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            detail = (
-                exc.stderr.strip()[-1000:]
-                if isinstance(exc, subprocess.CalledProcessError)
-                else str(exc)
-            )
-            raise AssetStorageError(f"视频区间截取失败: {detail}") from exc
-        finally:
-            output.unlink(missing_ok=True)
-
-    def build_delivery(
-        self,
-        *,
-        content_date: date,
-        run_id: uuid.UUID,
-        revision: int,
-        items: tuple[tuple[Slot, StoredAsset], ...],
-    ) -> DeliveryBuild:
-        if [slot.sort_order for slot, _ in items] != [1, 2, 3]:
-            raise AssetStorageError("交付必须严格包含morning、noon、evening")
-        parent = self._delivery_root / content_date.isoformat() / str(run_id)
-        destination = parent / f"delivery-r{revision}"
+        destination = (
+            self._asset_root / "generated" / "sha256" / sha256[:2] / f"{sha256}{extension.lower()}"
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists():
-            raise AssetStorageError(f"交付目录已经存在: {destination}")
-        building = parent / f".building-{uuid.uuid4().hex}"
-        building.mkdir(parents=True, exist_ok=False)
-        manifest_items: list[dict[str, str | int]] = []
-        try:
-            for slot, asset in items:
-                filename = f"{slot.sort_order:02d}-{slot.value}.mp4"
-                target = building / filename
-                shutil.copy2(asset.path, target)
-                digest = hashlib.sha256(target.read_bytes()).hexdigest()
-                if digest != asset.sha256:
-                    raise AssetStorageError(f"{filename}复制后哈希不一致")
-                manifest_items.append(
-                    {
-                        "slot": slot.value,
-                        "sortOrder": slot.sort_order,
-                        "filename": filename,
-                        "sha256": digest,
-                        "assetId": str(asset.id),
-                    }
-                )
-            manifest = {
-                "runId": str(run_id),
-                "contentDate": content_date.isoformat(),
-                "revision": revision,
-                "items": manifest_items,
-            }
-            manifest_path = building / "manifest.json"
-            manifest_path.write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-            parent.mkdir(parents=True, exist_ok=True)
-            os.replace(building, destination)
-            return DeliveryBuild(
-                path=destination,
-                manifest_sha256=manifest_hash,
-                items=tuple(manifest_items),
-            )
-        except Exception:
-            if building.exists():
-                shutil.rmtree(building)
-            raise
+            temporary.unlink(missing_ok=True)
+        else:
+            os.replace(temporary, destination)
+        return LandedAsset(destination, sha256, byte_size)
+
+    def _require_ffmpeg(self) -> Path:
+        if self._ffmpeg_path is None or not self._ffmpeg_path.is_file():
+            raise AssetStorageError("FFmpeg is required for local video editing")
+        return self._ffmpeg_path
+
+
+def _run(command: list[str], *, timeout: int, label: str) -> None:
+    try:
+        subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        detail = (
+            exc.stderr.strip()[-1200:]
+            if isinstance(exc, subprocess.CalledProcessError)
+            else str(exc)
+        )
+        raise AssetStorageError(f"{label} failed: {detail}") from exc

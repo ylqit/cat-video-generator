@@ -20,7 +20,7 @@ Linux 服务器需要 Docker Engine 和 Docker Compose v2。进入项目目录�
 ```bash
 cp .env.example .env
 chmod 600 .env
-mkdir -p docker-data/work docker-data/assets docker-data/output
+mkdir -p docker-data/work docker-data/assets docker-data/diagnostics
 ```
 
 在 `.env` 中填写 Ark 和 PostgreSQL 配置。不要把 `.env` 提交到 Git，也不要写入镜像。
@@ -29,8 +29,6 @@ Compose 会在容器中覆盖以下路径：
 ```text
 MEDIA_WORK_ROOT=/data/work
 MEDIA_ASSET_ROOT=/data/assets
-DELIVERY_OUTPUT_ROOT=/data/output
-CAT_VIDEO_EVENT_SEED_ROOT=/app/content/events
 FFMPEG_PATH=/usr/bin/ffmpeg
 FFPROBE_PATH=/usr/bin/ffprobe
 ```
@@ -42,6 +40,15 @@ sudo chown -R 10001:10001 docker-data
 ```
 
 ## 构建与启动
+
+已有 V3 数据库升级前，先使用同一 `.env` 执行只运行一次的归档清理；全新数据库可跳过：
+
+```bash
+docker compose build
+docker compose run --rm app python scripts/archive_v3_and_clear.py
+```
+
+Manifest 会写入宿主机 `docker-data/diagnostics`。不要绕过 `0015` 的旧业务记录检查。
 
 ```bash
 docker compose build
@@ -87,10 +94,11 @@ docker compose down
 `docker compose down` 不会删除 `docker-data`。不要使用 `docker compose down -v`，也不要
 手工删除持久目录。
 
-## Canon 迁移
+## Canon 与项目
 
-本轮不迁移历史视频。将人物、猫咪和画风源图复制到服务器，并在 Web 的 Canon 页面
-重新上传以下语义资产：
+V4不迁移旧生产项目，但 `0015` 会原样保留数据库中已经批准的 Canon 记录与本地文件。
+Canon 页面只读展示这些长期资产；每个新项目都可在镜头工作台上传外部参考图，并明确
+指定为生成参考或最终锚点，不要求先建立新的全局 Canon。
 
 ```text
 person:headshot
@@ -103,8 +111,7 @@ style:indoor
 style:outdoor
 ```
 
-新上传文件会写入 `/data/assets`，并成为相同 `semantic_key` 下最新的已批准版本。确认
-八项资产均可预览后，再创建新的全天 Run。
+项目上传文件会写入 `/data/assets`。确认迁移保留的 Canon 可以预览后，再创建镜头片段项目。
 
 ## 本地开发
 

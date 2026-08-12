@@ -86,9 +86,7 @@ def upgrade() -> None:
             "audio_policy = 'preserve_original'",
             name="ck_video_sequences_audio_policy",
         ),
-        sa.UniqueConstraint(
-            "episode_id", "revision", name="uq_video_sequences_episode_revision"
-        ),
+        sa.UniqueConstraint("episode_id", "revision", name="uq_video_sequences_episode_revision"),
         schema=schema,
     )
     op.create_index(

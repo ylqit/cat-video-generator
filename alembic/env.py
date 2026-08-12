@@ -28,6 +28,7 @@ def run_migrations_offline() -> None:
 
 
 def _run_migrations(connection: Connection, schema: str) -> None:
+    config.attributes["schema"] = schema
     context.configure(
         connection=connection,
         target_metadata=target_metadata,

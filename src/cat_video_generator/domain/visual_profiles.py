@@ -1,12 +1,10 @@
 """系列人物、猫咪与画风的长期视觉档案。
 
-本模块只描述跨 Run 稳定的视觉不变量，不保存服装、鞋帽、背包等剧情外观。
+本模块只描述跨项目稳定的视觉不变量，不保存服装、鞋帽、背包等场景外观。
 这些档案属于业务资产元数据，不从 ``.env`` 读取，也不依赖数据库或 Ark。
 """
 
 from __future__ import annotations
-
-import hashlib
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -25,91 +23,14 @@ class SeriesVisualProfile(VisualProfileModel):
     person_hair: str = Field(min_length=4, max_length=160)
     person_body: str = Field(min_length=4, max_length=160)
     cat_identity: str = Field(min_length=8, max_length=300)
-    person_personality: str = Field(
-        default="好奇心旺盛、做事认真，容易被小意外逗笑",
-        min_length=8,
-        max_length=200,
-    )
-    cat_personality: str = Field(
-        default="表面高冷、其实贪玩，常常先假装不在意再忍不住凑近的反差萌",
-        min_length=8,
-        max_length=200,
-    )
-    humor_style: str = Field(
-        default="每集至少一个意外、反差或幽默节拍，靠可见动作与表情呈现，不靠对白",
-        min_length=8,
-        max_length=200,
-    )
-    cat_motion_rules: str = Field(
-        default=(
-            "猫咪保持真实猫科生物力学：行走、坐卧、跳跃、攀爬均自然完成；允许以后腿"
-            "支撑、前爪短暂搭靠人物膝部或低矮物体，也允许拨、按、扶、轻拍；禁止无支撑"
-            "直立、双足行走、拟人行走或人手式抓握，移动物品一律用嘴叼"
-        ),
-        min_length=8,
-        max_length=300,
-    )
-    person_reference_keys: tuple[str, str] = (
-        "person:headshot",
-        "person:fullbody",
-    )
-    mutable_appearance: tuple[str, ...] = (
-        "衣服",
-        "鞋",
-        "帽子",
-        "外套",
-        "背包",
-        "配饰",
-    )
-    forbidden_identity_rewrites: tuple[str, ...] = (
-        "固定女孩",
-        "固定男孩",
-        "少女",
-        "少年",
-        "马尾",
-        "发髻",
-        "妆容",
-    )
-
-    def fingerprint(self) -> str:
-        """生成事件种子筛选和规划幂等使用的稳定摘要。"""
-
-        return hashlib.sha256(self.model_dump_json(exclude_none=True).encode("utf-8")).hexdigest()
-
-
-class CreativeProfileOverride(VisualProfileModel):
-    """单个Run可覆盖的行为偏好；不允许改写人物或猫咪身份。"""
-
-    person_personality: str | None = Field(default=None, min_length=4, max_length=200)
-    cat_personality: str | None = Field(default=None, min_length=4, max_length=200)
-    humor_style: str | None = Field(default=None, min_length=4, max_length=200)
-
-    def apply_to(self, profile: SeriesVisualProfile) -> SeriesVisualProfile:
-        """在不改变Canon边界的前提下生成本Run有效档案。"""
-
-        updates = self.model_dump(exclude_none=True)
-        return profile.model_copy(update=updates) if updates else profile
 
 
 class StyleProfile(VisualProfileModel):
-    """可执行的系列画风定义与允许使用的参考资产语义键。"""
+    """可执行的系列画风定义。"""
 
     profile_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{1,79}$")
     positive_features: tuple[str, ...] = Field(min_length=3, max_length=10)
     excluded_features: tuple[str, ...] = Field(min_length=2, max_length=10)
-    line_reference_key: str = "style:line_texture"
-    indoor_reference_key: str = "style:indoor"
-    outdoor_reference_key: str = "style:outdoor"
-
-    @property
-    def reference_keys(self) -> tuple[str, str, str]:
-        """返回生产链唯一允许使用的定稿画风资产键。"""
-
-        return (
-            self.line_reference_key,
-            self.indoor_reference_key,
-            self.outdoor_reference_key,
-        )
 
     def prompt_positive(self) -> str:
         return "、".join(self.positive_features)
@@ -132,9 +53,6 @@ DEFAULT_SERIES_VISUAL_PROFILE = SeriesVisualProfile(
         "同一只圆润灰白短毛猫，保持白色口鼻胸腹与四肢、灰色头顶和背部虎斑、"
         "灰白环纹、自然中等粗细且从后躯正常连接的尾巴、圆形琥珀棕眼睛及稳定体型"
     ),
-    person_personality="好奇心旺盛、做事认真，容易被小意外逗笑",
-    cat_personality="表面高冷、其实贪玩，常常先假装不在意再忍不住凑近的反差萌",
-    humor_style="每集至少一个意外、反差或幽默节拍，靠可见动作与表情而非对白",
 )
 
 DEFAULT_STYLE_PROFILE = StyleProfile(

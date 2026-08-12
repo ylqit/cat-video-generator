@@ -1,38 +1,22 @@
 <script setup lang="ts">
-import { useRoute } from "vue-router";
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { useRoute } from "vue-router";
 
 import { api } from "./api/client";
-import type { HealthStatus } from "./api/types";
+import type { HealthDto } from "./api/types";
 
 const route = useRoute();
-const active = computed(() => route.path);
-
-/** 后端健康状态：绿=数据库连通且迁移最新，黄=迁移落后，红=不可达。 */
-const health = ref<HealthStatus | null>(null);
+const health = ref<HealthDto | null>(null);
 const unreachable = ref(false);
 let timer: number | undefined;
-
-const healthColor = computed(() => {
-  if (unreachable.value) {
-    return "#f56c6c";
-  }
-  if (!health.value) {
-    return "#8a8f99";
-  }
-  return health.value.ready ? "#67c23a" : "#e6a23c";
+const statusText = computed(() => {
+  if (unreachable.value) return "后端不可达";
+  if (!health.value) return "检查中…";
+  return health.value.ready
+    ? `数据库已就绪 · ${health.value.alembicRevision}`
+    : `迁移不一致 · ${health.value.alembicRevision}`;
 });
-
-const healthText = computed(() => {
-  if (unreachable.value) {
-    return "后端不可达";
-  }
-  if (!health.value) {
-    return "检查中…";
-  }
-  const db = String(health.value.database ?? "");
-  return health.value.ready ? `已连接 ${db}` : `${db} 迁移落后`;
-});
+const statusColor = computed(() => unreachable.value ? "#f56c6c" : health.value?.ready ? "#67c23a" : "#e6a23c");
 
 async function checkHealth() {
   try {
@@ -51,39 +35,20 @@ onBeforeUnmount(() => window.clearInterval(timer));
 </script>
 
 <template>
-  <el-container style="height: 100%">
-    <el-aside
-      width="200px"
-      style="border-right: 1px solid #26282e; display: flex; flex-direction: column"
-    >
-      <div style="padding: 18px 16px; font-weight: 600">猫咪视频生产台</div>
-      <el-menu
-        :default-active="active"
-        router
-        background-color="transparent"
-        style="flex: 1"
-      >
-        <el-menu-item index="/studio">生产工作台</el-menu-item>
-        <el-menu-item index="/runs">生活故事项目</el-menu-item>
+  <el-container class="shell">
+    <el-aside width="190px" class="sidebar">
+      <div class="brand">猫咪视频工作台</div>
+      <el-menu :default-active="route.path" router background-color="transparent">
+        <el-menu-item index="/studio">镜头生产</el-menu-item>
+        <el-menu-item index="/projects">项目列表</el-menu-item>
         <el-menu-item index="/canon">Canon 资产</el-menu-item>
       </el-menu>
-      <div
-        style="padding: 12px 16px; font-size: 12px; color: #8a8f99; display: flex; align-items: center; gap: 6px"
-      >
-        <span
-          :style="{
-            width: '8px',
-            height: '8px',
-            borderRadius: '50%',
-            background: healthColor,
-            display: 'inline-block',
-          }"
-        />
-        {{ healthText }}
-      </div>
+      <div class="health"><i :style="{ background: statusColor }" />{{ statusText }}</div>
     </el-aside>
-    <el-main style="padding: 0; overflow-y: auto">
-      <router-view />
-    </el-main>
+    <el-main class="content"><router-view /></el-main>
   </el-container>
 </template>
+
+<style scoped>
+.shell { height: 100%; }.sidebar { border-right: 1px solid #252a34; background: #101319; display: flex; flex-direction: column; }.brand { padding: 20px 16px; font-weight: 700; }.sidebar .el-menu { flex: 1; border-right: 0; }.health { padding: 12px; font-size: 11px; color: #8c95a6; display: flex; align-items: center; gap: 6px; }.health i { width: 8px; height: 8px; border-radius: 50%; }.content { padding: 0; background: #0d1016; }
+</style>

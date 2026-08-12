@@ -1,32 +1,5 @@
 """Ark Responses 视觉审核使用的严格结构化输出 Schema。"""
 
-IMAGE_REVIEW_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "identityOk": {"type": "boolean"},
-        "styleOk": {"type": "boolean"},
-        "appearanceOk": {"type": "boolean"},
-        "compositionOk": {"type": "boolean"},
-        "constraintsOk": {"type": "boolean"},
-        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-        "violations": {"type": "array", "items": {"type": "string"}},
-        "warnings": {"type": "array", "items": {"type": "string"}},
-        "evidence": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": [
-        "identityOk",
-        "styleOk",
-        "appearanceOk",
-        "compositionOk",
-        "constraintsOk",
-        "confidence",
-        "violations",
-        "warnings",
-        "evidence",
-    ],
-    "additionalProperties": False,
-}
-
 VIDEO_DIAGNOSTIC_SCHEMA = {
     "type": "object",
     "properties": {
@@ -36,9 +9,6 @@ VIDEO_DIAGNOSTIC_SCHEMA = {
         "narrativeOrderOk": {"type": "boolean"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "violations": {"type": "array", "items": {"type": "string"}},
-        "actualOutcome": {"type": "string", "minLength": 8},
-        "carryForward": {"type": "array", "items": {"type": "string"}},
-        "doNotCarryForward": {"type": "array", "items": {"type": "string"}},
         "evidence": {
             "type": "array",
             "items": {
@@ -66,9 +36,6 @@ VIDEO_DIAGNOSTIC_SCHEMA = {
         "narrativeOrderOk",
         "confidence",
         "violations",
-        "actualOutcome",
-        "carryForward",
-        "doNotCarryForward",
         "evidence",
         "shotBoundariesSeconds",
     ],

@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
 
 from ...application.ports import StoredAsset
 
@@ -25,7 +25,7 @@ class FrameExtractionError(RuntimeError):
 
 
 class FfmpegFrameExtractor:
-    """从已通过技术QC的视频均匀抽取只读诊断帧。
+    """抽取首尾、近似均匀帧和显著变化帧用于只读诊断。
 
     本类服务最终视频语义诊断与用户选区的精确边界帧提取，不承担视频拼接或转码。
     临时帧由调用方在审核或边界资产落盘后删除。
@@ -56,7 +56,8 @@ class FfmpegFrameExtractor:
         self._work_root.mkdir(parents=True, exist_ok=True)
         token = uuid.uuid4().hex
         pattern = self._work_root / f".review-{token}-%02d.png"
-        frame_rate = count / (duration_ms / 1000)
+        sample_count = min(30, max(count * 2, count))
+        frame_rate = sample_count / (duration_ms / 1000)
         try:
             _run_ffmpeg(
                 self._ffmpeg_path,
@@ -66,13 +67,33 @@ class FfmpegFrameExtractor:
                     "-vf",
                     f"fps={frame_rate:.8f}",
                     "-frames:v",
-                    str(count),
+                    str(sample_count),
                     str(pattern),
                 ],
             )
-            frames = tuple(sorted(self._work_root.glob(f".review-{token}-*.png")))
-            if len(frames) != count:
-                raise FrameExtractionError(f"期望抽取{count}帧，实际得到{len(frames)}帧")
+            candidates = tuple(sorted(self._work_root.glob(f".review-{token}-*.png")))
+            if len(candidates) < count:
+                raise FrameExtractionError(f"期望至少抽取{count}帧，实际得到{len(candidates)}帧")
+            uniform_count = max(2, count - 2)
+            selected = {
+                round(index * (len(candidates) - 1) / (uniform_count - 1))
+                for index in range(uniform_count)
+            }
+            scored_changes: list[tuple[float, int]] = []
+            previous = _small_rgb(candidates[0])
+            for index, path in enumerate(candidates[1:], 1):
+                current = _small_rgb(path)
+                score = sum(ImageStat.Stat(ImageChops.difference(previous, current)).mean)
+                scored_changes.append((score, index))
+                previous = current
+            for _score, index in sorted(scored_changes, reverse=True):
+                selected.add(index)
+                if len(selected) == count:
+                    break
+            frames = tuple(candidates[index] for index in sorted(selected))
+            for path in candidates:
+                if path not in frames:
+                    path.unlink(missing_ok=True)
             return frames
         except Exception:
             for frame in self._work_root.glob(f".review-{token}-*.png"):
@@ -125,6 +146,11 @@ class FfmpegFrameExtractor:
             for frame in frames:
                 frame.unlink(missing_ok=True)
             raise
+
+
+def _small_rgb(path: Path) -> Image.Image:
+    with Image.open(path) as image:
+        return image.convert("RGB").resize((64, 64)).copy()
 
 
 class FfprobeMediaProbe:
@@ -196,12 +222,6 @@ class FfprobeMediaProbe:
             failures.append("missing_video")
         if require_audio and audio is None:
             failures.append("missing_audio")
-        if "mp4" not in str(format_info.get("format_name", "")):
-            failures.append("container_not_mp4")
-        if video is not None and video.get("codec_name") != "h264":
-            failures.append("video_codec_not_h264")
-        if audio is not None and audio.get("codec_name") != "aac":
-            failures.append("audio_codec_not_aac")
         if expected_width is None:
             failures.append("unsupported_expected_resolution")
         elif not isinstance(width, int) or abs(width - expected_width) > 16:

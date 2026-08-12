@@ -1,137 +1,43 @@
-# ADR-001：显式状态机与模块化单体
+# ADR-001：显式状态机与任意镜头队列
 
-状态：已采用。
+状态：已采用（V4）。
 
 ## 决策
 
-系统使用显式Python状态机、PostgreSQL、Pydantic、Ark网关、本地不可变媒体、
-FastAPI和Vue。日生产规模只有三个Episode，不引入LangGraph、AgentScope、
-Celery、Redis或第二套检查点。
+系统采用模块化单体、显式 Python 状态机、PostgreSQL、Pydantic、Ark 网关和本地不可变
+媒体，不引入 LangGraph、Celery、Redis 或第二套工作流状态源。
 
 ```mermaid
-flowchart TB
-  I["interfaces：CLI / FastAPI"] --> A["application：用例编排"]
-  A --> D["domain：契约 / Prompt / 状态机 / 渲染计划"]
-  X["infrastructure：PostgreSQL / Ark / 媒体 / ffprobe"] -. "实现 ports" .-> A
-  B["bootstrap.py：唯一组合根"] --> I
-  B --> A
-  B --> X
+flowchart LR
+  W["Web / FastAPI"] --> A["Application 用例"]
+  A --> D["Domain：项目 / 场景 / 镜头 / Prompt / 状态"]
+  A --> P["PostgreSQL Repository"]
+  A --> K["Ark Gateway"]
+  A --> M["本地媒体 / FFmpeg / ffprobe"]
 ```
 
-Domain不依赖框架或I/O；Application只依赖Domain和所需Port；Infrastructure不
-决定业务状态；接口层不直接写数据库或调用Ark。禁止只改名、转发参数或格式化
-路径的薄包装。
-
-## 两种剧情来源、两种规划模式与唯一生产模型
+## V4 事实模型
 
 ```text
-StoryProjectInput
-→ ProjectOutlineV3（仅theme_expand）
-→ EpisodeScript × 3
-→ RenderPlan（确定性推导）
+StoryProject(title)
+└─ Scene(order, title, sourceText, chapterLabel?, contextNote?)
+   └─ ShotCard(order, title, direction, durationSeconds, anchorMode, references)
 ```
 
-`StoryProjectInput`明确区分`theme_expand`与`episode_scripts`。前者调用一次总导演，
-输出固定命名的`episodes.morning/noon/evening`方向；后者直接保存用户原文，不创建
-Day Director Step，也不伪造总导演结果。完整三集粘贴由本地解析器预览并经用户确认，
-不触发任何供应商调用。契约V3不使用可重复的时段数组，因此不存在重复Noon或第四时段。
+删除总导演、自动三集、固定时段、场景路线、Episode、世界状态、强制故事板和长视频
+延展。完整镜头描述是创作事实；JSON 只保存排序、8～15 秒时长、锚点方式和用户明确
+选择的素材职责。
 
-Web默认使用`guided_sequential`：项目输入或Project Outline确认后只规划Morning；Morning最终视频
-人工批准并确认`AcceptedOutcome`后才解锁Noon，Evening同理。结果卡只保存实际成片
-事实，位于`production_runs.planning_json`，不增加第二套状态源。后续导演不会自动
-读取它；用户显式保存并启用`StoryConnection`后才注入关联正文。`auto_day`保留为
-无人值守批量模式。
+## 不变量
 
-可选总导演只定义全天边界、时段场景方向和交接意图，不设计手部动作、道具机制、镜头、
-活动焦点或时长；后两项始终以用户的`RunCreativeControls`为准。顺序模式的后续时段
-导演只读取用户启用的关联卡，不读取完整前序脚本、结果卡或视觉诊断。AI关联建议是
-独立付费节点，只产生草稿，不自动保存或加载。
+1. 一张镜头卡对应一个独立视频片段和自己的 attempt 历史。
+2. 收费 Step 与实际 Prompt 在一个短事务中创建，之后才调用 Provider。
+3. 相同输入复用原 Step；显式重做使用 `attempt+1`，旧证据不可覆盖。
+4. `submission_unknown` 禁止再提交，只能按任务列表对账；已有 Task ID 只能查询。
+5. 图片和视频均由人工批准；AI 视频抽帧分析只保存建议。
+6. 外部图片只在用户指定 usage、role 和目标节点后进入请求。
+7. 已批准镜头片段、区间版本和项目总片 Revision 都不可变、可比较、可回退。
+8. 区间重拍只在单一镜头内部进行；跨镜头必须拆分或重做镜头。
 
-已有剧本进入时段导演后只做镜头化适配。用户明确写出的核心事件、场景路线和结尾不得
-被改写；缺失的时段可在解锁后由用户补写，或显式选择“根据主题生成”；只有另行启用
-关联卡时才会参考前序。
-`progressive_locations`用于“家中准备→户外主活动→归家收束”，`single_location`
-用于同地点阶段递进，`adaptive`根据主题选择。场景路线是导演指导和诊断信息，不是
-对剧情审美的硬校验。
-
-`EpisodeScript`采用极简混合契约：完整长剧情是创作事实主体，活动焦点、时长、外观、
-关系弧、1～3段完整镜头描述和少量`hardConstraints`构成机器可读控制壳。镜头段落一次
-说明景别、机位、唯一运镜、站位、动作路径、接触结果和稳定切点；不会把同一剧情再
-拆成动作表和重复镜头字段。连接、承重、容器、接触、交接和穿戴等真正影响出片正确性
-的关系才进入硬约束，并由同一来源投影到图片、视频和审核Prompt。
-
-`storyText`服务于规划、人工阅读和媒体诊断；Seedance初始请求只接收当前RenderSection
-的镜头段落、相关硬约束、外观、声音和区段结尾。延展请求只承接输入视频末帧并执行
-下一RenderSection，不复述完整前文，避免触发动作重演。
-
-导演方法吸收`docs/healing-life-director`的“开场存在未完成小事件、猫咪先触发、每
-2～3秒刷新可见信息、结尾回应开场”和`docs/director`的“一镜一种运镜、路径/速度/
-接触/结果、稳定切点、必要素材、根因修复”。两份Docs只作为设计来源，不成为运行时
-依赖；固定女孩/服装/眼睛、九宫格、固定五镜、逐镜收费、FFmpeg创作拼接和重型世界
-状态均明确排除。
-
-系统不保存世界状态模拟、故事板面板、供应商输入模式、重复道具起终表或数据库资产ID。
-默认关系为猫咪推动主要可见信息、人物完成副活动或回应、两条线汇合回报。
-
-`RenderPlan`按精确时长确定性生成：8～15秒一个初始任务；16～30秒增加一次官方
-延展；31～45秒增加两次延展。首段只用批准开场锚点，延展只用上一版视频。模型
-不支持延展时在收费前失败，不自动换模型。供应商延展返回新增尾段，因此媒体边界
-只负责区段级QC与FFmpeg `stream copy`顺序封装；不重新编码，也不引入逐镜或
-`multi_clip`创作路径。
-
-## 模块所有权
-
-```text
-domain/contracts.py    StoryProjectInput、ProjectOutlineV3、EpisodeScript与极简导演壳
-domain/rendering.py    RenderPlan、VideoInputPlan与延展能力
-domain/prompts.py      导演、定妆、开场锚点、视频和审核Prompt
-domain/rules.py        少量身份、时长与跨时段硬门
-domain/workflow.py     Run/Episode/Step合法状态转换
-
-application/planning.py            可选总导演、已有剧本镜头化、guided逐时段导演与局部重规划
-application/visual_preparation.py  定妆图、开场锚点和图片审核
-application/video_execution.py     初始生成、官方延展、恢复、下载和QC
-application/production.py          流程编排
-application/retry.py               显式attempt、恢复和对账
-```
-
-## PostgreSQL与不变量
-
-八张生产事实表保持为`production_runs / episodes / workflow_steps / prompt_records /
-assets / reviews / delivery_packages / delivery_items`。`0013`另增加`video_sequences`，它只
-保存一个Episode的视频EDL revision，不成为工作流状态源，也不拆分Clip明细表。
-
-1. 收费意图和实际Prompt先在同一短事务落库，再调用Ark。
-2. PostgreSQL是唯一工作流状态源；JobRegistry只展示本进程异步任务。
-3. 幂等键包含操作、attempt和规范化输入哈希。
-4. `submission_unknown`冻结；已有Seedance Task ID只查询，不重复POST。
-5. 终态失败只能显式创建新attempt，`run-day`不暗中重试收费任务。
-6. 媒体通过`.part`下载、哈希校验和原子改名落盘。
-7. 图片和视频人工决定不可覆盖；相反决定必须产生新attempt。
-8. 最终视频停在`content_review`，三条人工批准后才能交付。
-9. 导演原始结构化JSON、可选归一化结果和警告保存在Step快照；查询层只在打开节点时
-   投影完整Trace，禁止把Key、Base64、签名URL或SDK对象写入数据库。
-10. 高级Prompt覆盖绑定当前脚本哈希；上游脚本变化后自动失效，旧attempt Prompt永久保留。
-11. 视频语义诊断只能生成建议与结果卡草稿；后续导演只有在用户另行启用关联卡时才可读取其正文。
-12. 前序媒体引用默认关闭，素材职责和使用节点由用户逐项确认；查询层可以给建议但不能自动绑定。
-
-## 固定语义画布与非破坏性视频版本
-
-Run Graph按输入模式投影项目输入或总导演、项目确认、早中晚五类节点及交付节点。已有
-剧本项目不会显示虚假Provider调用；未解锁的未来时段仍显示只读占位。每个节点分别返回
-`availability`和`executionStatus`：锁定占位节点使用`not_created`且不写`workflow_steps`；
-Provider成功但待审核的节点不会伪装为完成。`guided_sequential`只在本时段视频批准且
-`AcceptedOutcome`确认后解锁下一时段导演；`auto_day`在项目输入就绪后开放三条泳道。
-
-生产契约版本由`production_runs.contract_version`明确记录。V3新Run只接受当前结构；
-V2历史Run可以查看摘要，但不能继续规划、生成、重试或被近期记忆复用。系统不通过
-Pydantic别名或字段猜测把旧结构伪装成新结构。
-
-Vue Flow只渲染后端给出的稳定`semanticNodeId`和固定边，不允许任意新增、删除或连接。
-URL保存run、stage、slot、node和sequence；轮询只刷新数据，不能重置用户当前视口、
-时间轴选区或未保存编辑。
-
-每条正式视频首先形成`video_sequences` revision 1。整条重生成形成新的单Clip revision；
-区间编辑从上一revision派生一个EDL，在单一来源Clip内部用Ark源视频和两张边界帧生成
-替换候选，再由FFmpeg规范化画面并映射原视频完整音轨。候选审核通过前不改变Episode
-正式资产；已经确认结果卡时，切换版本必须显式选择保留既有事实或撤销确认并使后续过期。
+PostgreSQL保存关系与工作流状态；媒体正文保存到本地资产根并以 SHA-256 审计。Web
+JobRegistry只承担进程内展示和并发付费门，不是第二个状态源。
