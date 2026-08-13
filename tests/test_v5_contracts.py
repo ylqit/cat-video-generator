@@ -6,7 +6,18 @@ import pytest
 from pydantic import ValidationError
 
 from cat_video_generator.domain import contracts
-from cat_video_generator.domain.rendering import MediaSource, build_shot_input_plan
+from cat_video_generator.domain.prompts import (
+    PromptCompilationError,
+    compile_shot_video_prompt_parts,
+)
+from cat_video_generator.domain.rendering import (
+    MediaSource,
+    ProjectSequencePlan,
+    SequenceClip,
+    SequenceTransition,
+    build_shot_input_plan,
+)
+from cat_video_generator.interfaces.api_schemas import AcceptSuggestionsRequest
 
 
 def test_v5_contract_defaults_are_backward_compatible() -> None:
@@ -20,6 +31,26 @@ def test_v5_contract_defaults_are_backward_compatible() -> None:
     assert shot.inherit_project_references is True
     assert shot.scene_look_usage is contracts.SceneLookUsage.APPEARANCE_ONLY
     assert shot.use_scene_look is True
+
+
+def test_accept_suggestions_contract_defaults_and_parses_shot_revisions() -> None:
+    shot_id = uuid.uuid4()
+    request = AcceptSuggestionsRequest.model_validate(
+        {
+            "lookPlan": None,
+            "shots": [
+                {
+                    "title": "片段",
+                    "direction": "1. 中景建立。\n2. 稳定收尾。",
+                    "suggestedDurationSeconds": 10,
+                }
+            ],
+            "applyMode": "update_existing",
+            "sourceShotRevisions": {str(shot_id): 3},
+        }
+    )
+
+    assert request.source_shot_revisions == {shot_id: 3}
 
 
 def test_legacy_scene_look_boolean_maps_to_authoritative_usage() -> None:
@@ -179,4 +210,142 @@ def test_v5_video_input_contract_rejects_tenth_image() -> None:
             duration_seconds=10,
             anchor=_image_source(1),
             references=tuple(_image_source(index) for index in range(2, 11)),
+        )
+
+
+def test_semantic_material_links_follow_the_actual_image_order() -> None:
+    plan = build_shot_input_plan(
+        resolution="480p",
+        duration_seconds=10,
+        anchor=None,
+        references=(_image_source(1), _image_source(2)),
+    )
+    context = contracts.ShotPromptContext(
+        project_title="湖泊钓鱼",
+        scene_title="出发准备",
+        scene_text="小孩和猫咪准备钓具。",
+        shot_title="取出装备",
+        direction="1. {{人物}}拿起{{道具:伸缩鱼竿}}，{{猫咪}}在脚边观察。",
+        duration_seconds=10,
+    )
+    aliases = {
+        "人物": "人物“小孩”@图片1",
+        "道具:伸缩鱼竿": "道具“伸缩鱼竿”@图片2",
+    }
+
+    preview = compile_shot_video_prompt_parts(
+        context,
+        plan,
+        binding_descriptions=("@图片1=人物身份", "@图片2=伸缩鱼竿"),
+        semantic_aliases=aliases,
+        strict_semantic_links=False,
+    )
+
+    assert "人物“小孩”@图片1" in preview.creative_body
+    assert "道具“伸缩鱼竿”@图片2" in preview.creative_body
+    assert "猫咪（未绑定图片）" in preview.creative_body
+    assert preview.link_warnings == ("语义素材“猫咪”尚未绑定可用图片",)
+    with pytest.raises(PromptCompilationError, match="猫咪"):
+        compile_shot_video_prompt_parts(
+            context,
+            plan,
+            binding_descriptions=("@图片1=人物身份", "@图片2=伸缩鱼竿"),
+            semantic_aliases=aliases,
+        )
+
+
+def test_prompt_compiler_rejects_a_ghost_provider_alias() -> None:
+    plan = build_shot_input_plan(
+        resolution="480p",
+        duration_seconds=10,
+        anchor=None,
+        references=(_image_source(1),),
+    )
+    context = contracts.ShotPromptContext(
+        project_title="项目",
+        scene_title="场景",
+        scene_text="准备出发。",
+        shot_title="片段",
+        direction="1. 人物参考@图片2拿起装备。",
+        duration_seconds=10,
+    )
+
+    with pytest.raises(PromptCompilationError, match="@图片2"):
+        compile_shot_video_prompt_parts(
+            context,
+            plan,
+            binding_descriptions=("@图片1=人物身份",),
+        )
+
+
+def test_sequence_timeline_supports_cut_fade_and_cross_dissolve() -> None:
+    shot_ids = [uuid.uuid4() for _ in range(3)]
+    asset_ids = [uuid.uuid4() for _ in range(3)]
+    clips = [
+        SequenceClip(
+            order=1,
+            shot_card_id=shot_ids[0],
+            source_asset_id=asset_ids[0],
+            source_start_ms=0,
+            source_end_ms=10_000,
+            timeline_start_ms=0,
+            timeline_end_ms=10_000,
+        ),
+        SequenceClip(
+            order=2,
+            shot_card_id=shot_ids[1],
+            source_asset_id=asset_ids[1],
+            source_start_ms=0,
+            source_end_ms=10_000,
+            timeline_start_ms=10_000,
+            timeline_end_ms=20_000,
+            transitionFromPrevious={"type": "fade_black", "durationMs": 300},
+        ),
+        SequenceClip(
+            order=3,
+            shot_card_id=shot_ids[2],
+            source_asset_id=asset_ids[2],
+            source_start_ms=0,
+            source_end_ms=10_000,
+            timeline_start_ms=19_700,
+            timeline_end_ms=29_700,
+            transitionFromPrevious={"type": "cross_dissolve", "durationMs": 300},
+        ),
+    ]
+
+    plan = ProjectSequencePlan(duration_ms=29_700, clips=clips)
+
+    assert plan.clips[0].transition_from_previous is None
+    assert plan.clips[1].transition_from_previous == SequenceTransition(
+        type="fade_black",
+        durationMs=300,
+    )
+    assert plan.clips[2].timeline_start_ms == 19_700
+
+
+def test_sequence_rejects_timeline_that_ignores_dissolve_overlap() -> None:
+    with pytest.raises(ValidationError, match="时间轴起点"):
+        ProjectSequencePlan(
+            duration_ms=20_000,
+            clips=[
+                SequenceClip(
+                    order=1,
+                    shot_card_id=uuid.uuid4(),
+                    source_asset_id=uuid.uuid4(),
+                    source_start_ms=0,
+                    source_end_ms=10_000,
+                    timeline_start_ms=0,
+                    timeline_end_ms=10_000,
+                ),
+                SequenceClip(
+                    order=2,
+                    shot_card_id=uuid.uuid4(),
+                    source_asset_id=uuid.uuid4(),
+                    source_start_ms=0,
+                    source_end_ms=10_000,
+                    timeline_start_ms=10_000,
+                    timeline_end_ms=20_000,
+                    transitionFromPrevious={"type": "cross_dissolve", "durationMs": 300},
+                ),
+            ],
         )

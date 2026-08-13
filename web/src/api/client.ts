@@ -17,6 +17,7 @@ import type {
   SceneLookPromptPreview,
   SceneLookVersion,
   SequenceDto,
+  SequenceTransitionDto,
   ShotAssistContext,
   ShotAssistPatch,
   ShotAssistRecord,
@@ -131,7 +132,14 @@ export const api = {
     stepId: string,
     lookPlan: SceneLookPlan | null,
     shots: ShotSuggestion[],
-  ) => json<ShotDto[]>(`/steps/${stepId}/accept-suggestions`, "POST", { lookPlan, shots }),
+    applyMode: "replace" | "update_existing",
+    sourceShotRevisions: Record<string, number>,
+  ) => json<ShotDto[]>(`/steps/${stepId}/accept-suggestions`, "POST", {
+    lookPlan,
+    shots,
+    applyMode,
+    sourceShotRevisions,
+  }),
   addShot: (sceneId: string, body: Record<string, unknown>) =>
     json<ShotDto>(`/scenes/${sceneId}/shots`, "POST", body),
   updateShot: (shotId: string, body: Record<string, unknown>) =>
@@ -192,11 +200,13 @@ export const api = {
     projectId: string,
     usage: ReferenceUsage,
     role: ReferenceRole,
+    displayName: string,
     file: File,
   ) => {
     const form = new FormData();
     form.append("usage", usage);
     form.append("role", role);
+    form.append("displayName", displayName.trim() || file.name.replace(/\.[^.]+$/, ""));
     form.append("file", file);
     return request<AssetDto>(`/projects/${projectId}/references`, { method: "POST", body: form });
   },
@@ -238,8 +248,10 @@ export const api = {
       allowPaidGeneration: true;
     },
   ) => json<{ jobId: string }>(`/shots/${shotId}/range-edits`, "POST", body),
-  buildSequence: (projectId: string) =>
-    json<{ jobId: string }>(`/projects/${projectId}/sequences`, "POST"),
+  buildSequence: (
+    projectId: string,
+    transitions: Array<{ afterShotId: string; transition: SequenceTransitionDto }>,
+  ) => json<{ jobId: string }>(`/projects/${projectId}/sequences`, "POST", { transitions }),
   sequences: (projectId: string) => request<SequenceDto[]>(`/projects/${projectId}/sequences`),
   selectSequence: (projectId: string, sequenceId: string, approve: boolean) =>
     json<SequenceDto>(`/projects/${projectId}/sequences/${sequenceId}/select`, "POST", {

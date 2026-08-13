@@ -325,7 +325,11 @@ class AssetStore(Protocol):
 
     def import_local(self, path: Path) -> LandedAsset: ...
 
-    def concatenate_videos(self, paths: tuple[Path, ...]) -> LandedAsset: ...
+    def compose_sequence(
+        self,
+        paths: tuple[Path, ...],
+        plan: ProjectSequencePlan,
+    ) -> LandedAsset: ...
 
     def render_range_replacement(
         self,
@@ -447,6 +451,8 @@ class ShotQueueStore(Protocol):
         drafts: tuple[ShotCardDraft, ...],
         look_plan: SceneLookPlan | None,
         accepted_output: dict[str, Any],
+        apply_mode: str,
+        source_shot_revisions: dict[uuid.UUID, int],
     ) -> tuple[StoredShot, ...]: ...
 
     def accept_story_diagnosis(

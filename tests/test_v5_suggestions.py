@@ -151,13 +151,23 @@ def test_accept_suggestions_persists_edited_output_and_requires_target_count() -
         ShotSuggestion(title="一起出门", direction="1. 人物开门。\n2. 猫咪跟随。"),
     )
 
-    service.accept_suggestions(step_id, look_plan=look_plan, shots=shots)
+    source_revisions = {uuid.uuid4(): 3, uuid.uuid4(): 4}
+    service.accept_suggestions(
+        step_id,
+        look_plan=look_plan,
+        shots=shots,
+        apply_mode="update_existing",
+        source_shot_revisions=source_revisions,
+    )
 
     assert repository.accepted is not None
     assert repository.accepted["step_id"] == step_id
+    assert repository.accepted["apply_mode"] == "update_existing"
+    assert repository.accepted["source_shot_revisions"] == source_revisions
     accepted_output = repository.accepted["accepted_output"]
     assert isinstance(accepted_output, dict)
     assert accepted_output["lookPlan"]["personWardrobe"] == "浅色外套"
+    assert accepted_output["applyMode"] == "update_existing"
 
     with pytest.raises(ValueError, match="2"):
         service.accept_suggestions(step_id, look_plan=look_plan, shots=shots[:1])

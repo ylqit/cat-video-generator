@@ -146,7 +146,7 @@ describe("SceneLookWorkbench", () => {
     await wrapper.get("button").trigger("click");
     await flushPromises();
 
-    expect(document.body.textContent).toContain("场景定妆工作台");
+    expect(document.body.textContent).toContain("场景视觉基准工作台");
     const fieldValues = [...document.body.querySelectorAll("input, textarea")].map(
       (field) => (field as HTMLInputElement).value,
     );

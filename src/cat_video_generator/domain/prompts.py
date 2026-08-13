@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 
 from .contracts import (
@@ -39,6 +40,7 @@ class CompiledShotVideoPrompt:
     creative_body: str
     system_shell: CompiledPrompt
     final: CompiledPrompt
+    link_warnings: tuple[str, ...] = ()
 
 
 def _compiled(text: str) -> CompiledPrompt:
@@ -209,7 +211,7 @@ def compile_scene_look_prompt(
         else f"\n【本次单项修正】{regeneration_instruction.strip()}。其他已锁定内容保持不变。"
     )
     return _compiled(
-        f"""【任务】为项目“{project_title}”的场景“{scene_title}”生成一张无字9:16竖屏场景定妆图，作为该场景所有视频片段共享的服装、配件、道具和人猫比例参考。
+        f"""【任务】为项目“{project_title}”的场景“{scene_title}”生成一张无字9:16竖屏场景视觉基准图，作为该场景所有视频片段共享的服装、配件、环境基调、共同道具和人猫比例参考；它不是任何片段的首帧，不要表现已经完成的剧情动作。
 【人物身份锁定】{profile.person_identity}；{profile.person_hair}；{profile.person_body}。人物可以按本场景换装，但脸型、五官、发型、年龄感和头身比例必须保持。
 【猫咪身份锁定】{profile.cat_identity}。猫咪保持同一只，服饰或场景不得改写脸部、毛色分区、虎斑、眼睛、尾巴和体型。
 【参考图职责】{refs}；每张图只承担声明职责，不得改写Canon身份，不得互相改写角色、服装、道具或画风。
@@ -240,6 +242,7 @@ def compile_shot_video_prompt(
     series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
     visual_profile: VisualProfileDraft | None = None,
+    semantic_aliases: dict[str, str] | None = None,
 ) -> CompiledPrompt:
     return compile_shot_video_prompt_parts(
         context,
@@ -249,6 +252,7 @@ def compile_shot_video_prompt(
         series_profile=series_profile,
         style_profile=style_profile,
         visual_profile=visual_profile,
+        semantic_aliases=semantic_aliases,
     ).final
 
 
@@ -261,6 +265,8 @@ def compile_shot_video_prompt_parts(
     series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
     visual_profile: VisualProfileDraft | None = None,
+    semantic_aliases: dict[str, str] | None = None,
+    strict_semantic_links: bool = True,
 ) -> CompiledShotVideoPrompt:
     profile = visual_profile or VisualProfileDraft(
         personIdentity=series_profile.person_identity,
@@ -275,6 +281,14 @@ def compile_shot_video_prompt_parts(
         alias = description.split("=", 1)[0].strip()
         if alias.startswith("@") and alias not in aliases:
             raise PromptCompilationError(f"素材说明引用了未绑定别名{alias}")
+    creative_body, link_warnings = resolve_semantic_markers(
+        context.direction,
+        semantic_aliases or {},
+        strict=strict_semantic_links,
+    )
+    for alias in set(re.findall(r"@图片\d+", creative_body)):
+        if alias not in aliases:
+            raise PromptCompilationError(f"创作正文引用了未绑定别名{alias}")
     binding_text = "；".join(binding_descriptions) or "本镜头采用纯文本生成，不绑定图片。"
     retry = (
         ""
@@ -288,7 +302,7 @@ def compile_shot_video_prompt_parts(
         f"{profile.cat_identity}。采用{'、'.join(profile.style_positive)}，"
         f"排除{'、'.join(profile.style_negative)}。"
         "项目视觉档案负责长期人物和猫咪身份及系列画风；"
-        "场景基础定妆和片段素材只承担各自声明的视觉职责，不得反向改写长期身份。"
+        "场景视觉基准和片段素材只承担各自声明的视觉职责，不得反向改写长期身份。"
         f"素材：{binding_text}"
     )
     suffix = (
@@ -307,15 +321,45 @@ def compile_shot_video_prompt_parts(
     final = _compiled(
         f"""{prefix}
 
-【片段内子镜头、动作路径和结果】项目“{context.project_title}”，场景“{context.scene_title}”，视频片段“{context.shot_title}”。严格按下列编号子镜头的顺序、空间连续性和因果关系执行：{context.direction}
+【片段内子镜头、动作路径和结果】项目“{context.project_title}”，场景“{context.scene_title}”，视频片段“{context.shot_title}”。严格按下列编号子镜头的顺序、空间连续性和因果关系执行：{creative_body}
 
 {suffix}"""
     )
     return CompiledShotVideoPrompt(
-        creative_body=context.direction,
+        creative_body=creative_body,
         system_shell=system_shell,
         final=final,
+        link_warnings=link_warnings,
     )
+
+
+_SEMANTIC_MARKER = re.compile(r"\{\{([^{}]+)}}")
+
+
+def resolve_semantic_markers(
+    text: str,
+    aliases: dict[str, str],
+    *,
+    strict: bool,
+) -> tuple[str, tuple[str, ...]]:
+    """Resolve editor-only semantic material names without leaking them to a provider."""
+
+    warnings: list[str] = []
+
+    def replace(match: re.Match[str]) -> str:
+        key = match.group(1).strip()
+        resolved = aliases.get(key)
+        if resolved:
+            return resolved
+        warning = f"语义素材“{key}”尚未绑定可用图片"
+        warnings.append(warning)
+        if strict:
+            raise PromptCompilationError(warning)
+        if key.startswith("道具:"):
+            return f"道具“{key.split(':', 1)[1]}”（未绑定图片）"
+        return f"{key}（未绑定图片）"
+
+    return _SEMANTIC_MARKER.sub(replace, text), tuple(dict.fromkeys(warnings))
 
 
 def compile_shot_assistance_prompt(

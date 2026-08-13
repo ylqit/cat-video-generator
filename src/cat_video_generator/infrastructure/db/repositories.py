@@ -42,7 +42,7 @@ from ...domain.contracts import (
     StoryProjectInput,
     VisualProfileDraft,
 )
-from ...domain.creative_workflow import story_source_hash
+from ...domain.creative_workflow import shot_snapshot_hash, story_source_hash
 from ...domain.rendering import ProjectSequencePlan, SequenceStatus
 from ...domain.shot_assistance import apply_shot_assist_patch
 from ...domain.workflow import (
@@ -615,6 +615,8 @@ class SqlAlchemyWorkflowRepository:
         drafts: tuple[ShotCardDraft, ...],
         look_plan: SceneLookPlan | None,
         accepted_output: dict[str, Any],
+        apply_mode: str,
+        source_shot_revisions: dict[uuid.UUID, int],
     ) -> tuple[StoredShot, ...]:
         if not drafts:
             raise ValueError("accepted suggestions must contain at least one video clip")
@@ -640,7 +642,54 @@ class SqlAlchemyWorkflowRepository:
                     project_id=scene.production_run_id,
                     bindings=draft.reference_bindings,
                 )
-            rows = self._replace_shots_locked(session, scene=scene, drafts=drafts)
+            if apply_mode == "replace":
+                if source_shot_revisions:
+                    raise ValueError("replace mode does not accept source shot revisions")
+                rows = self._replace_shots_locked(session, scene=scene, drafts=drafts)
+            elif apply_mode == "update_existing":
+                rows = list(
+                    session.execute(
+                        select(ShotCard)
+                        .where(ShotCard.scene_id == scene.id)
+                        .order_by(ShotCard.sort_order)
+                        .with_for_update()
+                    ).scalars()
+                )
+                if len(rows) != len(drafts):
+                    raise WorkflowConflictError(
+                        "当前片段数量与分镜版本不一致，不能按现有片段更新"
+                    )
+                expected_ids = {row.id for row in rows}
+                if set(source_shot_revisions) != expected_ids:
+                    raise WorkflowConflictError(
+                        "片段集合已变化，请重新加载后再接受分镜版本"
+                    )
+                stale = [
+                    row
+                    for row in rows
+                    if source_shot_revisions[row.id] != row.draft_revision
+                ]
+                if stale:
+                    raise WorkflowConflictError(
+                        "片段草稿已变化，请重新加载后再接受分镜版本"
+                    )
+                changed = False
+                for row, draft in zip(rows, drafts, strict=True):
+                    current = _shot(row, scene.production_run_id).draft
+                    if current == draft:
+                        continue
+                    _write_shot_draft(row, draft)
+                    row.draft_revision += 1
+                    row.selected_anchor_asset_id = None
+                    row.selected_video_asset_id = None
+                    row.status = ShotStatus.READY.value
+                    changed = True
+                if changed:
+                    self._invalidate_project_sequence(session, scene.production_run_id)
+                    scene.status = SceneStatus.READY.value
+                session.flush()
+            else:
+                raise ValueError(f"unsupported suggestion apply mode: {apply_mode}")
             scene.look_plan_json = (
                 None
                 if look_plan is None
@@ -671,6 +720,14 @@ class SqlAlchemyWorkflowRepository:
                     )
                 scene.look_draft_json = look_draft.model_dump(mode="json", by_alias=True)
                 scene.look_draft_revision += 1
+            accepted_output = {
+                **accepted_output,
+                "appliedShotSnapshotHash": shot_snapshot_hash(
+                    (row.id, row.draft_revision, _shot(row, scene.production_run_id).draft)
+                    for row in rows
+                ),
+                "appliedShotIds": [str(row.id) for row in rows],
+            }
             snapshot["acceptedOutput"] = accepted_output
             snapshot["acceptedAt"] = datetime.now(timezone.utc).isoformat()
             step.input_snapshot_json = snapshot
@@ -1177,7 +1234,9 @@ class SqlAlchemyWorkflowRepository:
                 status=status.value,
                 duration_ms=plan.duration_ms,
                 audio_policy="native_fades",
-                clips_json=[clip.model_dump(mode="json") for clip in plan.clips],
+                clips_json=[
+                    clip.model_dump(mode="json", by_alias=True) for clip in plan.clips
+                ],
             )
             session.add(row)
             session.flush()

@@ -10,6 +10,7 @@ from cat_video_generator.application.ports import (
     DirectorResult,
     StoredProject,
     StoredScene,
+    StoredShot,
     StoredStep,
     StoredVisualProfileRevision,
 )
@@ -231,6 +232,10 @@ class _Repository:
         assert project_id == self.project.id
         return (self.scene,)
 
+    def list_shots(self, scene_id: uuid.UUID) -> tuple[StoredShot, ...]:
+        assert scene_id == self.scene.id
+        return ()
+
     def list_steps(
         self,
         *,
@@ -416,6 +421,51 @@ def test_story_rewrite_requires_accepted_diagnosis_and_updates_existing_source_t
     snapshot = repository.get_step(rewrite.step_id).input_snapshot
     assert snapshot["providerOutput"]["rewrittenStory"].startswith("孩子")
     assert snapshot["acceptedOutput"]["rewrittenStory"].startswith("人工编辑")
+
+
+def test_story_rewrite_uses_only_the_latest_accepted_diagnosis_version() -> None:
+    repository = _Repository()
+    gateway = _Gateway()
+    service = ProjectEditingService(
+        repository=repository,
+        director=gateway,
+        provider_name="fake",
+    )
+
+    first = service.diagnose_story(repository.scene.id, allow_paid_generation=True)
+    service.accept_story_diagnosis(
+        first.step_id,
+        diagnosis=first.output,
+        selected_strategy="balanced",
+        additional_instructions="第一版",
+        preserve_original=False,
+    )
+    second = service.diagnose_story(repository.scene.id, allow_paid_generation=True)
+    service.accept_story_diagnosis(
+        second.step_id,
+        diagnosis=second.output,
+        selected_strategy="balanced",
+        additional_instructions="第二版作为当前版本",
+        preserve_original=False,
+    )
+
+    workflow = service.creative_workflow(repository.scene.id)
+    assert [item["attempt"] for item in workflow["stages"]["diagnosis"]] == [2, 1]
+
+    gateway.payload = _rewrite_payload()
+    with pytest.raises(RevisionConflictError, match="latest accepted story diagnosis"):
+        service.rewrite_story(
+            repository.scene.id,
+            diagnosis_step_id=first.step_id,
+            allow_paid_generation=True,
+        )
+
+    rewrite = service.rewrite_story(
+        repository.scene.id,
+        diagnosis_step_id=second.step_id,
+        allow_paid_generation=True,
+    )
+    assert rewrite.output.rewritten_story.startswith("孩子")
 
 
 def test_preserve_original_skips_rewrite_but_allows_storyboard_dependency() -> None:

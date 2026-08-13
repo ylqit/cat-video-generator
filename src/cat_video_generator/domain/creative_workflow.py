@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable
+from uuid import UUID
 
-from .contracts import SceneDraft
+from .contracts import SceneDraft, ShotCardDraft
 
 
 def story_source_hash(scene: SceneDraft) -> str:
@@ -21,6 +23,28 @@ def story_source_hash(scene: SceneDraft) -> str:
         "storyMode": scene.story_mode.value,
         "targetShotCount": scene.target_shot_count,
     }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def shot_snapshot_hash(
+    shots: Iterable[tuple[UUID, int, ShotCardDraft]],
+) -> str:
+    """Stable optimistic-concurrency marker for an ordered set of shot drafts."""
+
+    payload = [
+        {
+            "id": str(shot_id),
+            "draftRevision": draft_revision,
+            "draft": draft.model_dump(mode="json", by_alias=True),
+        }
+        for shot_id, draft_revision, draft in shots
+    ]
     encoded = json.dumps(
         payload,
         ensure_ascii=False,

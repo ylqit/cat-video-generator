@@ -132,7 +132,7 @@ def test_scene_look_descriptions_explain_the_selected_visual_responsibility() ->
         1, binding, scene_look_usage=SceneLookUsage.DERIVE_ANCHOR
     )
 
-    assert "忽略定妆图中的姿态、动作结果和构图" in appearance
+    assert "忽略基准图中的姿态、动作结果和构图" in appearance
     assert "完整参考本场服装、道具、姿态和构图" in full
     assert "派生本片段开场状态" in derived
 

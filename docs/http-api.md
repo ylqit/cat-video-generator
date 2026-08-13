@@ -72,7 +72,9 @@ GET    /api/v1/jobs/{id}
 `POST /steps/{id}/accept-suggestions` 必须提交用户编辑后的 `lookPlan` 和 1～6 个
 `shots`；单片段场景严格为 1 个，多片段场景严格等于场景设置的 2～6 个。原始
 `providerOutput` 不变，服务端另存 `acceptedOutput` 与 `acceptedAt`。已有图片或视频
-Provider 历史时，整批覆盖返回 409。
+Provider 历史时，客户端使用 `applyMode=update_existing` 并提交所有 `sourceShotRevisions`：片段
+数量相同则按现有 ID 原子更新并清除过期的当前选择；数量不同返回 409。无媒体历史时使用
+`applyMode=replace` 整批替换。
 
 剧情诊断只分析当前原稿；接受时提交人工编辑后的 diagnosis、选择的三档方案之一，或明确
 `preserveOriginal=true`。剧情重写只能使用已接受诊断；接受后写回现有 `Scene.sourceText`。
@@ -93,14 +95,19 @@ revision，不同内容创建不可变 revision。`PUT /look-draft` 使用 `expe
 “批准锚点 → 片段自定义 → 场景定妆 → 项目 Canon → 可用上一片段尾帧”重排并按 SHA 去重。
 四个创作角色都使用 `ARK_PLANNING_MODEL`；`ARK_REVIEW_MODEL` 只用于生成后的视频抽帧诊断。
 
-`sceneLookUsage` 是片段场景定妆策略的权威字段：`off`、`appearance_only`、
+`sceneLookUsage` 是片段场景视觉基准策略的权威字段：`off`、`appearance_only`、
 `full_reference`、`derive_anchor`。响应中的 `useSceneLook` 仅为 V5 兼容派生值。派生锚点时，
-场景基础定妆只进入 Seedream 锚点输入；锚点批准后不再重复进入 Seedance 视频输入。
+场景视觉基准只进入 Seedream 锚点输入；锚点批准后不再重复进入 Seedance 视频输入。
 
 `prompt-preview` 分别返回 `creativeBody`、`systemShell`、实际参考图片及 `prompt`。素材职责由
-来源锁定：Canon 人物/猫咪为 identity、Canon 画风为 style、场景定妆为 scene、批准首帧为
-anchor；变更绑定后图片编号按实际输入重新编译，不输出不存在的 `@图片N`。
+来源锁定：Canon 人物/猫咪为 identity、Canon 画风为 style、场景视觉基准为 scene、批准首帧为
+anchor；正文可使用内部语义标记，变更绑定后图片编号按实际输入重新编译，不输出不存在的
+`@图片N`。
 
 批准片段视频后，系统尝试用本地 FFmpeg 生成可追溯 `shot_tail_frame`。下一片段可通过
 `adopt-previous-tail-anchor` 将其设为唯一批准锚点；如果上一片段更换批准视频，旧尾帧状态为
 过期，必须重新采用。采用新锚点会清除下一片段当前选中的锚点、视频与成片，但保留历史版本。
+
+`POST /projects/{id}/sequences` 可提交每个非首片段的 `transitionFromPrevious`：`cut` 的持续时间
+必须为 0，`fade_black` 和 `cross_dissolve` 为 150～1000 毫秒；旧请求省略时兼容为硬切。
+项目图片上传可附带 `displayName`，保存在现有 metadata 中，不新增数据库列。

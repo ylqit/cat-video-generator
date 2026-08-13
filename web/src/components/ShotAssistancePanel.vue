@@ -67,7 +67,7 @@ const fieldLabels: Record<string, string> = {
   title: "片段标题",
   direction: "完整分镜描述",
   durationSeconds: "目标时长",
-  sceneLookUsage: "场景定妆策略",
+  sceneLookUsage: "场景视觉基准策略",
   anchorMode: "锚点方式",
   referenceBindings: "片段参考绑定",
 };

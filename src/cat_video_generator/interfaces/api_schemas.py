@@ -22,6 +22,7 @@ from ..domain.contracts import (
     StoryRewriteStrategy,
     VisualProfileDraft,
 )
+from ..domain.rendering import SequenceTransition
 
 
 class ApiModel(BaseModel):
@@ -98,6 +99,26 @@ class AcceptShotAssistanceRequest(ApiModel):
 class AcceptSuggestionsRequest(ApiModel):
     look_plan: SceneLookPlan | None = Field(alias="lookPlan")
     shots: list[ShotSuggestion] = Field(min_length=1, max_length=6)
+    apply_mode: Literal["replace", "update_existing"] = Field(
+        default="replace",
+        alias="applyMode",
+    )
+    source_shot_revisions: dict[UUID, Annotated[int, Field(ge=1)]] = Field(
+        default_factory=dict,
+        alias="sourceShotRevisions",
+    )
+
+
+class SequenceTransitionRequest(ApiModel):
+    after_shot_id: UUID = Field(alias="afterShotId")
+    transition: SequenceTransition
+
+
+class BuildSequenceRequest(ApiModel):
+    transitions: list[SequenceTransitionRequest] = Field(
+        default_factory=list,
+        max_length=500,
+    )
 
 
 class ReferencesRequest(ApiModel):

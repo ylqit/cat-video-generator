@@ -34,6 +34,25 @@ class SequenceStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class SequenceTransitionType(StrEnum):
+    CUT = "cut"
+    FADE_BLACK = "fade_black"
+    CROSS_DISSOLVE = "cross_dissolve"
+
+
+class SequenceTransition(StrictModel):
+    type: SequenceTransitionType = SequenceTransitionType.CUT
+    duration_ms: Annotated[int, Field(default=0, alias="durationMs", ge=0, le=1_000)]
+
+    @model_validator(mode="after")
+    def validate_duration(self) -> SequenceTransition:
+        if self.type is SequenceTransitionType.CUT and self.duration_ms != 0:
+            raise ValueError("cut transition duration must be zero")
+        if self.type is not SequenceTransitionType.CUT and self.duration_ms < 150:
+            raise ValueError("fade transitions must be between 150 and 1000 milliseconds")
+        return self
+
+
 class MediaBinding(StrictModel):
     asset_id: UUID
     semantic_key: Annotated[str, Field(min_length=3, max_length=160)]
@@ -95,6 +114,10 @@ class SequenceClip(StrictModel):
     source_end_ms: Annotated[int, Field(gt=0)]
     timeline_start_ms: Annotated[int, Field(ge=0)]
     timeline_end_ms: Annotated[int, Field(gt=0)]
+    transition_from_previous: SequenceTransition | None = Field(
+        default=None,
+        alias="transitionFromPrevious",
+    )
 
     @model_validator(mode="after")
     def validate_interval(self) -> SequenceClip:
@@ -117,12 +140,28 @@ class ProjectSequencePlan(StrictModel):
     def validate_timeline(self) -> ProjectSequencePlan:
         if [clip.order for clip in self.clips] != list(range(1, len(self.clips) + 1)):
             raise ValueError("时间轴片段order必须连续")
-        cursor = 0
+        previous: SequenceClip | None = None
         for clip in self.clips:
-            if clip.timeline_start_ms != cursor:
-                raise ValueError("时间轴必须连续且不能重叠")
-            cursor = clip.timeline_end_ms
-        if cursor != self.duration_ms:
+            if previous is None:
+                if clip.timeline_start_ms != 0 or clip.transition_from_previous is not None:
+                    raise ValueError("首个片段必须从零开始且不能声明前置转场")
+                previous = clip
+                continue
+            transition = clip.transition_from_previous or SequenceTransition()
+            overlap = (
+                transition.duration_ms
+                if transition.type is SequenceTransitionType.CROSS_DISSOLVE
+                else 0
+            )
+            if overlap >= min(
+                previous.timeline_end_ms - previous.timeline_start_ms,
+                clip.timeline_end_ms - clip.timeline_start_ms,
+            ):
+                raise ValueError("叠化时长必须小于相邻两个片段的时长")
+            if clip.timeline_start_ms != previous.timeline_end_ms - overlap:
+                raise ValueError("时间轴起点与所选转场不一致")
+            previous = clip
+        if self.clips[-1].timeline_end_ms != self.duration_ms:
             raise ValueError("时间轴末尾必须等于总时长")
         return self
 

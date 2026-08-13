@@ -9,6 +9,7 @@ const props = defineProps<{
   assetId: string;
   src: string;
   durationMs: number;
+  direction: string;
   frames?: Array<{ src: string; label: string; timestampMs: number }>;
   markersMs?: number[];
 }>();
@@ -22,6 +23,29 @@ const message = ref("");
 const loopSelection = ref(false);
 const player = ref<HTMLVideoElement | null>(null);
 const durationSeconds = computed(() => Math.max(0.1, props.durationMs / 1000));
+const subshots = computed(() => {
+  const matches = [...props.direction.matchAll(
+    /(?:^|\n)\s*(\d+)\s*[.、．]\s*([\s\S]*?)(?=(?:\n\s*\d+\s*[.、．])|$)/g,
+  )];
+  if (!matches.length) return [];
+  const markers = [
+    0,
+    ...(props.markersMs ?? []).filter((item) => item > 0 && item < props.durationMs),
+    props.durationMs,
+  ].sort((left, right) => left - right);
+  const uniqueMarkers = [...new Set(markers)];
+  return matches.map((match, index) => {
+    const proportionalStart = Math.round((props.durationMs * index) / matches.length);
+    const proportionalEnd = Math.round((props.durationMs * (index + 1)) / matches.length);
+    return {
+      ordinal: Number(match[1]),
+      description: match[2].trim(),
+      startMs: uniqueMarkers[index] ?? proportionalStart,
+      endMs: uniqueMarkers[index + 1] ?? proportionalEnd,
+      estimated: uniqueMarkers.length < matches.length + 1,
+    };
+  });
+});
 
 watch(
   () => [props.assetId, props.durationMs] as const,
@@ -44,6 +68,13 @@ function handleTimeUpdate() {
 function seek(timestampMs: number) {
   if (!player.value) return;
   player.value.currentTime = timestampMs / 1000;
+}
+
+function selectSubshot(item: (typeof subshots.value)[number]) {
+  startMs.value = Math.max(0, item.startMs);
+  endMs.value = Math.min(props.durationMs, Math.max(item.startMs + 500, item.endMs));
+  instruction.value = `只重拍子镜头${item.ordinal}：${item.description}`;
+  seek(startMs.value);
 }
 
 async function submit() {
@@ -116,6 +147,13 @@ async function submit() {
             @click="seek(marker)"
           >{{ (marker / 1000).toFixed(2) }}s</el-button>
         </div>
+        <div v-if="subshots.length" class="subshot-list">
+          <b>按分镜选择重拍区间</b>
+          <button v-for="item in subshots" :key="item.ordinal" type="button" @click="selectSubshot(item)">
+            <span>子镜头 {{ item.ordinal }} · {{ (item.startMs / 1000).toFixed(2) }}–{{ (item.endMs / 1000).toFixed(2) }}s</span>
+            <small>{{ item.description }}{{ item.estimated ? '（按总时长估算，可手工调整）' : '' }}</small>
+          </button>
+        </div>
         <div class="range-values">
           <el-input-number v-model="startMs" :min="0" :max="Math.max(0, durationMs - 500)" :step="100" />
           <span>ms 至</span>
@@ -139,5 +177,6 @@ async function submit() {
 .timeline-head { display: flex; justify-content: space-between; align-items: start; gap: 20px; }.timeline-head h3 { margin: 0; }.timeline-head p { color: #9aa2b1; margin: 6px 0 14px; }.timeline-body { display: grid; grid-template-columns: minmax(360px, 45%) 1fr; gap: 18px; }.timeline video { width: 100%; max-height: 360px; background: #080a0e; }.range-editor { display: grid; gap: 10px; align-content: start; }.range-values { display: flex; align-items: center; gap: 10px; }
 .filmstrip { display: flex; gap: 5px; overflow-x: auto; padding-bottom: 4px; }.filmstrip figure { margin: 0; min-width: 72px; cursor: pointer; }.filmstrip img { display: block; width: 72px; height: 112px; object-fit: cover; border-radius: 5px; }.filmstrip figcaption { color: #7f899a; font-size: 10px; text-align: center; margin-top: 3px; }
 .boundary-markers { display: flex; align-items: center; flex-wrap: wrap; gap: 3px; color: #8b95a5; font-size: 12px; }
+.subshot-list { display: grid; gap: 6px; }.subshot-list button { display: grid; gap: 3px; text-align: left; padding: 8px; color: #cad4e2; background: #101722; border: 1px solid #2f3a4a; border-radius: 7px; cursor: pointer; }.subshot-list button:hover { border-color: #409eff; }.subshot-list small { color: #8791a2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 @media (max-width: 900px) { .timeline-body { grid-template-columns: 1fr; } }
 </style>

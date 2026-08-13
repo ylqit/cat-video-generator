@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
+import subprocess
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from cat_video_generator.domain.contracts import VisualProfileDraft
+from cat_video_generator.domain.rendering import ProjectSequencePlan, SequenceClip
 from cat_video_generator.infrastructure.db import models
 from cat_video_generator.infrastructure.db.repositories import (
     _asset,
@@ -17,6 +20,7 @@ from cat_video_generator.infrastructure.db.repositories import (
     _storage_key_for,
 )
 from cat_video_generator.infrastructure.db.session import ALEMBIC_HEAD
+from cat_video_generator.infrastructure.media.storage import LocalAssetStore
 
 
 def test_v5_database_models_expose_creation_flow_columns() -> None:
@@ -119,3 +123,156 @@ def test_visual_profile_hash_uses_the_migration_json_canonicalization() -> None:
     ).hexdigest()
 
     assert _profile_hash(draft, reference_snapshot=snapshot) == expected
+
+
+def test_sequence_renderer_compiles_fades_and_cross_dissolve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ffmpeg = tmp_path / "ffmpeg.exe"
+    ffmpeg.write_bytes(b"fixture")
+    sources = tuple(tmp_path / f"clip-{index}.mp4" for index in range(3))
+    for source in sources:
+        source.write_bytes(b"video")
+    shot_ids = [uuid.uuid4() for _ in sources]
+    asset_ids = [uuid.uuid4() for _ in sources]
+    plan = ProjectSequencePlan(
+        duration_ms=29_700,
+        clips=[
+            SequenceClip(
+                order=1,
+                shot_card_id=shot_ids[0],
+                source_asset_id=asset_ids[0],
+                source_start_ms=0,
+                source_end_ms=10_000,
+                timeline_start_ms=0,
+                timeline_end_ms=10_000,
+            ),
+            SequenceClip(
+                order=2,
+                shot_card_id=shot_ids[1],
+                source_asset_id=asset_ids[1],
+                source_start_ms=0,
+                source_end_ms=10_000,
+                timeline_start_ms=10_000,
+                timeline_end_ms=20_000,
+                transitionFromPrevious={"type": "fade_black", "durationMs": 300},
+            ),
+            SequenceClip(
+                order=3,
+                shot_card_id=shot_ids[2],
+                source_asset_id=asset_ids[2],
+                source_start_ms=0,
+                source_end_ms=10_000,
+                timeline_start_ms=19_700,
+                timeline_end_ms=29_700,
+                transitionFromPrevious={"type": "cross_dissolve", "durationMs": 300},
+            ),
+        ],
+    )
+    captured: list[str] = []
+
+    def fake_run(command: list[str], *, timeout: int, label: str) -> None:
+        assert timeout == 1800
+        assert label == "project sequence"
+        captured.extend(command)
+        Path(command[-1]).write_bytes(b"composite")
+
+    monkeypatch.setattr(
+        "cat_video_generator.infrastructure.media.storage._run",
+        fake_run,
+    )
+    store = LocalAssetStore(
+        work_root=tmp_path / "work",
+        asset_root=tmp_path / "assets",
+        ffmpeg_path=ffmpeg,
+    )
+
+    landed = store.compose_sequence(sources, plan)
+    filter_graph = captured[captured.index("-filter_complex") + 1]
+
+    assert landed.path.is_file()
+    assert "fade=t=out" in filter_graph
+    assert "fade=t=in" in filter_graph
+    assert "concat=n=2:v=1:a=1" in filter_graph
+    assert "xfade=transition=fade" in filter_graph
+    assert "acrossfade" in filter_graph
+
+
+def test_sequence_renderer_handles_dissolve_after_a_cut(tmp_path: Path) -> None:
+    ffmpeg_name = shutil.which("ffmpeg")
+    if ffmpeg_name is None:
+        pytest.skip("FFmpeg is not installed")
+    ffmpeg = Path(ffmpeg_name)
+    source = tmp_path / "clip.mp4"
+    subprocess.run(
+        [
+            str(ffmpeg),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=64x64:r=30:d=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(source),
+        ],
+        check=True,
+    )
+    shots = [uuid.uuid4() for _ in range(3)]
+    assets = [uuid.uuid4() for _ in range(3)]
+    plan = ProjectSequencePlan(
+        duration_ms=2_700,
+        clips=[
+            SequenceClip(
+                order=1,
+                shot_card_id=shots[0],
+                source_asset_id=assets[0],
+                source_start_ms=0,
+                source_end_ms=1_000,
+                timeline_start_ms=0,
+                timeline_end_ms=1_000,
+            ),
+            SequenceClip(
+                order=2,
+                shot_card_id=shots[1],
+                source_asset_id=assets[1],
+                source_start_ms=0,
+                source_end_ms=1_000,
+                timeline_start_ms=1_000,
+                timeline_end_ms=2_000,
+                transitionFromPrevious={"type": "cut", "durationMs": 0},
+            ),
+            SequenceClip(
+                order=3,
+                shot_card_id=shots[2],
+                source_asset_id=assets[2],
+                source_start_ms=0,
+                source_end_ms=1_000,
+                timeline_start_ms=1_700,
+                timeline_end_ms=2_700,
+                transitionFromPrevious={"type": "cross_dissolve", "durationMs": 300},
+            ),
+        ],
+    )
+    store = LocalAssetStore(
+        work_root=tmp_path / "work",
+        asset_root=tmp_path / "assets",
+        ffmpeg_path=ffmpeg,
+    )
+
+    landed = store.compose_sequence((source, source, source), plan)
+
+    assert landed.path.is_file()
+    assert landed.byte_size > 0

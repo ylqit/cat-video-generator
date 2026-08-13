@@ -22,6 +22,7 @@ from .api_schemas import (
     AcceptStoryRewriteRequest,
     AcceptSuggestionsRequest,
     AssistShotRequest,
+    BuildSequenceRequest,
     CreateProjectRequest,
     DiagnoseStoryRequest,
     GenerateRequest,
@@ -299,6 +300,8 @@ def create_app(
                 step_id,
                 look_plan=payload.look_plan,
                 shots=tuple(payload.shots),
+                apply_mode=payload.apply_mode,
+                source_shot_revisions=payload.source_shot_revisions,
             )
         ]
 
@@ -451,6 +454,7 @@ def create_app(
         project_id: uuid.UUID,
         usage: ReferenceUsage = Form(...),
         role: ReferenceRole = Form(...),
+        display_name: str | None = Form(default=None, alias="displayName"),
         file: UploadFile = File(...),
     ) -> dict[str, Any]:
         upload_root = container.runtime_settings.work_root / "uploads"
@@ -467,6 +471,7 @@ def create_app(
                 path=temporary,
                 usage=usage.value,
                 role=role.value,
+                display_name=display_name,
             )
             return _asset_json(asset)
         finally:
@@ -564,12 +569,24 @@ def create_app(
         )
 
     @app.post("/api/v1/projects/{project_id}/sequences")
-    def build_sequence(project_id: uuid.UUID) -> dict[str, Any]:
+    def build_sequence(
+        project_id: uuid.UUID,
+        payload: BuildSequenceRequest | None = None,
+    ) -> dict[str, Any]:
+        transitions = {
+            item.after_shot_id: item.transition
+            for item in (payload.transitions if payload is not None else [])
+        }
         return _submit(
             job_registry,
             kind="build_sequence",
             key=f"project:{project_id}:sequence",
-            fn=lambda: _sequence_json(container.sequences.build_project_sequence(project_id)),
+            fn=lambda: _sequence_json(
+                container.sequences.build_project_sequence(
+                    project_id,
+                    transitions=transitions,
+                )
+            ),
             context={"projectId": project_id, "operationKey": "sequence:build"},
         )
 

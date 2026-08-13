@@ -65,9 +65,11 @@ from cat_video_generator.domain.contracts import (
     StoryProjectInput,
     VisualProfileDraft,
 )
+from cat_video_generator.domain.creative_workflow import shot_snapshot_hash
 from cat_video_generator.domain.rendering import (
     ProjectSequencePlan,
     RenderOperation,
+    SequenceClip,
     SequenceStatus,
     VideoInputPlan,
 )
@@ -369,12 +371,37 @@ class MemoryStore:
         drafts: tuple[ShotCardDraft, ...],
         look_plan: SceneLookPlan | None,
         accepted_output: dict[str, Any],
+        apply_mode: str,
+        source_shot_revisions: dict[uuid.UUID, int],
     ) -> tuple[StoredShot, ...]:
         step = self.steps[step_id]
         if step.scene_id is None:
             raise ValueError("suggestion step is not bound to a scene")
         scene = self.scenes[step.scene_id]
-        shots = self.replace_shots(scene.id, drafts)
+        current = self.list_shots(scene.id)
+        if apply_mode == "replace":
+            if source_shot_revisions:
+                raise ValueError("replace mode does not accept source shot revisions")
+            shots = self.replace_shots(scene.id, drafts)
+        elif apply_mode == "update_existing":
+            if len(current) != len(drafts):
+                raise RevisionConflictError("shot count changed")
+            expected = {shot.id: shot.draft_revision for shot in current}
+            if source_shot_revisions != expected:
+                raise RevisionConflictError("shot revisions changed")
+            shots = tuple(
+                self.update_shot(shot.id, draft)
+                for shot, draft in zip(current, drafts, strict=True)
+            )
+        else:
+            raise ValueError(f"unsupported suggestion apply mode: {apply_mode}")
+        accepted_output = {
+            **accepted_output,
+            "appliedShotSnapshotHash": shot_snapshot_hash(
+                (shot.id, shot.draft_revision, shot.draft) for shot in shots
+            ),
+            "appliedShotIds": [str(shot.id) for shot in shots],
+        }
         self.scenes[scene.id] = replace(
             scene,
             draft=scene.draft.model_copy(update={"look_plan": look_plan}),
@@ -1005,6 +1032,7 @@ class FixtureGateway:
         self.image_submissions = 0
         self.image_prompts: list[str] = []
         self.image_references: list[tuple[Path, ...]] = []
+        self.video_prompts: list[str] = []
         self.fail_unknown_once = False
 
     def generate_image(self, *, prompt: str, reference_paths: tuple[Path, ...]) -> ImageResult:
@@ -1013,7 +1041,7 @@ class FixtureGateway:
         self.image_references.append(reference_paths)
         url = (
             "https://fixture.local/scene-look.png"
-            if "场景定妆图" in prompt
+            if "场景视觉基准图" in prompt
             else "https://fixture.local/anchor.png"
         )
         return ImageResult(url, self.image_model)
@@ -1025,7 +1053,8 @@ class FixtureGateway:
         input_plan: VideoInputPlan,
         input_sources: tuple[Path | str, ...],
     ) -> VideoTaskResult:
-        del prompt, input_sources
+        del input_sources
+        self.video_prompts.append(prompt)
         self.submissions.append(input_plan)
         if self.fail_unknown_once:
             self.fail_unknown_once = False
@@ -1090,8 +1119,12 @@ class FixtureAssetStore:
     def import_local(self, path: Path) -> LandedAsset:
         return self._local.import_local(path)
 
-    def concatenate_videos(self, paths: tuple[Path, ...]) -> LandedAsset:
-        return self._local.concatenate_videos(paths)
+    def compose_sequence(
+        self,
+        paths: tuple[Path, ...],
+        plan: ProjectSequencePlan,
+    ) -> LandedAsset:
+        return self._local.compose_sequence(paths, plan)
 
     def render_range_replacement(
         self,
@@ -1139,7 +1172,61 @@ def main() -> None:
             "采茶叶.mp4 has no readable video stream",
         )
         normalized_sample = _normalize_sample(ffmpeg, sample_path, root / "采茶叶-normalized.mp4")
-        sample_master = local_store.concatenate_videos((normalized_sample, normalized_sample))
+        sample_duration_ms = int(float(sample_probe["format"]["duration"]) * 1000)
+        sample_plan = ProjectSequencePlan(
+            duration_ms=(sample_duration_ms * 4) - 300,
+            clips=[
+                SequenceClip(
+                    order=1,
+                    shot_card_id=uuid.uuid4(),
+                    source_asset_id=uuid.uuid4(),
+                    source_start_ms=0,
+                    source_end_ms=sample_duration_ms,
+                    timeline_start_ms=0,
+                    timeline_end_ms=sample_duration_ms,
+                ),
+                SequenceClip(
+                    order=2,
+                    shot_card_id=uuid.uuid4(),
+                    source_asset_id=uuid.uuid4(),
+                    source_start_ms=0,
+                    source_end_ms=sample_duration_ms,
+                    timeline_start_ms=sample_duration_ms,
+                    timeline_end_ms=sample_duration_ms * 2,
+                    transitionFromPrevious={"type": "cut", "durationMs": 0},
+                ),
+                SequenceClip(
+                    order=3,
+                    shot_card_id=uuid.uuid4(),
+                    source_asset_id=uuid.uuid4(),
+                    source_start_ms=0,
+                    source_end_ms=sample_duration_ms,
+                    timeline_start_ms=sample_duration_ms * 2,
+                    timeline_end_ms=sample_duration_ms * 3,
+                    transitionFromPrevious={
+                        "type": "fade_black",
+                        "durationMs": 300,
+                    },
+                ),
+                SequenceClip(
+                    order=4,
+                    shot_card_id=uuid.uuid4(),
+                    source_asset_id=uuid.uuid4(),
+                    source_start_ms=0,
+                    source_end_ms=sample_duration_ms,
+                    timeline_start_ms=(sample_duration_ms * 3) - 300,
+                    timeline_end_ms=(sample_duration_ms * 4) - 300,
+                    transitionFromPrevious={
+                        "type": "cross_dissolve",
+                        "durationMs": 300,
+                    },
+                ),
+            ],
+        )
+        sample_master = local_store.compose_sequence(
+            (normalized_sample,) * 4,
+            sample_plan,
+        )
         _require(sample_master.path.is_file(), "采茶叶.mp4 local composition was not landed")
         composed_probe = _probe_json(ffprobe, sample_master.path)
         _require(
@@ -1313,6 +1400,41 @@ def main() -> None:
             accepted_step.input_snapshot["providerOutput"]
             != accepted_step.input_snapshot["acceptedOutput"],
             "edited suggestion was not distinct from provider output",
+        )
+        first_storyboard_ids = tuple(shot.id for shot in shots)
+        second_suggestion = editing.suggest_shots(scene.id, allow_paid_generation=True)
+        second_edited = tuple(
+            item.model_copy(
+                update={
+                    "title": f"第二版：{item.title}",
+                    "direction": (
+                        "1. 中景固定，{{人物}}整理装备，{{猫咪}}在脚边观察。\n"
+                        "2. 近景自然跟随，两者完成同一生活微事件并稳定收尾。"
+                    ),
+                }
+            )
+            for item in second_suggestion.output.shots
+        )
+        shots = list(
+            editing.accept_suggestions(
+                second_suggestion.step_id,
+                look_plan=second_suggestion.output.look_plan,
+                shots=second_edited,
+                apply_mode="replace",
+            )
+        )
+        _require(
+            tuple(shot.id for shot in shots) != first_storyboard_ids,
+            "replacement storyboard did not create the current clip set",
+        )
+        workflow = editing.creative_workflow(scene.id)
+        _require(
+            len(workflow["stages"]["storyboard"]) == 2
+            and workflow["stages"]["storyboard"][0]["acceptedOutput"][
+                "appliedShotSnapshotHash"
+            ]
+            == workflow["currentShotSnapshotHash"],
+            "storyboard versions were not retained or synchronized",
         )
 
         # A manual save is authoritative.  A failed paid analysis records its own
@@ -1556,7 +1678,7 @@ def main() -> None:
             "four scene-look strategies did not produce the expected video inputs",
         )
         _require(
-            "忽略定妆图中的姿态" in str(appearance_preview["prompt"])
+            "忽略基准图中的姿态" in str(appearance_preview["prompt"])
             and "完整参考本场服装" in str(full_reference_preview["prompt"]),
             "appearance-only and full-reference responsibilities were not distinct",
         )
@@ -1645,6 +1767,17 @@ def main() -> None:
             len(gateway.submissions[2].bindings) == 4,
             "derive-anchor repeated the scene look in the video request",
         )
+        for prompt, submission in zip(
+            gateway.video_prompts,
+            gateway.submissions,
+            strict=True,
+        ):
+            _require("{{" not in prompt, "internal semantic marker leaked to Seedance")
+            aliases = {int(value) for value in re.findall(r"@图片(\d+)", prompt)}
+            _require(
+                not aliases or max(aliases) <= len(submission.bindings),
+                "compiled prompt contains a ghost image alias",
+            )
 
         first_tail = production.tail_frame_status(shots[1].id)
         _require(first_tail["available"] is True, "approved video tail was not extracted")
@@ -1882,6 +2015,7 @@ def main() -> None:
                     "storyboardDirector": True,
                     "visualPromptReview": True,
                     "plannerOutputSchemas": director.planning_calls,
+                    "storyboardVersions": 2,
                 },
                 "providerAndAcceptedOutputRetained": True,
                 "visualProfileRevision": visual_profile.revision,
@@ -1917,6 +2051,8 @@ def main() -> None:
                 "referencePrecedenceAndLimits": True,
                 "sampleInput": str(sample_path),
                 "sampleCompositeSha256": sample_master.sha256,
+                "localTransitions": ["cut", "fade_black", "cross_dissolve"],
+                "semanticAutoLink": True,
                 "databaseCanon": database_canon,
                 "rangeEditPreservedSource": True,
                 "submissionUnknownFrozen": True,

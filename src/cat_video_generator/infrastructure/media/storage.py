@@ -13,6 +13,10 @@ import httpx
 from PIL import Image
 
 from ...application.ports import LandedAsset
+from ...domain.rendering import (
+    ProjectSequencePlan,
+    SequenceTransitionType,
+)
 
 
 class AssetStorageError(RuntimeError):
@@ -108,16 +112,18 @@ class LocalAssetStore:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def concatenate_videos(self, paths: tuple[Path, ...]) -> LandedAsset:
-        """Build an arbitrary-length single-track master with native clip audio.
-
-        Video uses stable hard cuts.  Each source audio stream receives an 80ms
-        edge fade before concat, avoiding clicks without changing EDL duration.
-        """
+    def compose_sequence(
+        self,
+        paths: tuple[Path, ...],
+        plan: ProjectSequencePlan,
+    ) -> LandedAsset:
+        """Render the validated sequence with cuts, black fades and dissolves."""
 
         ffmpeg = self._require_ffmpeg()
         if not paths:
             raise AssetStorageError("a project sequence needs at least one clip")
+        if len(paths) != len(plan.clips):
+            raise AssetStorageError("sequence source count does not match the render plan")
         resolved = tuple(path.expanduser().resolve() for path in paths)
         if any(not path.is_file() for path in resolved):
             raise AssetStorageError("a project sequence source clip is missing")
@@ -127,15 +133,70 @@ class LocalAssetStore:
         for path in resolved:
             command.extend(("-i", str(path)))
         filters: list[str] = []
-        inputs: list[str] = []
-        for index in range(len(resolved)):
-            filters.append(f"[{index}:v]setpts=PTS-STARTPTS,setsar=1,format=yuv420p[v{index}]")
-            filters.append(
-                f"[{index}:a]asetpts=PTS-STARTPTS,afade=t=in:st=0:d=0.08,"
-                f"areverse,afade=t=in:st=0:d=0.08,areverse[a{index}]"
+        durations = [
+            (clip.source_end_ms - clip.source_start_ms) / 1000
+            for clip in plan.clips
+        ]
+        for index, duration in enumerate(durations):
+            # `concat` emits AVTB (1/1_000_000). Keep every source on that
+            # time base after frame-rate normalization so a later `xfade`
+            # can consume either a raw clip or a preceding concat result.
+            video_filters = "setpts=PTS-STARTPTS,fps=30,settb=AVTB,setsar=1,format=yuv420p"
+            audio_filters = "asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo"
+            incoming = plan.clips[index].transition_from_previous
+            outgoing = (
+                None
+                if index + 1 == len(plan.clips)
+                else plan.clips[index + 1].transition_from_previous
             )
-            inputs.append(f"[v{index}][a{index}]")
-        filters.append(f"{''.join(inputs)}concat=n={len(resolved)}:v=1:a=1[vout][aout]")
+            if incoming is not None and incoming.type is SequenceTransitionType.FADE_BLACK:
+                seconds = incoming.duration_ms / 1000
+                video_filters += f",fade=t=in:st=0:d={seconds:.3f}"
+                audio_filters += f",afade=t=in:st=0:d={seconds:.3f}"
+            if outgoing is not None and outgoing.type is SequenceTransitionType.FADE_BLACK:
+                seconds = outgoing.duration_ms / 1000
+                start = duration - seconds
+                video_filters += f",fade=t=out:st={start:.3f}:d={seconds:.3f}"
+                audio_filters += f",afade=t=out:st={start:.3f}:d={seconds:.3f}"
+            filters.append(f"[{index}:v]{video_filters}[v{index}]")
+            filters.append(
+                f"[{index}:a]{audio_filters}[a{index}]"
+            )
+        current_video = "v0"
+        current_audio = "a0"
+        current_duration = durations[0]
+        for index in range(1, len(resolved)):
+            transition = plan.clips[index].transition_from_previous
+            transition_type = (
+                SequenceTransitionType.CUT if transition is None else transition.type
+            )
+            video_out = "vout" if index + 1 == len(resolved) else f"vm{index}"
+            audio_out = "aout" if index + 1 == len(resolved) else f"am{index}"
+            if transition_type is SequenceTransitionType.CROSS_DISSOLVE:
+                if transition is None:
+                    raise AssetStorageError("cross dissolve is missing its transition settings")
+                seconds = transition.duration_ms / 1000
+                offset = current_duration - seconds
+                filters.append(
+                    f"[{current_video}][v{index}]xfade=transition=fade:"
+                    f"duration={seconds:.3f}:offset={offset:.3f}[{video_out}]"
+                )
+                filters.append(
+                    f"[{current_audio}][a{index}]acrossfade=d={seconds:.3f}:"
+                    f"c1=tri:c2=tri[{audio_out}]"
+                )
+                current_duration += durations[index] - seconds
+            else:
+                filters.append(
+                    f"[{current_video}][{current_audio}][v{index}][a{index}]"
+                    f"concat=n=2:v=1:a=1[{video_out}][{audio_out}]"
+                )
+                current_duration += durations[index]
+            current_video = video_out
+            current_audio = audio_out
+        if len(resolved) == 1:
+            filters.append("[v0]null[vout]")
+            filters.append("[a0]anull[aout]")
         command.extend(
             (
                 "-filter_complex",

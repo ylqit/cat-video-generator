@@ -195,6 +195,7 @@ export interface CreativeWorkflowDto {
   currentStoryHash: string;
   currentStorySource: "scene_draft" | "preserved_original" | "accepted_rewrite";
   currentStorySourceStepId?: string | null;
+  currentShotSnapshotHash: string;
   stages: {
     diagnosis: CreativeStepRecord[];
     rewrite: CreativeStepRecord[];
@@ -202,6 +203,8 @@ export interface CreativeWorkflowDto {
   };
   reviews: CreativeStepRecord[];
 }
+
+export type SuggestionApplyMode = "replace" | "update_existing";
 
 export interface PromptDto {
   id: string;
@@ -280,8 +283,26 @@ export interface SequenceDto {
   status: string;
   plan: {
     duration_ms: number;
-    clips: Array<Record<string, unknown>>;
+    clips: SequenceClipDto[];
   };
+}
+
+export type SequenceTransitionType = "cut" | "fade_black" | "cross_dissolve";
+
+export interface SequenceTransitionDto {
+  type: SequenceTransitionType;
+  durationMs: number;
+}
+
+export interface SequenceClipDto {
+  order: number;
+  shot_card_id: string;
+  source_asset_id: string;
+  source_start_ms: number;
+  source_end_ms: number;
+  timeline_start_ms: number;
+  timeline_end_ms: number;
+  transitionFromPrevious?: SequenceTransitionDto | null;
 }
 
 export interface ProjectGraph {
@@ -362,10 +383,13 @@ export interface ShotPromptPreview {
   sceneLookUsage: SceneLookUsage;
   localAnalysis: ShotLocalAnalysis;
   qualitativePacing: string;
+  linkWarnings: string[];
   references: Array<{
     index: number;
     assetId: string;
     displayName: string;
+    promptAlias: string;
+    subjectLabel: string;
     sourceLayer: "shot" | "scene_look" | "project" | "previous_tail" | "candidate";
     responsibility: string;
     contentReady: boolean;

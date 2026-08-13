@@ -12,7 +12,6 @@ import type {
   SceneLookDraftEnvelope,
   SceneLookPromptPreview,
   SceneLookVersion,
-  VisualProfileDraft,
   VisualProfileRevisionDto,
 } from "../api/types";
 
@@ -28,7 +27,6 @@ const busy = ref(false);
 const errorText = ref("");
 const healthModel = ref("doubao-seedream-5-0-260128");
 const profile = ref<VisualProfileRevisionDto | null>(null);
-const profileForm = ref<VisualProfileDraft | null>(null);
 const envelope = ref<SceneLookDraftEnvelope | null>(null);
 const preview = ref<SceneLookPromptPreview | null>(null);
 const versions = ref<SceneLookVersion[]>([]);
@@ -53,18 +51,6 @@ const selectedAsset = computed(() => props.assets.find(
   (item) => item.id === props.scene.selectedLookAssetId,
 ) ?? null);
 
-function cloneProfile(value: VisualProfileDraft): VisualProfileDraft {
-  return structuredClone({
-    personIdentity: value.personIdentity,
-    personHair: value.personHair,
-    personBody: value.personBody,
-    catIdentity: value.catIdentity,
-    stylePositive: value.stylePositive,
-    styleNegative: value.styleNegative,
-    referenceBindings: value.referenceBindings,
-  });
-}
-
 async function open() {
   visible.value = true;
   await run(async () => {
@@ -75,7 +61,6 @@ async function open() {
       api.health(),
     ]);
     profile.value = loadedProfile;
-    profileForm.value = cloneProfile(loadedProfile);
     envelope.value = loadedDraft;
     versions.value = loadedVersions;
     healthModel.value = health.arkImageModel ?? healthModel.value;
@@ -98,35 +83,29 @@ async function run(action: () => Promise<void>) {
   }
 }
 
-function restoreProfile() {
-  if (!profile.value?.canonDefaults) return;
-  profileForm.value = cloneProfile(profile.value.canonDefaults);
-}
-
-async function saveProfile() {
-  if (!profileForm.value || !envelope.value) return;
+async function syncProjectProfile() {
+  if (!envelope.value) return;
   await run(async () => {
-    const saved = await api.updateVisualProfile(props.projectId, profileForm.value!);
-    profile.value = saved;
-    profileForm.value = cloneProfile(saved);
+    const current = await api.visualProfile(props.projectId);
+    profile.value = current;
     const extras = envelope.value!.draft.referenceBindings.filter(
       (item) => ["wardrobe", "prop", "composition"].includes(item.purpose),
     );
     const environmentKey = `style:${envelope.value!.draft.lookPlan.environmentStyle}`;
-    const profileBindings = saved.referenceBindings.filter((binding) => {
+    const profileBindings = current.referenceBindings.filter((binding) => {
       const semanticKey = props.assets.find((asset) => asset.id === binding.assetId)?.semanticKey;
       return !["style:outdoor", "style:indoor"].includes(semanticKey ?? "")
         || semanticKey === environmentKey;
     });
-    envelope.value!.draft.visualProfileRevisionId = saved.id;
+    envelope.value!.draft.visualProfileRevisionId = current.id;
     envelope.value!.draft.referenceBindings = [
       ...profileBindings,
       ...extras.filter((extra) => !profileBindings.some(
         (item) => item.assetId === extra.assetId,
       )),
     ];
-    ElMessage.success(`项目视觉档案已切换到 Revision ${saved.revision}`);
-    emit("refreshed");
+    preview.value = null;
+    ElMessage.success(`本场视觉基准草稿已引用项目视觉档案 Revision ${current.revision}，保存草稿后生效`);
   });
 }
 
@@ -206,13 +185,6 @@ function updateBinding(
   preview.value = null;
 }
 
-function updateStyleList(kind: "positive" | "negative", value: unknown) {
-  if (!profileForm.value) return;
-  const items = String(value).split("\n").map((item) => item.trim()).filter(Boolean);
-  if (kind === "positive") profileForm.value.stylePositive = items;
-  else profileForm.value.styleNegative = items;
-}
-
 async function saveDraft(showMessage = true): Promise<SceneLookDraftEnvelope | null> {
   if (!envelope.value) return null;
   const saved = await api.saveSceneLookDraft(
@@ -254,7 +226,7 @@ async function generate() {
     if (regenerate) {
       const answer = await ElMessageBox.prompt(
         "只填写本次需要修正的一项，其他角色与画风锁定保持不变。",
-        "定妆图重做目标",
+        "视觉基准图重做目标",
         { inputPlaceholder: "例如：围巾改为米白色，猫咪身份和其余构图保持不变" },
       );
       reason = answer.value.trim();
@@ -286,7 +258,7 @@ async function decide(version: SceneLookVersion, decision: "approved" | "rejecte
     await api.reviewAsset(
       version.id,
       decision,
-      decision === "approved" ? "人工确认角色、画风与本场景造型" : "人工拒绝定妆候选",
+      decision === "approved" ? "人工确认角色、画风与本场景造型" : "人工拒绝视觉基准候选",
     );
     versions.value = await api.sceneLookVersions(props.scene.id);
     selectedVersion.value = versions.value.find((item) => item.id === version.id)
@@ -328,23 +300,21 @@ async function recordImageFailure(asset: AssetDto) {
     />
   </div>
 
-  <el-dialog v-model="visible" title="场景定妆工作台" width="min(1180px, 96vw)" destroy-on-close>
+  <el-dialog v-model="visible" title="场景视觉基准工作台" width="min(1180px, 96vw)" destroy-on-close>
     <div v-loading="busy" class="look-workbench">
       <el-alert v-if="errorText" type="error" :closable="false" :title="errorText" show-icon />
 
-      <el-collapse v-if="profileForm && profile" model-value="profile">
-        <el-collapse-item name="profile" title="1. 角色与画风锁定（项目视觉档案）">
+      <el-collapse v-if="profile" model-value="profile">
+        <el-collapse-item name="profile" title="1. 角色与画风锁定（项目视觉档案，只读）">
           <div class="revision-line">
             <span>当前 Revision {{ profile.revision }} · {{ profile.profileHash.slice(0, 16) }}</span>
-            <div><el-button @click="restoreProfile">恢复 Canon 默认草稿</el-button><el-button type="primary" @click="saveProfile">保存新 Revision</el-button></div>
+            <el-button type="primary" plain @click="syncProjectProfile">同步当前项目档案到本场视觉基准草稿</el-button>
           </div>
-          <div class="form-grid">
-            <el-form-item label="人物身份"><el-input v-model="profileForm.personIdentity" type="textarea" :rows="3" /></el-form-item>
-            <el-form-item label="人物发型"><el-input v-model="profileForm.personHair" type="textarea" :rows="3" /></el-form-item>
-            <el-form-item label="年龄、体型与比例"><el-input v-model="profileForm.personBody" type="textarea" :rows="3" /></el-form-item>
-            <el-form-item label="猫咪身份"><el-input v-model="profileForm.catIdentity" type="textarea" :rows="3" /></el-form-item>
-            <el-form-item label="画风正向（每行一项）"><el-input :model-value="profileForm.stylePositive.join('\n')" type="textarea" :rows="4" @update:model-value="updateStyleList('positive', $event)" /></el-form-item>
-            <el-form-item label="画风排除（每行一项）"><el-input :model-value="profileForm.styleNegative.join('\n')" type="textarea" :rows="4" @update:model-value="updateStyleList('negative', $event)" /></el-form-item>
+          <el-alert type="info" :closable="false" title="项目视觉档案只在“项目设置”中编辑；这里确认本场视觉基准实际引用的不可变 Revision。" />
+          <div class="profile-summary">
+            <p><b>人物：</b>{{ profile.personIdentity }}；{{ profile.personHair }}；{{ profile.personBody }}</p>
+            <p><b>猫咪：</b>{{ profile.catIdentity }}</p>
+            <p><b>画风：</b>{{ profile.stylePositive.join('、') }}</p>
           </div>
         </el-collapse-item>
       </el-collapse>
@@ -399,11 +369,11 @@ async function recordImageFailure(asset: AssetDto) {
       </section>
 
       <section class="section">
-        <h3>5. 定妆版本画廊</h3>
+        <h3>5. 视觉基准版本画廊</h3>
         <div class="gallery">
           <div class="version-list">
             <button v-for="version in versions" :key="version.id" type="button" :class="{ active: selectedVersion?.id === version.id }" @click="selectedVersion = version">
-              <span>#{{ version.attempt ?? '?' }} · {{ version.status }}</span><small>{{ version.selected ? '当前场景定妆' : version.displayName }}</small><small>{{ version.createdAt ? new Date(version.createdAt).toLocaleString() : '时间未记录' }}</small>
+              <span>#{{ version.attempt ?? '?' }} · {{ version.status }}</span><small>{{ version.selected ? '当前场景视觉基准' : version.displayName }}</small><small>{{ version.createdAt ? new Date(version.createdAt).toLocaleString() : '时间未记录' }}</small>
             </button>
           </div>
           <div v-if="selectedVersion" class="version-detail">
@@ -423,7 +393,7 @@ async function recordImageFailure(asset: AssetDto) {
             <details v-if="selectedVersion.prompt"><summary>本次 Prompt</summary><pre>{{ selectedVersion.prompt.text }}</pre></details>
             <details><summary>参考图与审计快照</summary><pre>{{ JSON.stringify(selectedVersion.inputSnapshot, null, 2) }}</pre></details>
           </div>
-          <p v-else class="muted">尚无定妆图版本。</p>
+          <p v-else class="muted">尚无视觉基准图版本。</p>
         </div>
       </section>
     </div>
@@ -433,5 +403,6 @@ async function recordImageFailure(asset: AssetDto) {
 <style scoped>
 .look-entry { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 7px; }.look-entry span { color: #91a2ba; }.selected-thumb { width: 64px; height: 72px; background: #090c11; }
 .look-workbench { min-height: 500px; display: grid; gap: 14px; }.section { padding: 14px; border: 1px solid #2b323f; border-radius: 9px; background: #11161e; }.section h3 { margin: 0 0 12px; }.section-heading,.revision-line { display: flex; align-items: center; justify-content: space-between; gap: 14px; }.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }.muted { color: #8d97a8; font-size: 12px; }.asset-group { margin-top: 14px; }.asset-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 9px; margin-top: 7px; }.asset-grid article { display: grid; gap: 6px; padding: 8px; border: 1px solid #2c3441; border-radius: 7px; }.asset-grid article.chosen { border-color: #409eff; }.asset-grid .el-image,.image-failure { width: 100%; height: 150px; background: #090c11; }.image-failure { display: grid; place-content: center; box-sizing: border-box; padding: 8px; color: #dc9d62; font-size: 11px; }.asset-grid small { color: #dc9d62; }.prompt-section pre,.version-detail pre { white-space: pre-wrap; max-height: 360px; overflow: auto; background: #090c11; padding: 12px; border-radius: 7px; }.gallery { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 12px; }.version-list { display: grid; align-content: start; gap: 6px; }.version-list button { display: grid; gap: 3px; text-align: left; color: #dce2ec; background: #0d1219; border: 1px solid #2b3442; border-radius: 7px; padding: 9px; cursor: pointer; }.version-list button.active { border-color: #409eff; }.version-list small { color: #8490a2; }.large-image { width: 100%; height: min(66vh, 720px); background: #080b0f; }.gallery-actions { display: flex; gap: 8px; margin: 10px 0; }.version-references { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 7px; margin: 10px 0; }.version-references > div { display: grid; gap: 4px; color: #8d97a8; font-size: 10px; }.version-references .el-image { width: 100%; height: 100px; background: #090c11; }
+.profile-summary { margin-top: 10px; color: #aeb8c8; line-height: 1.6; }.profile-summary p { margin: 5px 0; }
 @media (max-width: 800px) { .form-grid,.gallery { grid-template-columns: 1fr; }.section-heading,.revision-line { align-items: flex-start; flex-direction: column; } }
 </style>
