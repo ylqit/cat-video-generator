@@ -1,5 +1,7 @@
 # CAT-VIDEO-GENERATOR V5 完整替换实施 Checklist
 
+> 历史阶段记录，当前验收状态由 `v5-staged-creative-workflow.md` 接管；本文件中的完成标记不代表分阶段 LLM 替换已最终验证。
+
 本清单是角色与画风一致性修订后的唯一验收依据。状态说明：
 
 - `[ ]` planned：尚未实现。

@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Annotated
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import Field, model_validator
@@ -27,6 +27,13 @@ class AnchorMode(StrEnum):
     TEXT_ONLY = "text_only"
     EXISTING = "existing"
     GENERATE = "generate"
+
+
+class SceneLookUsage(StrEnum):
+    OFF = "off"
+    APPEARANCE_ONLY = "appearance_only"
+    FULL_REFERENCE = "full_reference"
+    DERIVE_ANCHOR = "derive_anchor"
 
 
 class ReferenceUsage(StrEnum):
@@ -51,6 +58,23 @@ class ReferenceTarget(StrEnum):
 class EnvironmentStyle(StrEnum):
     OUTDOOR = "outdoor"
     INDOOR = "indoor"
+
+
+class StoryIssueCategory(StrEnum):
+    CONTINUITY = "continuity"
+    CANON_CONFLICT = "canon_conflict"
+    PHYSICAL_FEASIBILITY = "physical_feasibility"
+    ACTION_DENSITY = "action_density"
+    CAUSALITY = "causality"
+    HUMAN_CAT_INTERACTION = "human_cat_interaction"
+    GENERATION_CLARITY = "generation_clarity"
+    OTHER = "other"
+
+
+class StoryRewriteStrategy(StrEnum):
+    CONSERVATIVE = "conservative"
+    BALANCED = "balanced"
+    CREATIVE = "creative"
 
 
 class LookReferencePurpose(StrEnum):
@@ -210,6 +234,64 @@ class SceneDraft(StrictModel):
         return self
 
 
+class StoryIssue(StrictModel):
+    category: StoryIssueCategory
+    evidence: Annotated[str, Field(min_length=1, max_length=2_000)]
+    impact: Annotated[str, Field(min_length=1, max_length=2_000)]
+    suggestion: Annotated[str, Field(min_length=1, max_length=2_000)]
+
+
+class StoryRewriteOption(StrictModel):
+    strategy: StoryRewriteStrategy
+    title: Annotated[str, Field(min_length=1, max_length=120)]
+    summary: Annotated[str, Field(min_length=1, max_length=3_000)]
+    tradeoffs: Annotated[str, Field(min_length=1, max_length=2_000)]
+
+
+class StoryDiagnosisOutput(StrictModel):
+    overall_assessment: Annotated[
+        str,
+        Field(alias="overallAssessment", min_length=1, max_length=4_000),
+    ]
+    issues: list[StoryIssue] = Field(default_factory=list, max_length=20)
+    rewrite_options: list[StoryRewriteOption] = Field(
+        alias="rewriteOptions",
+        min_length=3,
+        max_length=3,
+    )
+
+    @model_validator(mode="after")
+    def require_three_rewrite_strategies(self) -> StoryDiagnosisOutput:
+        strategies = [item.strategy for item in self.rewrite_options]
+        expected = {
+            StoryRewriteStrategy.CONSERVATIVE,
+            StoryRewriteStrategy.BALANCED,
+            StoryRewriteStrategy.CREATIVE,
+        }
+        if len(set(strategies)) != 3 or set(strategies) != expected:
+            raise ValueError("story diagnosis must contain three rewrite strategies")
+        return self
+
+
+class StoryRewriteOutput(StrictModel):
+    rewritten_story: Annotated[
+        str,
+        Field(alias="rewrittenStory", min_length=1, max_length=12_000),
+    ]
+    change_summary: list[Annotated[str, Field(min_length=1, max_length=1_000)]] = Field(
+        default_factory=list,
+        alias="changeSummary",
+        max_length=20,
+    )
+    unresolved_questions: list[
+        Annotated[str, Field(min_length=1, max_length=1_000)]
+    ] = Field(
+        default_factory=list,
+        alias="unresolvedQuestions",
+        max_length=20,
+    )
+
+
 class ShotSuggestion(StrictModel):
     title: Annotated[str, Field(min_length=1, max_length=100)]
     direction: Annotated[str, Field(min_length=1, max_length=6_000)]
@@ -241,7 +323,29 @@ class ShotCardDraft(StrictModel):
         default=True,
         alias="inheritProjectReferences",
     )
-    use_scene_look: bool = Field(default=True, alias="useSceneLook")
+    scene_look_usage: SceneLookUsage = Field(
+        default=SceneLookUsage.APPEARANCE_ONLY,
+        alias="sceneLookUsage",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_scene_look_flag(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        legacy = data.pop("useSceneLook", data.pop("use_scene_look", None))
+        if "sceneLookUsage" not in data and "scene_look_usage" not in data and legacy is not None:
+            data["sceneLookUsage"] = (
+                SceneLookUsage.APPEARANCE_ONLY if legacy else SceneLookUsage.OFF
+            )
+        return data
+
+    @property
+    def use_scene_look(self) -> bool:
+        """Compatibility view; scene_look_usage is the authoritative value."""
+
+        return self.scene_look_usage is not SceneLookUsage.OFF
 
     @model_validator(mode="after")
     def validate_references(self) -> ShotCardDraft:
@@ -255,7 +359,128 @@ class ShotCardDraft(StrictModel):
             raise ValueError("existing模式必须且只能选择一张approved_anchor")
         if self.anchor_mode is not AnchorMode.EXISTING and approved_anchors:
             raise ValueError("只有existing模式允许绑定approved_anchor")
+        if (
+            self.scene_look_usage is SceneLookUsage.DERIVE_ANCHOR
+            and self.anchor_mode is not AnchorMode.GENERATE
+        ):
+            raise ValueError("derive_anchor 定妆策略必须使用 generate 锚点模式")
         return self
+
+
+class ShotPacingBeat(StrictModel):
+    ordinal: Annotated[int, Field(ge=1, le=4)]
+    description: Annotated[str, Field(min_length=1, max_length=1_000)]
+    rhythm: Literal["brief", "standard", "expanded"]
+
+
+class ShotPacingPlan(StrictModel):
+    recommended_duration_seconds: Annotated[
+        int,
+        Field(alias="recommendedDurationSeconds", ge=8, le=15),
+    ]
+    rationale: Annotated[str, Field(min_length=1, max_length=2_000)]
+    beats: list[ShotPacingBeat] = Field(min_length=2, max_length=4)
+
+
+class ShotReferenceDecision(StrictModel):
+    asset_id: Annotated[UUID, Field(alias="assetId")]
+    decision: Literal["keep", "remove", "change_role"]
+    recommended_role: ReferenceRole | None = Field(
+        default=None,
+        alias="recommendedRole",
+    )
+    reason: Annotated[str, Field(min_length=1, max_length=1_000)]
+
+
+class ShotContinuityAdvice(StrictModel):
+    previous_issues: list[Annotated[str, Field(max_length=1_000)]] = Field(
+        default_factory=list,
+        alias="previousIssues",
+        max_length=12,
+    )
+    next_issues: list[Annotated[str, Field(max_length=1_000)]] = Field(
+        default_factory=list,
+        alias="nextIssues",
+        max_length=12,
+    )
+    recommendation: Annotated[str, Field(min_length=1, max_length=2_000)]
+
+
+class ShotAssistPatch(StrictModel):
+    title: Annotated[str | None, Field(min_length=1, max_length=100)] = None
+    direction: Annotated[str | None, Field(min_length=1, max_length=6_000)] = None
+    duration_seconds: Annotated[
+        int | None,
+        Field(default=None, alias="durationSeconds", ge=8, le=15),
+    ]
+    scene_look_usage: SceneLookUsage | None = Field(
+        default=None,
+        alias="sceneLookUsage",
+    )
+    anchor_mode: AnchorMode | None = Field(default=None, alias="anchorMode")
+    reference_bindings: list[ReferenceBinding] | None = Field(
+        default=None,
+        alias="referenceBindings",
+    )
+
+    @model_validator(mode="after")
+    def require_selected_field(self) -> ShotAssistPatch:
+        if all(
+            value is None
+            for value in (
+                self.title,
+                self.direction,
+                self.duration_seconds,
+                self.scene_look_usage,
+                self.anchor_mode,
+                self.reference_bindings,
+            )
+        ):
+            raise ValueError("at least one shot-assistance field must be selected")
+        return self
+
+
+class ShotCreativeAlternative(StrictModel):
+    label: Literal["conservative", "stable"]
+    body: Annotated[str, Field(min_length=1, max_length=6_000)]
+    rationale: Annotated[str, Field(min_length=1, max_length=2_000)]
+
+
+class ShotAssistAnalysis(StrictModel):
+    action_density_assessment: Annotated[
+        str,
+        Field(alias="actionDensityAssessment", min_length=1, max_length=2_000),
+    ]
+    asset_compatibility_assessment: Annotated[
+        str,
+        Field(alias="assetCompatibilityAssessment", max_length=3_000),
+    ] = ""
+    pacing_plan: ShotPacingPlan = Field(alias="pacingPlan")
+    recommended_scene_look_usage: SceneLookUsage = Field(
+        alias="recommendedSceneLookUsage"
+    )
+    recommended_anchor_mode: AnchorMode = Field(alias="recommendedAnchorMode")
+    reference_decisions: list[ShotReferenceDecision] = Field(
+        default_factory=list,
+        alias="referenceDecisions",
+        max_length=9,
+    )
+    continuity: ShotContinuityAdvice
+    prompt_risks: list[Annotated[str, Field(max_length=1_000)]] = Field(
+        default_factory=list,
+        alias="promptRisks",
+        max_length=12,
+    )
+    creative_body: Annotated[
+        str | None,
+        Field(default=None, alias="creativeBody", min_length=1, max_length=6_000),
+    ]
+    creative_alternatives: list[ShotCreativeAlternative] = Field(
+        default_factory=list,
+        alias="creativeAlternatives",
+        max_length=2,
+    )
+    patch: ShotAssistPatch | None = None
 
 
 class ShotPromptContext(StrictModel):

@@ -37,11 +37,14 @@ from ...domain.contracts import (
     SceneDraft,
     SceneLookDraft,
     SceneLookPlan,
+    ShotAssistPatch,
     ShotCardDraft,
     StoryProjectInput,
     VisualProfileDraft,
 )
+from ...domain.creative_workflow import story_source_hash
 from ...domain.rendering import ProjectSequencePlan, SequenceStatus
+from ...domain.shot_assistance import apply_shot_assist_patch
 from ...domain.workflow import (
     PromptPurpose,
     RunStatus,
@@ -219,6 +222,79 @@ class SqlAlchemyWorkflowRepository:
             project.current_visual_profile_revision_id = row.id
             project.default_reference_bindings_json = _project_reference_bindings(draft)
             return _visual_profile(row)
+
+    def restore_project_canon_references(
+        self,
+        project_id: uuid.UUID,
+        draft: VisualProfileDraft,
+    ) -> tuple[StoredVisualProfileRevision, int]:
+        with self._sessions.begin() as session:
+            project = self._require_project(session, project_id)
+            normalized_bindings = self._normalize_look_reference_bindings(
+                session,
+                project_id=project_id,
+                bindings=draft.reference_bindings,
+                profile_only=True,
+            )
+            draft = draft.model_copy(update={"reference_bindings": normalized_bindings})
+            reference_snapshot = _reference_snapshot(session, normalized_bindings)
+            profile_hash = _profile_hash(draft, reference_snapshot=reference_snapshot)
+            profile = session.scalar(
+                select(VisualProfileRevision).where(
+                    VisualProfileRevision.production_run_id == project_id,
+                    VisualProfileRevision.profile_hash == profile_hash,
+                )
+            )
+            if profile is None:
+                profile = self._create_visual_profile_revision(
+                    session,
+                    project=project,
+                    draft=draft,
+                    reference_snapshot=reference_snapshot,
+                )
+            project.current_visual_profile_revision_id = profile.id
+            project.default_reference_bindings_json = _project_reference_bindings(draft)
+
+            scene_look_ids = set(
+                session.execute(
+                    select(Asset.id).where(
+                        Asset.production_run_id == project_id,
+                        Asset.role == "scene_look",
+                    )
+                ).scalars()
+            )
+            cleaned_shot_count = 0
+            shot_rows = session.execute(
+                select(ShotCard)
+                .join(Scene, Scene.id == ShotCard.scene_id)
+                .where(Scene.production_run_id == project_id)
+            ).scalars()
+            for shot_row in shot_rows:
+                scene = _required(session, Scene, shot_row.scene_id)
+                draft_before = _shot(shot_row, project_id).draft
+                selected_scene_look_ids = set(scene_look_ids)
+                if scene.selected_look_asset_id is not None:
+                    selected_scene_look_ids.add(scene.selected_look_asset_id)
+                filtered = [
+                    binding
+                    for binding in draft_before.reference_bindings
+                    if not (
+                        binding.asset_id in selected_scene_look_ids
+                        and binding.role is ReferenceRole.IDENTITY
+                    )
+                ]
+                if len(filtered) == len(draft_before.reference_bindings):
+                    continue
+                updated = draft_before.model_copy(update={"reference_bindings": filtered})
+                _write_shot_draft(shot_row, updated)
+                shot_row.draft_revision += 1
+                shot_row.selected_anchor_asset_id = None
+                shot_row.selected_video_asset_id = None
+                shot_row.status = ShotStatus.READY.value
+                cleaned_shot_count += 1
+            if cleaned_shot_count:
+                self._invalidate_project_sequence(session, project_id)
+            return _visual_profile(profile), cleaned_shot_count
 
     def get_project(self, project_id: uuid.UUID) -> StoredProject:
         with self._sessions() as session:
@@ -458,6 +534,80 @@ class SqlAlchemyWorkflowRepository:
             rows = self._replace_shots_locked(session, scene=scene, drafts=drafts)
             return tuple(_shot(row, scene.production_run_id) for row in rows)
 
+    def accept_story_diagnosis(
+        self,
+        *,
+        step_id: uuid.UUID,
+        expected_source_hash: str,
+        accepted_output: dict[str, Any],
+    ) -> StoredStep:
+        with self._sessions.begin() as session:
+            step = _required(session, WorkflowStep, step_id)
+            if (
+                StepKind(step.kind) is not StepKind.DIRECTOR
+                or StepStatus(step.status) is not StepStatus.SUCCEEDED
+                or step.operation_key != "director:story-diagnosis"
+                or step.scene_id is None
+                or step.shot_card_id is not None
+            ):
+                raise ValueError("step is not a succeeded story diagnosis")
+            snapshot = dict(step.input_snapshot_json)
+            if "acceptedAt" in snapshot:
+                raise WorkflowConflictError("该剧情诊断已经接受过")
+            scene = _required(session, Scene, step.scene_id)
+            current_hash = story_source_hash(_scene(scene).draft)
+            if (
+                snapshot.get("sourceHash") != expected_source_hash
+                or current_hash != expected_source_hash
+            ):
+                raise WorkflowConflictError("场景剧情已变化，旧诊断不能再接受")
+            snapshot["acceptedOutput"] = accepted_output
+            snapshot["acceptedAt"] = datetime.now(timezone.utc).isoformat()
+            step.input_snapshot_json = snapshot
+            return _step(step)
+
+    def accept_story_rewrite(
+        self,
+        *,
+        step_id: uuid.UUID,
+        expected_source_hash: str,
+        accepted_output: dict[str, Any],
+        rewritten_story: str,
+    ) -> StoredScene:
+        with self._sessions.begin() as session:
+            step = _required(session, WorkflowStep, step_id)
+            if (
+                StepKind(step.kind) is not StepKind.DIRECTOR
+                or StepStatus(step.status) is not StepStatus.SUCCEEDED
+                or step.operation_key != "director:story-rewrite"
+                or step.scene_id is None
+                or step.shot_card_id is not None
+            ):
+                raise ValueError("step is not a succeeded story rewrite")
+            snapshot = dict(step.input_snapshot_json)
+            if "acceptedAt" in snapshot:
+                raise WorkflowConflictError("该剧情重写已经接受过")
+            scene = _required(session, Scene, step.scene_id)
+            current_hash = story_source_hash(_scene(scene).draft)
+            if (
+                snapshot.get("sourceHash") != expected_source_hash
+                or current_hash != expected_source_hash
+            ):
+                raise WorkflowConflictError("场景剧情已变化，旧重写稿不能再接受")
+            scene.source_text = rewritten_story
+            shots = session.execute(
+                select(ShotCard).where(ShotCard.scene_id == scene.id)
+            ).scalars()
+            for shot in shots:
+                shot.selected_anchor_asset_id = None
+                shot.selected_video_asset_id = None
+                shot.status = ShotStatus.READY.value
+            self._invalidate_project_sequence(session, scene.production_run_id)
+            snapshot["acceptedOutput"] = accepted_output
+            snapshot["acceptedAt"] = datetime.now(timezone.utc).isoformat()
+            step.input_snapshot_json = snapshot
+            return _scene(scene)
+
     def accept_scene_suggestions(
         self,
         *,
@@ -473,10 +623,17 @@ class SqlAlchemyWorkflowRepository:
             if (
                 StepKind(step.kind) is not StepKind.DIRECTOR
                 or StepStatus(step.status) is not StepStatus.SUCCEEDED
+                or step.operation_key != "director:shot-suggestions"
                 or step.scene_id is None
+                or step.shot_card_id is not None
             ):
                 raise ValueError("step is not an accepted scene suggestion result")
             scene = _required(session, Scene, step.scene_id)
+            snapshot = dict(step.input_snapshot_json)
+            if "acceptedAt" in snapshot:
+                raise WorkflowConflictError("该分镜建议已经接受过")
+            if snapshot.get("sourceHash") != story_source_hash(_scene(scene).draft):
+                raise WorkflowConflictError("场景剧情已变化，旧分镜建议不能再接受")
             for draft in drafts:
                 self._validate_reference_bindings(
                     session,
@@ -514,7 +671,6 @@ class SqlAlchemyWorkflowRepository:
                     )
                 scene.look_draft_json = look_draft.model_dump(mode="json", by_alias=True)
                 scene.look_draft_revision += 1
-            snapshot = dict(step.input_snapshot_json)
             snapshot["acceptedOutput"] = accepted_output
             snapshot["acceptedAt"] = datetime.now(timezone.utc).isoformat()
             step.input_snapshot_json = snapshot
@@ -531,21 +687,60 @@ class SqlAlchemyWorkflowRepository:
                 bindings=draft.reference_bindings,
             )
             changed = _shot(row, scene.production_run_id).draft != draft
-            row.title = draft.title
-            row.direction = draft.direction
-            row.duration_seconds = draft.duration_seconds
-            row.anchor_mode = draft.anchor_mode.value
-            row.reference_bindings_json = [
-                binding.model_dump(mode="json", by_alias=True)
-                for binding in draft.reference_bindings
-            ]
-            row.inherit_project_references = draft.inherit_project_references
-            row.use_scene_look = draft.use_scene_look
+            _write_shot_draft(row, draft)
             if changed:
+                row.draft_revision += 1
                 row.selected_anchor_asset_id = None
                 row.selected_video_asset_id = None
                 row.status = ShotStatus.READY.value
                 self._invalidate_project_sequence(session, scene.production_run_id)
+            return _shot(row, scene.production_run_id)
+
+    def accept_shot_assistance(
+        self,
+        *,
+        step_id: uuid.UUID,
+        source_draft_revision: int,
+        patch: ShotAssistPatch,
+    ) -> StoredShot:
+        with self._sessions.begin() as session:
+            step = _required(session, WorkflowStep, step_id)
+            if (
+                StepKind(step.kind) is not StepKind.DIRECTOR
+                or StepStatus(step.status) is not StepStatus.SUCCEEDED
+                or step.operation_key != "director:shot-assistance"
+                or step.shot_card_id is None
+            ):
+                raise ValueError("step is not a succeeded shot-assistance analysis")
+            snapshot = dict(step.input_snapshot_json)
+            if "acceptedAt" in snapshot:
+                raise WorkflowConflictError("该片段创作建议已经接受过")
+            recorded_revision = snapshot.get("sourceDraftRevision")
+            if recorded_revision != source_draft_revision:
+                raise WorkflowConflictError("接受请求与分析来源版本不一致")
+            row = _required(session, ShotCard, step.shot_card_id)
+            scene = _required(session, Scene, row.scene_id)
+            if row.draft_revision != source_draft_revision:
+                raise WorkflowConflictError("片段草稿已更新，旧分析不能再接受")
+            current = _shot(row, scene.production_run_id).draft
+            updated = apply_shot_assist_patch(current, patch)
+            self._validate_reference_bindings(
+                session,
+                project_id=scene.production_run_id,
+                bindings=updated.reference_bindings,
+            )
+            changed = current != updated
+            _write_shot_draft(row, updated)
+            if changed:
+                row.draft_revision += 1
+                row.selected_anchor_asset_id = None
+                row.selected_video_asset_id = None
+                row.status = ShotStatus.READY.value
+                self._invalidate_project_sequence(session, scene.production_run_id)
+            snapshot["acceptedOutput"] = patch.model_dump(mode="json", by_alias=True)
+            snapshot["acceptedAt"] = datetime.now(timezone.utc).isoformat()
+            snapshot["acceptedDraftRevision"] = row.draft_revision
+            step.input_snapshot_json = snapshot
             return _shot(row, scene.production_run_id)
 
     def delete_shot(self, shot_id: uuid.UUID) -> None:
@@ -1207,6 +1402,16 @@ class SqlAlchemyWorkflowRepository:
                 raise ValueError("a reference file is unavailable; repair or upload it first")
             if binding.usage.value == "approved_anchor" and asset.status != "approved":
                 raise ValueError("an approved_anchor binding requires an approved image")
+            expected_role = _expected_reference_role(asset)
+            if expected_role is not None and binding.role is not expected_role:
+                raise ValueError(
+                    f"asset {asset.id} has fixed reference role {expected_role.value}"
+                )
+            if (
+                asset.role == "shot_tail_frame"
+                and binding.usage is not ReferenceUsage.APPROVED_ANCHOR
+            ):
+                raise ValueError("a shot tail frame can only be used as an approved anchor")
 
     def _normalize_look_reference_bindings(
         self,
@@ -1313,6 +1518,17 @@ def _default_visual_profile(session: Session) -> VisualProfileDraft:
         if key in by_key
     ]
     return VisualProfileDraft(referenceBindings=bindings)
+
+
+def _expected_reference_role(asset: Asset) -> ReferenceRole | None:
+    if asset.role == "scene_look":
+        return ReferenceRole.SCENE
+    semantic_key = asset.semantic_key or ""
+    if asset.scope == "canon" and semantic_key.startswith(("person:", "cat:")):
+        return ReferenceRole.IDENTITY
+    if asset.scope == "canon" and semantic_key.startswith("style:"):
+        return ReferenceRole.STYLE
+    return None
 
 
 def _reference_snapshot(
@@ -1455,20 +1671,26 @@ def _scene(row: Scene) -> StoredScene:
 
 
 def _new_shot(scene_id: uuid.UUID, order: int, draft: ShotCardDraft) -> ShotCard:
-    return ShotCard(
+    row = ShotCard(
         scene_id=scene_id,
         sort_order=order,
-        title=draft.title,
-        direction=draft.direction,
-        duration_seconds=draft.duration_seconds,
-        anchor_mode=draft.anchor_mode.value,
-        reference_bindings_json=[
-            item.model_dump(mode="json", by_alias=True) for item in draft.reference_bindings
-        ],
-        inherit_project_references=draft.inherit_project_references,
-        use_scene_look=draft.use_scene_look,
         status=ShotStatus.READY.value,
     )
+    _write_shot_draft(row, draft)
+    return row
+
+
+def _write_shot_draft(row: ShotCard, draft: ShotCardDraft) -> None:
+    row.title = draft.title
+    row.direction = draft.direction
+    row.duration_seconds = draft.duration_seconds
+    row.anchor_mode = draft.anchor_mode.value
+    row.reference_bindings_json = [
+        item.model_dump(mode="json", by_alias=True) for item in draft.reference_bindings
+    ]
+    row.inherit_project_references = draft.inherit_project_references
+    row.use_scene_look = draft.use_scene_look
+    row.scene_look_usage = draft.scene_look_usage.value
 
 
 def _shot(row: ShotCard, project_id: uuid.UUID) -> StoredShot:
@@ -1486,9 +1708,10 @@ def _shot(row: ShotCard, project_id: uuid.UUID) -> StoredShot:
                 ReferenceBinding.model_validate(item) for item in row.reference_bindings_json
             ],
             inheritProjectReferences=row.inherit_project_references,
-            useSceneLook=row.use_scene_look,
+            sceneLookUsage=row.scene_look_usage,
         ),
         status=ShotStatus(row.status),
+        draft_revision=row.draft_revision,
         selected_anchor_asset_id=row.selected_anchor_asset_id,
         selected_video_asset_id=row.selected_video_asset_id,
     )
@@ -1617,6 +1840,8 @@ def _json_shot(row: StoredShot) -> dict[str, Any]:
         "sceneId": str(row.scene_id),
         "order": row.order,
         **row.draft.model_dump(mode="json", by_alias=True),
+        "draftRevision": row.draft_revision,
+        "useSceneLook": row.draft.use_scene_look,
         "status": row.status.value,
         "selectedAnchorAssetId": None
         if row.selected_anchor_asset_id is None

@@ -13,9 +13,13 @@ from ..domain.contracts import (
     SceneDraft,
     SceneLookDraft,
     SceneLookPlan,
+    ShotAssistPatch,
     ShotCardDraft,
     ShotSuggestion,
+    StoryDiagnosisOutput,
     StoryProjectInput,
+    StoryRewriteOutput,
+    StoryRewriteStrategy,
     VisualProfileDraft,
 )
 
@@ -48,6 +52,47 @@ class ShotRequest(ShotCardDraft):
 
 class SuggestShotsRequest(ApiModel):
     allow_paid_generation: bool = Field(alias="allowPaidGeneration")
+
+
+class DiagnoseStoryRequest(ApiModel):
+    allow_paid_generation: bool = Field(alias="allowPaidGeneration")
+
+
+class AcceptStoryDiagnosisRequest(ApiModel):
+    diagnosis: StoryDiagnosisOutput
+    selected_strategy: StoryRewriteStrategy | None = Field(
+        default=None,
+        alias="selectedStrategy",
+    )
+    additional_instructions: Annotated[
+        str,
+        Field(alias="additionalInstructions", max_length=4_000),
+    ] = ""
+    preserve_original: bool = Field(default=False, alias="preserveOriginal")
+
+
+class RewriteStoryRequest(ApiModel):
+    diagnosis_step_id: UUID = Field(alias="diagnosisStepId")
+    allow_paid_generation: bool = Field(alias="allowPaidGeneration")
+
+
+class AcceptStoryRewriteRequest(ApiModel):
+    rewrite: StoryRewriteOutput
+
+
+class AssistShotRequest(ApiModel):
+    source_draft_revision: int = Field(alias="sourceDraftRevision", ge=1)
+    candidate_asset_ids: list[UUID] = Field(
+        default_factory=list,
+        alias="candidateAssetIds",
+        max_length=32,
+    )
+    allow_paid_generation: bool = Field(alias="allowPaidGeneration")
+
+
+class AcceptShotAssistanceRequest(ApiModel):
+    source_draft_revision: int = Field(alias="sourceDraftRevision", ge=1)
+    patch: ShotAssistPatch
 
 
 class AcceptSuggestionsRequest(ApiModel):

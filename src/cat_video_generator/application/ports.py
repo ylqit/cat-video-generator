@@ -13,6 +13,7 @@ from ..domain.contracts import (
     SceneDraft,
     SceneLookDraft,
     SceneLookPlan,
+    ShotAssistPatch,
     ShotCardDraft,
     StoryProjectInput,
     VisualProfileDraft,
@@ -134,6 +135,7 @@ class StoredShot:
     order: int
     draft: ShotCardDraft
     status: ShotStatus
+    draft_revision: int = 1
     selected_anchor_asset_id: uuid.UUID | None = None
     selected_video_asset_id: uuid.UUID | None = None
 
@@ -262,8 +264,20 @@ class DirectorGateway(Protocol):
     @property
     def model(self) -> str: ...
 
+    @property
+    def analysis_model(self) -> str: ...
+
     def generate_structured(
         self, *, prompt: str, schema: dict[str, Any], output_name: str
+    ) -> DirectorResult: ...
+
+    def analyze_structured(
+        self,
+        *,
+        prompt: str,
+        schema: dict[str, Any],
+        output_name: str,
+        image_paths: tuple[Path, ...],
     ) -> DirectorResult: ...
 
 
@@ -347,6 +361,8 @@ class FrameExtractor(Protocol):
         self, source: StoredAsset, *, timestamps_ms: tuple[int, ...]
     ) -> tuple[Path, ...]: ...
 
+    def extract_tail_frame(self, source: StoredAsset) -> tuple[Path, int]: ...
+
 
 class ShotQueueStore(Protocol):
     def create_project(self, source: StoryProjectInput, *, content_date: date) -> StoredProject: ...
@@ -383,6 +399,12 @@ class ShotQueueStore(Protocol):
         project_id: uuid.UUID,
         draft: VisualProfileDraft,
     ) -> StoredVisualProfileRevision: ...
+
+    def restore_project_canon_references(
+        self,
+        project_id: uuid.UUID,
+        draft: VisualProfileDraft,
+    ) -> tuple[StoredVisualProfileRevision, int]: ...
 
     def add_scene(self, project_id: uuid.UUID, draft: SceneDraft) -> StoredScene: ...
 
@@ -427,7 +449,32 @@ class ShotQueueStore(Protocol):
         accepted_output: dict[str, Any],
     ) -> tuple[StoredShot, ...]: ...
 
+    def accept_story_diagnosis(
+        self,
+        *,
+        step_id: uuid.UUID,
+        expected_source_hash: str,
+        accepted_output: dict[str, Any],
+    ) -> StoredStep: ...
+
+    def accept_story_rewrite(
+        self,
+        *,
+        step_id: uuid.UUID,
+        expected_source_hash: str,
+        accepted_output: dict[str, Any],
+        rewritten_story: str,
+    ) -> StoredScene: ...
+
     def update_shot(self, shot_id: uuid.UUID, draft: ShotCardDraft) -> StoredShot: ...
+
+    def accept_shot_assistance(
+        self,
+        *,
+        step_id: uuid.UUID,
+        source_draft_revision: int,
+        patch: ShotAssistPatch,
+    ) -> StoredShot: ...
 
     def delete_shot(self, shot_id: uuid.UUID) -> None: ...
 

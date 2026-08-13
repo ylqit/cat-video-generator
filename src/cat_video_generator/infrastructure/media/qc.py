@@ -149,6 +149,40 @@ class FfmpegFrameExtractor:
                 frame.unlink(missing_ok=True)
             raise
 
+    def extract_tail_frame(self, source: StoredAsset) -> tuple[Path, int]:
+        """Choose the latest frame from the calmest transition near the video end."""
+
+        qc_metadata = source.metadata.get("qc")
+        duration_ms = (
+            qc_metadata.get("durationMs")
+            if isinstance(qc_metadata, dict)
+            else source.metadata.get("durationMs")
+        )
+        if not isinstance(duration_ms, int) or duration_ms <= 0:
+            raise ValueError("视频资产缺少durationMs")
+        timestamps_ms = tuple(
+            dict.fromkeys(
+                max(0, duration_ms - offset)
+                for offset in (900, 500, 120)
+                if max(0, duration_ms - offset) < duration_ms
+            )
+        )
+        frames = self.extract_frames_at(source, timestamps_ms=timestamps_ms)
+        selected_index = len(frames) - 1
+        if len(frames) > 1:
+            scores = []
+            previous = _small_rgb(frames[0])
+            for index, path in enumerate(frames[1:], 1):
+                current = _small_rgb(path)
+                score = sum(ImageStat.Stat(ImageChops.difference(previous, current)).mean)
+                scores.append((score, -index, index))
+                previous = current
+            selected_index = min(scores)[2]
+        for index, frame in enumerate(frames):
+            if index != selected_index:
+                frame.unlink(missing_ok=True)
+        return frames[selected_index], timestamps_ms[selected_index]
+
 
 def _small_rgb(path: Path) -> Image.Image:
     with Image.open(path) as image:

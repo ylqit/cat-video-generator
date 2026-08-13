@@ -13,6 +13,7 @@ from cat_video_generator.domain.contracts import (
     ShotSuggestion,
     ShotSuggestionOutput,
 )
+from cat_video_generator.domain.creative_workflow import story_source_hash
 from cat_video_generator.domain.prompts import (
     compile_scene_look_prompt,
     compile_shot_suggestion_prompt,
@@ -116,7 +117,10 @@ def test_accept_suggestions_persists_edited_output_and_requires_target_count() -
         status=StepStatus.SUCCEEDED,
         attempt=1,
         operation_key="director:shot-suggestions",
-        input_snapshot={"providerOutput": {"sceneTitle": "原始", "lookPlan": {}, "shots": []}},
+        input_snapshot={
+            "sourceHash": story_source_hash(scene.draft),
+            "providerOutput": {"sceneTitle": "原始", "lookPlan": {}, "shots": []},
+        },
         created_at=datetime.now(UTC),
     )
 

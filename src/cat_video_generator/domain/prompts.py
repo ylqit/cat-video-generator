@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
-from .contracts import SceneLookPlan, ShotPromptContext, VisualProfileDraft
+from .contracts import (
+    SceneDraft,
+    SceneLookPlan,
+    ShotCardDraft,
+    ShotPromptContext,
+    VisualProfileDraft,
+)
 from .rendering import VideoInputPlan
+from .shot_assistance import ShotLocalAnalysis
 from .visual_profiles import (
     DEFAULT_SERIES_VISUAL_PROFILE,
     DEFAULT_STYLE_PROFILE,
@@ -26,6 +34,13 @@ class CompiledPrompt:
     warnings: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class CompiledShotVideoPrompt:
+    creative_body: str
+    system_shell: CompiledPrompt
+    final: CompiledPrompt
+
+
 def _compiled(text: str) -> CompiledPrompt:
     normalized = text.strip()
     if not normalized:
@@ -37,6 +52,66 @@ def _compiled(text: str) -> CompiledPrompt:
     )
 
 
+def compile_story_diagnosis_prompt(
+    *,
+    project_title: str,
+    scene: SceneDraft,
+    visual_profile: VisualProfileDraft,
+    previous_scene_summary: str | None,
+    next_scene_summary: str | None,
+) -> str:
+    previous = previous_scene_summary or "无上一场景。"
+    following = next_scene_summary or "无下一场景。"
+    return f"""你是剧情医生。你的职责是分析用户原始剧情是否连续、物理可表达并适合后续视频生成；
+只提出诊断和候选方案，不改写原稿。
+
+【项目】{project_title}
+【当前场景】{scene.title}
+【用户原始剧情】{scene.source_text}
+【补充口述】{scene.context_note or '无'}
+【上一场景摘要】{previous}
+【下一场景摘要】{following}
+【目标视频片段数量】{scene.target_shot_count}
+【每片段允许时长】8至15秒
+【长期人物约束】{visual_profile.person_identity}；{visual_profile.person_hair}；{visual_profile.person_body}
+【长期猫咪约束】{visual_profile.cat_identity}
+【系列画风】{'、'.join(visual_profile.style_positive)}
+
+请逐条检查：人物、猫咪、服饰和长期身份是否冲突；道具初始位置与后续流向是否重复或断裂；容器、场景结构、主体尺寸和动作路径是否可能不匹配；动作是否缺少合理起点、接触路径或完成结果；事件数量与目标片段数是否匹配；因果关系和相邻场景是否连续；人猫互动是否符合生活切片定位；哪些描述可以直接生成、哪些应改写或拆分。
+
+输出总体评价和问题列表。每个问题必须引用原文证据，说明生成影响并给出通用修改建议。再分别输出保守修订、平衡优化、创作增强三种方案，说明改动范围与取舍。不要在本阶段输出重写后的完整剧情，不要输出镜头或供应商Prompt。""".strip()
+
+
+def compile_story_rewrite_prompt(
+    *,
+    project_title: str,
+    scene: SceneDraft,
+    visual_profile: VisualProfileDraft,
+    accepted_diagnosis: dict[str, object],
+) -> str:
+    accepted_json = json.dumps(
+        accepted_diagnosis,
+        ensure_ascii=False,
+        sort_keys=True,
+        indent=2,
+    )
+    return f"""你是剧本编辑。根据已经由用户确认的剧情诊断，
+把原始剧情重写为一份完整、连续、尚未拆分镜头的场景剧情。
+
+【项目】{project_title}
+【场景】{scene.title}
+【原始剧情】{scene.source_text}
+【补充口述】{scene.context_note or '无'}
+【用户已确认的诊断与方案】
+{accepted_json}
+【长期人物约束】{visual_profile.person_identity}；{visual_profile.person_hair}；{visual_profile.person_body}
+【长期猫咪约束】{visual_profile.cat_identity}
+
+保持用户的核心事件和情绪目标；统一每件道具的初始位置、移动路径和后续流向；把不合理的尺寸、收纳或操作关系改成可生成的合理形态；明确人物与猫咪各自能够完成的动作；场景服饰只能服务本场剧情，不得反向改变长期角色身份。不要拆分视频片段，不要写机位、景别、精确秒点或供应商Prompt。
+
+只输出完整重写剧情、修改摘要和仍需人工决定的问题。""".strip()
+
+
 def compile_shot_suggestion_prompt(
     *,
     project_title: str,
@@ -45,20 +120,25 @@ def compile_shot_suggestion_prompt(
     context_note: str | None,
     story_mode: str,
     target_shot_count: int,
+    visual_profile: VisualProfileDraft | None = None,
 ) -> str:
+    profile = visual_profile or VisualProfileDraft()
     context = (
         "本场景不加载其他剧情。"
         if not context_note
         else f"可选关联说明：{context_note.strip()}。只把它当作建议，不得改写用户原文。"
     )
     mode = "单片段短片" if story_mode == "single" else "多片段剧情"
-    return f"""你是生活短片导演。把用户原始场景转换成可编辑的竖屏视频片段队列。
+    return f"""你是分镜导演。把用户已经确认的场景剧情转换成可编辑的竖屏视频片段队列；
+不得回退到未经确认的旧口述。
 
 项目：{project_title}
 场景：{scene_title}
-用户原文：{source_text}
+已批准剧情：{source_text}
 {context}
 创作模式：{mode}。严格输出{target_shot_count}个视频片段。
+长期人物：{profile.person_identity}；{profile.person_hair}；{profile.person_body}。
+长期猫咪：{profile.cat_identity}。
 
 使用内置“生活短片镜头化”规则：
 1. 每个视频片段只表达一个生活微事件、一项主要动作链和一个稳定可见结果；
@@ -161,6 +241,27 @@ def compile_shot_video_prompt(
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
     visual_profile: VisualProfileDraft | None = None,
 ) -> CompiledPrompt:
+    return compile_shot_video_prompt_parts(
+        context,
+        input_plan,
+        binding_descriptions=binding_descriptions,
+        regeneration_instruction=regeneration_instruction,
+        series_profile=series_profile,
+        style_profile=style_profile,
+        visual_profile=visual_profile,
+    ).final
+
+
+def compile_shot_video_prompt_parts(
+    context: ShotPromptContext,
+    input_plan: VideoInputPlan,
+    *,
+    binding_descriptions: tuple[str, ...],
+    regeneration_instruction: str | None = None,
+    series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
+    style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
+    visual_profile: VisualProfileDraft | None = None,
+) -> CompiledShotVideoPrompt:
     profile = visual_profile or VisualProfileDraft(
         personIdentity=series_profile.person_identity,
         personHair=series_profile.person_hair,
@@ -180,13 +281,89 @@ def compile_shot_video_prompt(
         if not regeneration_instruction
         else f"\n【本次重做目标】{regeneration_instruction.strip()}"
     )
-    return _compiled(
-        f"""【主体、画风和素材职责】输出{input_plan.resolution}、9:16竖屏、{context.duration_seconds}秒的一个完整视频片段，使用原生环境声和动作声。{profile.person_identity}；{profile.person_hair}；{profile.person_body}；{profile.cat_identity}。采用{'、'.join(profile.style_positive)}，排除{'、'.join(profile.style_negative)}。项目视觉档案负责长期人物和猫咪身份及系列画风；场景定妆只负责本场服装、配件、道具、姿态和构图，不得反向改写长期身份。素材：{binding_text}
+    prefix = (
+        f"【主体、画风和素材职责】输出{input_plan.resolution}、9:16竖屏、"
+        f"{context.duration_seconds}秒的一个完整视频片段，使用原生环境声和动作声。"
+        f"{profile.person_identity}；{profile.person_hair}；{profile.person_body}；"
+        f"{profile.cat_identity}。采用{'、'.join(profile.style_positive)}，"
+        f"排除{'、'.join(profile.style_negative)}。"
+        "项目视觉档案负责长期人物和猫咪身份及系列画风；"
+        "场景基础定妆和片段素材只承担各自声明的视觉职责，不得反向改写长期身份。"
+        f"素材：{binding_text}"
+    )
+    suffix = (
+        "【系统技术限制】严格执行已确认创作正文，"
+        "不由系统补写剧情、动作、空间关系、节奏或声音。"
+        "保持输入图片对应主体与素材数量；禁止角色分身、无原因换装、"
+        f"关键物体悬空或自动恢复、字幕、水印、Logo和供应商UI。{retry}"
+    )
+    system_shell = _compiled(
+        f"""{prefix}
+
+【片段内子镜头、动作路径和结果】项目“{context.project_title}”，场景“{context.scene_title}”，视频片段“{context.shot_title}”。正文由片段已确认正文注入，此技术外壳不改写创作内容。
+
+{suffix}"""
+    )
+    final = _compiled(
+        f"""{prefix}
 
 【片段内子镜头、动作路径和结果】项目“{context.project_title}”，场景“{context.scene_title}”，视频片段“{context.shot_title}”。严格按下列编号子镜头的顺序、空间连续性和因果关系执行：{context.direction}
 
-【关键关系、声音和稳定结尾】整个片段只表达一个生活微事件，2至4个子镜头连续完成同一动作链；猫咪是主要观察和行动对象，人物负责手部或工具操作。动作接触关系必须服从片段文字，角色与道具数量保持，最后切点落在交互结果完成后的稳定状态。原生环境声和接触声与画面同步，无对白、旁白或歌词；禁止角色分身、无原因换装、关键物体悬空或自动恢复、字幕、水印、Logo和供应商UI。{retry}"""
+{suffix}"""
     )
+    return CompiledShotVideoPrompt(
+        creative_body=context.direction,
+        system_shell=system_shell,
+        final=final,
+    )
+
+
+def compile_shot_assistance_prompt(
+    *,
+    project_title: str,
+    scene_title: str,
+    scene_text: str,
+    current: ShotCardDraft,
+    previous: ShotCardDraft | None,
+    following: ShotCardDraft | None,
+    visual_profile: VisualProfileDraft,
+    local_analysis: ShotLocalAnalysis,
+    reference_manifest: tuple[str, ...],
+) -> str:
+    previous_text = (
+        "无上一片段"
+        if previous is None
+        else f"{previous.title}：{previous.direction}"
+    )
+    following_text = (
+        "无下一片段"
+        if following is None
+        else f"{following.title}：{following.direction}"
+    )
+    references = "\n".join(reference_manifest) or "本次没有选择图片。"
+    return f"""你是二维治愈生活短片的片段级创作分析器。
+只返回符合Schema的候选建议，不直接覆盖用户稿，也不直接提交视频生成。
+
+【项目与场景】项目“{project_title}”，场景“{scene_title}”：{scene_text}
+【长期角色与画风】人物：{visual_profile.person_identity}；{visual_profile.person_hair}；{visual_profile.person_body}。猫咪：{visual_profile.cat_identity}。画风：{'、'.join(visual_profile.style_positive)}。排除：{'、'.join(visual_profile.style_negative)}。
+【上一片段】{previous_text}
+【当前片段】标题：{current.title}；目标总时长：{current.duration_seconds}秒；场景定妆策略：{current.scene_look_usage.value}；锚点方式：{current.anchor_mode.value}；完整分镜：{current.direction}
+【下一片段】{following_text}
+【免费本地诊断】{local_analysis.model_dump_json(by_alias=True)}
+【本次实际分析图片，按顺序】
+{references}
+
+请实际查看每张图片，而不是只根据素材ID判断。重点比较图片里的动作起始状态、人物与猫咪位置、
+道具所在位置、姿态、构图和当前分镜是否一致；判断场景定妆更适合off、appearance_only、
+full_reference还是derive_anchor，并说明是否需要独立开场锚点。
+
+分析动作密度、2至4个连续子镜头的定性节奏、推荐总时长、当前与相邻片段的重复、遗漏、
+因果断裂、每张参考图职责、锚点方式以及Prompt风险。输出一份可编辑的Seedance 创作正文；
+必要时再给出保守版和稳定版两个候选正文。缩短时优先删除重复建立、次要道具动作和冗余反应；
+延长时只增加观察、动作完成过程、互动反馈或稳定收尾，不增加第二个故事事件。
+猫咪是主要观察和行动对象，人物承担手部和工具操作。不要为子镜头编造精确秒点。
+patch只给出确有必要且等待用户勾选接受的字段修改稿，
+且direction必须与creativeBody完全一致。""".strip()
 
 
 def compile_video_review_prompt(context: ShotPromptContext) -> str:

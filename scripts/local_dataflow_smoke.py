@@ -42,6 +42,7 @@ from cat_video_generator.application.ports import (
 )
 from cat_video_generator.application.shot_queue import (
     ProjectEditingService,
+    RevisionConflictError,
     SequenceService,
     ShotProductionService,
 )
@@ -57,6 +58,8 @@ from cat_video_generator.domain.contracts import (
     SceneDraft,
     SceneLookDraft,
     SceneLookPlan,
+    SceneLookUsage,
+    ShotAssistPatch,
     ShotCardDraft,
     StoryMode,
     StoryProjectInput,
@@ -68,6 +71,7 @@ from cat_video_generator.domain.rendering import (
     SequenceStatus,
     VideoInputPlan,
 )
+from cat_video_generator.domain.shot_assistance import apply_shot_assist_patch
 from cat_video_generator.domain.workflow import (
     PromptPurpose,
     RunStatus,
@@ -205,6 +209,38 @@ class MemoryStore:
             ),
         )
         return profile
+
+    def restore_project_canon_references(
+        self,
+        project_id: uuid.UUID,
+        draft: VisualProfileDraft,
+    ) -> tuple[StoredVisualProfileRevision, int]:
+        profile = self.save_visual_profile(project_id, draft)
+        scene_look_ids = {
+            item.id
+            for item in self.assets.values()
+            if item.project_id == project_id and item.role == "scene_look"
+        }
+        cleaned = 0
+        for shot in tuple(self.shots.values()):
+            if shot.project_id != project_id:
+                continue
+            filtered = [
+                binding
+                for binding in shot.draft.reference_bindings
+                if not (
+                    binding.asset_id in scene_look_ids
+                    and binding.role is ReferenceRole.IDENTITY
+                )
+            ]
+            if len(filtered) == len(shot.draft.reference_bindings):
+                continue
+            self.update_shot(
+                shot.id,
+                shot.draft.model_copy(update={"reference_bindings": filtered}),
+            )
+            cleaned += 1
+        return profile, cleaned
 
     def _new_visual_profile(
         self,
@@ -365,9 +401,98 @@ class MemoryStore:
         )
         return shots
 
+    def accept_story_diagnosis(
+        self,
+        *,
+        step_id: uuid.UUID,
+        expected_source_hash: str,
+        accepted_output: dict[str, Any],
+    ) -> StoredStep:
+        step = self.steps[step_id]
+        if step.input_snapshot.get("sourceHash") != expected_source_hash:
+            raise RevisionConflictError("stale story diagnosis")
+        updated = replace(
+            step,
+            input_snapshot={
+                **step.input_snapshot,
+                "acceptedOutput": accepted_output,
+                "acceptedAt": datetime.now(UTC).isoformat(),
+            },
+        )
+        self.steps[step_id] = updated
+        return updated
+
+    def accept_story_rewrite(
+        self,
+        *,
+        step_id: uuid.UUID,
+        expected_source_hash: str,
+        accepted_output: dict[str, Any],
+        rewritten_story: str,
+    ) -> StoredScene:
+        step = self.steps[step_id]
+        if step.input_snapshot.get("sourceHash") != expected_source_hash or step.scene_id is None:
+            raise RevisionConflictError("stale story rewrite")
+        scene = self.scenes[step.scene_id]
+        self.scenes[scene.id] = replace(
+            scene,
+            draft=scene.draft.model_copy(update={"source_text": rewritten_story}),
+        )
+        self.steps[step_id] = replace(
+            step,
+            input_snapshot={
+                **step.input_snapshot,
+                "acceptedOutput": accepted_output,
+                "acceptedAt": datetime.now(UTC).isoformat(),
+            },
+        )
+        return self.scenes[scene.id]
+
     def update_shot(self, shot_id: uuid.UUID, draft: ShotCardDraft) -> StoredShot:
-        self.shots[shot_id] = replace(self.shots[shot_id], draft=draft, status=ShotStatus.READY)
+        current = self.shots[shot_id]
+        self.shots[shot_id] = replace(
+            current,
+            draft=draft,
+            draft_revision=current.draft_revision + (1 if current.draft != draft else 0),
+            selected_anchor_asset_id=None,
+            selected_video_asset_id=None,
+            status=ShotStatus.READY,
+        )
         return self.shots[shot_id]
+
+    def accept_shot_assistance(
+        self,
+        *,
+        step_id: uuid.UUID,
+        source_draft_revision: int,
+        patch: ShotAssistPatch,
+    ) -> StoredShot:
+        step = self.steps[step_id]
+        if step.shot_card_id is None:
+            raise ValueError("shot assistance is not bound to a shot")
+        current = self.shots[step.shot_card_id]
+        if current.draft_revision != source_draft_revision:
+            raise RevisionConflictError("stale shot assistance")
+        updated_draft = apply_shot_assist_patch(current.draft, patch)
+        updated = replace(
+            current,
+            draft=updated_draft,
+            draft_revision=current.draft_revision + (1 if updated_draft != current.draft else 0),
+            selected_anchor_asset_id=None,
+            selected_video_asset_id=None,
+            status=ShotStatus.READY,
+        )
+        self.shots[current.id] = updated
+        self.steps[step_id] = replace(
+            step,
+            input_snapshot={
+                **step.input_snapshot,
+                "acceptedOutput": patch.model_dump(mode="json", by_alias=True),
+                "acceptedAt": datetime.now(UTC).isoformat(),
+                "acceptedDraftRevision": updated.draft_revision,
+            },
+        )
+        return updated
 
     def delete_shot(self, shot_id: uuid.UUID) -> None:
         del self.shots[shot_id]
@@ -701,11 +826,72 @@ class MemoryStore:
 
 class FixtureDirector:
     model = "fixture-director"
+    analysis_model = model
+
+    def __init__(self) -> None:
+        self.planning_calls: list[str] = []
+        self.analysis_calls = 0
+        self.analysis_image_paths: list[tuple[Path, ...]] = []
+        self.fail_analysis_once = False
 
     def generate_structured(
         self, *, prompt: str, schema: dict[str, Any], output_name: str
     ) -> DirectorResult:
-        del schema, output_name
+        del schema
+        self.planning_calls.append(output_name)
+        if output_name == "StoryDiagnosisOutput":
+            return DirectorResult(
+                payload={
+                    "overallAssessment": (
+                        "故事核心明确，但需要统一动作起点、道具流向和人猫因果互动。"
+                    ),
+                    "issues": [
+                        {
+                            "category": "physical_feasibility",
+                            "evidence": "原稿没有完整交代部分道具的初始状态与移动路径。",
+                            "impact": "视频生成可能出现状态跳变。",
+                            "suggestion": "在重写稿中统一起点、路径和完成结果。",
+                        }
+                    ],
+                    "rewriteOptions": [
+                        {
+                            "strategy": "conservative",
+                            "title": "保守修订",
+                            "summary": "只修正连续性",
+                            "tradeoffs": "变化较少",
+                        },
+                        {
+                            "strategy": "balanced",
+                            "title": "平衡优化",
+                            "summary": "调整动作顺序",
+                            "tradeoffs": "会改写部分动作",
+                        },
+                        {
+                            "strategy": "creative",
+                            "title": "创作增强",
+                            "summary": "增强人猫因果互动",
+                            "tradeoffs": "变化最大",
+                        },
+                    ],
+                },
+                response_id="fixture-diagnosis",
+                model=self.model,
+                request_hash="fixture-diagnosis-request",
+            )
+        if output_name == "StoryRewriteOutput":
+            return DirectorResult(
+                payload={
+                    "rewrittenStory": (
+                        "灰白猫先观察准备中的道具，孩子完成必要的手部操作并回应猫咪，"
+                        "随后两者自然过渡到出门状态。"
+                    ),
+                    "changeSummary": ["统一动作起点与道具流向", "补充人猫因果互动"],
+                    "unresolvedQuestions": [],
+                },
+                response_id="fixture-rewrite",
+                model=self.model,
+                request_hash="fixture-rewrite-request",
+            )
         match = re.search(r"严格输出(\d+)个视频片段", prompt)
         count = int(match.group(1)) if match else 1
         suggestions = [
@@ -741,6 +927,71 @@ class FixtureDirector:
             response_id="fixture-response",
             model=self.model,
             request_hash="fixture-request",
+        )
+
+    def analyze_structured(
+        self,
+        *,
+        prompt: str,
+        schema: dict[str, Any],
+        output_name: str,
+        image_paths: tuple[Path, ...],
+    ) -> DirectorResult:
+        del schema, output_name
+        self.analysis_calls += 1
+        self.analysis_image_paths.append(image_paths)
+        if self.fail_analysis_once:
+            self.fail_analysis_once = False
+            raise GatewayError(
+                "fixture LLM timeout",
+                code="fixture_analysis_timeout",
+                retryable=True,
+                timed_out=True,
+            )
+        _require("上一片段" in prompt and "下一片段" in prompt, "adjacent shots missing")
+        return DirectorResult(
+            payload={
+                "actionDensityAssessment": "当前12秒内容可压缩为两个连续子镜头",
+                "pacingPlan": {
+                    "recommendedDurationSeconds": 11,
+                    "rationale": "删除重复建立，保留猫咪观察和人物配合",
+                    "beats": [
+                        {"ordinal": 1, "description": "简洁建立人猫位置", "rhythm": "brief"},
+                        {"ordinal": 2, "description": "展开互动并稳定收尾", "rhythm": "expanded"},
+                    ],
+                },
+                "recommendedSceneLookUsage": "appearance_only",
+                "recommendedAnchorMode": "text_only",
+                "referenceDecisions": [],
+                "continuity": {
+                    "previousIssues": [],
+                    "nextIssues": ["下一片段不要重复收起同一件道具"],
+                    "recommendation": "以猫咪回看人物作为稳定交接状态",
+                },
+                "promptRisks": ["原稿动作密度偏高"],
+                "assetCompatibilityAssessment": (
+                    "实际图片只适合继承共同造型，不应覆盖当前动作起点。"
+                ),
+                "creativeBody": (
+                    "1. 中景固定，猫咪先观察目标，人物保持在后方准备。\n"
+                    "2. 近景，人物完成必要操作，猫咪给出反馈并稳定收尾。"
+                ),
+                "creativeAlternatives": [
+                    {
+                        "label": "stable",
+                        "body": "1. 固定中景建立人猫位置。\n2. 固定近景完成互动并停稳。",
+                        "rationale": "减少运镜和状态跳变",
+                    }
+                ],
+                "patch": {
+                    "title": "LLM建议：猫咪完成观察",
+                    "durationSeconds": 11,
+                    "sceneLookUsage": "appearance_only",
+                },
+            },
+            response_id=f"fixture-analysis-{self.analysis_calls}",
+            model=self.analysis_model,
+            request_hash=f"analysis-{self.analysis_calls:02d}",
         )
 
 
@@ -895,9 +1146,10 @@ def main() -> None:
             any(item.get("codec_type") == "video" for item in composed_probe.get("streams", [])),
             "composed sample asset is unreadable",
         )
+        director = FixtureDirector()
         editing = ProjectEditingService(
             repository=repository,
-            director=FixtureDirector(),
+            director=director,
             provider_name="fixture",
         )
         production = ShotProductionService(
@@ -934,24 +1186,28 @@ def main() -> None:
             repository.get_project(project_id).content_date == date(2026, 8, 13),
             "project settings did not flow through storage",
         )
-        person_reference = production.import_reference(
-            project_id=project_id,
-            path=fixtures["https://fixture.local/person.png"],
-            usage="generation_reference",
-            role="identity",
-        )
-        cat_reference = production.import_reference(
-            project_id=project_id,
-            path=fixtures["https://fixture.local/cat.png"],
-            usage="generation_reference",
-            role="identity",
-        )
-        style_reference = production.import_reference(
-            project_id=project_id,
-            path=fixtures["https://fixture.local/style.png"],
-            usage="generation_reference",
-            role="style",
-        )
+        fixture_canon: dict[str, StoredAsset] = {}
+        for key, fixture_url in (
+            ("person:headshot", "https://fixture.local/person.png"),
+            ("cat:front", "https://fixture.local/cat.png"),
+            ("style:line_texture", "https://fixture.local/style.png"),
+        ):
+            fixture_canon[key] = repository.add_asset(
+                landed=store.import_local(fixtures[fixture_url]),
+                role="canon",
+                media_type="image",
+                scope="canon",
+                status="approved",
+                project_id=None,
+                scene_id=None,
+                shot_id=None,
+                step_id=None,
+                semantic_key=key,
+                metadata={"displayName": key},
+            )
+        person_reference = fixture_canon["person:headshot"]
+        cat_reference = fixture_canon["cat:front"]
+        style_reference = fixture_canon["style:line_texture"]
         visual_profile = repository.save_visual_profile(
             project_id,
             VisualProfileDraft(
@@ -986,6 +1242,41 @@ def main() -> None:
             not repository.list_steps(project_id=project_id), "project creation created a step"
         )
 
+        diagnosis = editing.diagnose_story(scene.id, allow_paid_generation=True)
+        edited_diagnosis = diagnosis.output.model_copy(
+            update={"overall_assessment": "人工确认：先统一连续性，再进入完整剧情重写。"}
+        )
+        editing.accept_story_diagnosis(
+            diagnosis.step_id,
+            diagnosis=edited_diagnosis,
+            selected_strategy="balanced",
+            additional_instructions="保持猫咪主导观察、人物完成手部操作",
+            preserve_original=False,
+        )
+        rewrite = editing.rewrite_story(
+            scene.id,
+            diagnosis_step_id=diagnosis.step_id,
+            allow_paid_generation=True,
+        )
+        edited_rewrite = rewrite.output.model_copy(
+            update={
+                "rewritten_story": (
+                    "灰白猫先观察已经归拢好的准备物品，孩子按合理顺序完成必要的手部操作；"
+                    "孩子回应猫咪的观察，两者在物品状态明确后自然准备出门。"
+                )
+            }
+        )
+        scene = editing.accept_story_rewrite(rewrite.step_id, rewrite=edited_rewrite)
+        _require(
+            repository.get_step(diagnosis.step_id).input_snapshot["providerOutput"]
+            != repository.get_step(diagnosis.step_id).input_snapshot["acceptedOutput"]["diagnosis"],
+            "story diagnosis provider and accepted drafts were not retained",
+        )
+        _require(
+            repository.get_step(rewrite.step_id).input_snapshot["providerOutput"]
+            != repository.get_step(rewrite.step_id).input_snapshot["acceptedOutput"],
+            "story rewrite provider and accepted drafts were not retained",
+        )
         suggestion = editing.suggest_shots(scene.id, allow_paid_generation=True)
         edited_look = suggestion.output.look_plan.model_copy(
             update={"person_wardrobe": "人工调整后的米白外套"}
@@ -1023,6 +1314,81 @@ def main() -> None:
             != accepted_step.input_snapshot["acceptedOutput"],
             "edited suggestion was not distinct from provider output",
         )
+
+        # A manual save is authoritative.  A failed paid analysis records its own
+        # failure without rolling back the saved revision; the next attempt may
+        # then succeed and only the user-selected field is applied.
+        saved_for_assist = repository.update_shot(
+            shots[0].id,
+            shots[0].draft.model_copy(
+                update={
+                    "duration_seconds": 12,
+                    "scene_look_usage": SceneLookUsage.FULL_REFERENCE,
+                }
+            ),
+        )
+        shots[0] = saved_for_assist
+        analysis_calls_before = director.analysis_calls
+        try:
+            editing.assist_shot(
+                saved_for_assist.id,
+                source_draft_revision=saved_for_assist.draft_revision,
+                candidate_asset_ids=(person_reference.id,),
+                allow_paid_generation=False,
+            )
+        except ValueError as exc:
+            _require("explicit" in str(exc), "missing paid analysis gate")
+        else:
+            raise AssertionError("LLM analysis ran without explicit payment permission")
+        _require(
+            director.analysis_calls == analysis_calls_before,
+            "unconfirmed analysis reached the fake gateway",
+        )
+        director.fail_analysis_once = True
+        try:
+            editing.assist_shot(
+                saved_for_assist.id,
+                source_draft_revision=saved_for_assist.draft_revision,
+                candidate_asset_ids=(person_reference.id, cat_reference.id),
+                allow_paid_generation=True,
+            )
+        except GatewayError:
+            pass
+        else:
+            raise AssertionError("fixture LLM failure was not surfaced")
+        _require(
+            repository.get_shot(saved_for_assist.id).draft_revision
+            == saved_for_assist.draft_revision,
+            "failed LLM analysis rolled back the saved shot",
+        )
+        assistance = editing.assist_shot(
+            saved_for_assist.id,
+            source_draft_revision=saved_for_assist.draft_revision,
+            candidate_asset_ids=(
+                person_reference.id,
+                cat_reference.id,
+                style_reference.id,
+                person_reference.id,
+            ),
+            allow_paid_generation=True,
+        )
+        _require(
+            len(director.analysis_image_paths[-1]) == 3,
+            "multimodal analysis did not deduplicate candidate images",
+        )
+        accepted_assistance = editing.accept_shot_assistance(
+            assistance.step_id,
+            source_draft_revision=saved_for_assist.draft_revision,
+            patch=ShotAssistPatch(durationSeconds=11),
+        )
+        _require(
+            accepted_assistance.draft.duration_seconds == 11
+            and accepted_assistance.draft.title == saved_for_assist.draft.title
+            and accepted_assistance.draft.scene_look_usage
+            is SceneLookUsage.FULL_REFERENCE,
+            "field-level LLM acceptance changed unselected fields",
+        )
+        shots[0] = accepted_assistance
         single_scene = repository.add_scene(
             project_id,
             SceneDraft(
@@ -1031,6 +1397,17 @@ def main() -> None:
                 storyMode="single",
                 targetShotCount=1,
             ),
+        )
+        single_diagnosis = editing.diagnose_story(
+            single_scene.id,
+            allow_paid_generation=True,
+        )
+        editing.accept_story_diagnosis(
+            single_diagnosis.step_id,
+            diagnosis=single_diagnosis.output,
+            selected_strategy=None,
+            additional_instructions="",
+            preserve_original=True,
         )
         single_suggestion = editing.suggest_shots(
             single_scene.id,
@@ -1128,13 +1505,60 @@ def main() -> None:
                 },
             )
             _require(review_response.status_code == 200, "look review API failed")
+            stale_acceptance = api_client.post(
+                f"/api/v1/steps/{assistance.step_id}/accept-shot-assistance",
+                json={
+                    "sourceDraftRevision": saved_for_assist.draft_revision,
+                    "patch": {"durationSeconds": 11},
+                },
+            )
+            _require(
+                stale_acceptance.status_code == 409,
+                "stale shot-assistance acceptance did not return HTTP 409",
+            )
         _require(
             repository.get_scene(single_scene.id).selected_look_asset_id == look_asset_id,
             "approved look was not selected through the API",
         )
-        third = repository.update_shot(
+        appearance_preview = production.preview_shot_prompt(single_shots[0].id)
+        full_reference_shot = repository.update_shot(
             single_shots[0].id,
-            single_shots[0].draft.model_copy(update={"anchor_mode": AnchorMode.GENERATE}),
+            single_shots[0].draft.model_copy(
+                update={"scene_look_usage": SceneLookUsage.FULL_REFERENCE}
+            ),
+        )
+        full_reference_preview = production.preview_shot_prompt(full_reference_shot.id)
+        off_shot = repository.update_shot(
+            full_reference_shot.id,
+            full_reference_shot.draft.model_copy(
+                update={"scene_look_usage": SceneLookUsage.OFF}
+            ),
+        )
+        off_preview = production.preview_shot_prompt(off_shot.id)
+        third = repository.update_shot(
+            off_shot.id,
+            off_shot.draft.model_copy(
+                update={
+                    "anchor_mode": AnchorMode.GENERATE,
+                    "scene_look_usage": SceneLookUsage.DERIVE_ANCHOR,
+                }
+            ),
+        )
+        derive_video_preview = production.preview_shot_prompt(third.id)
+        _require(
+            [len(item["references"]) for item in (
+                appearance_preview,
+                full_reference_preview,
+                off_preview,
+                derive_video_preview,
+            )]
+            == [4, 4, 3, 3],
+            "four scene-look strategies did not produce the expected video inputs",
+        )
+        _require(
+            "忽略定妆图中的姿态" in str(appearance_preview["prompt"])
+            and "完整参考本场服装" in str(full_reference_preview["prompt"]),
+            "appearance-only and full-reference responsibilities were not distinct",
         )
         shots.append(third)
 
@@ -1173,6 +1597,19 @@ def main() -> None:
         shots[2] = repository.update_shot(shots[2].id, generated_draft)
 
         anchor_result = production.generate_anchor(shots[2].id, allow_paid_generation=True)
+        _require(
+            tuple(path.read_bytes() for path in gateway.image_references[-1])
+            == tuple(
+                item.require_path().read_bytes()
+                for item in (
+                    person_reference,
+                    repository.get_asset(look_asset_id),
+                    cat_reference,
+                    style_reference,
+                )
+            ),
+            "derive-anchor did not use custom, scene-look, then project references",
+        )
         production.decide_asset(
             uuid.UUID(anchor_result["assetId"]),
             decision="approved",
@@ -1205,8 +1642,28 @@ def main() -> None:
             "existing anchor and project visual references were not all sent",
         )
         _require(
-            len(gateway.submissions[2].bindings) == 5,
-            "generated anchor/custom-scene-project reference order or deduplication failed",
+            len(gateway.submissions[2].bindings) == 4,
+            "derive-anchor repeated the scene look in the video request",
+        )
+
+        first_tail = production.tail_frame_status(shots[1].id)
+        _require(first_tail["available"] is True, "approved video tail was not extracted")
+        shots[1] = production.adopt_previous_tail_anchor(shots[1].id)
+        _require(
+            len(
+                [
+                    item
+                    for item in shots[1].draft.reference_bindings
+                    if item.usage is ReferenceUsage.APPROVED_ANCHOR
+                ]
+            )
+            == 1,
+            "previous tail was not installed as the unique anchor",
+        )
+        repository.select_shot_asset(
+            shots[1].id,
+            kind="video",
+            asset_id=approved_videos[1],
         )
 
         regenerated = production.generate_video(
@@ -1221,6 +1678,20 @@ def main() -> None:
             decision="approved",
             reason="offline regenerated version",
             select=True,
+        )
+        stale_tail = production.tail_frame_status(shots[1].id)
+        _require(stale_tail["stale"] is True, "old tail did not become stale")
+        shots[1] = production.adopt_previous_tail_anchor(shots[1].id)
+        refreshed_tail = production.tail_frame_status(shots[1].id)
+        _require(
+            refreshed_tail["available"] is True
+            and refreshed_tail["boundAssetId"] != stale_tail["boundAssetId"],
+            "tail anchor was not refreshed from the new approved video",
+        )
+        repository.select_shot_asset(
+            shots[1].id,
+            kind="video",
+            asset_id=approved_videos[1],
         )
         video_attempts = [
             item
@@ -1310,7 +1781,7 @@ def main() -> None:
                 project_id=project_id,
                 path=source,
                 usage="generation_reference",
-                role="identity",
+                role="prop",
             )
             for source in limit_sources
         )
@@ -1329,7 +1800,7 @@ def main() -> None:
                     ReferenceBinding(
                         assetId=item.id,
                         usage=ReferenceUsage.GENERATION_REFERENCE,
-                        role=ReferenceRole.IDENTITY,
+                        role=ReferenceRole.PROP,
                         applyTo=ReferenceTarget.ANCHOR,
                     )
                     for item in limit_assets
@@ -1355,7 +1826,7 @@ def main() -> None:
                     ReferenceBinding(
                         assetId=item.id,
                         usage=ReferenceUsage.GENERATION_REFERENCE,
-                        role=ReferenceRole.IDENTITY,
+                        role=ReferenceRole.PROP,
                         applyTo=ReferenceTarget.VIDEO,
                     )
                     for item in limit_assets[:10]
@@ -1405,11 +1876,39 @@ def main() -> None:
                 ),
                 "sequenceRevisions": len(repository.list_sequences(project_id)),
                 "singleAndMultiSuggestions": True,
+                "stagedCreativeWorkflow": {
+                    "storyDiagnosis": True,
+                    "storyRewrite": True,
+                    "storyboardDirector": True,
+                    "visualPromptReview": True,
+                    "plannerOutputSchemas": director.planning_calls,
+                },
                 "providerAndAcceptedOutputRetained": True,
                 "visualProfileRevision": visual_profile.revision,
                 "sceneLookDraftRevision": saved_single_scene.look_draft_revision,
                 "sceneLookPromptPreviewNoArk": True,
                 "lookCandidateWebApiReadReviewSelect": True,
+                "shotAssistance": {
+                    "saveBeforeAnalysis": True,
+                    "failedAnalysisPreservedDraft": True,
+                    "multimodalCalls": director.analysis_calls,
+                    "deduplicatedImageCount": len(director.analysis_image_paths[-1]),
+                    "fieldLevelAcceptance": True,
+                    "staleAcceptanceHttpStatus": 409,
+                },
+                "sceneLookUsageStrategies": [
+                    "off",
+                    "appearance_only",
+                    "full_reference",
+                    "derive_anchor",
+                ],
+                "deriveAnchorDoesNotRepeatSceneLookInVideo": True,
+                "tailFrame": {
+                    "automaticExtraction": True,
+                    "adoptedByNextShot": True,
+                    "oldSourceDetectedStale": True,
+                    "refreshedFromNewApprovedVideo": True,
+                },
                 "fakeSeedreamReferenceOrder": [
                     "person_identity",
                     "cat_identity",
@@ -1429,7 +1928,7 @@ def main() -> None:
         }
         diagnostics = Path(__file__).parents[1] / "var" / "diagnostics"
         diagnostics.mkdir(parents=True, exist_ok=True)
-        report_path = diagnostics / "v5-local-dataflow.json"
+        report_path = diagnostics / "v5-staged-creative-workflow-local-dataflow.json"
         report_path.write_text(
             json.dumps(report, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -1456,7 +1955,20 @@ def _verify_database_canon() -> dict[str, Any]:
             _require(digest == asset.sha256, f"Canon content hash drifted: {asset.semantic_key}")
         projects = container.repository.list_projects()
         _require(projects, "Canon project-default verification requires one local project")
-        project = projects[0]
+        project = next(
+            (item for item in projects if item.title in {"湖泊钓鱼", "湖泊的鱼"}),
+            projects[0],
+        )
+        canon_restore = ProjectEditingService(
+            repository=container.repository,
+            director=None,
+            provider_name="offline-validation",
+        ).restore_project_canon_references(project.id)
+        _require(
+            canon_restore["referenceCount"] >= 5,
+            "project Canon restoration did not install the required identities and style",
+        )
+        project = container.repository.get_project(project.id)
         current_profile = container.repository.get_visual_profile(project.id)
         original_profile = container.repository.save_visual_profile(
             project.id,
@@ -1539,6 +2051,8 @@ def _verify_database_canon() -> dict[str, Any]:
             "visualProfileRevisionRoundTrip": new_profile.revision,
             "sceneLookDraftRevision": saved_scene.look_draft_revision,
             "projectId": str(project.id),
+            "restoredCanonReferenceCount": canon_restore["referenceCount"],
+            "cleanedMisboundShotCount": canon_restore["cleanedShotCount"],
         }
     finally:
         container.close()

@@ -18,7 +18,45 @@ def test_v5_contract_defaults_are_backward_compatible() -> None:
     assert scene.target_shot_count == 1
     assert scene.look_plan is None
     assert shot.inherit_project_references is True
+    assert shot.scene_look_usage is contracts.SceneLookUsage.APPEARANCE_ONLY
     assert shot.use_scene_look is True
+
+
+def test_legacy_scene_look_boolean_maps_to_authoritative_usage() -> None:
+    disabled = contracts.ShotCardDraft(
+        title="猫咪观察",
+        direction="1. 中景，猫咪观察门边。",
+        useSceneLook=False,
+    )
+    explicit = contracts.ShotCardDraft(
+        title="猫咪观察",
+        direction="1. 中景，猫咪观察门边。",
+        sceneLookUsage="full_reference",
+        useSceneLook=False,
+    )
+
+    assert disabled.scene_look_usage is contracts.SceneLookUsage.OFF
+    assert disabled.use_scene_look is False
+    assert explicit.scene_look_usage is contracts.SceneLookUsage.FULL_REFERENCE
+    assert explicit.use_scene_look is True
+
+
+def test_derive_anchor_requires_generate_anchor_mode() -> None:
+    with pytest.raises(ValidationError, match="derive_anchor"):
+        contracts.ShotCardDraft(
+            title="猫咪观察",
+            direction="1. 中景，猫咪观察门边。",
+            sceneLookUsage="derive_anchor",
+            anchorMode="text_only",
+        )
+
+    draft = contracts.ShotCardDraft(
+        title="猫咪观察",
+        direction="1. 中景，猫咪观察门边。",
+        sceneLookUsage="derive_anchor",
+        anchorMode="generate",
+    )
+    assert draft.scene_look_usage is contracts.SceneLookUsage.DERIVE_ANCHOR
 
 
 @pytest.mark.parametrize(

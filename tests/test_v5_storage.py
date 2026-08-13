@@ -20,7 +20,7 @@ from cat_video_generator.infrastructure.db.session import ALEMBIC_HEAD
 
 
 def test_v5_database_models_expose_creation_flow_columns() -> None:
-    assert ALEMBIC_HEAD == "0017_v5_visual_profile"
+    assert ALEMBIC_HEAD == "0018_v5_shot_assistance"
     assert hasattr(models.ProductionRun, "default_reference_bindings_json")
     assert hasattr(models.ProductionRun, "current_visual_profile_revision_id")
     assert hasattr(models.VisualProfileRevision, "profile_hash")
@@ -33,6 +33,8 @@ def test_v5_database_models_expose_creation_flow_columns() -> None:
     assert hasattr(models.Scene, "look_draft_revision")
     assert hasattr(models.ShotCard, "inherit_project_references")
     assert hasattr(models.ShotCard, "use_scene_look")
+    assert hasattr(models.ShotCard, "draft_revision")
+    assert hasattr(models.ShotCard, "scene_look_usage")
     assert hasattr(models.Asset, "storage_key")
     assert not hasattr(models.Asset, "local_path")
 

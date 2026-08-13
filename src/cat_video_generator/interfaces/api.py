@@ -17,8 +17,13 @@ from ..domain.rendering import SequenceStatus
 from ..infrastructure.db.repositories import WorkflowConflictError
 from ..infrastructure.db.session import ALEMBIC_HEAD
 from .api_schemas import (
+    AcceptShotAssistanceRequest,
+    AcceptStoryDiagnosisRequest,
+    AcceptStoryRewriteRequest,
     AcceptSuggestionsRequest,
+    AssistShotRequest,
     CreateProjectRequest,
+    DiagnoseStoryRequest,
     GenerateRequest,
     GenerateSceneLookRequest,
     OrderRequest,
@@ -26,6 +31,7 @@ from .api_schemas import (
     ReconcileRequest,
     ReferencesRequest,
     ReviewRequest,
+    RewriteStoryRequest,
     SaveSceneLookDraftRequest,
     SceneRequest,
     SelectSceneLookRequest,
@@ -172,6 +178,10 @@ def create_app(
     ) -> dict[str, Any]:
         return _visual_profile_json(repository.save_visual_profile(project_id, payload))
 
+    @app.post("/api/v1/projects/{project_id}/restore-canon-references")
+    def restore_project_canon_references(project_id: uuid.UUID) -> dict[str, Any]:
+        return container.editing.restore_project_canon_references(project_id)
+
     @app.post("/api/v1/projects/{project_id}/scenes")
     def add_scene(project_id: uuid.UUID, payload: SceneRequest) -> dict[str, Any]:
         return _scene_json(repository.add_scene(project_id, payload))
@@ -188,6 +198,80 @@ def create_app(
     def reorder_scenes(project_id: uuid.UUID, payload: OrderRequest) -> dict[str, bool]:
         repository.reorder_scenes(project_id, tuple(payload.ids))
         return {"saved": True}
+
+    @app.get("/api/v1/scenes/{scene_id}/creative-workflow")
+    def creative_workflow(scene_id: uuid.UUID) -> dict[str, Any]:
+        return container.editing.creative_workflow(scene_id)
+
+    @app.post("/api/v1/scenes/{scene_id}/story-diagnoses")
+    def diagnose_story(
+        scene_id: uuid.UUID,
+        payload: DiagnoseStoryRequest,
+    ) -> dict[str, Any]:
+        return _submit(
+            job_registry,
+            kind="story_diagnosis",
+            key=f"scene:{scene_id}:story-diagnosis",
+            fn=lambda: _story_diagnosis_json(
+                container.editing.diagnose_story(
+                    scene_id,
+                    allow_paid_generation=payload.allow_paid_generation,
+                )
+            ),
+            context={
+                "sceneId": scene_id,
+                "operationKey": "director:story-diagnosis",
+            },
+        )
+
+    @app.post("/api/v1/steps/{step_id}/accept-story-diagnosis")
+    def accept_story_diagnosis(
+        step_id: uuid.UUID,
+        payload: AcceptStoryDiagnosisRequest,
+    ) -> dict[str, Any]:
+        step = container.editing.accept_story_diagnosis(
+            step_id,
+            diagnosis=payload.diagnosis,
+            selected_strategy=payload.selected_strategy,
+            additional_instructions=payload.additional_instructions,
+            preserve_original=payload.preserve_original,
+        )
+        return _creative_step_json(step)
+
+    @app.post("/api/v1/scenes/{scene_id}/story-rewrites")
+    def rewrite_story(
+        scene_id: uuid.UUID,
+        payload: RewriteStoryRequest,
+    ) -> dict[str, Any]:
+        return _submit(
+            job_registry,
+            kind="story_rewrite",
+            key=f"scene:{scene_id}:story-rewrite:{payload.diagnosis_step_id}",
+            fn=lambda: _story_rewrite_json(
+                container.editing.rewrite_story(
+                    scene_id,
+                    diagnosis_step_id=payload.diagnosis_step_id,
+                    allow_paid_generation=payload.allow_paid_generation,
+                )
+            ),
+            context={
+                "sceneId": scene_id,
+                "stepId": payload.diagnosis_step_id,
+                "operationKey": "director:story-rewrite",
+            },
+        )
+
+    @app.post("/api/v1/steps/{step_id}/accept-story-rewrite")
+    def accept_story_rewrite(
+        step_id: uuid.UUID,
+        payload: AcceptStoryRewriteRequest,
+    ) -> dict[str, Any]:
+        return _scene_json(
+            container.editing.accept_story_rewrite(
+                step_id,
+                rewrite=payload.rewrite,
+            )
+        )
 
     @app.post("/api/v1/scenes/{scene_id}/shot-suggestions")
     def suggest_shots(scene_id: uuid.UUID, payload: SuggestShotsRequest) -> dict[str, Any]:
@@ -225,6 +309,60 @@ def create_app(
     @app.patch("/api/v1/shots/{shot_id}")
     def update_shot(shot_id: uuid.UUID, payload: ShotRequest) -> dict[str, Any]:
         return _shot_json(repository.update_shot(shot_id, payload))
+
+    @app.get("/api/v1/shots/{shot_id}/assist-context")
+    def shot_assist_context(shot_id: uuid.UUID) -> dict[str, Any]:
+        return container.editing.shot_assist_context(shot_id)
+
+    @app.post("/api/v1/shots/{shot_id}/assist")
+    def assist_shot(shot_id: uuid.UUID, payload: AssistShotRequest) -> dict[str, Any]:
+        return _submit(
+            job_registry,
+            kind="shot_assistance",
+            key=f"shot:{shot_id}:assist:{payload.source_draft_revision}",
+            fn=lambda: _shot_assistance_json(
+                container.editing.assist_shot(
+                    shot_id,
+                    source_draft_revision=payload.source_draft_revision,
+                    candidate_asset_ids=tuple(payload.candidate_asset_ids),
+                    allow_paid_generation=payload.allow_paid_generation,
+                )
+            ),
+            context={
+                "shotId": shot_id,
+                "operationKey": "director:shot-assistance",
+                "sourceDraftRevision": payload.source_draft_revision,
+            },
+        )
+
+    @app.get("/api/v1/shots/{shot_id}/assist-analyses")
+    def shot_assist_analyses(shot_id: uuid.UUID) -> list[dict[str, Any]]:
+        return container.editing.list_shot_assistance(shot_id)
+
+    @app.get("/api/v1/shots/{shot_id}/previous-tail")
+    def previous_tail(shot_id: uuid.UUID) -> dict[str, Any]:
+        return container.production.tail_frame_status(shot_id)
+
+    @app.post("/api/v1/shots/{shot_id}/adopt-previous-tail-anchor")
+    def adopt_previous_tail_anchor(shot_id: uuid.UUID) -> dict[str, Any]:
+        shot = container.production.adopt_previous_tail_anchor(shot_id)
+        return {
+            **_shot_json(shot),
+            "previousTail": container.production.tail_frame_status(shot_id),
+        }
+
+    @app.post("/api/v1/steps/{step_id}/accept-shot-assistance")
+    def accept_shot_assistance(
+        step_id: uuid.UUID,
+        payload: AcceptShotAssistanceRequest,
+    ) -> dict[str, Any]:
+        return _shot_json(
+            container.editing.accept_shot_assistance(
+                step_id,
+                source_draft_revision=payload.source_draft_revision,
+                patch=payload.patch,
+            )
+        )
 
     @app.delete("/api/v1/shots/{shot_id}", status_code=204)
     def delete_shot(shot_id: uuid.UUID) -> None:
@@ -524,7 +662,6 @@ def _scene_json(item: Any) -> dict[str, Any]:
         "projectId": str(item.project_id),
         "order": item.order,
         **item.draft.model_dump(mode="json", by_alias=True),
-        "referenceSnapshot": list(item.reference_snapshot),
         "status": item.status.value,
         "selectedLookAssetId": (
             None
@@ -541,6 +678,8 @@ def _shot_json(item: Any) -> dict[str, Any]:
         "sceneId": str(item.scene_id),
         "order": item.order,
         **item.draft.model_dump(mode="json", by_alias=True),
+        "draftRevision": item.draft_revision,
+        "useSceneLook": item.draft.use_scene_look,
         "status": item.status.value,
         "selectedAnchorAssetId": None
         if item.selected_anchor_asset_id is None
@@ -570,6 +709,43 @@ def _asset_json(item: Any) -> dict[str, Any]:
         "referencePurpose": item.reference_purpose,
         "visualProfileRevisionId": item.metadata.get("visualProfileRevisionId"),
         "lookDraftRevision": item.metadata.get("lookDraftRevision"),
+        "createdAt": None if item.created_at is None else item.created_at.isoformat(),
+    }
+
+
+def _shot_assistance_json(item: Any) -> dict[str, Any]:
+    return {
+        "stepId": str(item.step_id),
+        "analysis": item.analysis.model_dump(mode="json", by_alias=True),
+    }
+
+
+def _story_diagnosis_json(item: Any) -> dict[str, Any]:
+    return {
+        "stepId": str(item.step_id),
+        "diagnosis": item.output.model_dump(mode="json", by_alias=True),
+    }
+
+
+def _story_rewrite_json(item: Any) -> dict[str, Any]:
+    return {
+        "stepId": str(item.step_id),
+        "rewrite": item.output.model_dump(mode="json", by_alias=True),
+    }
+
+
+def _creative_step_json(item: Any) -> dict[str, Any]:
+    return {
+        "stepId": str(item.id),
+        "operationKey": item.operation_key,
+        "status": item.status.value,
+        "attempt": item.attempt,
+        "model": item.model,
+        "sourceHash": item.input_snapshot.get("sourceHash"),
+        "providerOutput": item.input_snapshot.get("providerOutput"),
+        "acceptedOutput": item.input_snapshot.get("acceptedOutput"),
+        "acceptedAt": item.input_snapshot.get("acceptedAt"),
+        "error": item.error,
         "createdAt": None if item.created_at is None else item.created_at.isoformat(),
     }
 

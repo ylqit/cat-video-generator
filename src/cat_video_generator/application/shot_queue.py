@@ -22,18 +22,30 @@ from ..domain.contracts import (
     ReferenceUsage,
     SceneLookDraft,
     SceneLookPlan,
+    SceneLookUsage,
+    ShotAssistAnalysis,
+    ShotAssistPatch,
     ShotCardDraft,
     ShotPromptContext,
     ShotSuggestion,
     ShotSuggestionOutput,
+    StoryDiagnosisOutput,
     StoryProjectInput,
+    StoryRewriteOutput,
+    StoryRewriteStrategy,
+    VisualProfileDraft,
 )
+from ..domain.creative_workflow import story_source_hash
 from ..domain.prompts import (
     compile_anchor_prompt,
     compile_range_edit_prompt,
     compile_scene_look_prompt,
+    compile_shot_assistance_prompt,
     compile_shot_suggestion_prompt,
     compile_shot_video_prompt,
+    compile_shot_video_prompt_parts,
+    compile_story_diagnosis_prompt,
+    compile_story_rewrite_prompt,
     compile_video_review_prompt,
 )
 from ..domain.rendering import (
@@ -44,6 +56,7 @@ from ..domain.rendering import (
     build_edit_input_plan,
     build_shot_input_plan,
 )
+from ..domain.shot_assistance import analyze_shot_draft
 from ..domain.workflow import PromptPurpose, StepKind, StepStatus
 from .ports import (
     AssetStore,
@@ -55,6 +68,7 @@ from .ports import (
     RuntimePreflight,
     ShotQueueStore,
     StoredAsset,
+    StoredProject,
     StoredScene,
     StoredSequence,
     StoredShot,
@@ -70,6 +84,24 @@ class SuggestionResult:
     output: ShotSuggestionOutput
 
 
+@dataclass(frozen=True, slots=True)
+class StoryDiagnosisResult:
+    step_id: uuid.UUID
+    output: StoryDiagnosisOutput
+
+
+@dataclass(frozen=True, slots=True)
+class StoryRewriteResult:
+    step_id: uuid.UUID
+    output: StoryRewriteOutput
+
+
+@dataclass(frozen=True, slots=True)
+class ShotAssistanceResult:
+    step_id: uuid.UUID
+    analysis: ShotAssistAnalysis
+
+
 class RevisionConflictError(ValueError):
     pass
 
@@ -83,6 +115,22 @@ class SceneLookInputSet:
     assets: tuple[StoredAsset, ...]
     descriptions: tuple[str, ...]
     warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PreviousTailState:
+    previous_shot: StoredShot | None
+    source_video_id: uuid.UUID | None
+    active: StoredAsset | None
+    bound: StoredAsset | None
+    stale: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ShotAssistCandidate:
+    asset: StoredAsset
+    source_layer: str
+    responsibility: str
 
 
 class ProjectEditingService:
@@ -106,6 +154,312 @@ class ProjectEditingService:
         )
         return {"projectId": str(project.id), "sceneCount": 1}
 
+    def diagnose_story(
+        self,
+        scene_id: uuid.UUID,
+        *,
+        allow_paid_generation: bool,
+    ) -> StoryDiagnosisResult:
+        self._require_paid_director(
+            allow_paid_generation,
+            "story diagnosis requires explicit paid-generation permission",
+        )
+        scene = self._repository.get_scene(scene_id)
+        project = self._repository.get_project(scene.project_id)
+        profile = self._repository.get_visual_profile(project.id)
+        self._assert_scene_stage_available(
+            project_id=project.id,
+            scene_id=scene.id,
+            operation_key="director:story-diagnosis",
+        )
+        previous, following = self._adjacent_scenes(scene)
+        prompt = compile_story_diagnosis_prompt(
+            project_title=project.title,
+            scene=scene.draft,
+            visual_profile=profile.draft,
+            previous_scene_summary=(
+                None if previous is None else previous.draft.source_text
+            ),
+            next_scene_summary=(
+                None if following is None else following.draft.source_text
+            ),
+        )
+        snapshot = {
+            "sourceHash": story_source_hash(scene.draft),
+            "scene": scene.draft.model_dump(mode="json", by_alias=True),
+            "visualProfileRevisionId": str(profile.id),
+            "visualProfileHash": profile.profile_hash,
+            "previousScene": _scene_story_snapshot(previous),
+            "nextScene": _scene_story_snapshot(following),
+        }
+        step = self._run_scene_director_stage(
+            project_id=project.id,
+            scene_id=scene.id,
+            operation_key="director:story-diagnosis",
+            prompt=prompt,
+            snapshot=snapshot,
+            output_type=StoryDiagnosisOutput,
+            output_name="StoryDiagnosisOutput",
+        )
+        return StoryDiagnosisResult(
+            step_id=step.id,
+            output=StoryDiagnosisOutput.model_validate(
+                step.input_snapshot.get("providerOutput")
+            ),
+        )
+
+    def accept_story_diagnosis(
+        self,
+        step_id: uuid.UUID,
+        *,
+        diagnosis: StoryDiagnosisOutput,
+        selected_strategy: StoryRewriteStrategy | str | None,
+        additional_instructions: str,
+        preserve_original: bool,
+    ) -> StoredStep:
+        step = self._repository.get_step(step_id)
+        self._validate_scene_stage_step(
+            step,
+            operation_key="director:story-diagnosis",
+        )
+        assert step.scene_id is not None
+        scene = self._repository.get_scene(step.scene_id)
+        expected_hash = str(step.input_snapshot.get("sourceHash") or "")
+        if story_source_hash(scene.draft) != expected_hash:
+            raise RevisionConflictError(
+                "scene story changed after diagnosis; run the diagnosis again"
+            )
+        selected = (
+            None
+            if selected_strategy is None
+            else StoryRewriteStrategy(selected_strategy)
+        )
+        if preserve_original and selected is not None:
+            raise ValueError(
+                "preserve-original and a rewrite strategy are mutually exclusive"
+            )
+        if not preserve_original and selected is None:
+            raise ValueError("select a rewrite strategy or preserve the original story")
+        if selected is not None and selected not in {
+            item.strategy for item in diagnosis.rewrite_options
+        }:
+            raise ValueError("selected rewrite strategy is not present in the accepted diagnosis")
+        accepted_output = {
+            "diagnosis": diagnosis.model_dump(mode="json", by_alias=True),
+            "selectedStrategy": None if selected is None else selected.value,
+            "additionalInstructions": additional_instructions.strip(),
+            "preserveOriginal": preserve_original,
+        }
+        return self._repository.accept_story_diagnosis(
+            step_id=step.id,
+            expected_source_hash=expected_hash,
+            accepted_output=accepted_output,
+        )
+
+    def rewrite_story(
+        self,
+        scene_id: uuid.UUID,
+        *,
+        diagnosis_step_id: uuid.UUID,
+        allow_paid_generation: bool,
+    ) -> StoryRewriteResult:
+        self._require_paid_director(
+            allow_paid_generation,
+            "story rewrite requires explicit paid-generation permission",
+        )
+        scene = self._repository.get_scene(scene_id)
+        project = self._repository.get_project(scene.project_id)
+        profile = self._repository.get_visual_profile(project.id)
+        diagnosis_step = self._repository.get_step(diagnosis_step_id)
+        if (
+            diagnosis_step.scene_id != scene.id
+            or diagnosis_step.operation_key != "director:story-diagnosis"
+            or diagnosis_step.status is not StepStatus.SUCCEEDED
+            or "acceptedOutput" not in diagnosis_step.input_snapshot
+        ):
+            raise ValueError("story rewrite requires an accepted story diagnosis")
+        accepted_diagnosis = diagnosis_step.input_snapshot["acceptedOutput"]
+        if (
+            accepted_diagnosis.get("preserveOriginal") is True
+            or not accepted_diagnosis.get("selectedStrategy")
+        ):
+            raise ValueError(
+                "story rewrite requires a selected diagnosis rewrite strategy"
+            )
+        if diagnosis_step.input_snapshot.get("sourceHash") != story_source_hash(
+            scene.draft
+        ):
+            raise RevisionConflictError(
+                "scene story changed after diagnosis; run the diagnosis again"
+            )
+        self._assert_scene_stage_available(
+            project_id=project.id,
+            scene_id=scene.id,
+            operation_key="director:story-rewrite",
+        )
+        prompt = compile_story_rewrite_prompt(
+            project_title=project.title,
+            scene=scene.draft,
+            visual_profile=profile.draft,
+            accepted_diagnosis=accepted_diagnosis,
+        )
+        snapshot = {
+            "sourceHash": story_source_hash(scene.draft),
+            "scene": scene.draft.model_dump(mode="json", by_alias=True),
+            "visualProfileRevisionId": str(profile.id),
+            "visualProfileHash": profile.profile_hash,
+            "diagnosisStepId": str(diagnosis_step.id),
+            "acceptedDiagnosis": accepted_diagnosis,
+        }
+        step = self._run_scene_director_stage(
+            project_id=project.id,
+            scene_id=scene.id,
+            operation_key="director:story-rewrite",
+            prompt=prompt,
+            snapshot=snapshot,
+            output_type=StoryRewriteOutput,
+            output_name="StoryRewriteOutput",
+        )
+        return StoryRewriteResult(
+            step_id=step.id,
+            output=StoryRewriteOutput.model_validate(
+                step.input_snapshot.get("providerOutput")
+            ),
+        )
+
+    def accept_story_rewrite(
+        self,
+        step_id: uuid.UUID,
+        *,
+        rewrite: StoryRewriteOutput,
+    ) -> StoredScene:
+        step = self._repository.get_step(step_id)
+        self._validate_scene_stage_step(
+            step,
+            operation_key="director:story-rewrite",
+        )
+        assert step.scene_id is not None
+        scene = self._repository.get_scene(step.scene_id)
+        expected_hash = str(step.input_snapshot.get("sourceHash") or "")
+        if story_source_hash(scene.draft) != expected_hash:
+            raise RevisionConflictError(
+                "scene story changed after rewrite; generate a new rewrite"
+            )
+        revised_draft = scene.draft.model_copy(
+            update={"source_text": rewrite.rewritten_story}
+        )
+        accepted_output = {
+            **rewrite.model_dump(mode="json", by_alias=True),
+            "acceptedStoryHash": story_source_hash(revised_draft),
+        }
+        return self._repository.accept_story_rewrite(
+            step_id=step.id,
+            expected_source_hash=expected_hash,
+            accepted_output=accepted_output,
+            rewritten_story=rewrite.rewritten_story,
+        )
+
+    def creative_workflow(self, scene_id: uuid.UUID) -> dict[str, Any]:
+        scene = self._repository.get_scene(scene_id)
+        steps = self._repository.list_steps(
+            project_id=scene.project_id,
+            scene_id=scene.id,
+        )
+        stage_keys = {
+            "diagnosis": "director:story-diagnosis",
+            "rewrite": "director:story-rewrite",
+            "storyboard": "director:shot-suggestions",
+        }
+        diagnosis_steps = [
+            item
+            for item in steps
+            if item.operation_key == "director:story-diagnosis"
+        ]
+        first_scene_snapshot = (
+            None
+            if not diagnosis_steps
+            else diagnosis_steps[0].input_snapshot.get("scene")
+        )
+        original_story = (
+            first_scene_snapshot.get("sourceText")
+            if isinstance(first_scene_snapshot, dict)
+            else scene.draft.source_text
+        )
+        current_source = "scene_draft"
+        current_source_step_id: str | None = None
+        current_hash = story_source_hash(scene.draft)
+        for step in reversed(steps):
+            accepted = step.input_snapshot.get("acceptedOutput")
+            if not isinstance(accepted, dict):
+                continue
+            if (
+                step.operation_key == "director:story-rewrite"
+                and accepted.get("acceptedStoryHash") == current_hash
+            ):
+                current_source = "accepted_rewrite"
+                current_source_step_id = str(step.id)
+                break
+            if (
+                step.operation_key == "director:story-diagnosis"
+                and accepted.get("preserveOriginal") is True
+                and step.input_snapshot.get("sourceHash") == current_hash
+            ):
+                current_source = "preserved_original"
+                current_source_step_id = str(step.id)
+                break
+        return {
+            "sceneId": str(scene.id),
+            "originalStory": original_story,
+            "currentStory": scene.draft.source_text,
+            "currentStoryHash": current_hash,
+            "currentStorySource": current_source,
+            "currentStorySourceStepId": current_source_step_id,
+            "stages": {
+                name: [
+                    _creative_step_json(item)
+                    for item in reversed(steps)
+                    if item.operation_key == operation_key
+                ]
+                for name, operation_key in stage_keys.items()
+            },
+            "reviews": [
+                _creative_step_json(item)
+                for item in reversed(steps)
+                if item.operation_key == "director:shot-assistance"
+            ],
+        }
+
+    def restore_project_canon_references(
+        self,
+        project_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        current = self._repository.get_visual_profile(project_id)
+        canon = self._repository.get_default_visual_profile(project_id)
+        purposes = {item.purpose for item in canon.reference_bindings}
+        required = {
+            LookReferencePurpose.PERSON_IDENTITY,
+            LookReferencePurpose.CAT_IDENTITY,
+            LookReferencePurpose.STYLE,
+        }
+        if not required.issubset(purposes):
+            raise ValueError(
+                "Canon references are incomplete; repair Canon assets before restoring the project"
+            )
+        restored_draft: VisualProfileDraft = current.draft.model_copy(
+            update={"reference_bindings": canon.reference_bindings}
+        )
+        profile, cleaned_shot_count = self._repository.restore_project_canon_references(
+            project_id,
+            restored_draft,
+        )
+        return {
+            "projectId": str(project_id),
+            "visualProfileRevisionId": str(profile.id),
+            "visualProfileRevision": profile.revision,
+            "referenceCount": len(profile.draft.reference_bindings),
+            "cleanedShotCount": cleaned_shot_count,
+        }
+
     def suggest_shots(
         self,
         scene_id: uuid.UUID,
@@ -118,6 +472,8 @@ class ProjectEditingService:
             raise RuntimeError("Director gateway is not configured")
         scene = self._repository.get_scene(scene_id)
         project = self._repository.get_project(scene.project_id)
+        profile = self._repository.get_visual_profile(project.id)
+        approved_story_step = self._approved_story_step(scene)
         prior_steps = [
             item
             for item in self._repository.list_steps(
@@ -157,11 +513,16 @@ class ProjectEditingService:
             context_note=scene.draft.context_note,
             story_mode=scene.draft.story_mode.value,
             target_shot_count=scene.draft.target_shot_count,
+            visual_profile=profile.draft,
         )
         input_hash = _hash_json(
             {
+                "prompt": prompt,
                 "project": str(project.id),
                 "scene": scene.draft.model_dump(mode="json", by_alias=True),
+                "approvedStoryStepId": str(approved_story_step.id),
+                "visualProfileRevisionId": str(profile.id),
+                "visualProfileHash": profile.profile_hash,
             }
         )
         attempt = self._repository.next_scene_attempt(
@@ -178,7 +539,13 @@ class ProjectEditingService:
             provider=self._provider_name,
             model=self._director.model,
             input_hash=input_hash,
-            input_snapshot={"scene": scene.draft.model_dump(mode="json", by_alias=True)},
+            input_snapshot={
+                "scene": scene.draft.model_dump(mode="json", by_alias=True),
+                "sourceHash": story_source_hash(scene.draft),
+                "approvedStoryStepId": str(approved_story_step.id),
+                "visualProfileRevisionId": str(profile.id),
+                "visualProfileHash": profile.profile_hash,
+            },
             purpose=PromptPurpose.DIRECTOR,
             prompt_text=prompt,
         )
@@ -208,6 +575,10 @@ class ProjectEditingService:
             raise
         snapshot = {
             "scene": scene.draft.model_dump(mode="json", by_alias=True),
+            "sourceHash": story_source_hash(scene.draft),
+            "approvedStoryStepId": str(approved_story_step.id),
+            "visualProfileRevisionId": str(profile.id),
+            "visualProfileHash": profile.profile_hash,
             "providerOutput": result.payload,
             "responseId": result.response_id,
             "requestHash": result.request_hash,
@@ -244,6 +615,10 @@ class ProjectEditingService:
         if step.status is not StepStatus.SUCCEEDED:
             raise ValueError("only a succeeded suggestion step can be accepted")
         scene = self._repository.get_scene(step.scene_id)
+        if step.input_snapshot.get("sourceHash") != story_source_hash(scene.draft):
+            raise RevisionConflictError(
+                "scene story changed after storyboard generation; generate suggestions again"
+            )
         if len(shots) != scene.draft.target_shot_count:
             raise ValueError(
                 f"当前模式必须接受{scene.draft.target_shot_count}个视频片段"
@@ -270,6 +645,587 @@ class ProjectEditingService:
             drafts=drafts,
             look_plan=look_plan,
             accepted_output=accepted_output,
+        )
+
+    def _require_paid_director(self, allowed: bool, message: str) -> None:
+        if not allowed:
+            raise ValueError(message)
+        if self._director is None:
+            raise RuntimeError("Director gateway is not configured")
+
+    def _assert_scene_stage_available(
+        self,
+        *,
+        project_id: uuid.UUID,
+        scene_id: uuid.UUID,
+        operation_key: str,
+    ) -> None:
+        prior = [
+            item
+            for item in self._repository.list_steps(
+                project_id=project_id,
+                scene_id=scene_id,
+            )
+            if item.shot_card_id is None and item.operation_key == operation_key
+        ]
+        unresolved = next(
+            (item for item in prior if item.status is StepStatus.SUBMISSION_UNKNOWN),
+            None,
+        )
+        if unresolved is not None:
+            raise ValueError(
+                f"step {unresolved.id} is submission_unknown; do not repeat the paid request"
+            )
+        active = next(
+            (
+                item
+                for item in prior
+                if item.status
+                in {
+                    StepStatus.PENDING,
+                    StepStatus.SUBMITTING,
+                    StepStatus.QUEUED,
+                    StepStatus.RUNNING,
+                }
+            ),
+            None,
+        )
+        if active is not None:
+            raise ValueError(f"step {active.id} is still active")
+
+    def _run_scene_director_stage(
+        self,
+        *,
+        project_id: uuid.UUID,
+        scene_id: uuid.UUID,
+        operation_key: str,
+        prompt: str,
+        snapshot: dict[str, Any],
+        output_type: type[StoryDiagnosisOutput] | type[StoryRewriteOutput],
+        output_name: str,
+    ) -> StoredStep:
+        if self._director is None:
+            raise RuntimeError("Director gateway is not configured")
+        attempt = self._repository.next_scene_attempt(
+            scene_id=scene_id,
+            operation_key=operation_key,
+        )
+        step, _ = self._repository.create_step_with_prompt(
+            project_id=project_id,
+            scene_id=scene_id,
+            shot_id=None,
+            kind=StepKind.DIRECTOR,
+            operation_key=operation_key,
+            attempt=attempt,
+            provider=self._provider_name,
+            model=self._director.model,
+            input_hash=_hash_json({"prompt": prompt, "snapshot": snapshot}),
+            input_snapshot=snapshot,
+            purpose=PromptPurpose.DIRECTOR,
+            prompt_text=prompt,
+        )
+        if step.status is StepStatus.SUCCEEDED:
+            output_type.model_validate(step.input_snapshot.get("providerOutput"))
+            return step
+        self._repository.update_step(step.id, status=StepStatus.SUBMITTING)
+        try:
+            result = self._director.generate_structured(
+                prompt=prompt,
+                schema=output_type.model_json_schema(by_alias=True),
+                output_name=output_name,
+            )
+            output_type.model_validate(result.payload)
+        except GatewayError as exc:
+            status = (
+                StepStatus.SUBMISSION_UNKNOWN
+                if exc.submission_unknown
+                else StepStatus.FAILED
+            )
+            self._repository.update_step(
+                step.id,
+                status=status,
+                error=_error_payload(exc),
+            )
+            raise
+        except Exception as exc:
+            self._repository.update_step(
+                step.id,
+                status=StepStatus.FAILED,
+                error=_error_payload(exc),
+            )
+            raise
+        return self._repository.update_step(
+            step.id,
+            status=StepStatus.SUCCEEDED,
+            input_snapshot={
+                **snapshot,
+                "providerOutput": result.payload,
+                "responseId": result.response_id,
+                "requestHash": result.request_hash,
+            },
+        )
+
+    def _adjacent_scenes(
+        self,
+        scene: StoredScene,
+    ) -> tuple[StoredScene | None, StoredScene | None]:
+        ordered = sorted(
+            self._repository.list_scenes(scene.project_id),
+            key=lambda item: item.order,
+        )
+        index = next(index for index, item in enumerate(ordered) if item.id == scene.id)
+        previous = ordered[index - 1] if index > 0 else None
+        following = ordered[index + 1] if index + 1 < len(ordered) else None
+        return previous, following
+
+    def _validate_scene_stage_step(
+        self,
+        step: StoredStep,
+        *,
+        operation_key: str,
+    ) -> None:
+        if (
+            step.kind is not StepKind.DIRECTOR
+            or step.status is not StepStatus.SUCCEEDED
+            or step.scene_id is None
+            or step.shot_card_id is not None
+            or step.operation_key != operation_key
+        ):
+            raise ValueError(f"step is not a succeeded {operation_key} result")
+        if "acceptedAt" in step.input_snapshot:
+            raise RevisionConflictError("creative workflow step has already been accepted")
+
+    def _approved_story_step(self, scene: StoredScene) -> StoredStep:
+        current_hash = story_source_hash(scene.draft)
+        steps = reversed(
+            self._repository.list_steps(
+                project_id=scene.project_id,
+                scene_id=scene.id,
+            )
+        )
+        for step in steps:
+            accepted = step.input_snapshot.get("acceptedOutput")
+            if not isinstance(accepted, dict):
+                continue
+            if (
+                step.operation_key == "director:story-rewrite"
+                and accepted.get("acceptedStoryHash") == current_hash
+            ):
+                return step
+            if (
+                step.operation_key == "director:story-diagnosis"
+                and accepted.get("preserveOriginal") is True
+                and step.input_snapshot.get("sourceHash") == current_hash
+            ):
+                return step
+        raise ValueError(
+            "storyboard generation requires an accepted story rewrite or an explicit "
+            "preserve-original decision"
+        )
+
+    def assist_shot(
+        self,
+        shot_id: uuid.UUID,
+        *,
+        source_draft_revision: int,
+        candidate_asset_ids: tuple[uuid.UUID, ...],
+        allow_paid_generation: bool,
+    ) -> ShotAssistanceResult:
+        if not allow_paid_generation:
+            raise ValueError("shot assistance requires explicit paid-generation permission")
+        if self._director is None:
+            raise RuntimeError("Director gateway is not configured")
+        shot = self._repository.get_shot(shot_id)
+        if shot.draft_revision != source_draft_revision:
+            raise RevisionConflictError("片段草稿已更新，请基于最新版本重新分析")
+        prior_steps = [
+            item
+            for item in self._repository.list_steps(
+                project_id=shot.project_id,
+                shot_id=shot.id,
+            )
+            if item.operation_key == "director:shot-assistance"
+        ]
+        unresolved = next(
+            (item for item in prior_steps if item.status is StepStatus.SUBMISSION_UNKNOWN),
+            None,
+        )
+        if unresolved is not None:
+            raise ValueError(
+                f"step {unresolved.id} is submission_unknown; do not repeat the paid request"
+            )
+        active = next(
+            (
+                item
+                for item in prior_steps
+                if item.status
+                in {
+                    StepStatus.PENDING,
+                    StepStatus.SUBMITTING,
+                    StepStatus.QUEUED,
+                    StepStatus.RUNNING,
+                }
+            ),
+            None,
+        )
+        if active is not None:
+            raise ValueError(f"step {active.id} is still active")
+
+        scene = self._repository.get_scene(shot.scene_id)
+        project = self._repository.get_project(shot.project_id)
+        candidates = self._shot_assist_candidates(shot, scene, project)
+        candidate_by_id = {item.asset.id: item for item in candidates}
+        unknown_ids = set(candidate_asset_ids).difference(candidate_by_id)
+        if unknown_ids:
+            raise ValueError(
+                "shot-assistance references must come from the current shot input context"
+            )
+
+        requested_ids = set(candidate_asset_ids)
+        selected_candidates: list[ShotAssistCandidate] = []
+        seen_hashes: set[str] = set()
+        for candidate in candidates:
+            asset = candidate.asset
+            if asset.id not in requested_ids:
+                continue
+            if (
+                asset.media_type != "image"
+                or asset.status not in {"approved", "ready"}
+                or not asset.content_ready
+            ):
+                raise ValueError("shot-assistance reference is unavailable or not an image")
+            if asset.sha256 in seen_hashes:
+                continue
+            seen_hashes.add(asset.sha256)
+            selected_candidates.append(candidate)
+        if len(selected_candidates) > 9:
+            raise ValueError("shot assistance accepts at most 9 unique images")
+
+        assets = tuple(item.asset for item in selected_candidates)
+        profile = self._repository.get_visual_profile(shot.project_id)
+        ordered_shots = sorted(
+            self._repository.list_shots(shot.scene_id),
+            key=lambda item: item.order,
+        )
+        current_index = next(
+            index for index, item in enumerate(ordered_shots) if item.id == shot.id
+        )
+        previous = ordered_shots[current_index - 1] if current_index > 0 else None
+        following = (
+            ordered_shots[current_index + 1]
+            if current_index + 1 < len(ordered_shots)
+            else None
+        )
+        local_analysis = analyze_shot_draft(shot.draft)
+        reference_manifest = tuple(
+            f"@图片{index}={candidate.asset.display_name}；"
+            f"assetId={candidate.asset.id}；来源={candidate.source_layer}；"
+            f"当前职责={candidate.responsibility}"
+            for index, candidate in enumerate(selected_candidates, 1)
+        )
+        prompt = compile_shot_assistance_prompt(
+            project_title=project.title,
+            scene_title=scene.draft.title,
+            scene_text=scene.draft.source_text,
+            current=shot.draft,
+            previous=None if previous is None else previous.draft,
+            following=None if following is None else following.draft,
+            visual_profile=profile.draft,
+            local_analysis=local_analysis,
+            reference_manifest=reference_manifest,
+        )
+        snapshot = {
+            "sourceDraftRevision": shot.draft_revision,
+            "currentShot": shot.draft.model_dump(mode="json", by_alias=True),
+            "previousShot": (
+                None
+                if previous is None
+                else previous.draft.model_dump(mode="json", by_alias=True)
+            ),
+            "nextShot": (
+                None
+                if following is None
+                else following.draft.model_dump(mode="json", by_alias=True)
+            ),
+            "localAnalysis": local_analysis.model_dump(mode="json", by_alias=True),
+            "sceneStoryHash": story_source_hash(scene.draft),
+            "visualProfileRevisionId": str(profile.id),
+            "visualProfileHash": profile.profile_hash,
+            "candidateAssets": [
+                {
+                    "assetId": str(candidate.asset.id),
+                    "sha256": candidate.asset.sha256,
+                    "ordinal": index,
+                    "sourceLayer": candidate.source_layer,
+                    "responsibility": candidate.responsibility,
+                }
+                for index, candidate in enumerate(selected_candidates, 1)
+            ],
+        }
+        attempt = self._repository.next_attempt(
+            shot_id=shot.id,
+            operation_key="director:shot-assistance",
+        )
+        step, _ = self._repository.create_step_with_prompt(
+            project_id=shot.project_id,
+            scene_id=shot.scene_id,
+            shot_id=shot.id,
+            kind=StepKind.DIRECTOR,
+            operation_key="director:shot-assistance",
+            attempt=attempt,
+            provider=self._provider_name,
+            model=self._director.analysis_model,
+            input_hash=_hash_json({"prompt": prompt, "snapshot": snapshot}),
+            input_snapshot=snapshot,
+            purpose=PromptPurpose.DIRECTOR,
+            prompt_text=prompt,
+        )
+        self._repository.update_step(step.id, status=StepStatus.SUBMITTING)
+        try:
+            result = self._director.analyze_structured(
+                prompt=prompt,
+                schema=ShotAssistAnalysis.model_json_schema(by_alias=True),
+                output_name="ShotAssistAnalysis",
+                image_paths=tuple(asset.require_path() for asset in assets),
+            )
+            analysis = ShotAssistAnalysis.model_validate(result.payload)
+        except GatewayError as exc:
+            status = StepStatus.SUBMISSION_UNKNOWN if exc.submission_unknown else StepStatus.FAILED
+            self._repository.update_step(step.id, status=status, error=_error_payload(exc))
+            raise
+        except Exception as exc:
+            self._repository.update_step(
+                step.id,
+                status=StepStatus.FAILED,
+                error=_error_payload(exc),
+            )
+            raise
+        completed_snapshot = {
+            **snapshot,
+            "providerOutput": result.payload,
+            "responseId": result.response_id,
+            "requestHash": result.request_hash,
+        }
+        self._repository.update_step(
+            step.id,
+            status=StepStatus.SUCCEEDED,
+            input_snapshot=completed_snapshot,
+        )
+        return ShotAssistanceResult(step.id, analysis)
+
+    def shot_assist_context(self, shot_id: uuid.UUID) -> dict[str, Any]:
+        shot = self._repository.get_shot(shot_id)
+        scene = self._repository.get_scene(shot.scene_id)
+        project = self._repository.get_project(shot.project_id)
+        ordered_shots = sorted(
+            self._repository.list_shots(shot.scene_id),
+            key=lambda item: item.order,
+        )
+        current_index = next(
+            index for index, item in enumerate(ordered_shots) if item.id == shot.id
+        )
+        tail_state = _previous_tail_state(self._repository, shot)
+        candidates: list[dict[str, Any]] = []
+        selected_ids: list[str] = []
+        seen_ids: set[uuid.UUID] = set()
+        seen_hashes: set[str] = set()
+        for candidate in self._shot_assist_candidates(shot, scene, project):
+            asset = candidate.asset
+            duplicate = asset.id in seen_ids or asset.sha256 in seen_hashes
+            if not duplicate:
+                seen_ids.add(asset.id)
+                seen_hashes.add(asset.sha256)
+            available = (
+                asset.media_type == "image"
+                and asset.status in {"approved", "ready"}
+                and asset.content_ready
+            )
+            if not duplicate and available and len(selected_ids) < 9:
+                selected_ids.append(str(asset.id))
+            candidates.append(
+                {
+                    "assetId": str(asset.id),
+                    "displayName": asset.display_name,
+                    "sha256": asset.sha256,
+                    "sourceLayer": candidate.source_layer,
+                    "responsibility": candidate.responsibility,
+                    "contentReady": asset.content_ready,
+                    "available": available,
+                    "duplicate": duplicate,
+                }
+            )
+        return {
+            "shotId": str(shot.id),
+            "sourceDraftRevision": shot.draft_revision,
+            "model": (
+                None if self._director is None else self._director.analysis_model
+            ),
+            "localAnalysis": analyze_shot_draft(shot.draft).model_dump(
+                mode="json", by_alias=True
+            ),
+            "previousShot": (
+                None
+                if current_index == 0
+                else {
+                    "id": str(ordered_shots[current_index - 1].id),
+                    "title": ordered_shots[current_index - 1].draft.title,
+                }
+            ),
+            "nextShot": (
+                None
+                if current_index + 1 >= len(ordered_shots)
+                else {
+                    "id": str(ordered_shots[current_index + 1].id),
+                    "title": ordered_shots[current_index + 1].draft.title,
+                }
+            ),
+            "previousTail": _tail_state_json(tail_state),
+            "candidates": candidates,
+            "defaultCandidateAssetIds": selected_ids,
+            "warnings": (
+                ["可用候选图片超过9张，请在付费分析前取消部分选择"]
+                if sum(1 for item in candidates if item["available"] and not item["duplicate"])
+                > 9
+                else []
+            ),
+        }
+
+    def _shot_assist_candidates(
+        self,
+        shot: StoredShot,
+        scene: StoredScene,
+        project: StoredProject,
+    ) -> tuple[ShotAssistCandidate, ...]:
+        candidate_ids: list[uuid.UUID] = []
+        if shot.selected_anchor_asset_id is not None:
+            candidate_ids.append(shot.selected_anchor_asset_id)
+        candidate_ids.extend(
+            binding.asset_id
+            for binding in shot.draft.reference_bindings
+            if binding.asset_id != scene.selected_look_asset_id
+        )
+        if scene.selected_look_asset_id is not None:
+            candidate_ids.append(scene.selected_look_asset_id)
+        candidate_ids.extend(
+            binding.asset_id
+            for binding in _project_reference_bindings(
+                self._repository,
+                shot,
+                scene,
+                project,
+            )
+            if binding.asset_id != scene.selected_look_asset_id
+        )
+        tail_state = _previous_tail_state(self._repository, shot)
+        if tail_state.active is not None:
+            candidate_ids.append(tail_state.active.id)
+
+        seen_ids: set[uuid.UUID] = set()
+        candidates: list[ShotAssistCandidate] = []
+        for asset_id in candidate_ids:
+            if asset_id in seen_ids:
+                continue
+            seen_ids.add(asset_id)
+            asset = self._repository.get_asset(asset_id)
+            if asset.project_id not in {None, shot.project_id}:
+                raise ValueError("shot-assistance reference belongs to another project")
+            candidates.append(
+                ShotAssistCandidate(
+                    asset=asset,
+                    source_layer=_shot_assist_asset_layer(shot, scene, project, asset),
+                    responsibility=_shot_assist_asset_responsibility(shot, asset),
+                )
+            )
+        return tuple(candidates)
+
+    def list_shot_assistance(self, shot_id: uuid.UUID) -> list[dict[str, Any]]:
+        shot = self._repository.get_shot(shot_id)
+        records: list[dict[str, Any]] = []
+        for step in reversed(
+            self._repository.list_steps(project_id=shot.project_id, shot_id=shot.id)
+        ):
+            if step.operation_key != "director:shot-assistance":
+                continue
+            source_revision = step.input_snapshot.get("sourceDraftRevision")
+            records.append(
+                {
+                    "stepId": str(step.id),
+                    "status": step.status.value,
+                    "sourceDraftRevision": source_revision,
+                    "stale": source_revision != shot.draft_revision,
+                    "analysis": step.input_snapshot.get("providerOutput"),
+                    "acceptedOutput": step.input_snapshot.get("acceptedOutput"),
+                    "acceptedAt": step.input_snapshot.get("acceptedAt"),
+                    "error": step.error,
+                    "createdAt": (
+                        None if step.created_at is None else step.created_at.isoformat()
+                    ),
+                }
+            )
+        return records
+
+    def accept_shot_assistance(
+        self,
+        step_id: uuid.UUID,
+        *,
+        source_draft_revision: int,
+        patch: ShotAssistPatch,
+    ) -> StoredShot:
+        step = self._repository.get_step(step_id)
+        if (
+            step.kind is not StepKind.DIRECTOR
+            or step.status is not StepStatus.SUCCEEDED
+            or step.operation_key != "director:shot-assistance"
+            or step.shot_card_id is None
+        ):
+            raise ValueError("step is not a succeeded shot-assistance analysis")
+        shot = self._repository.get_shot(step.shot_card_id)
+        if step.input_snapshot.get("sourceDraftRevision") != source_draft_revision:
+            raise RevisionConflictError("接受请求与分析来源版本不一致")
+        if shot.draft_revision != source_draft_revision:
+            raise RevisionConflictError("片段草稿已更新，旧分析不能再接受")
+        analysis = ShotAssistAnalysis.model_validate(
+            step.input_snapshot.get("providerOutput")
+        )
+        selected = patch.model_dump(mode="json", by_alias=True, exclude_none=True)
+        proposed = (
+            {}
+            if analysis.patch is None
+            else analysis.patch.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            )
+        )
+        proposed.setdefault(
+            "durationSeconds",
+            analysis.pacing_plan.recommended_duration_seconds,
+        )
+        proposed.setdefault(
+            "sceneLookUsage",
+            analysis.recommended_scene_look_usage.value,
+        )
+        proposed.setdefault(
+            "anchorMode",
+            analysis.recommended_anchor_mode.value,
+        )
+        creative_bodies = {
+            body
+            for body in (
+                analysis.creative_body,
+                *(item.body for item in analysis.creative_alternatives),
+            )
+            if body is not None
+        }
+        for key, value in selected.items():
+            if key == "direction" and value in creative_bodies:
+                continue
+            if proposed.get(key) != value:
+                raise ValueError("只能接受该次LLM分析实际提出的字段值")
+        return self._repository.accept_shot_assistance(
+            step_id=step.id,
+            source_draft_revision=source_draft_revision,
+            patch=patch,
         )
 
 
@@ -311,8 +1267,11 @@ class ShotProductionService:
     ) -> StoredAsset:
         if usage not in {"approved_anchor", "generation_reference"}:
             raise ValueError("unsupported reference usage")
-        if role not in {"identity", "style", "scene", "prop", "composition"}:
-            raise ValueError("unsupported reference role")
+        if role not in {"style", "prop", "composition"}:
+            raise ValueError(
+                "uploaded generic references may only use style, prop, or composition; "
+                "identity and scene responsibilities come from managed sources"
+            )
         landed = self._asset_store.import_local(path)
         qc = self._media_probe.inspect_image(landed.path)
         return self._repository.add_asset(
@@ -406,6 +1365,8 @@ class ShotProductionService:
     def preview_shot_prompt(self, shot_id: uuid.UUID) -> dict[str, Any]:
         shot = self._repository.get_shot(shot_id)
         profile = self._repository.get_visual_profile(shot.project_id)
+        scene = self._repository.get_scene(shot.scene_id)
+        project = self._repository.get_project(shot.project_id)
         context = self._prompt_context(shot)
         anchor, references, descriptions = self._resolve_video_inputs(
             shot,
@@ -417,17 +1378,42 @@ class ShotProductionService:
             anchor=None if anchor is None else _media_source(anchor),
             references=tuple(_media_source(item) for item in references),
         )
-        prompt = compile_shot_video_prompt(
+        prompt_parts = compile_shot_video_prompt_parts(
             context,
             plan,
             binding_descriptions=descriptions,
             visual_profile=profile.draft,
         )
+        prompt = prompt_parts.final
+        ordered_assets = (() if anchor is None else (anchor,)) + references
+        local_analysis = analyze_shot_draft(shot.draft)
         return {
             "prompt": prompt.text,
+            "creativeBody": prompt_parts.creative_body,
+            "systemShell": prompt_parts.system_shell.text,
             "charCount": prompt.char_count,
             "utf8Bytes": prompt.utf8_bytes,
             "inputPlan": plan.model_dump(mode="json"),
+            "draftRevision": shot.draft_revision,
+            "sceneLookUsage": shot.draft.scene_look_usage.value,
+            "localAnalysis": local_analysis.model_dump(mode="json", by_alias=True),
+            "qualitativePacing": local_analysis.qualitative_pacing,
+            "references": [
+                {
+                    "index": index,
+                    "assetId": str(asset.id),
+                    "displayName": asset.display_name,
+                    "sourceLayer": _shot_assist_asset_layer(
+                        shot, scene, project, asset
+                    ),
+                    "responsibility": descriptions[index - 1],
+                    "contentReady": asset.content_ready,
+                }
+                for index, asset in enumerate(ordered_assets, 1)
+            ],
+            "previousTail": _tail_state_json(
+                _previous_tail_state(self._repository, shot)
+            ),
         }
 
     def generate_anchor(
@@ -451,7 +1437,11 @@ class ShotProductionService:
             raise ValueError("Seedream最多允许14张参考图")
         context = self._prompt_context(shot)
         descriptions = tuple(
-            _video_reference_description(index, binding)
+            _video_reference_description(
+                index,
+                binding,
+                scene_look_usage=shot.draft.scene_look_usage,
+            )
             for index, (binding, _asset) in enumerate(reference_pairs, 1)
         )
         profile = self._repository.get_visual_profile(shot.project_id)
@@ -853,7 +1843,122 @@ class ShotProductionService:
             elif asset.shot_card_id is not None:
                 kind = "anchor" if asset.media_type == "image" else "video"
                 self._repository.select_shot_asset(asset.shot_card_id, kind=kind, asset_id=asset.id)
-        return {"assetId": str(asset.id), "decision": decision, "selected": select}
+        tail_frame: dict[str, Any] | None = None
+        if (
+            decision == "approved"
+            and asset.media_type == "video"
+            and asset.shot_card_id is not None
+        ):
+            try:
+                tail = self._ensure_tail_frame(asset, shot_id=asset.shot_card_id)
+                tail_frame = {"status": "ready", "assetId": str(tail.id)}
+            except Exception as exc:
+                tail_frame = {
+                    "status": "unavailable",
+                    "error": _error_payload(exc),
+                }
+        return {
+            "assetId": str(asset.id),
+            "decision": decision,
+            "selected": select,
+            "tailFrame": tail_frame,
+        }
+
+    def adopt_previous_tail_anchor(self, shot_id: uuid.UUID) -> StoredShot:
+        shot = self._repository.get_shot(shot_id)
+        ordered = sorted(
+            self._repository.list_shots(shot.scene_id),
+            key=lambda item: item.order,
+        )
+        current_index = next(index for index, item in enumerate(ordered) if item.id == shot.id)
+        if current_index == 0:
+            raise ValueError("第一个片段没有可采用的上一片段尾帧")
+        previous = ordered[current_index - 1]
+        if previous.selected_video_asset_id is None:
+            raise ValueError("上一片段尚未选择批准视频")
+        source_video = self._repository.get_asset(previous.selected_video_asset_id)
+        tail = self._ensure_tail_frame(source_video, shot_id=previous.id)
+        bindings = [
+            binding
+            for binding in shot.draft.reference_bindings
+            if binding.usage is not ReferenceUsage.APPROVED_ANCHOR
+        ]
+        bindings.append(
+            ReferenceBinding(
+                assetId=tail.id,
+                usage=ReferenceUsage.APPROVED_ANCHOR,
+                role=ReferenceRole.COMPOSITION,
+                applyTo=ReferenceTarget.BOTH,
+            )
+        )
+        values = shot.draft.model_dump(mode="python")
+        values.update(
+            {
+                "anchor_mode": AnchorMode.EXISTING,
+                "reference_bindings": bindings,
+                "scene_look_usage": (
+                    SceneLookUsage.APPEARANCE_ONLY
+                    if shot.draft.scene_look_usage is SceneLookUsage.DERIVE_ANCHOR
+                    else shot.draft.scene_look_usage
+                ),
+            }
+        )
+        return self._repository.update_shot(
+            shot.id,
+            ShotCardDraft.model_validate(values),
+        )
+
+    def tail_frame_status(self, shot_id: uuid.UUID) -> dict[str, Any]:
+        shot = self._repository.get_shot(shot_id)
+        return _tail_state_json(_previous_tail_state(self._repository, shot))
+
+    def _ensure_tail_frame(
+        self,
+        source_video: StoredAsset,
+        *,
+        shot_id: uuid.UUID,
+    ) -> StoredAsset:
+        if source_video.media_type != "video" or source_video.status != "approved":
+            raise ValueError("尾帧只能从已批准视频抽取")
+        existing = next(
+            (
+                asset
+                for asset in reversed(self._repository.list_assets(shot_id=shot_id))
+                if asset.role == "shot_tail_frame"
+                and asset.metadata.get("sourceVideoAssetId") == str(source_video.id)
+                and asset.metadata.get("sourceVideoSha256") == source_video.sha256
+                and asset.content_ready
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing
+        if self._frame_extractor is None:
+            raise RuntimeError("尾帧抽取需要可用的FFmpeg")
+        frame_path, timestamp_ms = self._frame_extractor.extract_tail_frame(source_video)
+        try:
+            landed = self._asset_store.import_local(frame_path)
+            qc = self._media_probe.inspect_image(landed.path)
+        finally:
+            frame_path.unlink(missing_ok=True)
+        return self._repository.add_asset(
+            landed=landed,
+            role="shot_tail_frame",
+            media_type="image",
+            scope="shot",
+            status="approved",
+            project_id=source_video.project_id,
+            scene_id=source_video.scene_id,
+            shot_id=shot_id,
+            step_id=None,
+            semantic_key=f"shot:{shot_id}:tail:{source_video.id}",
+            metadata={
+                "sourceVideoAssetId": str(source_video.id),
+                "sourceVideoSha256": source_video.sha256,
+                "timestampMs": timestamp_ms,
+                "qc": qc,
+            },
+        )
 
     def reconcile_candidates(self, step_id: uuid.UUID) -> tuple[dict[str, Any], ...]:
         self._require_gateway()
@@ -1303,7 +2408,11 @@ class ShotProductionService:
             raise ValueError("Seedance最多允许9张图片输入（含锚点）")
         descriptions = (() if anchor is None else ("@图片1=批准锚点，锁定本片段开场状态",))
         descriptions += tuple(
-            _video_reference_description(index, binding)
+            _video_reference_description(
+                index,
+                binding,
+                scene_look_usage=shot.draft.scene_look_usage,
+            )
             for index, (binding, _asset) in enumerate(
                 generation_pairs,
                 1 if anchor is None else 2,
@@ -1348,9 +2457,15 @@ class ShotProductionService:
             for item in _merge_generation_references(
                 custom=tuple(shot.draft.reference_bindings),
                 scene_look_asset_id=scene.selected_look_asset_id,
-                project_defaults=project.default_reference_bindings,
+                project_defaults=_project_reference_bindings(
+                    self._repository,
+                    shot,
+                    scene,
+                    project,
+                ),
                 inherit_project_references=shot.draft.inherit_project_references,
-                use_scene_look=shot.draft.use_scene_look,
+                scene_look_usage=shot.draft.scene_look_usage,
+                target=target,
             )
             if item.apply_to in {target, ReferenceTarget.BOTH}
         )
@@ -1542,18 +2657,75 @@ class SequenceService:
         )
 
 
+def _project_reference_bindings(
+    repository: ShotQueueStore,
+    shot: StoredShot,
+    scene: StoredScene,
+    project: StoredProject,
+) -> tuple[ReferenceBinding, ...]:
+    bindings = project.default_reference_bindings
+    if not bindings:
+        profile = repository.get_visual_profile(shot.project_id)
+        bindings = tuple(
+            ReferenceBinding(
+                assetId=item.asset_id,
+                usage=ReferenceUsage.GENERATION_REFERENCE,
+                role=(
+                    ReferenceRole.STYLE
+                    if item.purpose is LookReferencePurpose.STYLE
+                    else ReferenceRole.IDENTITY
+                ),
+                applyTo=ReferenceTarget.BOTH,
+            )
+            for item in profile.draft.reference_bindings
+        )
+
+    look_plan = (
+        scene.look_draft.look_plan
+        if scene.look_draft is not None
+        else scene.draft.look_plan
+    )
+    expected_style = (
+        None
+        if look_plan is None
+        else f"style:{look_plan.environment_style.value}"
+    )
+    filtered: list[ReferenceBinding] = []
+    for binding in bindings:
+        asset = repository.get_asset(binding.asset_id)
+        if (
+            expected_style is not None
+            and asset.semantic_key in {"style:outdoor", "style:indoor"}
+            and asset.semantic_key != expected_style
+        ):
+            continue
+        filtered.append(binding)
+    return tuple(filtered)
+
+
 def _merge_generation_references(
     *,
     custom: tuple[ReferenceBinding, ...],
     scene_look_asset_id: uuid.UUID | None,
     project_defaults: tuple[ReferenceBinding, ...],
     inherit_project_references: bool,
-    use_scene_look: bool,
+    scene_look_usage: SceneLookUsage,
+    target: ReferenceTarget,
 ) -> tuple[ReferenceBinding, ...]:
     ordered = [
-        item for item in custom if item.usage is ReferenceUsage.GENERATION_REFERENCE
+        item
+        for item in custom
+        if item.usage is ReferenceUsage.GENERATION_REFERENCE
+        and item.asset_id != scene_look_asset_id
     ]
-    if use_scene_look and scene_look_asset_id is not None:
+    include_scene_look = scene_look_usage in {
+        SceneLookUsage.APPEARANCE_ONLY,
+        SceneLookUsage.FULL_REFERENCE,
+    } or (
+        scene_look_usage is SceneLookUsage.DERIVE_ANCHOR
+        and target is ReferenceTarget.ANCHOR
+    )
+    if include_scene_look and scene_look_asset_id is not None:
         ordered.append(
             ReferenceBinding(
                 assetId=scene_look_asset_id,
@@ -1567,6 +2739,7 @@ def _merge_generation_references(
             item
             for item in project_defaults
             if item.usage is ReferenceUsage.GENERATION_REFERENCE
+            and item.asset_id != scene_look_asset_id
         )
     seen: set[uuid.UUID] = set()
     merged: list[ReferenceBinding] = []
@@ -1576,6 +2749,32 @@ def _merge_generation_references(
         seen.add(item.asset_id)
         merged.append(item)
     return tuple(merged)
+
+
+def _scene_story_snapshot(scene: StoredScene | None) -> dict[str, Any] | None:
+    if scene is None:
+        return None
+    return {
+        "sceneId": str(scene.id),
+        "title": scene.draft.title,
+        "sourceText": scene.draft.source_text,
+    }
+
+
+def _creative_step_json(step: StoredStep) -> dict[str, Any]:
+    return {
+        "stepId": str(step.id),
+        "operationKey": step.operation_key,
+        "status": step.status.value,
+        "attempt": step.attempt,
+        "model": step.model,
+        "sourceHash": step.input_snapshot.get("sourceHash"),
+        "providerOutput": step.input_snapshot.get("providerOutput"),
+        "acceptedOutput": step.input_snapshot.get("acceptedOutput"),
+        "acceptedAt": step.input_snapshot.get("acceptedAt"),
+        "error": step.error,
+        "createdAt": None if step.created_at is None else step.created_at.isoformat(),
+    }
 
 
 def _scene_look_reference_description(
@@ -1597,11 +2796,29 @@ def _scene_look_reference_description(
     return f"@图片{index}={semantic}；{responsibilities[binding.purpose]}{instruction}"
 
 
-def _video_reference_description(index: int, binding: ReferenceBinding) -> str:
+def _video_reference_description(
+    index: int,
+    binding: ReferenceBinding,
+    *,
+    scene_look_usage: SceneLookUsage = SceneLookUsage.APPEARANCE_ONLY,
+) -> str:
+    scene_responsibilities = {
+        SceneLookUsage.OFF: "场景基础定妆已禁用",
+        SceneLookUsage.APPEARANCE_ONLY: (
+            "场景基础定妆，只继承服饰、配件、环境基调和共同道具；"
+            "忽略定妆图中的姿态、动作结果和构图"
+        ),
+        SceneLookUsage.FULL_REFERENCE: (
+            "场景基础定妆，完整参考本场服装、道具、姿态和构图"
+        ),
+        SceneLookUsage.DERIVE_ANCHOR: (
+            "场景基础定妆，用于派生本片段开场状态；角色身份仍由项目身份图负责"
+        ),
+    }
     responsibilities = {
         ReferenceRole.IDENTITY: "项目角色身份，只锁定人物或猫咪的长期外观",
         ReferenceRole.STYLE: "项目系列画风，只锁定线条、材质、色彩和光线",
-        ReferenceRole.SCENE: "场景定妆，只锁定本次服装、配件、道具、姿态和构图",
+        ReferenceRole.SCENE: scene_responsibilities[scene_look_usage],
         ReferenceRole.PROP: "本片段道具外观、结构和比例",
         ReferenceRole.COMPOSITION: "本片段构图、机位和主体空间关系",
     }
@@ -1642,6 +2859,86 @@ def _validate_suggestion_count(output: ShotSuggestionOutput, target_count: int) 
         raise ValueError(
             f"导演建议返回{len(output.shots)}个视频片段，但当前场景要求{target_count}个"
         )
+
+
+def _shot_assist_asset_layer(
+    shot: StoredShot,
+    scene: StoredScene,
+    project: StoredProject,
+    asset: StoredAsset,
+) -> str:
+    if asset.role == "shot_tail_frame":
+        return "previous_tail"
+    if shot.selected_anchor_asset_id == asset.id:
+        return "shot"
+    if scene.selected_look_asset_id == asset.id:
+        return "scene_look"
+    if any(binding.asset_id == asset.id for binding in shot.draft.reference_bindings):
+        return "shot"
+    if any(binding.asset_id == asset.id for binding in project.default_reference_bindings):
+        return "project"
+    return "candidate"
+
+
+def _shot_assist_asset_responsibility(shot: StoredShot, asset: StoredAsset) -> str:
+    if shot.selected_anchor_asset_id == asset.id:
+        return "批准锚点：锁定当前片段开场状态"
+    if asset.role == "shot_tail_frame":
+        return "上一片段尾帧：只用于判断连续衔接"
+    if asset.role == "scene_look":
+        return "场景基础定妆：只承担当前场景造型与共同视觉基线"
+    return asset.reference_purpose or asset.role
+
+
+def _previous_tail_state(repository: ShotQueueStore, shot: StoredShot) -> PreviousTailState:
+    ordered = sorted(
+        repository.list_shots(shot.scene_id),
+        key=lambda item: item.order,
+    )
+    current_index = next(index for index, item in enumerate(ordered) if item.id == shot.id)
+    if current_index == 0:
+        return PreviousTailState(None, None, None, None, False)
+    previous = ordered[current_index - 1]
+    source_video_id = previous.selected_video_asset_id
+    bound: StoredAsset | None = None
+    for binding in shot.draft.reference_bindings:
+        if binding.usage is not ReferenceUsage.APPROVED_ANCHOR:
+            continue
+        candidate = repository.get_asset(binding.asset_id)
+        if candidate.role == "shot_tail_frame":
+            bound = candidate
+            break
+    source_id_text = None if source_video_id is None else str(source_video_id)
+    stale = bool(
+        bound is not None
+        and bound.metadata.get("sourceVideoAssetId") != source_id_text
+    )
+    active = next(
+        (
+            asset
+            for asset in reversed(repository.list_assets(shot_id=previous.id))
+            if asset.role == "shot_tail_frame"
+            and asset.metadata.get("sourceVideoAssetId") == source_id_text
+            and asset.content_ready
+        ),
+        None,
+    )
+    return PreviousTailState(previous, source_video_id, active, bound, stale)
+
+
+def _tail_state_json(state: PreviousTailState) -> dict[str, Any]:
+    if state.previous_shot is None:
+        return {"available": False, "reason": "first_shot", "stale": False}
+    return {
+        "available": state.active is not None,
+        "previousShotId": str(state.previous_shot.id),
+        "sourceVideoAssetId": (
+            None if state.source_video_id is None else str(state.source_video_id)
+        ),
+        "assetId": None if state.active is None else str(state.active.id),
+        "boundAssetId": None if state.bound is None else str(state.bound.id),
+        "stale": state.stale,
+    }
 
 
 def _media_source(asset: StoredAsset) -> MediaSource:

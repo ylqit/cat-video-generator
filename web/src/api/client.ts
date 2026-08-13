@@ -1,7 +1,10 @@
 import type {
   AssetDto,
+  CreativeStepRecord,
+  CreativeWorkflowDto,
   HealthDto,
   JobDto,
+  PreviousTailStatus,
   ProjectGraph,
   ProjectSummary,
   ReferenceBinding,
@@ -14,9 +17,16 @@ import type {
   SceneLookPromptPreview,
   SceneLookVersion,
   SequenceDto,
+  ShotAssistContext,
+  ShotAssistPatch,
+  ShotAssistRecord,
   ShotDto,
+  ShotPromptPreview,
   ShotSuggestion,
   ShotSuggestionOutput,
+  StoryDiagnosisOutput,
+  StoryRewriteOutput,
+  StoryRewriteStrategy,
   VisualProfileDraft,
   VisualProfileRevisionDto,
 } from "./types";
@@ -73,6 +83,14 @@ export const api = {
     request<VisualProfileRevisionDto>(`/projects/${projectId}/visual-profile`),
   updateVisualProfile: (projectId: string, draft: VisualProfileDraft) =>
     json<VisualProfileRevisionDto>(`/projects/${projectId}/visual-profile`, "PUT", draft),
+  restoreProjectCanonReferences: (projectId: string) =>
+    json<{
+      projectId: string;
+      visualProfileRevisionId: string;
+      visualProfileRevision: number;
+      referenceCount: number;
+      cleanedShotCount: number;
+    }>(`/projects/${projectId}/restore-canon-references`, "POST"),
   addScene: (projectId: string, body: Record<string, unknown>) =>
     json<SceneDto>(`/projects/${projectId}/scenes`, "POST", body),
   updateScene: (sceneId: string, body: Record<string, unknown>) =>
@@ -80,6 +98,31 @@ export const api = {
   deleteScene: (sceneId: string) => request<void>(`/scenes/${sceneId}`, { method: "DELETE" }),
   reorderScenes: (projectId: string, ids: string[]) =>
     json<{ saved: boolean }>(`/projects/${projectId}/scene-order`, "PUT", { ids }),
+  creativeWorkflow: (sceneId: string) =>
+    request<CreativeWorkflowDto>(`/scenes/${sceneId}/creative-workflow`),
+  diagnoseStory: (sceneId: string) =>
+    json<{ jobId: string }>(`/scenes/${sceneId}/story-diagnoses`, "POST", {
+      allowPaidGeneration: true,
+    }),
+  acceptStoryDiagnosis: (
+    stepId: string,
+    diagnosis: StoryDiagnosisOutput,
+    selectedStrategy: StoryRewriteStrategy | null,
+    additionalInstructions: string,
+    preserveOriginal: boolean,
+  ) => json<CreativeStepRecord>(`/steps/${stepId}/accept-story-diagnosis`, "POST", {
+    diagnosis,
+    selectedStrategy,
+    additionalInstructions,
+    preserveOriginal,
+  }),
+  rewriteStory: (sceneId: string, diagnosisStepId: string) =>
+    json<{ jobId: string }>(`/scenes/${sceneId}/story-rewrites`, "POST", {
+      diagnosisStepId,
+      allowPaidGeneration: true,
+    }),
+  acceptStoryRewrite: (stepId: string, rewrite: StoryRewriteOutput) =>
+    json<SceneDto>(`/steps/${stepId}/accept-story-rewrite`, "POST", { rewrite }),
   suggestShots: (sceneId: string) =>
     json<{ jobId: string }>(`/scenes/${sceneId}/shot-suggestions`, "POST", {
       allowPaidGeneration: true,
@@ -98,8 +141,34 @@ export const api = {
     json<{ saved: boolean }>(`/scenes/${sceneId}/shot-order`, "PUT", { ids }),
   shot: (shotId: string) => request<ShotDto>(`/shots/${shotId}`),
   promptPreview: (shotId: string) =>
-    request<{ prompt: string; charCount: number; utf8Bytes: number }>(
-      `/shots/${shotId}/prompt-preview`,
+    request<ShotPromptPreview>(`/shots/${shotId}/prompt-preview`),
+  shotAssistContext: (shotId: string) =>
+    request<ShotAssistContext>(`/shots/${shotId}/assist-context`),
+  assistShot: (
+    shotId: string,
+    sourceDraftRevision: number,
+    candidateAssetIds: string[],
+  ) => json<{ jobId: string }>(`/shots/${shotId}/assist`, "POST", {
+    sourceDraftRevision,
+    candidateAssetIds,
+    allowPaidGeneration: true,
+  }),
+  shotAssistAnalyses: (shotId: string) =>
+    request<ShotAssistRecord[]>(`/shots/${shotId}/assist-analyses`),
+  acceptShotAssistance: (
+    stepId: string,
+    sourceDraftRevision: number,
+    patch: ShotAssistPatch,
+  ) => json<ShotDto>(`/steps/${stepId}/accept-shot-assistance`, "POST", {
+    sourceDraftRevision,
+    patch,
+  }),
+  previousTail: (shotId: string) =>
+    request<PreviousTailStatus>(`/shots/${shotId}/previous-tail`),
+  adoptPreviousTailAnchor: (shotId: string) =>
+    json<ShotDto & { previousTail: PreviousTailStatus }>(
+      `/shots/${shotId}/adopt-previous-tail-anchor`,
+      "POST",
     ),
   updateReferences: (shotId: string, references: ReferenceBinding[]) =>
     json<ShotDto>(`/shots/${shotId}/references`, "PUT", { references }),

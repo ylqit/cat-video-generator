@@ -10,9 +10,11 @@ import base64
 import hashlib
 import json
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+from PIL import Image
 from volcenginesdkarkruntime import Ark
 from volcenginesdkarkruntime._exceptions import (
     ArkAPIConnectionError,
@@ -74,6 +76,12 @@ class ArkGateway:
     @property
     def model(self) -> str:
         return self._settings.ark_planning_model
+
+    @property
+    def analysis_model(self) -> str:
+        # The four creative roles intentionally share the planning model.
+        # review_model remains reserved for post-generation video diagnostics.
+        return self.model
 
     @property
     def image_model(self) -> str:
@@ -151,6 +159,87 @@ class ArkGateway:
             raise ArkGatewayError(
                 "Ark导演返回的JSON顶层必须是对象。",
                 code="invalid_director_output",
+                retryable=False,
+            )
+        return DirectorResult(
+            payload=payload,
+            response_id=response.id,
+            model=response.model,
+            request_hash=request_hash,
+        )
+
+    def analyze_structured(
+        self,
+        *,
+        prompt: str,
+        schema: dict[str, Any],
+        output_name: str,
+        image_paths: tuple[Path, ...],
+    ) -> DirectorResult:
+        """Run paid multimodal analysis using compressed, non-persistent previews."""
+
+        if len(image_paths) > 9:
+            raise ArkGatewayError(
+                "片段创作分析最多允许9张图片",
+                code="invalid_shot_assistance_image_count",
+                retryable=False,
+            )
+        instructions, text_format = self._structured_output(prompt, schema, output_name)
+        image_hashes: list[str] = []
+        content: list[dict[str, str]] = [
+            {"type": "input_text", "text": f"生成一个{output_name}对象。"}
+        ]
+        for index, path in enumerate(image_paths, 1):
+            _validate_reference_file(path)
+            image_hashes.append(hashlib.sha256(path.read_bytes()).hexdigest())
+            content.append({"type": "input_text", "text": f"按顺序查看@图片{index}"})
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": _analysis_preview_data_url(path),
+                }
+            )
+        request_hash = _json_hash(
+            {
+                "model": self.analysis_model,
+                "instructions": instructions,
+                "schema": schema,
+                "outputName": output_name,
+                "orderedImageSha256": image_hashes,
+            }
+        )
+        try:
+            response = self._client.responses.create(
+                model=self.analysis_model,
+                instructions=instructions,
+                input=[{"role": "user", "content": content}],
+                text={"format": text_format},
+                temperature=0.2,
+                max_output_tokens=6000,
+                thinking={"type": "disabled"},
+                store=False,
+                timeout=self._settings.ark_review_request_timeout_seconds,
+            )
+        except ArkAPIError as exc:
+            raise _provider_error(exc, submission=True) from exc
+        if response.status != "completed":
+            raise ArkGatewayError(
+                f"Ark片段创作分析状态为{response.status!r}",
+                code="shot_assistance_not_completed",
+                retryable=False,
+            )
+        try:
+            payload = json.loads(_response_text(response))
+        except json.JSONDecodeError as exc:
+            raise ArkGatewayError(
+                "Ark片段创作分析没有返回合法JSON对象。",
+                code="invalid_shot_assistance_output",
+                retryable=False,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ArkGatewayError(
+                "Ark片段创作分析的JSON顶层必须是对象。",
+                code="invalid_shot_assistance_output",
                 retryable=False,
             )
         return DirectorResult(
@@ -488,6 +577,24 @@ def _repair_utf8_mojibake(value: str) -> str:
 
 def _cjk_count(value: str) -> int:
     return sum(0x3400 <= ord(character) <= 0x9FFF for character in value)
+
+
+def _analysis_preview_data_url(path: Path) -> str:
+    """Encode a bounded JPEG preview without modifying or persisting the source image."""
+
+    try:
+        with Image.open(path) as source:
+            image = source.convert("RGB")
+            image.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+            payload = BytesIO()
+            image.save(payload, format="JPEG", quality=82, optimize=True)
+    except (OSError, ValueError) as exc:
+        raise ArkGatewayError(
+            f"无法创建分析预览图: {path.name}",
+            code="analysis_preview_failed",
+            retryable=False,
+        ) from exc
+    return f"data:image/jpeg;base64,{base64.b64encode(payload.getvalue()).decode('ascii')}"
 
 
 def _asset_data_url(path: Path) -> str:

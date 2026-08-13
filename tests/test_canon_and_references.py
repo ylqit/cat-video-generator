@@ -14,12 +14,22 @@ from cat_video_generator.application.ports import (
     StoredProject,
     StoredScene,
     StoredShot,
+    StoredVisualProfileRevision,
 )
 from cat_video_generator.application.shot_queue import (
     ShotProductionService,
     _merge_generation_references,
+    _video_reference_description,
 )
-from cat_video_generator.domain.contracts import ReferenceBinding, SceneDraft, ShotCardDraft
+from cat_video_generator.domain.contracts import (
+    ReferenceBinding,
+    ReferenceRole,
+    ReferenceTarget,
+    SceneDraft,
+    SceneLookUsage,
+    ShotCardDraft,
+    VisualProfileDraft,
+)
 from cat_video_generator.domain.workflow import RunStatus, SceneStatus, ShotStatus
 
 
@@ -42,11 +52,29 @@ def test_reference_precedence_is_custom_then_scene_then_project_with_deduplicati
         scene_look_asset_id=scene_id,
         project_defaults=(_binding(project_id),),
         inherit_project_references=True,
-        use_scene_look=True,
+        scene_look_usage=SceneLookUsage.APPEARANCE_ONLY,
+        target=ReferenceTarget.VIDEO,
     )
 
     assert [item.asset_id for item in merged] == [custom_id, project_id, scene_id]
     assert merged[-1].role.value == "scene"
+
+
+def test_scene_look_cannot_be_relabelled_as_custom_identity() -> None:
+    scene_id = uuid.uuid4()
+
+    merged = _merge_generation_references(
+        custom=(_binding(scene_id, role="identity"),),
+        scene_look_asset_id=scene_id,
+        project_defaults=(_binding(scene_id, role="identity"),),
+        inherit_project_references=True,
+        scene_look_usage=SceneLookUsage.APPEARANCE_ONLY,
+        target=ReferenceTarget.VIDEO,
+    )
+
+    assert len(merged) == 1
+    assert merged[0].asset_id == scene_id
+    assert merged[0].role is ReferenceRole.SCENE
 
 
 def test_reference_inheritance_and_scene_look_can_be_disabled() -> None:
@@ -55,10 +83,58 @@ def test_reference_inheritance_and_scene_look_can_be_disabled() -> None:
         scene_look_asset_id=uuid.uuid4(),
         project_defaults=(_binding(uuid.uuid4()),),
         inherit_project_references=False,
-        use_scene_look=False,
+        scene_look_usage=SceneLookUsage.OFF,
+        target=ReferenceTarget.VIDEO,
     )
 
     assert len(merged) == 1
+
+
+@pytest.mark.parametrize(
+    ("usage", "target", "includes_scene"),
+    [
+        (SceneLookUsage.OFF, ReferenceTarget.ANCHOR, False),
+        (SceneLookUsage.OFF, ReferenceTarget.VIDEO, False),
+        (SceneLookUsage.APPEARANCE_ONLY, ReferenceTarget.VIDEO, True),
+        (SceneLookUsage.FULL_REFERENCE, ReferenceTarget.VIDEO, True),
+        (SceneLookUsage.DERIVE_ANCHOR, ReferenceTarget.ANCHOR, True),
+        (SceneLookUsage.DERIVE_ANCHOR, ReferenceTarget.VIDEO, False),
+    ],
+)
+def test_scene_look_strategy_controls_anchor_and_video_inputs(
+    usage: SceneLookUsage,
+    target: ReferenceTarget,
+    includes_scene: bool,
+) -> None:
+    scene_id = uuid.uuid4()
+    merged = _merge_generation_references(
+        custom=(),
+        scene_look_asset_id=scene_id,
+        project_defaults=(),
+        inherit_project_references=False,
+        scene_look_usage=usage,
+        target=target,
+    )
+
+    assert ([item.asset_id for item in merged] == [scene_id]) is includes_scene
+
+
+def test_scene_look_descriptions_explain_the_selected_visual_responsibility() -> None:
+    binding = _binding(uuid.uuid4(), role=ReferenceRole.SCENE.value)
+
+    appearance = _video_reference_description(
+        1, binding, scene_look_usage=SceneLookUsage.APPEARANCE_ONLY
+    )
+    full = _video_reference_description(
+        1, binding, scene_look_usage=SceneLookUsage.FULL_REFERENCE
+    )
+    derived = _video_reference_description(
+        1, binding, scene_look_usage=SceneLookUsage.DERIVE_ANCHOR
+    )
+
+    assert "忽略定妆图中的姿态、动作结果和构图" in appearance
+    assert "完整参考本场服装、道具、姿态和构图" in full
+    assert "派生本片段开场状态" in derived
 
 
 def test_resolved_video_references_keep_precedence_and_deduplicate_sha(
@@ -135,6 +211,82 @@ def test_resolved_video_references_keep_precedence_and_deduplicate_sha(
     assert anchor is None
     assert [item.id for item in references] == [custom.id, scene_look.id, project_style.id]
     assert "长期身份" in descriptions[1]
+
+
+def test_empty_project_defaults_fall_back_to_visual_profile_references(tmp_path: Path) -> None:
+    project_id = uuid.uuid4()
+    scene_id = uuid.uuid4()
+    identity = _image_asset(tmp_path, "profile-person", "d" * 64, project_id, scene_id)
+    style = _image_asset(tmp_path, "profile-style", "e" * 64, project_id, scene_id)
+    assets = {identity.id: identity, style.id: style}
+    project = StoredProject(
+        id=project_id,
+        title="项目",
+        content_date=date(2026, 8, 13),
+        status=RunStatus.ACTIVE,
+        default_reference_bindings=(),
+    )
+    scene = StoredScene(
+        id=scene_id,
+        project_id=project_id,
+        order=1,
+        draft=SceneDraft(title="场景", sourceText="人物与猫咪准备。"),
+        status=SceneStatus.READY,
+    )
+    shot = StoredShot(
+        id=uuid.uuid4(),
+        scene_id=scene_id,
+        project_id=project_id,
+        order=1,
+        draft=ShotCardDraft(title="片段", direction="1. 建立。\n2. 收尾。"),
+        status=ShotStatus.READY,
+    )
+    profile = StoredVisualProfileRevision(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        revision=1,
+        profile_hash="profile",
+        source_profile_id="Canon-v1",
+        draft=VisualProfileDraft(
+            referenceBindings=[
+                {"assetId": str(identity.id), "purpose": "person_identity"},
+                {"assetId": str(style.id), "purpose": "style"},
+            ]
+        ),
+    )
+
+    class Repository:
+        def get_project(self, requested_id: uuid.UUID) -> StoredProject:
+            assert requested_id == project_id
+            return project
+
+        def get_scene(self, requested_id: uuid.UUID) -> StoredScene:
+            assert requested_id == scene_id
+            return scene
+
+        def get_visual_profile(self, requested_id: uuid.UUID) -> StoredVisualProfileRevision:
+            assert requested_id == project_id
+            return profile
+
+        def get_asset(self, asset_id: uuid.UUID) -> StoredAsset:
+            return assets[asset_id]
+
+    service = ShotProductionService(
+        repository=Repository(),  # type: ignore[arg-type]
+        gateway=None,
+        asset_store=object(),  # type: ignore[arg-type]
+        media_probe=object(),  # type: ignore[arg-type]
+        frame_extractor=None,
+        provider_name="fake",
+        resolution="480p",
+    )
+
+    pairs = service._resolved_reference_pairs(shot, target=ReferenceTarget.VIDEO)
+
+    assert [binding.role for binding, _asset in pairs] == [
+        ReferenceRole.IDENTITY,
+        ReferenceRole.STYLE,
+    ]
 
 
 def _image_asset(

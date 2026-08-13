@@ -24,7 +24,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from ...domain.contracts import CURRENT_CONTRACT_VERSION
+from ...domain.contracts import CURRENT_CONTRACT_VERSION, SceneLookUsage
 from ...domain.workflow import (
     PromptPurpose,
     RunStatus,
@@ -228,6 +228,10 @@ class ShotCard(Base):
             "anchor_mode IN ('text_only', 'existing', 'generate')",
             name="ck_shot_cards_anchor_mode",
         ),
+        CheckConstraint(
+            _check("scene_look_usage", _values(SceneLookUsage)),
+            name="ck_shot_cards_scene_look_usage",
+        ),
         UniqueConstraint("scene_id", "sort_order", name="uq_shot_cards_scene_order"),
         Index("ix_shot_cards_scene_status", "scene_id", "status", "sort_order"),
         {"schema": SCHEMA_NAME},
@@ -252,6 +256,15 @@ class ShotCard(Base):
     )
     use_scene_look: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="true"
+    )
+    draft_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    scene_look_usage: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=SceneLookUsage.APPEARANCE_ONLY.value,
+        server_default=SceneLookUsage.APPEARANCE_ONLY.value,
     )
     selected_anchor_asset_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),

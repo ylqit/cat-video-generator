@@ -1,8 +1,10 @@
 export type AnchorMode = "text_only" | "existing" | "generate";
+export type SceneLookUsage = "off" | "appearance_only" | "full_reference" | "derive_anchor";
 export type ReferenceUsage = "approved_anchor" | "generation_reference";
 export type ReferenceRole = "identity" | "style" | "scene" | "prop" | "composition";
 export type ReferenceTarget = "anchor" | "video" | "both";
 export type StoryMode = "single" | "multi";
+export type StoryRewriteStrategy = "conservative" | "balanced" | "creative";
 export type EnvironmentStyle = "outdoor" | "indoor";
 export type LookReferencePurpose =
   | "person_identity"
@@ -140,6 +142,67 @@ export interface ShotSuggestionOutput {
   shots: ShotSuggestion[];
 }
 
+export interface StoryIssue {
+  category:
+    | "continuity"
+    | "canon_conflict"
+    | "physical_feasibility"
+    | "action_density"
+    | "causality"
+    | "human_cat_interaction"
+    | "generation_clarity"
+    | "other";
+  evidence: string;
+  impact: string;
+  suggestion: string;
+}
+
+export interface StoryDiagnosisOutput {
+  overallAssessment: string;
+  issues: StoryIssue[];
+  rewriteOptions: Array<{
+    strategy: StoryRewriteStrategy;
+    title: string;
+    summary: string;
+    tradeoffs: string;
+  }>;
+}
+
+export interface StoryRewriteOutput {
+  rewrittenStory: string;
+  changeSummary: string[];
+  unresolvedQuestions: string[];
+}
+
+export interface CreativeStepRecord {
+  stepId: string;
+  operationKey: string;
+  status: string;
+  attempt: number;
+  model?: string | null;
+  sourceHash?: string | null;
+  providerOutput?: Record<string, unknown> | null;
+  acceptedOutput?: Record<string, unknown> | null;
+  acceptedAt?: string | null;
+  error?: Record<string, unknown> | null;
+  createdAt?: string | null;
+}
+
+export interface CreativeWorkflowDto {
+  sceneId: string;
+  originalStory: string;
+  currentStory: string;
+  currentStoryHash: string;
+  currentStorySource: "scene_draft" | "preserved_original" | "accepted_rewrite";
+  currentStorySourceStepId?: string | null;
+  stages: {
+    diagnosis: CreativeStepRecord[];
+    rewrite: CreativeStepRecord[];
+    storyboard: CreativeStepRecord[];
+  };
+  reviews: CreativeStepRecord[];
+}
+
 export interface PromptDto {
   id: string;
   purpose: string;
@@ -177,9 +240,12 @@ export interface ShotDto {
   title: string;
   direction: string;
   durationSeconds: number;
+  draftRevision: number;
   anchorMode: AnchorMode;
   referenceBindings: ReferenceBinding[];
   inheritProjectReferences: boolean;
+  sceneLookUsage: SceneLookUsage;
+  /** V5 compatibility projection; sceneLookUsage is authoritative. */
   useSceneLook: boolean;
   status: string;
   selectedAnchorAssetId?: string | null;
@@ -247,6 +313,8 @@ export interface HealthDto {
   expectedAlembicRevision: string;
   arkImageModel?: string;
   arkVideoModel?: string;
+  arkPlanningModel?: string;
+  arkReviewModel?: string;
   arkReady?: boolean;
   ffmpegAvailable?: boolean;
   ffprobeAvailable?: boolean;
@@ -254,4 +322,123 @@ export interface HealthDto {
   localCompositionReady?: boolean;
   configurationWarnings?: string[];
   generationConfigurationValid?: boolean;
+}
+
+export interface ShotRuleFinding {
+  code: string;
+  severity: "info" | "warning";
+  message: string;
+}
+
+export interface ShotLocalAnalysis {
+  suggestedSubshotMin: number;
+  suggestedSubshotMax: number;
+  detectedSubshotCount: number;
+  actionCount: number | null;
+  cameraMoveCount: number | null;
+  hasStableEnding: boolean | null;
+  hasSound: boolean | null;
+  qualitativePacing: string;
+  findings: ShotRuleFinding[];
+}
+
+export interface PreviousTailStatus {
+  available: boolean;
+  reason?: string;
+  previousShotId?: string;
+  sourceVideoAssetId?: string | null;
+  assetId?: string | null;
+  boundAssetId?: string | null;
+  stale: boolean;
+}
+
+export interface ShotPromptPreview {
+  prompt: string;
+  creativeBody: string;
+  systemShell: string;
+  charCount: number;
+  utf8Bytes: number;
+  draftRevision: number;
+  sceneLookUsage: SceneLookUsage;
+  localAnalysis: ShotLocalAnalysis;
+  qualitativePacing: string;
+  references: Array<{
+    index: number;
+    assetId: string;
+    displayName: string;
+    sourceLayer: "shot" | "scene_look" | "project" | "previous_tail" | "candidate";
+    responsibility: string;
+    contentReady: boolean;
+  }>;
+  previousTail: PreviousTailStatus;
+}
+
+export interface ShotAssistPatch {
+  title?: string;
+  direction?: string;
+  durationSeconds?: number;
+  sceneLookUsage?: SceneLookUsage;
+  anchorMode?: AnchorMode;
+  referenceBindings?: ReferenceBinding[];
+}
+
+export interface ShotAssistAnalysis {
+  actionDensityAssessment: string;
+  assetCompatibilityAssessment?: string;
+  pacingPlan: {
+    recommendedDurationSeconds: number;
+    rationale: string;
+    beats: Array<{ ordinal: number; description: string; rhythm: "brief" | "standard" | "expanded" }>;
+  };
+  recommendedSceneLookUsage: SceneLookUsage;
+  recommendedAnchorMode: AnchorMode;
+  referenceDecisions: Array<{
+    assetId: string;
+    decision: "keep" | "remove" | "change_role";
+    recommendedRole?: ReferenceRole | null;
+    reason: string;
+  }>;
+  continuity: { previousIssues: string[]; nextIssues: string[]; recommendation: string };
+  promptRisks: string[];
+  creativeBody?: string | null;
+  creativeAlternatives?: Array<{
+    label: "conservative" | "stable";
+    body: string;
+    rationale: string;
+  }>;
+  patch?: ShotAssistPatch | null;
+}
+
+export interface ShotAssistRecord {
+  stepId: string;
+  status: string;
+  sourceDraftRevision: number;
+  stale: boolean;
+  analysis?: ShotAssistAnalysis | null;
+  acceptedOutput?: ShotAssistPatch | null;
+  acceptedAt?: string | null;
+  error?: Record<string, unknown> | null;
+  createdAt?: string | null;
+}
+
+export interface ShotAssistContext {
+  shotId: string;
+  sourceDraftRevision: number;
+  model?: string | null;
+  localAnalysis: ShotLocalAnalysis;
+  previousShot?: { id: string; title: string } | null;
+  nextShot?: { id: string; title: string } | null;
+  previousTail: PreviousTailStatus;
+  candidates: Array<{
+    assetId: string;
+    displayName: string;
+    sha256: string;
+    sourceLayer: string;
+    responsibility: string;
+    contentReady: boolean;
+    available: boolean;
+    duplicate: boolean;
+  }>;
+  defaultCandidateAssetIds: string[];
+  warnings: string[];
 }

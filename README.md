@@ -4,8 +4,10 @@
 
 ```text
 创建项目 → 锁定项目角色与画风 Revision → 选择单/多片段模式
-→ AI造型与分镜建议 → 人工编辑 → 可选场景定妆草稿/参考/Prompt/版本审核
-→ 纯文本 / 已有图片 / 新锚点 → 每片段独立视频
+→ 剧情医生诊断 → 人工选择方案 → 剧本编辑重写 → 人工确认
+→ 分镜导演拆分 → 可选场景定妆草稿/参考/Prompt/版本审核
+→ 片段级定妆策略 → 保存 → 视觉与 Prompt 审稿 → 人工逐项接受
+→ 纯文本 / 已有图片 / 派生锚点 → 每片段独立视频 → 尾帧衔接
 → AI建议＋人工审核 → 可选总片 → 可选区间重拍
 ```
 
@@ -17,8 +19,9 @@
 
 - FastAPI + Vue 单体工作台，PostgreSQL 是唯一工作流状态源。
 - Pydantic V5 契约保存版本化项目视觉档案、场景定妆草稿、完整分镜描述和三层素材职责。
-- Ark 文本模型按场景给出可编辑的造型与视频片段建议；Seedream 可选生成场景定妆或锚点；Seedance 每片段生成视频。
-- 片段参考按“片段自定义 → 场景定妆 → 项目视觉档案”排序，并按资产 ID 和 SHA-256 去重；Canon 使用相对 `asset_root` 的存储键。
+- 同一个 Ark 规划模型串行承担剧情医生、剧本编辑、分镜导演和多模态审稿角色；每一步单独付费确认、保存原稿与接受稿，不是多智能体或多进程系统。
+- 片段参考按“批准锚点 → 片段自定义 → 场景定妆 → 项目 Canon”排序，并按资产 ID 和 SHA-256 去重；资产来源决定职责，场景定妆不能标记为角色身份。
+- 最终视频 Prompt 是“人工确认的 LLM 创作正文 + 系统技术外壳”；系统只补分辨率、比例、时长、角色/画风档案、真实图片编号和技术排除项，不用代码重写剧情。
 - `docs/采茶叶.mp4` 只定义二维水彩画风，不定义角色身份；角色固定为 5–7 岁短波波头儿童与灰白虎斑猫。
 - Step 与实际 Prompt 原子落库；Task ID、attempt、资产和审核记录永久保留。
 - `submission_unknown` 冻结并人工对账，已有 Task ID 只能继续查询。
@@ -48,8 +51,8 @@ uv run cvg api --static-dir web/dist
 
 ## 付费按钮
 
-只有“AI 造型与视频片段建议”“生成场景定妆”“生成锚点”“生成视频片段”“重新生成”和“区间重拍”会调用
-Ark；创建项目、编辑场景/片段、绑定素材、Prompt 预览、人工审核、版本选择和本地总片
+只有“剧情诊断”“剧情重写”“分镜导演”“片段视觉与 Prompt 审稿”“生成场景定妆”“生成锚点”“生成视频片段”“重新生成”和“区间重拍”会调用
+Ark；创建项目、编辑场景/片段、仅保存、绑定素材、Prompt 预览、人工审核、版本选择和本地总片
 合成都不会产生 Ark 生成费用。
 
 ## 文档
@@ -60,5 +63,8 @@ Ark；创建项目、编辑场景/片段、绑定素材、Prompt 预览、人工
 - [Docker Compose 部署](docs/workflows/docker-deployment.md)
 - [HTTP API](docs/http-api.md)
 - [V5 升级 Checklist](docs/checklists/v5-creation-flow-upgrade.md)
+- [片段视觉与 LLM 辅助 Checklist](docs/checklists/v5-shot-assistance-upgrade.md)
+- [分阶段 LLM 创作工作流 Checklist](docs/checklists/v5-staged-creative-workflow.md)
+- [设计脚本教程适配说明](docs/workflows/tutorial-adaptation.md)
 
 `.env`、Ark Key、数据库密码、Base64 和签名 URL 不得进入 Git、日志或诊断 Manifest。
