@@ -428,6 +428,88 @@ export interface ShotPromptPreview {
   previousTail: PreviousTailStatus;
 }
 
+export type ProductionNextAction =
+  | "open_scene_look"
+  | "generate_anchor"
+  | "open_task"
+  | "generate_video"
+  | "review_media"
+  | "open_versions"
+  | "fix_inputs";
+
+export interface ShotProductionSummaryDto {
+  shotId: string;
+  sceneId: string;
+  state:
+    | "needs_opening"
+    | "generating_anchor"
+    | "ready_video"
+    | "generating_video"
+    | "awaiting_review"
+    | "approved"
+    | "stale"
+    | "blocked";
+  stateLabel: string;
+  nextAction: ProductionNextAction;
+  primaryActionLabel: string;
+  blockers: string[];
+  referenceCounts: {
+    custom: number;
+    scene: number;
+    project: number;
+    opening: number;
+    person: number;
+    cat: number;
+    style: number;
+    prop: number;
+    total: number;
+  };
+  anchorVersionCount: number;
+  videoVersionCount: number;
+  activeTaskCount: number;
+  previewAssetId?: string | null;
+  previewMediaType?: "image" | "video" | null;
+  usesSceneLook: boolean;
+  inputHash: string;
+}
+
+export interface SceneProductionSummaryDto {
+  sceneId: string;
+  selectedLookAssetId?: string | null;
+  lookVersionCount: number;
+  lookStatus: string;
+  shots: ShotProductionSummaryDto[];
+}
+
+export interface ProductionBoardDto {
+  projectId: string;
+  scenes: SceneProductionSummaryDto[];
+}
+
+export interface ReferenceSlotDto {
+  key: "person" | "cat" | "style" | "scene" | "prop" | "opening" | "custom";
+  label: string;
+  target: "anchor" | "video";
+  items: Array<ShotPromptPreview["references"][number] & { asset: AssetDto }>;
+}
+
+export interface ShotGenerationWorkspaceDto {
+  shot: ShotDto;
+  scene: {
+    id: string;
+    title: string;
+    selectedLookAssetId?: string | null;
+  };
+  anchorPreview: ShotPromptPreview;
+  videoPreview: ShotPromptPreview;
+  referenceSlots: {
+    anchor: ReferenceSlotDto[];
+    video: ReferenceSlotDto[];
+  };
+  previousTail: PreviousTailStatus;
+  activeTasks: AttemptDto[];
+}
+
 export interface ShotAssistPatch {
   title?: string;
   direction?: string;

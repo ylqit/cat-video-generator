@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ElMessage, ElMessageBox } from "element-plus";
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
 import { api, assetContentUrl } from "../api/client";
@@ -8,11 +8,11 @@ import type {
   AnchorMode,
   AssetDto,
   LookReferencePurpose,
+  ProductionBoardDto,
   ProjectGraph,
   ProjectSummary,
   ReferenceBinding,
   ReferenceRole,
-  ReferenceTarget,
   ReferenceUsage,
   SceneDto,
   SceneLookPlan,
@@ -23,7 +23,9 @@ import type {
   ShotAssistPatch,
   ShotAssistRecord,
   ShotDto,
+  ShotGenerationWorkspaceDto,
   ShotPromptPreview,
+  ShotProductionSummaryDto,
   StoryMode,
   VisualProfileDraft,
   VisualProfileRevisionDto,
@@ -31,14 +33,15 @@ import type {
 import VideoTimeline from "../components/VideoTimeline.vue";
 import CreativeWorkflowPanel from "../components/CreativeWorkflowPanel.vue";
 import SceneLookWorkbench from "../components/SceneLookWorkbench.vue";
-import ShotAssistancePanel from "../components/ShotAssistancePanel.vue";
-import ShotMediaVersions from "../components/ShotMediaVersions.vue";
+import ShotGenerationWorkspace from "../components/ShotGenerationWorkspace.vue";
 import { registerTask, rememberProject, useTaskCenter } from "../tasks/taskCenter";
 
 const route = useRoute();
 const router = useRouter();
 const projects = ref<ProjectSummary[]>([]);
 const graph = ref<ProjectGraph | null>(null);
+const productionBoard = ref<ProductionBoardDto | null>(null);
+const generationWorkspace = ref<ShotGenerationWorkspaceDto | null>(null);
 const selectedShotId = ref<string | null>(null);
 const selectedSequenceId = ref<string | null>(null);
 const busy = ref(false);
@@ -49,13 +52,10 @@ const sequenceBuilderVisible = ref(false);
 const sceneVisible = ref(false);
 const shotVisible = ref(false);
 const assistConfirmVisible = ref(false);
-const promptTarget = ref<"anchor" | "video">("video");
-const inspectorTab = ref("config");
+const assetDrawerVisible = ref(false);
+const shotWorkspaceVisible = ref(false);
 const anchorPromptPreview = ref<ShotPromptPreview | null>(null);
 const videoPromptPreview = ref<ShotPromptPreview | null>(null);
-const promptPreview = computed(() => promptTarget.value === "anchor"
-  ? anchorPromptPreview.value
-  : videoPromptPreview.value);
 const assistContext = ref<ShotAssistContext | null>(null);
 const assistAnalyses = ref<ShotAssistRecord[]>([]);
 const assistCandidateIds = ref<string[]>([]);
@@ -65,7 +65,6 @@ const sequenceTransitions = ref<Record<string, SequenceTransitionDto>>({});
 const projectProfile = ref<VisualProfileRevisionDto | null>(null);
 const projectProfileForm = ref<VisualProfileDraft | null>(null);
 const projectProfileReferenceIds = ref<string[]>([]);
-let polling: number | undefined;
 const taskCenter = useTaskCenter();
 
 function emptyLookPlan(): SceneLookPlan {
@@ -106,12 +105,6 @@ const shotForm = reactive({
   referenceBindings: [] as ReferenceBinding[],
   inheritProjectReferences: true,
   sceneLookUsage: "appearance_only" as SceneLookUsage,
-});
-const referenceForm = reactive({
-  assetId: "",
-  usage: "generation_reference" as ReferenceUsage,
-  role: "identity" as ReferenceRole,
-  applyTo: "both" as ReferenceTarget,
 });
 const uploadForm = reactive({
   usage: "generation_reference" as ReferenceUsage,
@@ -158,6 +151,15 @@ const selectedScene = computed<SceneDto | null>(() => {
   if (!graph.value || !selectedShot.value) return null;
   return graph.value.scenes.find((item) => item.id === selectedShot.value?.sceneId) ?? null;
 });
+const productionStage = computed(() => {
+  const summaries = productionBoard.value?.scenes.flatMap((scene) => scene.shots) ?? [];
+  if (!summaries.length || productionBoard.value?.scenes.some((scene) => !scene.selectedLookAssetId)) return 0;
+  if (summaries.some((item) => ["needs_opening", "generating_anchor", "blocked"].includes(item.state))) return 1;
+  if (summaries.some((item) => ["ready_video", "generating_video"].includes(item.state))) return 2;
+  if (summaries.some((item) => ["awaiting_review", "stale"].includes(item.state))) return 3;
+  return 4;
+});
+const productionStageLabels = ["场景视觉基准", "片段开场", "视频生成", "审核与衔接", "成片编排"];
 const selectedVideoDurationMs = computed(() => {
   if (!selectedVideo.value || !selectedShot.value) return 0;
   const qc = selectedVideo.value.metadata.qc as Record<string, unknown> | undefined;
@@ -235,35 +237,6 @@ const shotFormFindings = computed(() => {
   return findings;
 });
 
-function sceneLookUsageLabel(value: SceneLookUsage): string {
-  return {
-    off: "关闭场景视觉基准",
-    appearance_only: "只继承造型（默认）",
-    full_reference: "完整参考姿态与构图",
-    derive_anchor: "由场景视觉基准派生开场锚点",
-  }[value];
-}
-
-function shotReferenceSummary(shot: ShotDto, scene: SceneDto): string {
-  const existingAnchor = shot.referenceBindings.some(
-    (item) => item.usage === "approved_anchor",
-  );
-  const anchor = shot.selectedAnchorAssetId
-    ? "已选锚点"
-    : shot.anchorMode === "generate"
-      ? "待生成锚点"
-      : shot.anchorMode === "existing"
-        ? existingAnchor ? "已采用已有锚点" : "待选已有锚点"
-        : "无锚点";
-  const sceneLayer = scene.selectedLookAssetId && shot.sceneLookUsage !== "off"
-    ? sceneLookUsageLabel(shot.sceneLookUsage)
-    : "不使用场景基准";
-  const projectLayer = shot.inheritProjectReferences
-    ? `${graph.value?.project.defaultReferenceBindings.length ?? 0} 张项目继承`
-    : "项目继承关闭";
-  return `${anchor} / ${shot.referenceBindings.length} 张片段专用 / ${sceneLayer} / ${projectLayer}`;
-}
-
 function localDateText(): string {
   const now = new Date();
   const year = now.getFullYear();
@@ -280,15 +253,20 @@ async function loadGraph(projectId?: string) {
   const id = projectId ?? String(route.query.project ?? "");
   if (!id) {
     graph.value = null;
+    productionBoard.value = null;
     return;
   }
   rememberProject(id);
-  graph.value = await api.project(id);
+  [graph.value, productionBoard.value] = await Promise.all([
+    api.project(id),
+    api.productionBoard(id),
+  ]);
   const requestedSequence = String(route.query.sequence ?? "");
   if (graph.value.sequences.some((item) => item.id === requestedSequence)) {
     selectedSequenceId.value = requestedSequence;
     selectedShotId.value = null;
-    await Promise.all([loadShotAssistance(null), loadShotPrompts(null)]);
+    generationWorkspace.value = null;
+    await loadShotAssistance(null);
     return;
   }
   selectedSequenceId.value = null;
@@ -299,10 +277,13 @@ async function loadGraph(projectId?: string) {
     : selectedShotId.value && allShots.some((item) => item.id === selectedShotId.value)
       ? selectedShotId.value
       : allShots[0]?.id ?? null;
-  await Promise.all([
-    loadShotAssistance(selectedShotId.value),
-    loadShotPrompts(selectedShotId.value),
-  ]);
+  const requestedWorkspace = Boolean(requestedShot && selectedShotId.value === requestedShot);
+  if (requestedWorkspace || shotWorkspaceVisible.value) {
+    await Promise.all([loadShotAssistance(selectedShotId.value), loadGenerationWorkspace(selectedShotId.value)]);
+    if (requestedWorkspace) shotWorkspaceVisible.value = true;
+    return;
+  }
+  await Promise.all([loadShotAssistance(null), loadGenerationWorkspace(null)]);
 }
 
 async function reloadGenerationInputs() {
@@ -312,6 +293,7 @@ async function reloadGenerationInputs() {
 }
 
 async function selectProject(id: string) {
+  shotWorkspaceVisible.value = false;
   await router.replace({ path: "/studio", query: { project: id } });
   await loadGraph(id);
 }
@@ -325,23 +307,30 @@ async function selectShot(id: string) {
   });
   anchorPromptPreview.value = null;
   videoPromptPreview.value = null;
-  await Promise.all([loadShotAssistance(id), loadShotPrompts(id)]);
+  shotWorkspaceVisible.value = true;
+  await Promise.all([loadShotAssistance(id), loadGenerationWorkspace(id)]);
 }
 
-async function loadShotPrompts(shotId?: string | null) {
+async function loadGenerationWorkspace(shotId?: string | null) {
   if (!shotId) {
+    generationWorkspace.value = null;
     anchorPromptPreview.value = null;
     videoPromptPreview.value = null;
     return;
   }
   try {
-    [anchorPromptPreview.value, videoPromptPreview.value] = await Promise.all([
-      api.promptPreview(shotId, "anchor"),
-      api.promptPreview(shotId, "video"),
-    ]);
+    generationWorkspace.value = await api.shotGenerationWorkspace(shotId);
+    anchorPromptPreview.value = generationWorkspace.value.anchorPreview;
+    videoPromptPreview.value = generationWorkspace.value.videoPreview;
   } catch (error) {
+    generationWorkspace.value = null;
     persistentError.value = error instanceof Error ? error.message : String(error);
   }
+}
+
+async function closeShotWorkspace() {
+  shotWorkspaceVisible.value = false;
+  await router.replace({ path: "/studio", query: { project: graph.value?.project.id } });
 }
 
 async function loadShotAssistance(shotId?: string | null) {
@@ -359,9 +348,12 @@ async function loadShotAssistance(shotId?: string | null) {
 }
 
 async function showSequence(id: string) {
+  shotWorkspaceVisible.value = false;
   selectedSequenceId.value = id;
   selectedShotId.value = null;
-  await Promise.all([loadShotAssistance(null), loadShotPrompts(null)]);
+  anchorPromptPreview.value = null;
+  videoPromptPreview.value = null;
+  await loadShotAssistance(null);
   await router.replace({
     path: "/studio",
     query: { project: graph.value?.project.id, sequence: id },
@@ -409,6 +401,30 @@ function cloneVisualProfile(value: VisualProfileDraft): VisualProfileDraft {
     styleNegative: value.styleNegative,
     referenceBindings: value.referenceBindings,
   });
+}
+
+function boardScene(sceneId: string) {
+  return productionBoard.value?.scenes.find((item) => item.sceneId === sceneId) ?? null;
+}
+
+function boardShot(shotId: string): ShotProductionSummaryDto | null {
+  return productionBoard.value?.scenes.flatMap((item) => item.shots).find(
+    (item) => item.shotId === shotId,
+  ) ?? null;
+}
+
+function productionPreviewAsset(summary: ShotProductionSummaryDto | null): AssetDto | null {
+  if (!summary?.previewAssetId || !graph.value) return null;
+  return graph.value.assets.find((item) => item.id === summary.previewAssetId)
+    ?? graph.value.scenes.flatMap((scene) => scene.shots.flatMap((shot) => shot.assets)).find(
+      (item) => item.id === summary.previewAssetId,
+    )
+    ?? null;
+}
+
+function productionPreviewUrl(summary: ShotProductionSummaryDto | null): string | null {
+  const asset = productionPreviewAsset(summary);
+  return asset?.contentReady ? assetContentUrl(asset.id) : null;
 }
 
 function canonPurpose(asset: AssetDto): LookReferencePurpose {
@@ -657,7 +673,6 @@ async function adoptPreviousTail() {
   await act(async () => {
     await api.adoptPreviousTailAnchor(selectedShot.value!.id);
     await reloadGenerationInputs();
-    await showPrompt("video");
   });
 }
 
@@ -692,30 +707,6 @@ async function moveShot(scene: SceneDto, index: number, delta: number) {
   });
 }
 
-
-async function showPrompt(target: "anchor" | "video" = "video") {
-  if (!selectedShot.value) return;
-  promptTarget.value = target;
-  persistentError.value = "";
-  try {
-    const preview = await api.promptPreview(selectedShot.value.id, target);
-    if (target === "anchor") anchorPromptPreview.value = preview;
-    else videoPromptPreview.value = preview;
-  } catch (error) {
-    persistentError.value = error instanceof Error ? error.message : String(error);
-  }
-}
-
-function openPromptReview(target: "anchor" | "video") {
-  inspectorTab.value = "review";
-  void showPrompt(target);
-}
-
-function changePromptTarget(value: string | number | boolean | undefined) {
-  const target = value === "anchor" ? "anchor" : "video";
-  void showPrompt(target);
-}
-
 async function generate(kind: "anchor" | "video") {
   if (!selectedShot.value || !graph.value) return;
   const shot = selectedShot.value;
@@ -727,7 +718,6 @@ async function generate(kind: "anchor" | "video") {
   }
   if (kind === "anchor") anchorPromptPreview.value = preview;
   else videoPromptPreview.value = preview;
-  promptTarget.value = kind;
   const operationKey = kind === "anchor" ? "image:anchor" : "video:shot";
   const priorAttempts = shot.attempts.filter(
     (item) => item.operationKey === operationKey,
@@ -884,28 +874,24 @@ function editableReferenceRole(asset: AssetDto | undefined): ReferenceRole {
     : "prop";
 }
 
-const selectedBindingAsset = computed(() => selectableAssets.value.find(
-  (item) => item.id === referenceForm.assetId,
-));
-const bindingRoleLocked = computed(() => fixedReferenceRole(selectedBindingAsset.value) !== null);
-
-async function bindReference() {
-  if (!selectedShot.value || !referenceForm.assetId) return;
-  const fixedRole = fixedReferenceRole(selectedBindingAsset.value);
-  if (fixedRole) referenceForm.role = fixedRole;
-  const bindings = selectedShot.value.referenceBindings.filter((item) => item.assetId !== referenceForm.assetId);
-  bindings.push({ ...referenceForm });
+async function bindShotReference(binding: ReferenceBinding) {
+  if (!selectedShot.value) return;
+  const selectedAsset = selectableAssets.value.find((item) => item.id === binding.assetId);
+  const fixedRole = fixedReferenceRole(selectedAsset);
+  if (fixedRole) binding.role = fixedRole;
+  const bindings = selectedShot.value.referenceBindings.filter(
+    (item) => item.assetId !== binding.assetId,
+  );
+  bindings.push(binding);
+  const approvedAnchor = binding.usage === "approved_anchor";
   const draft = {
     title: selectedShot.value.title,
     direction: selectedShot.value.direction,
     durationSeconds: selectedShot.value.durationSeconds,
-    anchorMode: referenceForm.usage === "approved_anchor"
-      ? "existing"
-      : selectedShot.value.anchorMode,
+    anchorMode: approvedAnchor ? "existing" : selectedShot.value.anchorMode,
     referenceBindings: bindings,
     inheritProjectReferences: selectedShot.value.inheritProjectReferences,
-    sceneLookUsage: referenceForm.usage === "approved_anchor"
-      && selectedShot.value.sceneLookUsage === "derive_anchor"
+    sceneLookUsage: approvedAnchor && selectedShot.value.sceneLookUsage === "derive_anchor"
       ? "appearance_only"
       : selectedShot.value.sceneLookUsage,
   };
@@ -913,6 +899,32 @@ async function bindReference() {
     await api.updateShot(selectedShot.value!.id, draft);
     await reloadGenerationInputs();
   });
+}
+
+async function saveShotWorkspaceSettings(settings: {
+  anchorMode: AnchorMode;
+  sceneLookUsage: SceneLookUsage;
+  inheritProjectReferences: boolean;
+}) {
+  if (!selectedShot.value) return;
+  await act(async () => {
+    await api.updateShot(selectedShot.value!.id, {
+      title: selectedShot.value!.title,
+      direction: selectedShot.value!.direction,
+      durationSeconds: selectedShot.value!.durationSeconds,
+      anchorMode: settings.anchorMode,
+      referenceBindings: selectedShot.value!.referenceBindings,
+      inheritProjectReferences: settings.inheritProjectReferences,
+      sceneLookUsage: settings.sceneLookUsage,
+    });
+    await reloadGenerationInputs();
+    ElMessage.success("片段开场与参考策略已保存");
+  });
+}
+
+async function openSelectedShotEditor() {
+  if (!selectedShot.value) return;
+  editShot(selectedShot.value.sceneId, selectedShot.value);
 }
 
 async function removeBinding(assetId: string) {
@@ -1043,31 +1055,34 @@ watch(() => shotForm.anchorMode, (value) => {
     shotForm.sceneLookUsage = "appearance_only";
   }
 });
-watch(() => referenceForm.assetId, () => {
-  const fixedRole = fixedReferenceRole(selectedBindingAsset.value);
-  if (fixedRole) referenceForm.role = fixedRole;
-  else referenceForm.role = editableReferenceRole(selectedBindingAsset.value);
-});
 onMounted(async () => {
   await act(async () => {
     await loadProjects();
     if (route.query.project) await loadGraph();
   });
-  polling = window.setInterval(() => {
-    if (route.query.project) void loadGraph();
-  }, 10000);
 });
-onBeforeUnmount(() => window.clearInterval(polling));
 </script>
 
 <template>
   <div class="studio" v-loading="busy">
     <header class="studio-header">
       <div>
-        <h1>视频片段工作台</h1>
-        <p>按场景规划视频片段、逐段确认、独立版本；生成前的造型、分镜文字和素材均可修改。</p>
+        <h1>视觉制作看板</h1>
+        <p>分镜确认后，按场景视觉基准、片段开场、视频生成、审核衔接和成片顺序制作。</p>
       </div>
-      <el-button type="primary" @click="createVisible = true">新建项目</el-button>
+      <div class="header-actions">
+        <el-select
+          :model-value="graph?.project.id"
+          filterable
+          placeholder="选择项目"
+          style="width: 220px"
+          @update:model-value="selectProject(String($event))"
+        >
+          <el-option v-for="project in projects" :key="project.id" :label="project.title" :value="project.id" />
+        </el-select>
+        <el-button v-if="graph" @click="assetDrawerVisible = true">项目素材</el-button>
+        <el-button type="primary" @click="createVisible = true">新建项目</el-button>
+      </div>
     </header>
 
     <el-alert v-if="persistentError" type="error" :closable="false" show-icon class="persistent-alert">
@@ -1075,305 +1090,236 @@ onBeforeUnmount(() => window.clearInterval(polling));
       {{ persistentError }}
     </el-alert>
 
-    <div class="workspace-grid">
-      <aside class="project-rail panel">
-        <div class="panel-title">项目</div>
-        <button
-          v-for="project in projects"
-          :key="project.id"
-          class="project-item"
-          :class="{ active: graph?.project.id === project.id }"
-          @click="selectProject(project.id)"
-        >
-          <strong>{{ project.title }}</strong>
-          <span>{{ project.contentDate }}</span>
-        </button>
-        <template v-if="graph">
-          <div class="panel-title reference-title">项目素材</div>
-          <el-select v-model="uploadForm.usage" size="small">
-            <el-option label="生成参考" value="generation_reference" />
-            <el-option label="最终锚点" value="approved_anchor" />
-          </el-select>
-          <el-select v-model="uploadForm.role" size="small">
-            <el-option v-for="item in ['style','prop','composition']" :key="item" :label="item" :value="item" />
-          </el-select>
-          <el-input v-model="uploadForm.displayName" size="small" placeholder="素材名称，如：伸缩鱼竿" />
-          <input type="file" accept="image/*" @change="chooseUploadFile" />
-          <el-button size="small" :disabled="!uploadForm.file" @click="uploadReference">上传</el-button>
-          <p class="source-hint">全局 Canon 只提供人物、猫咪和画风基准；上传素材、场景视觉基准、锚点和视频帧均只属于当前项目。</p>
-          <b class="asset-group-title">全局 Canon 引用</b>
-          <div class="asset-strip">
+    <section v-if="graph" class="production-shell">
+      <div class="production-heading panel">
+        <div>
+          <span class="panel-title">当前项目</span>
+          <h2>{{ graph.project.title }}</h2>
+          <p>V5 · {{ graph.project.contentDate }} · {{ graph.scenes.length }} 个场景</p>
+        </div>
+        <div class="production-heading-actions">
+          <el-button @click="editProjectSettings">项目设置</el-button>
+          <el-button @click="restoreCanonReferences">恢复 Canon 引用</el-button>
+          <el-button @click="editScene()">添加场景</el-button>
+          <el-button type="success" @click="openSequenceBuilder">编排并合成已批准片段</el-button>
+        </div>
+      </div>
+
+      <div class="production-steps panel" aria-label="视觉制作阶段">
+        <el-steps :active="productionStage" align-center finish-status="success">
+          <el-step v-for="label in productionStageLabels" :key="label" :title="label" />
+        </el-steps>
+      </div>
+
+      <section v-for="(scene, sceneIndex) in graph.scenes" :key="scene.id" class="production-scene panel">
+        <header class="scene-production-header">
+          <div>
+            <span class="order-chip">场景 {{ scene.order }}</span>
+            <h2>{{ scene.title }}</h2>
+            <p>{{ scene.storyMode === 'single' ? '单视频片段' : `${scene.targetShotCount} 个独立视频片段` }} · 每个片段独立生成与审核</p>
+          </div>
+          <div>
+            <el-button text @click="moveScene(sceneIndex, -1)">上移</el-button>
+            <el-button text @click="moveScene(sceneIndex, 1)">下移</el-button>
+            <el-button text @click="editScene(scene)">编辑场景</el-button>
+            <el-button text type="danger" @click="removeScene(scene)">删除</el-button>
+          </div>
+        </header>
+
+        <details class="creative-summary" :open="!scene.shots.length">
+          <summary>
+            <span><b>剧情与分镜创作</b><small>{{ scene.shots.length ? '分镜已同步，可继续查看历史或重新设计' : '请先完成剧情与分镜' }}</small></span>
+            <el-tag :type="scene.shots.length ? 'success' : 'warning'">{{ scene.shots.length ? '已建立片段' : '待完成' }}</el-tag>
+          </summary>
+          <p class="source-text">{{ scene.sourceText }}</p>
+          <CreativeWorkflowPanel :scene="scene" :project-id="graph.project.id" @changed="loadGraph()" />
+        </details>
+
+        <div class="scene-production-grid">
+          <SceneLookWorkbench
+            :project-id="graph.project.id"
+            :scene="scene"
+            :assets="graph.assets"
+            @refreshed="reloadGenerationInputs()"
+          />
+          <div class="scene-overview">
+            <div class="overview-stat"><span>场景基准版本</span><b>{{ boardScene(scene.id)?.lookVersionCount ?? 0 }}</b></div>
+            <div class="overview-stat"><span>视频片段</span><b>{{ scene.shots.length }}</b></div>
+            <div class="overview-stat"><span>已批准视频</span><b>{{ scene.shots.filter(item => item.selectedVideoAssetId).length }}</b></div>
+          </div>
+        </div>
+
+        <div class="shot-board-heading">
+          <div><h3>视频片段制作</h3><p>每张卡只显示当前最重要的下一步；点击进入完整片段生成台。</p></div>
+          <el-button @click="editShot(scene.id)">手工添加片段</el-button>
+        </div>
+
+        <div class="production-shot-grid">
+          <div v-for="(shot, shotIndex) in scene.shots" :key="shot.id" class="shot-flow-item">
+            <div v-if="shotIndex > 0" class="continuity-link">
+              <span>上一片段尾帧</span><i>→</i><span>{{ boardShot(shot.id)?.state === 'needs_opening' ? '待确认开场' : '片段开场' }}</span>
+            </div>
+            <article class="production-shot-card" @click="selectShot(shot.id)">
+              <div class="shot-preview">
+                <template v-if="productionPreviewUrl(boardShot(shot.id))">
+                  <img
+                    v-if="productionPreviewAsset(boardShot(shot.id))?.mediaType === 'image'"
+                    :src="productionPreviewUrl(boardShot(shot.id)) || undefined"
+                  />
+                  <video
+                    v-else
+                    muted
+                    preload="metadata"
+                    :src="productionPreviewUrl(boardShot(shot.id)) || undefined"
+                  />
+                </template>
+                <div v-else><span>{{ shot.order }}</span><small>尚无开场图或视频</small></div>
+                <el-tag class="shot-state" :type="boardShot(shot.id)?.state === 'approved' ? 'success' : boardShot(shot.id)?.state === 'stale' ? 'warning' : 'info'">
+                  {{ boardShot(shot.id)?.stateLabel ?? '读取制作状态' }}
+                </el-tag>
+              </div>
+              <div class="production-shot-content">
+                <div class="shot-head"><b>{{ shot.order }}. {{ shot.title }}</b><el-tag size="small">{{ shot.durationSeconds }}s</el-tag></div>
+                <p>{{ shot.direction }}</p>
+                <div class="visual-slots" aria-label="实际视觉来源">
+                  <span :class="{ ready: (boardShot(shot.id)?.referenceCounts.person ?? 0) > 0 }">人物</span>
+                  <span :class="{ ready: (boardShot(shot.id)?.referenceCounts.cat ?? 0) > 0 }">猫咪</span>
+                  <span :class="{ ready: (boardShot(shot.id)?.referenceCounts.style ?? 0) > 0 }">画风</span>
+                  <span :class="{ ready: (boardShot(shot.id)?.referenceCounts.scene ?? 0) > 0 }">场景</span>
+                  <span :class="{ ready: (boardShot(shot.id)?.referenceCounts.prop ?? 0) > 0 }">道具</span>
+                  <span :class="{ ready: (boardShot(shot.id)?.referenceCounts.opening ?? 0) > 0 }">开场</span>
+                </div>
+                <div class="reference-counts">
+                  <span>片段专用 {{ boardShot(shot.id)?.referenceCounts.custom ?? 0 }}</span>
+                  <span>场景 {{ boardShot(shot.id)?.referenceCounts.scene ?? 0 }}</span>
+                  <span>项目 {{ boardShot(shot.id)?.referenceCounts.project ?? 0 }}</span>
+                  <b>实际提交 {{ boardShot(shot.id)?.referenceCounts.total ?? 0 }} 张</b>
+                </div>
+                <div class="version-counts">
+                  <span>开场图 {{ boardShot(shot.id)?.anchorVersionCount ?? 0 }} 个版本</span>
+                  <span>视频 {{ boardShot(shot.id)?.videoVersionCount ?? 0 }} 个版本</span>
+                </div>
+                <el-alert
+                  v-if="boardShot(shot.id)?.blockers[0]"
+                  type="warning"
+                  :closable="false"
+                  :title="boardShot(shot.id)!.blockers[0]"
+                />
+                <footer>
+                  <div>
+                    <el-button text size="small" @click.stop="moveShot(scene, shotIndex, -1)">↑</el-button>
+                    <el-button text size="small" @click.stop="moveShot(scene, shotIndex, 1)">↓</el-button>
+                    <el-button text size="small" @click.stop="editShot(scene.id, shot)">编辑</el-button>
+                    <el-button text size="small" type="danger" @click.stop="removeShot(shot)">删除</el-button>
+                  </div>
+                  <el-button type="primary" @click.stop="selectShot(shot.id)">{{ boardShot(shot.id)?.primaryActionLabel ?? '打开片段生成台' }}</el-button>
+                </footer>
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <section v-else class="empty-state panel project-empty">
+      <div>
+        <h2>从一个主题或一段剧情开始</h2>
+        <p>创建项目后，先完成剧情与分镜，再进入场景视觉基准、片段开场和视频生成。</p>
+        <el-button type="primary" @click="createVisible = true">创建第一个项目</el-button>
+      </div>
+    </section>
+
+    <el-dialog
+      v-model="shotWorkspaceVisible"
+      fullscreen
+      :show-close="false"
+      destroy-on-close
+      class="shot-workspace-dialog"
+    >
+      <ShotGenerationWorkspace
+        v-if="selectedShot && selectedScene"
+        :shot="selectedShot"
+        :scene="selectedScene"
+        :all-assets="graph?.assets ?? []"
+        :selectable-assets="selectableAssets"
+        :anchor-preview="anchorPromptPreview"
+        :video-preview="videoPromptPreview"
+        :reference-slots="generationWorkspace?.referenceSlots ?? null"
+        :previous-tail="generationWorkspace?.previousTail ?? assistContext?.previousTail ?? null"
+        :active-tasks="generationWorkspace?.activeTasks ?? []"
+        :assist-context="assistContext"
+        :assist-records="assistAnalyses"
+        @close="closeShotWorkspace"
+        @edit="openSelectedShotEditor"
+        @generate="generate"
+        @review="review"
+        @select-version="selectVideoVersion"
+        @resume="resumeAttempt"
+        @reconcile="reconcileAttempt"
+        @adopt-tail="adoptPreviousTail"
+        @bind-reference="bindShotReference"
+        @remove-binding="removeBinding"
+        @save-settings="saveShotWorkspaceSettings"
+        @apply-assistance="applyShotAssistance"
+      />
+    </el-dialog>
+
+    <el-drawer v-model="assetDrawerVisible" title="当前项目素材" size="520px">
+      <template v-if="graph">
+        <el-alert type="info" :closable="false" title="全局 Canon 只提供长期人物、猫咪和画风；场景图、开场图和视频帧只属于当前项目。" />
+        <div class="asset-upload-panel">
+          <h3>上传可复用项目素材</h3>
+          <el-input v-model="uploadForm.displayName" placeholder="素材名称，例如：伸缩鱼竿" />
+          <div class="binding-row">
+            <el-select v-model="uploadForm.role"><el-option label="画风" value="style" /><el-option label="道具" value="prop" /><el-option label="构图" value="composition" /></el-select>
+            <input type="file" accept="image/*" @change="chooseUploadFile" />
+          </div>
+          <el-button type="primary" :disabled="!uploadForm.file" @click="uploadReference">上传项目素材</el-button>
+        </div>
+        <section class="drawer-assets">
+          <h3>全局 Canon 引用</h3>
+          <div class="drawer-asset-grid">
             <button
               v-for="asset in canonAssets"
               :key="asset.id"
               type="button"
               :class="{ selected: isProjectDefault(asset.id), missing: !asset.contentReady }"
-              :title="`${String(asset.metadata.referenceRole ?? asset.role)} / ${String(asset.metadata.usage ?? asset.status)}`"
               @click="toggleProjectDefault(asset)"
             >
               <img v-if="asset.contentReady" :src="assetContentUrl(asset.id)" />
-              <span v-else>缺失<br />请修复</span>
-              <small>{{ isProjectDefault(asset.id) ? '项目已引用' : '全局 Canon' }}</small>
+              <span v-else>内容缺失</span>
+              <b>{{ asset.displayName }}</b><small>{{ isProjectDefault(asset.id) ? '项目已引用' : '全局 Canon' }}</small>
             </button>
           </div>
-          <template v-if="projectReferenceAssets.length">
-            <b class="asset-group-title">当前项目上传素材</b>
-            <div class="asset-strip">
-              <button
-                v-for="asset in projectReferenceAssets"
-                :key="asset.id"
-                type="button"
-                :class="{ selected: isProjectDefault(asset.id), missing: !asset.contentReady }"
-                :title="`${String(asset.metadata.referenceRole ?? asset.role)} / 当前项目`"
-                @click="toggleProjectDefault(asset)"
-              >
-                <img v-if="asset.contentReady" :src="assetContentUrl(asset.id)" />
-                <span v-else>缺失<br />请修复</span>
-                <small>{{ isProjectDefault(asset.id) ? '项目默认' : '项目上传' }}</small>
-              </button>
-            </div>
-          </template>
-          <template v-if="projectGeneratedAssets.length">
-            <b class="asset-group-title">当前项目生成媒体（只读）</b>
-            <p class="source-hint">场景视觉基准、锚点和视频帧按原场景/片段使用，不会进入全局 Canon 或项目身份档案。</p>
-            <div class="asset-strip generated-assets">
-              <div
-                v-for="asset in projectGeneratedAssets"
-                :key="asset.id"
-                class="generated-asset"
-                :class="{ missing: !asset.contentReady }"
-                :title="`${asset.displayName} / ${asset.scope}`"
-              >
-                <img v-if="asset.contentReady" :src="assetContentUrl(asset.id)" />
-                <span v-else>缺失<br />请修复</span>
-                <small>{{ asset.scope === 'scene' ? '场景专属' : '片段专属' }}</small>
-              </div>
-            </div>
-          </template>
-        </template>
-      </aside>
-
-      <main class="queue panel">
-        <div v-if="!graph" class="empty-state">
-          <h2>从一段场景剧本开始</h2>
-          <p>不需要先设计全天结构，也不会预建上午、中午、傍晚节点。</p>
-          <el-button type="primary" @click="createVisible = true">创建第一个项目</el-button>
-        </div>
-        <template v-else>
-          <div class="queue-heading">
-            <div><h2>{{ graph.project.title }}</h2><span>V5 · {{ graph.project.contentDate }} · {{ graph.scenes.length }} 个场景</span></div>
-            <div><el-button @click="editProjectSettings">项目设置</el-button><el-button @click="restoreCanonReferences">恢复 Canon 引用</el-button><el-button @click="editScene()">添加场景</el-button><el-button type="success" @click="openSequenceBuilder">编排并合成已批准片段</el-button></div>
+        </section>
+        <section v-if="projectReferenceAssets.length" class="drawer-assets">
+          <h3>项目上传素材</h3>
+          <div class="drawer-asset-grid">
+            <button
+              v-for="asset in projectReferenceAssets"
+              :key="asset.id"
+              type="button"
+              :class="{ selected: isProjectDefault(asset.id) }"
+              @click="toggleProjectDefault(asset)"
+            >
+              <img v-if="asset.contentReady" :src="assetContentUrl(asset.id)" />
+              <span v-else>内容缺失</span>
+              <b>{{ asset.displayName }}</b><small>{{ isProjectDefault(asset.id) ? '项目默认' : '项目素材' }}</small>
+            </button>
           </div>
-          <section v-for="(scene, sceneIndex) in graph.scenes" :key="scene.id" class="scene-card">
-            <header>
-              <div>
-                <span class="order-chip">场景 {{ scene.order }}</span>
-                <strong>{{ scene.title }}</strong>
-                <small v-if="scene.chapterLabel">{{ scene.chapterLabel }}</small>
-                <el-tag size="small">{{ scene.storyMode === 'single' ? '单片段' : `${scene.targetShotCount} 个片段` }}</el-tag>
-              </div>
-              <div>
-                <el-button text @click="moveScene(sceneIndex, -1)">上移</el-button>
-                <el-button text @click="moveScene(sceneIndex, 1)">下移</el-button>
-                <el-button text @click="editScene(scene)">编辑</el-button>
-                <el-button text type="danger" @click="removeScene(scene)">删除</el-button>
-              </div>
-            </header>
-            <p class="source-text">{{ scene.sourceText }}</p>
-            <CreativeWorkflowPanel :scene="scene" :project-id="graph.project.id" @changed="loadGraph()" />
-            <div v-if="scene.lookPlan" class="look-plan">
-              <b>场景造型方案</b>
-              <span>人物服装：{{ scene.lookPlan.personWardrobe || '沿用 Canon' }}</span>
-              <span>人物配件：{{ scene.lookPlan.personAccessories || '无新增' }}</span>
-              <span>猫咪外观：{{ scene.lookPlan.catAppearance || '保持 Canon 外观' }}</span>
-              <span>关键道具：{{ scene.lookPlan.keyProps || '无新增' }}</span>
-              <span>环境与姿态：{{ scene.lookPlan.environmentStyle === 'indoor' ? '室内' : '户外' }} · {{ scene.lookPlan.personPose || '人物自然准备姿态' }} · {{ scene.lookPlan.catPose || '猫咪自然四足姿态' }}</span>
-              <span>构图：{{ scene.lookPlan.composition || '稳定展示人猫关系、服饰与道具' }}</span>
-              <el-alert
-                v-if="scene.lookPlan.imageRecommended"
-                type="warning"
-                :closable="false"
-                :title="`建议生成场景视觉基准：${scene.lookPlan.recommendationReason || '造型或互动关系需要视觉确认'}`"
-              />
-            </div>
-            <SceneLookWorkbench
-              :project-id="graph.project.id"
-              :scene="scene"
-              :assets="graph.assets"
-              @refreshed="reloadGenerationInputs()"
-            />
-            <div class="scene-actions">
-              <el-button @click="editShot(scene.id)">手工添加视频片段</el-button>
-            </div>
-            <el-collapse v-if="scene.attempts.length" class="scene-attempts">
-              <el-collapse-item title="AI 片段建议历史与审计" name="suggestions">
-                <div v-for="attempt in scene.attempts" :key="attempt.id" class="attempt">
-                  <b>#{{ attempt.attempt }} {{ attempt.status }}</b>
-                  <span>{{ attempt.model || "未记录模型" }}</span>
-                  <pre v-if="attempt.prompt">{{ attempt.prompt.text }}</pre>
-                  <details>
-                    <summary>Provider 输入与原始输出</summary>
-                    <pre>{{ JSON.stringify(attempt.inputSnapshot, null, 2) }}</pre>
-                  </details>
-                  <el-alert
-                    v-if="attempt.error"
-                    type="error"
-                    :title="String(attempt.error.message ?? attempt.error.code)"
-                    :closable="false"
-                  />
-                </div>
-              </el-collapse-item>
-            </el-collapse>
-            <div class="shots">
-              <article
-                v-for="(shot, shotIndex) in scene.shots"
-                :key="shot.id"
-                class="shot-card"
-                :class="{ selected: selectedShotId === shot.id }"
-                @click="selectShot(shot.id)"
-              >
-                <div class="shot-head"><b>{{ shot.order }}. {{ shot.title }}</b><el-tag size="small">{{ shot.durationSeconds }}s</el-tag></div>
-                <p>{{ shot.direction }}</p>
-                <footer>
-                  <span>
-                    {{ shot.status }} · {{ shotReferenceSummary(shot, scene) }}
-                    <template v-if="selectedShotId === shot.id && videoPromptPreview">
-                      / 实际提交 {{ videoPromptPreview.references.length }} 张
-                    </template>
-                  </span>
-                  <span>
-                    <el-button text size="small" @click.stop="moveShot(scene, shotIndex, -1)">↑</el-button>
-                    <el-button text size="small" @click.stop="moveShot(scene, shotIndex, 1)">↓</el-button>
-                    <el-button text size="small" @click.stop="editShot(scene.id, shot)">编辑</el-button>
-                    <el-button text size="small" type="danger" @click.stop="removeShot(shot)">删除</el-button>
-                  </span>
-                </footer>
-              </article>
-            </div>
-          </section>
-        </template>
-      </main>
-
-      <aside class="inspector panel">
-        <template v-if="selectedShot">
-          <div class="panel-title">视频片段详情</div>
-          <h3>{{ selectedShot.title }}</h3>
-          <p class="direction">{{ selectedShot.direction }}</p>
-          <el-tabs v-model="inspectorTab" stretch class="inspector-tabs">
-            <el-tab-pane label="生成配置" name="config">
-              <el-descriptions :column="1" size="small" border>
-                <el-descriptions-item label="时长">{{ selectedShot.durationSeconds }} 秒</el-descriptions-item>
-                <el-descriptions-item label="锚点">{{ selectedShot.anchorMode }}</el-descriptions-item>
-                <el-descriptions-item label="场景基准">{{ sceneLookUsageLabel(selectedShot.sceneLookUsage) }}{{ selectedScene?.selectedLookAssetId ? '' : '（当前无批准版本）' }}</el-descriptions-item>
-                <el-descriptions-item label="项目继承">{{ selectedShot.inheritProjectReferences ? `${graph?.project.defaultReferenceBindings.length ?? 0} 张` : '关闭' }}</el-descriptions-item>
-                <el-descriptions-item label="状态">{{ selectedShot.status }}</el-descriptions-item>
-              </el-descriptions>
-              <el-alert
-                v-if="selectedShot.anchorMode === 'generate' && !selectedShot.selectedAnchorAssetId"
-                type="warning"
-                title="该片段需要先生成、批准并选择开场锚点，之后才能提交视频。"
-                :closable="false"
-              />
-              <div class="inspector-actions">
-                <el-button @click="openPromptReview('video')">查看视频 Prompt</el-button>
-                <el-button
-                  v-if="assistContext?.previousTail.available || assistContext?.previousTail.stale"
-                  :type="assistContext.previousTail.stale ? 'warning' : 'default'"
-                  @click="adoptPreviousTail"
-                >{{ assistContext.previousTail.stale ? '尾帧已过期，重新采用' : '采用上一片段尾帧' }}</el-button>
-                <el-button v-if="selectedShot.anchorMode === 'generate'" @click="generate('anchor')">生成锚点</el-button>
-                <el-button type="primary" :disabled="videoPromptPreview ? !videoPromptPreview.ready : false" @click="generate('video')">生成视频片段</el-button>
-              </div>
-              <el-divider content-position="left">添加片段专用素材</el-divider>
-              <el-select v-model="referenceForm.assetId" filterable placeholder="选择素材">
-                <el-option v-for="asset in selectableAssets" :key="asset.id" :label="`${String(asset.metadata.referenceRole ?? asset.role)} · ${String(asset.metadata.usage ?? asset.status)} · ${asset.semanticKey ?? asset.id.slice(0,8)}`" :value="asset.id" />
-              </el-select>
-              <div class="binding-row">
-                <el-select v-model="referenceForm.usage"><el-option label="生成参考" value="generation_reference" /><el-option label="最终锚点" value="approved_anchor" /></el-select>
-                <el-select v-model="referenceForm.role" :disabled="bindingRoleLocked"><el-option label="identity（来源锁定）" value="identity" disabled /><el-option label="scene（场景策略专用）" value="scene" disabled /><el-option v-for="item in ['style','prop','composition']" :key="item" :label="item" :value="item" /></el-select>
-                <el-select v-model="referenceForm.applyTo"><el-option label="锚点" value="anchor" /><el-option label="视频" value="video" /><el-option label="两者" value="both" /></el-select>
-              </div>
-              <el-button size="small" @click="bindReference">加入片段自定义集合</el-button>
-              <ul>
-                <li v-for="item in selectedShot.referenceBindings" :key="item.assetId">
-                  {{ item.usage }} / {{ item.role }} / {{ item.applyTo }}
-                  <el-button text type="danger" size="small" @click="removeBinding(item.assetId)">移除</el-button>
-                </li>
-              </ul>
-              <p class="source-hint">Canon 与项目默认属于继承层；场景视觉基准由片段策略控制；这里仅添加真正的片段覆盖素材。</p>
-            </el-tab-pane>
-
-            <el-tab-pane label="实际参考图" name="references">
-              <div class="reference-target-switch">
-                <el-radio-group v-model="promptTarget" size="small" @change="changePromptTarget">
-                  <el-radio-button value="anchor">锚点生成</el-radio-button>
-                  <el-radio-button value="video">视频生成</el-radio-button>
-                </el-radio-group>
-                <el-tag v-if="promptPreview" :type="promptPreview.ready ? 'success' : 'warning'">
-                  {{ promptPreview.ready ? `就绪 · ${promptPreview.references.length} 张` : '未就绪' }}
-                </el-tag>
-              </div>
-              <el-alert v-for="blocker in promptPreview?.blockers ?? []" :key="blocker" type="warning" :title="blocker" :closable="false" />
-              <el-empty v-if="promptPreview && !promptPreview.references.length" description="该目标当前没有实际图片输入" />
-              <div v-for="item in promptPreview?.references ?? []" :key="item.assetId" class="prompt-reference">
-                <img v-if="item.contentReady" :src="assetContentUrl(item.assetId)" />
-                <div v-else class="missing-reference">图片不可读<br />{{ item.assetId }}</div>
-                <div>
-                  <b>{{ item.promptAlias }} · {{ item.displayName }}</b>
-                  <span>{{ item.subjectLabel }} · 来源：{{ item.sourceLayer }}</span>
-                  <small>{{ item.responsibility }}</small>
-                </div>
-              </div>
-              <p class="source-hint">以上顺序就是实际 Provider 输入顺序；素材或策略改变后会本地重新编译，不调用 Ark。</p>
-            </el-tab-pane>
-
-            <el-tab-pane label="锚点与视频版本" name="versions">
-              <ShotMediaVersions
-                :shot="selectedShot"
-                :anchor-preview="anchorPromptPreview"
-                :video-preview="videoPromptPreview"
-                @review="review"
-                @select="selectVideoVersion"
-                @resume="resumeAttempt"
-                @reconcile="reconcileAttempt"
-                @retry="generate"
-              />
-            </el-tab-pane>
-
-            <el-tab-pane label="LLM审稿与Prompt" name="review">
-              <ShotAssistancePanel
-                :context="assistContext"
-                :records="assistAnalyses"
-                :shot="selectedShot"
-                @apply="applyShotAssistance"
-                @adopt-tail="adoptPreviousTail"
-              />
-              <div v-if="promptPreview" class="prompt-preview">
-                <div class="reference-target-switch">
-                  <el-radio-group v-model="promptTarget" size="small" @change="changePromptTarget">
-                    <el-radio-button value="anchor">锚点 Prompt</el-radio-button>
-                    <el-radio-button value="video">视频 Prompt</el-radio-button>
-                  </el-radio-group>
-                  <b>{{ promptPreview.charCount }} 字</b>
-                </div>
-                <p>定性节奏：{{ promptPreview.qualitativePacing }}</p>
-                <el-alert v-for="blocker in promptPreview.blockers" :key="blocker" type="warning" :title="blocker" :closable="false" />
-                <el-alert v-for="warning in promptPreview.linkWarnings" :key="warning" type="warning" :title="warning" :closable="false" />
-                <el-alert v-for="finding in promptPreview.localAnalysis.findings" :key="finding.code" :type="finding.severity === 'warning' ? 'warning' : 'info'" :title="finding.message" :closable="false" />
-                <el-divider content-position="left">LLM / 人工确认创作正文</el-divider>
-                <pre>{{ promptPreview.creativeBody }}</pre>
-                <el-divider content-position="left">系统技术外壳</el-divider>
-                <pre>{{ promptPreview.systemShell }}</pre>
-                <el-divider content-position="left">最终 Provider Prompt</el-divider>
-                <pre>{{ promptPreview.prompt }}</pre>
-                <small>输入哈希：{{ promptPreview.inputHash }} · 内容版本：{{ promptPreview.sourceRevisionHash }}</small>
-              </div>
-            </el-tab-pane>
-          </el-tabs>
-        </template>
-        <div v-else class="empty-state"><p>选择一个视频片段查看 Prompt、素材来源、任务和版本。</p></div>
-      </aside>
-    </div>
+        </section>
+        <section v-if="projectGeneratedAssets.length" class="drawer-assets">
+          <h3>项目生成媒体</h3>
+          <div class="drawer-asset-grid generated">
+            <article v-for="asset in projectGeneratedAssets" :key="asset.id">
+              <img v-if="asset.contentReady" :src="assetContentUrl(asset.id)" />
+              <span v-else>内容缺失</span>
+              <b>{{ asset.displayName }}</b><small>{{ asset.scope === 'scene' ? '场景专属' : '片段专属' }}</small>
+            </article>
+          </div>
+        </section>
+      </template>
+    </el-drawer>
 
     <section v-if="graph?.sequences.length" class="sequence-panel panel">
       <div class="sequence-heading">
@@ -1602,22 +1548,26 @@ onBeforeUnmount(() => window.clearInterval(polling));
 
 <style scoped>
 .studio { min-height: 100%; background: #0d1016; color: #e8eaf0; padding: 22px; }
-.studio-header, .queue-heading, .scene-card > header, .shot-head, .shot-card footer { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
-.studio-header h1, .queue-heading h2 { margin: 0; }.studio-header p { color: #9299a8; margin: 6px 0 0; }
-.persistent-alert { margin: 16px 0; }.workspace-grid { display: grid; grid-template-columns: 220px minmax(520px, 1fr) 390px; gap: 14px; margin-top: 18px; align-items: start; }
-.panel { background: #151922; border: 1px solid #292f3b; border-radius: 12px; }.project-rail, .inspector { padding: 14px; position: sticky; top: 12px; max-height: calc(100vh - 40px); overflow: auto; }.queue { padding: 18px; min-height: 650px; }
+.studio-header, .shot-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.studio-header h1 { margin: 0; }.studio-header p { color: #9299a8; margin: 6px 0 0; }
+.header-actions,.production-heading-actions,.scene-production-header,.shot-board-heading,.production-shot-card footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.production-shell { display: grid; gap: 14px; margin-top: 18px; }.production-heading { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 18px 20px; }.production-heading h2 { margin: 3px 0; }.production-heading p,.scene-production-header p,.shot-board-heading p { margin: 4px 0 0; color: #8c97a9; }.production-steps { padding: 18px 12px; }.production-scene { padding: 20px; }.scene-production-header h2 { display: inline; margin: 0 0 0 6px; }.scene-production-header { align-items: flex-start; }
+.creative-summary { margin: 16px 0; border: 1px solid #2b3441; border-radius: 10px; background: #10151d; }.creative-summary > summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 15px; cursor: pointer; list-style: none; }.creative-summary > summary span { display: grid; gap: 3px; }.creative-summary > summary small { color: #8793a6; }.creative-summary > .source-text,.creative-summary > :deep(.creative-workflow) { margin-left: 14px; margin-right: 14px; }.creative-summary[open] { padding-bottom: 14px; }
+.scene-production-grid { display: grid; grid-template-columns: minmax(360px, 1fr) minmax(360px, .8fr); gap: 12px; align-items: stretch; }.scene-overview { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; }.overview-stat { display: grid; place-content: center; gap: 5px; min-height: 116px; text-align: center; border: 1px solid #2c3645; border-radius: 10px; background: #111821; }.overview-stat span { color: #8995a8; font-size: 12px; }.overview-stat b { font-size: 24px; }
+.shot-board-heading { margin: 20px 0 10px; }.shot-board-heading h3 { margin: 0; }.production-shot-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }.shot-flow-item { min-width: 0; display: grid; gap: 7px; }.continuity-link { min-height: 28px; display: flex; align-items: center; justify-content: center; gap: 7px; color: #8492a7; font-size: 11px; }.continuity-link i { color: #5fa3f5; font-style: normal; }.production-shot-card { min-width: 0; height: 100%; display: grid; grid-template-rows: 190px 1fr; overflow: hidden; border: 1px solid #2c3747; border-radius: 12px; background: #101720; cursor: pointer; transition: border-color .15s ease, transform .15s ease; }.production-shot-card:hover { border-color: #4d96ff; transform: translateY(-1px); }.shot-preview { position: relative; display: grid; place-items: center; overflow: hidden; background: #080b10; }.shot-preview img,.shot-preview video { width: 100%; height: 100%; object-fit: cover; }.shot-preview > div { display: grid; gap: 6px; place-items: center; color: #8792a4; }.shot-preview > div > span { font-size: 36px; color: #41516a; }.shot-state { position: absolute; top: 10px; right: 10px; }.production-shot-content { display: grid; gap: 10px; padding: 13px; }.production-shot-content > p { margin: 0; max-height: 86px; overflow: hidden; color: #b7c0ce; font-size: 13px; line-height: 1.65; white-space: pre-wrap; }.visual-slots,.reference-counts,.version-counts { display: flex; gap: 6px; flex-wrap: wrap; }.visual-slots span { padding: 4px 7px; border: 1px solid #303a49; border-radius: 6px; color: #6f7b8e; font-size: 11px; }.visual-slots span.ready { color: #bfe3cb; border-color: #2f6547; background: #12251d; }.reference-counts span,.version-counts span { color: #8794a7; font-size: 11px; }.reference-counts b { margin-left: auto; color: #dce4ef; font-size: 11px; }
+.asset-upload-panel,.drawer-assets { display: grid; gap: 10px; margin-top: 16px; }.drawer-asset-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }.drawer-asset-grid button,.drawer-asset-grid article { min-width: 0; display: grid; gap: 5px; padding: 7px; text-align: left; color: #dce4ef; background: #101721; border: 1px solid #2d3746; border-radius: 8px; cursor: pointer; }.drawer-asset-grid button.selected { border-color: #409eff; }.drawer-asset-grid button.missing { border-color: #9a6732; }.drawer-asset-grid img,.drawer-asset-grid button > span,.drawer-asset-grid article > span { width: 100%; height: 112px; object-fit: cover; border-radius: 5px; background: #080b10; }.drawer-asset-grid button > span,.drawer-asset-grid article > span { display: grid; place-items: center; color: #d09a61; }.drawer-asset-grid small { color: #7f8da0; font-size: 10px; }.drawer-asset-grid.generated { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.shot-workspace-dialog :deep(.el-dialog__header) { display: none; }.shot-workspace-dialog :deep(.el-dialog__body) { padding: 0; }
+.persistent-alert { margin: 16px 0; }
+.panel { background: #151922; border: 1px solid #292f3b; border-radius: 12px; }
 .panel-title { color: #8c95a7; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 10px; }.reference-title { margin-top: 22px; }
-.project-item { display: flex; flex-direction: column; width: 100%; color: #d9dde7; background: transparent; border: 0; border-radius: 8px; text-align: left; padding: 10px; cursor: pointer; }.project-item:hover, .project-item.active { background: #232a36; }.project-item span { color: #80899a; font-size: 12px; margin-top: 4px; }
-.scene-card { border-top: 1px solid #2b313d; padding: 18px 0; }.scene-card small { color: #7d8798; margin-left: 8px; }.order-chip { color: #68a8ff; margin-right: 10px; }.source-text { color: #aeb5c3; line-height: 1.7; white-space: pre-wrap; }.scene-actions { margin: 12px 0; }.look-plan { display: grid; gap: 5px; border-left: 3px solid #6d8fc7; padding: 10px 12px; background: #101722; color: #aeb8c8; font-size: 13px; }.look-actions { display: flex; gap: 8px; margin-top: 5px; }.look-actions .el-select { min-width: 260px; }.selected-look-preview { width: 160px; max-height: 220px; object-fit: contain; background: #090c11; border-radius: 7px; }.look-candidate { display: flex; gap: 10px; padding: 8px; border: 1px solid #4b3d25; border-radius: 7px; }.look-candidate img { width: 100px; height: 120px; object-fit: contain; background: #090c11; }.look-candidate > div { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
-.shots { display: grid; gap: 10px; }.shot-card { padding: 14px; background: #10141b; border: 1px solid #292f3b; border-radius: 10px; cursor: pointer; }.shot-card.selected { border-color: #4d96ff; box-shadow: 0 0 0 1px #4d96ff55; }.shot-card p, .direction { color: #b6bdca; font-size: 13px; line-height: 1.65; white-space: pre-wrap; }.shot-card footer { color: #768092; font-size: 12px; }
-.inspector h3 { margin: 4px 0 8px; }.inspector-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }.binding-row { display: flex; gap: 8px; margin: 8px 0; }.attempt { padding: 10px 0; border-bottom: 1px solid #292f3b; display: grid; gap: 5px; }.attempt span { color: #8992a3; font-size: 12px; } pre { white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto; background: #0c0f15; padding: 10px; border-radius: 8px; color: #cdd3dd; }
-.inspector-tabs :deep(.el-tab-pane) { display: grid; gap: 10px; }.reference-target-switch { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }.missing-reference { display: grid; place-content: center; width: 56px; height: 56px; padding: 3px; box-sizing: border-box; color: #d89b62; background: #0b0e14; font-size: 9px; text-align: center; word-break: break-all; }
-.asset-group-title { display: block; margin-top: 14px; color: #b7c0ce; font-size: 12px; }.asset-strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; margin-top: 10px; }.asset-strip button, .asset-strip .generated-asset { border: 1px solid #2b313d; border-radius: 6px; padding: 3px; background: #0c1017; color: #aab2c1; }.asset-strip button { cursor: pointer; }.asset-strip button.selected { border-color: #409eff; box-shadow: 0 0 0 1px #409eff66; }.asset-strip button.missing, .asset-strip .generated-asset.missing { border-color: #8b5e2b; cursor: default; }.asset-strip img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 4px; }.asset-strip button > span, .asset-strip .generated-asset > span { display: grid; place-content: center; aspect-ratio: 1; color: #d6a15e; font-size: 11px; }.asset-strip small { display: block; margin: 2px 0; color: #7f8999; font-size: 9px; }.generated-assets { max-height: 260px; overflow-y: auto; }.source-hint { color: #8791a2; font-size: 11px; line-height: 1.5; }.version-card { border: 1px solid #2b313d; border-radius: 8px; padding: 8px; margin: 8px 0; display: grid; gap: 6px; }.version-card img, .version-card video { width: 100%; max-height: 240px; object-fit: contain; background: #090b0f; }.empty-state { text-align: center; color: #8f98a7; padding: 80px 20px; }
-.scene-attempts { margin: 10px 0; }.attempt details summary, .master-timeline summary { color: #8fa7c9; cursor: pointer; font-size: 12px; }.sequence-panel, .master-timeline { margin-top: 16px; padding: 16px; }.sequence-heading h3, .master-timeline h3 { margin: 0; }.sequence-heading p, .master-timeline p { color: #9299a8; }.sequence-grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }.sequence-card { border: 1px solid #2b313d; border-radius: 9px; padding: 10px; display: grid; gap: 8px; }.sequence-card.selected { border-color: #4d96ff; }.sequence-open { border: 0; background: transparent; color: #e8eaf0; text-align: left; cursor: pointer; display: grid; gap: 4px; }.sequence-open span { color: #8490a3; font-size: 12px; }.master-timeline video { width: 100%; max-height: 560px; background: #080a0e; }
+.order-chip { color: #68a8ff; margin-right: 10px; }.source-text { color: #aeb5c3; line-height: 1.7; white-space: pre-wrap; }
+.binding-row { display: flex; gap: 8px; margin: 8px 0; } pre { white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto; background: #0c0f15; padding: 10px; border-radius: 8px; color: #cdd3dd; }
+.source-hint { color: #8791a2; font-size: 11px; line-height: 1.5; }.empty-state { text-align: center; color: #8f98a7; padding: 80px 20px; }.project-empty { display: grid; min-height: 520px; margin-top: 18px; place-items: center; }
+.master-timeline summary { color: #8fa7c9; cursor: pointer; font-size: 12px; }.sequence-panel, .master-timeline { margin-top: 16px; padding: 16px; }.sequence-heading h3, .master-timeline h3 { margin: 0; }.sequence-heading p, .master-timeline p { color: #9299a8; }.sequence-grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }.sequence-card { border: 1px solid #2b313d; border-radius: 9px; padding: 10px; display: grid; gap: 8px; }.sequence-card.selected { border-color: #4d96ff; }.sequence-open { border: 0; background: transparent; color: #e8eaf0; text-align: left; cursor: pointer; display: grid; gap: 4px; }.sequence-open span { color: #8490a3; font-size: 12px; }.master-timeline video { width: 100%; max-height: 560px; background: #080a0e; }
 .mode-row { align-items: end; }.look-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }.suggestion-summary, .suggestion-shot-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }.suggestion-shot { padding: 14px; margin: 10px 0; border: 1px solid #2b313d; border-radius: 9px; background: #10141b; }.suggestion-shot-head { margin-bottom: 10px; }
-.assist-context, .assist-analysis, .assist-patch { display: grid; gap: 8px; margin: 8px 0; }.prompt-reference { display: grid; grid-template-columns: 56px 1fr; gap: 8px; align-items: center; margin: 7px 0; padding: 7px; border: 1px solid #293344; border-radius: 7px; }.prompt-reference img { width: 56px; height: 56px; object-fit: cover; }.prompt-reference div { display: grid; gap: 3px; }.prompt-reference span, .prompt-reference small { color: #8f9caf; }.assist-candidate-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 12px 0; }.assist-candidate-grid label { display: grid; grid-template-columns: auto 64px 1fr; gap: 7px; align-items: center; padding: 7px; border: 1px solid #303847; border-radius: 8px; }.assist-candidate-grid label.disabled { opacity: .48; }.assist-candidate-grid img { width: 64px; height: 64px; object-fit: cover; }.assist-candidate-grid span { display: grid; font-size: 12px; }.assist-candidate-grid small { color: #8791a2; }
+.assist-candidate-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 12px 0; }.assist-candidate-grid label { display: grid; grid-template-columns: auto 64px 1fr; gap: 7px; align-items: center; padding: 7px; border: 1px solid #303847; border-radius: 8px; }.assist-candidate-grid label.disabled { opacity: .48; }.assist-candidate-grid img { width: 64px; height: 64px; object-fit: cover; }.assist-candidate-grid span { display: grid; font-size: 12px; }.assist-candidate-grid small { color: #8791a2; }
 .shot-local-findings { display: grid; gap: 6px; width: 100%; }
 .profile-reference-heading { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin: 12px 0 8px; }.profile-reference-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px 16px; }
 .sequence-editor { display: grid; gap: 9px; margin-top: 14px; }.sequence-editor-row { display: grid; grid-template-columns: minmax(0, 1fr) 180px 150px; align-items: center; gap: 10px; padding: 10px; border: 1px solid #2c3645; border-radius: 8px; }.sequence-editor-row div { display: grid; gap: 4px; }.sequence-editor-row small { color: #8791a2; }
-@media (max-width: 1280px) { .workspace-grid { grid-template-columns: 190px 1fr; }.inspector { position: static; grid-column: 1 / -1; max-height: none; } }
+@media (max-width: 1280px) { .scene-production-grid { grid-template-columns: 1fr; }.production-shot-grid { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); } }
 </style>

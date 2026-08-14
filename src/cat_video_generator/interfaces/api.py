@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from ..application.shot_queue import RevisionConflictError
+from ..application.shot_queue import GatewayUnavailableError, RevisionConflictError
 from ..domain.contracts import (
     CURRENT_CONTRACT_VERSION,
     ReferenceRole,
@@ -101,6 +101,10 @@ def create_app(
     async def revision_conflict(_request: Request, exc: RevisionConflictError) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
 
+    @app.exception_handler(GatewayUnavailableError)
+    async def gateway_unavailable(_request: Request, exc: GatewayUnavailableError) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
+
     @app.get("/api/v1/health")
     def health() -> dict[str, Any]:
         database_ready = container.alembic_revision == ALEMBIC_HEAD
@@ -135,6 +139,260 @@ def create_app(
     @app.get("/api/v1/projects/{project_id}")
     def project_graph(project_id: uuid.UUID) -> dict[str, Any]:
         return repository.project_graph(project_id)
+
+    @app.get("/api/v1/projects/{project_id}/production-board")
+    def production_board(project_id: uuid.UUID) -> dict[str, Any]:
+        graph = repository.project_graph(project_id)
+        assets_by_id = {item["id"]: item for item in graph["assets"]}
+        for graph_scene in graph["scenes"]:
+            for graph_shot in graph_scene["shots"]:
+                assets_by_id.update({item["id"]: item for item in graph_shot["assets"]})
+        active_statuses = {"pending", "submitting", "queued", "running"}
+        scene_summaries: list[dict[str, Any]] = []
+        for scene in graph["scenes"]:
+            scene_look_versions = [
+                item
+                for item in graph["assets"]
+                if item.get("sceneId") == scene["id"] and item.get("role") == "scene_look"
+            ]
+            shot_summaries: list[dict[str, Any]] = []
+            for shot in scene["shots"]:
+                active_attempts = [
+                    item for item in shot["attempts"] if item["status"] in active_statuses
+                ]
+                active_anchor = next(
+                    (
+                        item
+                        for item in active_attempts
+                        if item["operationKey"] == "image:anchor"
+                    ),
+                    None,
+                )
+                active_video = next(
+                    (
+                        item
+                        for item in active_attempts
+                        if item["operationKey"] in {"video:shot", "video:range-edit"}
+                    ),
+                    None,
+                )
+                anchor_assets = [
+                    item for item in shot["assets"] if item["role"] == "shot_anchor"
+                ]
+                video_assets = [
+                    item
+                    for item in shot["assets"]
+                    if item["role"] in {"shot_video", "shot_video_edit"}
+                ]
+                selected_anchor = assets_by_id.get(shot.get("selectedAnchorAssetId"))
+                selected_video = assets_by_id.get(shot.get("selectedVideoAssetId"))
+                candidate_video = next(
+                    (item for item in reversed(video_assets) if item["status"] == "candidate"),
+                    None,
+                )
+                selected_video_step = next(
+                    (
+                        item
+                        for item in shot["attempts"]
+                        if selected_video
+                        and item["id"] == selected_video.get("producingStepId")
+                    ),
+                    None,
+                )
+
+                ordered_source_ids: list[str] = []
+                if selected_anchor:
+                    ordered_source_ids.append(selected_anchor["id"])
+                ordered_source_ids.extend(
+                    binding["assetId"]
+                    for binding in shot["referenceBindings"]
+                    if binding["usage"] != "approved_anchor"
+                    and binding["applyTo"] in {"video", "both"}
+                )
+                include_scene_look = (
+                    scene.get("selectedLookAssetId") is not None
+                    and shot["sceneLookUsage"] in {"appearance_only", "full_reference"}
+                )
+                if include_scene_look:
+                    ordered_source_ids.append(scene["selectedLookAssetId"])
+                if shot["inheritProjectReferences"]:
+                    ordered_source_ids.extend(
+                        binding["assetId"]
+                        for binding in graph["project"]["defaultReferenceBindings"]
+                        if binding["applyTo"] in {"video", "both"}
+                    )
+
+                source_ids: list[str] = []
+                seen_asset_ids: set[str] = set()
+                seen_sha256: set[str] = set()
+                for asset_id in ordered_source_ids:
+                    asset = assets_by_id.get(asset_id)
+                    if asset_id in seen_asset_ids:
+                        continue
+                    sha256 = str(asset.get("sha256") or "") if asset else ""
+                    if sha256 and sha256 in seen_sha256:
+                        continue
+                    source_ids.append(asset_id)
+                    seen_asset_ids.add(asset_id)
+                    if sha256:
+                        seen_sha256.add(sha256)
+
+                current_revision = shot["draftRevision"]
+                selected_snapshot = (
+                    selected_video_step.get("inputSnapshot", {})
+                    if selected_video_step
+                    else {}
+                )
+                generated_revision = selected_snapshot.get("shotDraftRevision")
+                generated_source_ids = selected_snapshot.get("sourceAssetIds")
+                stale = bool(
+                    selected_video
+                    and (
+                        (
+                            generated_revision is not None
+                            and generated_revision != current_revision
+                        )
+                        or (
+                            isinstance(generated_source_ids, list)
+                            and generated_source_ids != source_ids
+                        )
+                    )
+                )
+                uses_scene_look = (
+                    shot["sceneLookUsage"] != "off"
+                    and scene.get("selectedLookAssetId") is not None
+                )
+                if active_anchor:
+                    state, next_action = "generating_anchor", "open_task"
+                    state_label, action_label = "开场图生成中", "查看生成任务"
+                elif active_video:
+                    state, next_action = "generating_video", "open_task"
+                    state_label, action_label = "视频生成中", "查看生成任务"
+                elif selected_video and stale:
+                    state, next_action = "stale", "open_versions"
+                    state_label, action_label = "基于旧输入", "查看并决定是否重做"
+                elif selected_video:
+                    state, next_action = "approved", "open_versions"
+                    state_label, action_label = "已批准", "查看视频版本"
+                elif candidate_video:
+                    state, next_action = "awaiting_review", "review_media"
+                    state_label, action_label = "等待审核", "审核视频版本"
+                elif shot["anchorMode"] in {"generate", "existing"} and not selected_anchor:
+                    state, next_action = "needs_opening", "generate_anchor"
+                    state_label = "待设计开场"
+                    action_label = (
+                        "生成片段开场图"
+                        if shot["anchorMode"] == "generate"
+                        else "选择已有开场图"
+                    )
+                elif any(
+                    assets_by_id.get(asset_id) is None
+                    or not assets_by_id[asset_id].get("contentReady", False)
+                    for asset_id in source_ids
+                ):
+                    state, next_action = "blocked", "fix_inputs"
+                    state_label, action_label = "生成条件未完成", "检查缺失素材"
+                else:
+                    state, next_action = "ready_video", "generate_video"
+                    state_label, action_label = "可以生成视频", "生成视频片段"
+                if state == "needs_opening":
+                    blockers = [
+                        "请先生成并批准片段开场图"
+                        if shot["anchorMode"] == "generate"
+                        else "请先上传或选择已有开场图"
+                    ]
+                elif state == "blocked":
+                    blockers = ["实际参考图中存在不可读取的文件，请打开片段生成台检查"]
+                else:
+                    blockers = []
+
+                selected_anchor_id = shot.get("selectedAnchorAssetId")
+                person_reference_count = 0
+                cat_reference_count = 0
+                style_reference_count = 0
+                prop_reference_count = 0
+                for asset_id in source_ids:
+                    asset = assets_by_id.get(asset_id, {})
+                    semantic_key = str(asset.get("semanticKey") or "")
+                    if semantic_key.startswith("person:"):
+                        person_reference_count += 1
+                    elif semantic_key.startswith("cat:"):
+                        cat_reference_count += 1
+                    elif semantic_key.startswith("style:"):
+                        style_reference_count += 1
+                    elif (
+                        asset_id != selected_anchor_id
+                        and asset_id != scene.get("selectedLookAssetId")
+                    ):
+                        prop_reference_count += 1
+                reference_counts = {
+                    "custom": sum(
+                        1
+                        for item in shot["referenceBindings"]
+                        if item["usage"] != "approved_anchor"
+                        and item["applyTo"] in {"video", "both"}
+                        and item["assetId"] in source_ids
+                    ),
+                    "scene": int(
+                        include_scene_look
+                        and scene.get("selectedLookAssetId") in source_ids
+                    ),
+                    "project": sum(
+                        1
+                        for item in graph["project"]["defaultReferenceBindings"]
+                        if item["assetId"] in source_ids
+                    ),
+                    "opening": int(
+                        selected_anchor_id is not None and selected_anchor_id in source_ids
+                    ),
+                    "person": person_reference_count,
+                    "cat": cat_reference_count,
+                    "style": style_reference_count,
+                    "prop": prop_reference_count,
+                    "total": len(source_ids),
+                }
+                preview_asset = (
+                    selected_video
+                    or selected_anchor
+                    or candidate_video
+                    or (anchor_assets[-1] if anchor_assets else None)
+                    or assets_by_id.get(scene.get("selectedLookAssetId"))
+                )
+                shot_summaries.append(
+                    {
+                        "shotId": shot["id"],
+                        "sceneId": scene["id"],
+                        "state": state,
+                        "stateLabel": state_label,
+                        "nextAction": next_action,
+                        "primaryActionLabel": action_label,
+                        "blockers": blockers,
+                        "referenceCounts": reference_counts,
+                        "anchorVersionCount": len(anchor_assets),
+                        "videoVersionCount": len(video_assets),
+                        "activeTaskCount": len(active_attempts),
+                        "previewAssetId": preview_asset["id"] if preview_asset else None,
+                        "previewMediaType": (
+                            preview_asset["mediaType"] if preview_asset else None
+                        ),
+                        "usesSceneLook": uses_scene_look,
+                        "inputHash": f"draft:{current_revision}:" + ",".join(source_ids),
+                    }
+                )
+            scene_summaries.append(
+                {
+                    "sceneId": scene["id"],
+                    "selectedLookAssetId": scene.get("selectedLookAssetId"),
+                    "lookVersionCount": len(scene_look_versions),
+                    "lookStatus": (
+                        assets_by_id.get(scene.get("selectedLookAssetId"), {}).get("status")
+                        if scene.get("selectedLookAssetId")
+                        else "missing"
+                    ),
+                    "shots": shot_summaries,
+                }
+            )
+        return {"projectId": str(project_id), "scenes": scene_summaries}
 
     @app.patch("/api/v1/projects/{project_id}")
     def update_project(
@@ -443,6 +701,91 @@ def create_app(
     @app.get("/api/v1/shots/{shot_id}")
     def shot_trace(shot_id: uuid.UUID) -> dict[str, Any]:
         return repository.shot_trace(shot_id)
+
+    @app.get("/api/v1/shots/{shot_id}/generation-workspace")
+    def shot_generation_workspace(shot_id: uuid.UUID) -> dict[str, Any]:
+        shot = repository.shot_trace(shot_id)
+        scene = repository.get_scene(uuid.UUID(shot["sceneId"]))
+        anchor_preview = container.production.preview_shot_prompt(
+            shot_id,
+            target=ReferenceTarget.ANCHOR,
+        )
+        video_preview = container.production.preview_shot_prompt(
+            shot_id,
+            target=ReferenceTarget.VIDEO,
+        )
+        assets = {
+            item["id"]: item
+            for item in repository.project_graph(scene.project_id)["assets"]
+        }
+
+        def reference_slots(preview: dict[str, Any], target: str) -> list[dict[str, Any]]:
+            grouped: dict[str, list[dict[str, Any]]] = {
+                "person": [],
+                "cat": [],
+                "style": [],
+                "scene": [],
+                "prop": [],
+                "opening": [],
+                "custom": [],
+            }
+            for reference in preview["references"]:
+                asset = assets.get(reference["assetId"], {})
+                semantic_key = str(asset.get("semanticKey") or "")
+                if reference["assetId"] == shot.get("selectedAnchorAssetId"):
+                    key = "opening"
+                elif reference["sourceLayer"] == "scene_look":
+                    key = "scene"
+                elif semantic_key.startswith("person:"):
+                    key = "person"
+                elif semantic_key.startswith("cat:"):
+                    key = "cat"
+                elif semantic_key.startswith("style:"):
+                    key = "style"
+                elif reference["sourceLayer"] == "shot":
+                    key = "custom"
+                else:
+                    key = "prop"
+                grouped[key].append({**reference, "asset": asset})
+            labels = {
+                "person": "人物身份",
+                "cat": "猫咪身份",
+                "style": "系列画风",
+                "scene": "场景视觉基准",
+                "prop": "道具与构图",
+                "opening": "批准开场图",
+                "custom": "片段专用素材",
+            }
+            return [
+                {"key": key, "label": labels[key], "target": target, "items": items}
+                for key, items in grouped.items()
+                if items
+            ]
+
+        active_statuses = {"pending", "submitting", "queued", "running"}
+        active_tasks = [
+            item for item in shot["attempts"] if item["status"] in active_statuses
+        ]
+        return {
+            "shot": shot,
+            "scene": {
+                "id": str(scene.id),
+                "title": scene.draft.title,
+                "selectedLookAssetId": (
+                    str(scene.selected_look_asset_id)
+                    if scene.selected_look_asset_id
+                    else None
+                ),
+            },
+            "anchorPreview": anchor_preview,
+            "videoPreview": video_preview,
+            "referenceSlots": {
+                "anchor": reference_slots(anchor_preview, "anchor"),
+                "video": reference_slots(video_preview, "video"),
+            },
+            "previousTail": container.production.tail_frame_status(shot_id),
+            "activeTasks": active_tasks,
+        }
 
     @app.get("/api/v1/shots/{shot_id}/prompt-preview")
     def shot_prompt_preview(

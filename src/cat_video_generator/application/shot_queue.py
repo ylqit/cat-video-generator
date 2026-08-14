@@ -81,6 +81,10 @@ from .ports import (
 )
 
 
+class GatewayUnavailableError(RuntimeError):
+    """Raised before a paid task is submitted when its Ark gateway is unavailable."""
+
+
 @dataclass(frozen=True, slots=True)
 class SuggestionResult:
     step_id: uuid.UUID
@@ -514,7 +518,7 @@ class ProjectEditingService:
         if not allow_paid_generation:
             raise ValueError("AI shot suggestions require explicit paid-generation permission")
         if self._director is None:
-            raise RuntimeError("Director gateway is not configured")
+            raise GatewayUnavailableError("Director gateway is not configured")
         scene = self._repository.get_scene(scene_id)
         project = self._repository.get_project(scene.project_id)
         profile = self._repository.get_visual_profile(project.id)
@@ -702,7 +706,7 @@ class ProjectEditingService:
         if not allowed:
             raise ValueError(message)
         if self._director is None:
-            raise RuntimeError("Director gateway is not configured")
+            raise GatewayUnavailableError("Director gateway is not configured")
 
     def _assert_scene_stage_available(
         self,
@@ -756,7 +760,7 @@ class ProjectEditingService:
         output_name: str,
     ) -> StoredStep:
         if self._director is None:
-            raise RuntimeError("Director gateway is not configured")
+            raise GatewayUnavailableError("Director gateway is not configured")
         attempt = self._repository.next_scene_attempt(
             scene_id=scene_id,
             operation_key=operation_key,
@@ -885,7 +889,7 @@ class ProjectEditingService:
         if not allow_paid_generation:
             raise ValueError("shot assistance requires explicit paid-generation permission")
         if self._director is None:
-            raise RuntimeError("Director gateway is not configured")
+            raise GatewayUnavailableError("Director gateway is not configured")
         shot = self._repository.get_shot(shot_id)
         if shot.draft_revision != source_draft_revision:
             raise RevisionConflictError("片段草稿已更新，请基于最新版本重新分析")
@@ -2755,7 +2759,7 @@ class ShotProductionService:
 
     def _require_gateway(self) -> None:
         if self._gateway is None:
-            raise RuntimeError("Ark media gateway is not configured")
+            raise GatewayUnavailableError("Ark media gateway is not configured")
 
     def _require_paid_gateway(self, allowed: bool) -> None:
         if not allowed:

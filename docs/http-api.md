@@ -5,6 +5,7 @@ GET    /api/v1/health
 GET    /api/v1/projects
 POST   /api/v1/projects
 GET    /api/v1/projects/{id}
+GET    /api/v1/projects/{id}/production-board
 PATCH  /api/v1/projects/{id}
 PUT    /api/v1/projects/{id}/default-references
 GET    /api/v1/projects/{id}/visual-profile
@@ -34,6 +35,7 @@ PATCH  /api/v1/shots/{id}
 DELETE /api/v1/shots/{id}
 PUT    /api/v1/scenes/{id}/shot-order
 GET    /api/v1/shots/{id}
+GET    /api/v1/shots/{id}/generation-workspace
 GET    /api/v1/shots/{id}/prompt-preview
 GET    /api/v1/shots/{id}/assist-context
 POST   /api/v1/shots/{id}/assist
@@ -117,6 +119,11 @@ revision，不同内容创建不可变 revision。`PUT /look-draft` 使用 `expe
 `derive_anchor` 的锚点预览包含“片段自定义 → 场景视觉基准 → 项目身份/画风”；批准锚点后的
 视频预览为“锚点 → 片段自定义 → 项目身份/画风”，场景视觉基准不重复提交。没有批准锚点时
 视频预览直接返回未就绪，POST 视频任务也在登记后台任务之前拒绝。
+
+`GET /projects/{id}/production-board` 和 `GET /shots/{id}/generation-workspace` 都是只读聚合接口：
+前者为看板派生中文状态、下一操作、六类视觉来源、版本数和阻断原因；后者一次返回锚点/视频
+双目标 Prompt、职责分组后的实际素材、媒体版本上下文、上一片段尾帧和活跃任务。两者不写入
+数据库，也不引入新的状态真相；真实生成仍使用 `prompt-preview` 背后的同一生成规格编译边界。
 
 批准片段视频后，系统尝试用本地 FFmpeg 生成可追溯 `shot_tail_frame`。下一片段可通过
 `adopt-previous-tail-anchor` 将其设为唯一批准锚点；如果上一片段更换批准视频，旧尾帧状态为

@@ -6,6 +6,7 @@ import type {
   JobDto,
   PersistentTaskDto,
   PreviousTailStatus,
+  ProductionBoardDto,
   ProjectGraph,
   ProjectSummary,
   ReferenceBinding,
@@ -23,6 +24,7 @@ import type {
   ShotAssistPatch,
   ShotAssistRecord,
   ShotDto,
+  ShotGenerationWorkspaceDto,
   ShotPromptPreview,
   ShotSuggestion,
   ShotSuggestionOutput,
@@ -69,6 +71,8 @@ export const api = {
   health: () => request<HealthDto>("/health"),
   projects: () => request<ProjectSummary[]>("/projects"),
   project: (id: string) => request<ProjectGraph>(`/projects/${id}`),
+  productionBoard: (id: string) =>
+    request<ProductionBoardDto>(`/projects/${id}/production-board`),
   createProject: (body: {
     project: { title: string; firstSceneTitle: string; firstSceneText: string };
     contentDate?: string;
@@ -149,6 +153,8 @@ export const api = {
   reorderShots: (sceneId: string, ids: string[]) =>
     json<{ saved: boolean }>(`/scenes/${sceneId}/shot-order`, "PUT", { ids }),
   shot: (shotId: string) => request<ShotDto>(`/shots/${shotId}`),
+  shotGenerationWorkspace: (shotId: string) =>
+    request<ShotGenerationWorkspaceDto>(`/shots/${shotId}/generation-workspace`),
   promptPreview: (
     shotId: string,
     target: "anchor" | "video" = "video",
