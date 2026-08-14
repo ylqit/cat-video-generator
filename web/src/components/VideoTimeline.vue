@@ -3,9 +3,12 @@ import { ElMessageBox } from "element-plus";
 import { computed, ref, watch } from "vue";
 
 import { api } from "../api/client";
+import { registerTask } from "../tasks/taskCenter";
 
 const props = defineProps<{
   shotId: string;
+  projectId?: string;
+  sceneId?: string;
   assetId: string;
   src: string;
   durationMs: number;
@@ -13,7 +16,7 @@ const props = defineProps<{
   frames?: Array<{ src: string; label: string; timestampMs: number }>;
   markersMs?: number[];
 }>();
-const emit = defineEmits<{ completed: [] }>();
+const emit = defineEmits<{ submitted: [] }>();
 
 const startMs = ref(0);
 const endMs = ref(Math.min(props.durationMs, 4000));
@@ -101,16 +104,18 @@ async function submit() {
           instruction: instruction.value,
           allowPaidGeneration: true,
         });
-    for (;;) {
-      const job = await api.job(accepted.jobId);
-      if (job.status === "failed") throw new Error(String(job.error?.message ?? "区间重拍失败"));
-      if (job.status === "succeeded") break;
-      await new Promise((resolve) => window.setTimeout(resolve, 1200));
-    }
+    registerTask(accepted.jobId, {
+      kind: wholeShot ? "generate_video" : "range_edit",
+      label: wholeShot ? "完整视频片段重做" : "片段区间重拍",
+      projectId: props.projectId,
+      sceneId: props.sceneId,
+      shotId: props.shotId,
+      operationKey: wholeShot ? "video:shot" : "video:range-edit",
+    });
     message.value = wholeShot
-      ? "完整镜头新版本已生成并等待人工审核，原版本未被覆盖。"
-      : "区间新版本已生成并等待人工审核，原版本未被覆盖。";
-    emit("completed");
+      ? "完整镜头重做已提交到全局任务中心，原版本不会被覆盖。"
+      : "区间重拍已提交到全局任务中心，原版本不会被覆盖。";
+    emit("submitted");
   } catch (error) {
     message.value = error instanceof Error ? error.message : String(error);
   } finally {

@@ -299,6 +299,20 @@ class ShotSuggestion(StrictModel):
         int,
         Field(alias="suggestedDurationSeconds", ge=8, le=15),
     ] = 8
+    anchor_mode: AnchorMode = Field(default=AnchorMode.TEXT_ONLY, alias="anchorMode")
+    scene_look_usage: SceneLookUsage = Field(
+        default=SceneLookUsage.APPEARANCE_ONLY,
+        alias="sceneLookUsage",
+    )
+
+    @model_validator(mode="after")
+    def validate_visual_strategy(self) -> ShotSuggestion:
+        if (
+            self.scene_look_usage is SceneLookUsage.DERIVE_ANCHOR
+            and self.anchor_mode is not AnchorMode.GENERATE
+        ):
+            raise ValueError("derive_anchor requires anchorMode=generate")
+        return self
 
 
 class ShotSuggestionOutput(StrictModel):

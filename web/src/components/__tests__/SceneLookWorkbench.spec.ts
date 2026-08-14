@@ -1,4 +1,4 @@
-import ElementPlus from "element-plus";
+import ElementPlus, { ElMessageBox } from "element-plus";
 import { flushPromises, mount } from "@vue/test-utils";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -18,6 +18,7 @@ const calls = vi.hoisted(() => ({
   health: vi.fn(),
   saveSceneLookDraft: vi.fn(),
   previewSceneLookPrompt: vi.fn(),
+  generateSceneLook: vi.fn(),
 }));
 
 vi.mock("../../api/client", () => ({
@@ -25,7 +26,7 @@ vi.mock("../../api/client", () => ({
   api: {
     ...calls,
     updateVisualProfile: vi.fn(),
-    generateSceneLook: vi.fn(),
+    generateSceneLook: calls.generateSceneLook,
     job: vi.fn(),
     reviewAsset: vi.fn(),
     selectSceneLook: vi.fn(),
@@ -167,5 +168,38 @@ describe("SceneLookWorkbench", () => {
     expect(calls.previewSceneLookPrompt).toHaveBeenCalledWith(scene.id);
     expect(document.body.textContent).toContain("至少选择一张猫咪身份参考");
     expect(document.body.textContent).toContain("@图片1");
+  });
+
+  it("submits generation without polling the job inside the workbench", async () => {
+    calls.visualProfile.mockResolvedValue(profile);
+    calls.sceneLookDraft.mockResolvedValue(envelope);
+    calls.sceneLookVersions.mockResolvedValue([]);
+    calls.health.mockResolvedValue({ arkImageModel: "fake-seedream" });
+    calls.saveSceneLookDraft.mockResolvedValue(envelope);
+    calls.previewSceneLookPrompt.mockResolvedValue({ ...promptPreview, warnings: [] });
+    calls.generateSceneLook.mockResolvedValue({ jobId: "look-job-1" });
+    vi.spyOn(ElMessageBox, "confirm").mockResolvedValue({ action: "confirm" } as never);
+
+    const wrapper = mount(SceneLookWorkbench, {
+      attachTo: document.body,
+      props: { projectId: profile.projectId, scene, assets: [asset] },
+      global: { plugins: [ElementPlus] },
+    });
+    await wrapper.get("button").trigger("click");
+    await flushPromises();
+
+    const previewButton = [...document.body.querySelectorAll("button")].find(
+      (button) => button.textContent?.includes("编译预览"),
+    );
+    previewButton!.click();
+    await flushPromises();
+    const generateButton = [...document.body.querySelectorAll("button")].find(
+      (button) => button.textContent?.includes("确认并生成"),
+    );
+    generateButton!.click();
+    await flushPromises();
+
+    expect(calls.generateSceneLook).toHaveBeenCalledWith(scene.id, envelope.revision, false, undefined);
+    expect(document.body.textContent).toContain("场景视觉基准工作台");
   });
 });

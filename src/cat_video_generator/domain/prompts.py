@@ -1,4 +1,4 @@
-"""V5造型建议、片段内分镜、场景定妆和视频Prompt编译。"""
+"""V5造型建议、片段内分镜、场景视觉基准和视频Prompt编译。"""
 
 from __future__ import annotations
 
@@ -154,8 +154,13 @@ def compile_shot_suggestion_prompt(
 6. 每个片段建议8至15秒；suggestedDurationSeconds填写整数，但不得在direction中编造精确秒点。
 7. 同时给出lookPlan：personWardrobe、personAccessories、catAppearance、keyProps、
    environmentStyle、personPose、catPose、composition、additionalInstructions、
-   imageRecommended、recommendationReason。只有服饰、配件、关键道具或双主体关系需要视觉确认时才建议定妆图。
-8. 只输出sceneTitle、lookPlan和shots；每个shot只有title、direction、suggestedDurationSeconds。
+   imageRecommended、recommendationReason。只有服饰、配件、关键道具或双主体关系需要视觉确认时才建议场景视觉基准图。
+8. 为每个片段给出anchorMode和sceneLookUsage预填建议。anchorMode只能是text_only、existing、generate；
+   sceneLookUsage只能是off、appearance_only、full_reference、derive_anchor。derive_anchor必须同时使用generate。
+   开场需要从场景视觉基准派生独立首帧时使用generate+derive_anchor；同场连续动作可建议existing；
+   基准图只适合继承造型和环境时使用appearance_only，不要把它误当作严格首帧。
+9. 只输出sceneTitle、lookPlan和shots；每个shot只有title、direction、
+   suggestedDurationSeconds、anchorMode、sceneLookUsage。
 """.strip()
 
 
@@ -391,14 +396,14 @@ def compile_shot_assistance_prompt(
 【项目与场景】项目“{project_title}”，场景“{scene_title}”：{scene_text}
 【长期角色与画风】人物：{visual_profile.person_identity}；{visual_profile.person_hair}；{visual_profile.person_body}。猫咪：{visual_profile.cat_identity}。画风：{'、'.join(visual_profile.style_positive)}。排除：{'、'.join(visual_profile.style_negative)}。
 【上一片段】{previous_text}
-【当前片段】标题：{current.title}；目标总时长：{current.duration_seconds}秒；场景定妆策略：{current.scene_look_usage.value}；锚点方式：{current.anchor_mode.value}；完整分镜：{current.direction}
+【当前片段】标题：{current.title}；目标总时长：{current.duration_seconds}秒；场景视觉基准策略：{current.scene_look_usage.value}；锚点方式：{current.anchor_mode.value}；完整分镜：{current.direction}
 【下一片段】{following_text}
 【免费本地诊断】{local_analysis.model_dump_json(by_alias=True)}
 【本次实际分析图片，按顺序】
 {references}
 
 请实际查看每张图片，而不是只根据素材ID判断。重点比较图片里的动作起始状态、人物与猫咪位置、
-道具所在位置、姿态、构图和当前分镜是否一致；判断场景定妆更适合off、appearance_only、
+道具所在位置、姿态、构图和当前分镜是否一致；判断场景视觉基准更适合off、appearance_only、
 full_reference还是derive_anchor，并说明是否需要独立开场锚点。
 
 分析动作密度、2至4个连续子镜头的定性节奏、推荐总时长、当前与相邻片段的重复、遗漏、

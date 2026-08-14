@@ -6,15 +6,15 @@ import { api } from "../api/client";
 import type {
   CreativeWorkflowDto,
   CreativeStepRecord,
-  JobDto,
   SceneDto,
   ShotSuggestionOutput,
   StoryDiagnosisOutput,
   StoryRewriteOutput,
   StoryRewriteStrategy,
 } from "../api/types";
+import { registerTask, useTaskCenter } from "../tasks/taskCenter";
 
-const props = defineProps<{ scene: SceneDto }>();
+const props = defineProps<{ scene: SceneDto; projectId?: string }>();
 const emit = defineEmits<{ changed: [] }>();
 
 const workflow = ref<CreativeWorkflowDto | null>(null);
@@ -30,6 +30,7 @@ const rewriteStepId = ref("");
 const rewriteDraft = ref<StoryRewriteOutput | null>(null);
 const storyboardStepId = ref("");
 const storyboardDraft = ref<ShotSuggestionOutput | null>(null);
+const taskCenter = useTaskCenter();
 
 const diagnosisVersions = computed(() => workflow.value?.stages.diagnosis ?? []);
 
@@ -110,7 +111,30 @@ function selectStoryboardVersion(item: CreativeStepRecord | null) {
   const accepted = item.acceptedOutput as unknown as ShotSuggestionOutput | null | undefined;
   const provider = item.providerOutput as unknown as ShotSuggestionOutput | null | undefined;
   const output = accepted?.shots ? accepted : provider;
-  storyboardDraft.value = output ? structuredClone(toRaw(output)) : null;
+  if (!output) {
+    storyboardDraft.value = null;
+    return;
+  }
+  const draft = structuredClone(toRaw(output));
+  draft.shots = draft.shots.map((shot) => ({
+    ...shot,
+    anchorMode: shot.anchorMode ?? "text_only",
+    sceneLookUsage: shot.sceneLookUsage ?? "appearance_only",
+  }));
+  storyboardDraft.value = draft;
+}
+
+function updateAnchorMode(index: number) {
+  const shot = storyboardDraft.value?.shots[index];
+  if (!shot) return;
+  if (shot.anchorMode !== "generate" && shot.sceneLookUsage === "derive_anchor") {
+    shot.sceneLookUsage = "appearance_only";
+  }
+}
+
+function updateSceneLookUsage(index: number) {
+  const shot = storyboardDraft.value?.shots[index];
+  if (shot?.sceneLookUsage === "derive_anchor") shot.anchorMode = "generate";
 }
 
 function diagnosisState(item: CreativeStepRecord): string {
@@ -148,14 +172,6 @@ function selectDiagnosisVersion(item: CreativeStepRecord | null) {
     ?? "balanced";
 }
 
-async function waitJob(id: string): Promise<JobDto> {
-  for (;;) {
-    const job = await api.job(id);
-    if (job.status === "succeeded" || job.status === "failed") return job;
-    await new Promise((resolve) => window.setTimeout(resolve, 1000));
-  }
-}
-
 async function perform(action: () => Promise<void>) {
   busy.value = true;
   error.value = "";
@@ -168,18 +184,33 @@ async function perform(action: () => Promise<void>) {
   }
 }
 
+async function submitBackground(
+  submit: () => Promise<{ jobId: string }>,
+  options: { kind: string; label: string; operationKey: string },
+) {
+  error.value = "";
+  try {
+    const submitted = await submit();
+    registerTask(submitted.jobId, {
+      ...options,
+      projectId: props.projectId,
+      sceneId: props.scene.id,
+    });
+    ElMessage.success(`${options.label}已提交到全局任务中心，可继续编辑或切换页面`);
+  } catch (caught) {
+    error.value = caught instanceof Error ? caught.message : String(caught);
+  }
+}
+
 async function diagnose() {
   await ElMessageBox.confirm(
     `剧情医生将把当前原始剧情和项目角色档案发送给 ${planningModel.value}。本次不分析图片，但会产生一次 Ark 规划模型费用。`,
     "剧情诊断付费确认",
   );
-  await perform(async () => {
-    const submitted = await api.diagnoseStory(props.scene.id);
-    const job = await waitJob(submitted.jobId);
-    if (job.status === "failed") throw new Error(String(job.error?.message ?? "剧情诊断失败"));
-    const result = job.result as { stepId: string; diagnosis: StoryDiagnosisOutput };
-    diagnosisStepId.value = result.stepId;
-    await load();
+  await submitBackground(() => api.diagnoseStory(props.scene.id), {
+    kind: "story_diagnosis",
+    label: "剧情诊断",
+    operationKey: "director:story-diagnosis",
   });
 }
 
@@ -205,18 +236,17 @@ async function rewrite() {
     `剧本编辑将使用已接受诊断调用 ${planningModel.value}，重写完整剧情但不拆镜头。本次会产生一次 Ark 规划模型费用。`,
     "剧情重写付费确认",
   );
-  await perform(async () => {
-    const submitted = await api.rewriteStory(
+  await submitBackground(
+    () => api.rewriteStory(
       props.scene.id,
       rewriteEligibleDiagnosis.value!.stepId,
-    );
-    const job = await waitJob(submitted.jobId);
-    if (job.status === "failed") throw new Error(String(job.error?.message ?? "剧情重写失败"));
-    const result = job.result as { stepId: string; rewrite: StoryRewriteOutput };
-    rewriteStepId.value = result.stepId;
-    rewriteDraft.value = structuredClone(result.rewrite);
-    await load();
-  });
+    ),
+    {
+      kind: "story_rewrite",
+      label: "剧情重写",
+      operationKey: "director:story-rewrite",
+    },
+  );
 }
 
 function editRewriteHistory() {
@@ -242,13 +272,10 @@ async function runStoryboard() {
     `分镜导演将使用当前批准剧情调用 ${planningModel.value}，生成 ${props.scene.targetShotCount} 个可编辑视频片段。本次会产生一次 Ark 规划模型费用。`,
     "分镜导演付费确认",
   );
-  await perform(async () => {
-    const submitted = await api.suggestShots(props.scene.id);
-    const job = await waitJob(submitted.jobId);
-    if (job.status === "failed") throw new Error(String(job.error?.message ?? "分镜生成失败"));
-    const result = job.result as { stepId: string; output: ShotSuggestionOutput };
-    storyboardStepId.value = result.stepId;
-    await load();
+  await submitBackground(() => api.suggestShots(props.scene.id), {
+    kind: "shot_suggestions",
+    label: "分镜导演",
+    operationKey: "director:shot-suggestions",
   });
 }
 
@@ -273,6 +300,10 @@ async function acceptStoryboard() {
 }
 
 watch(() => [props.scene.id, props.scene.sourceText], () => void load());
+watch(() => taskCenter.revision.value, () => {
+  const event = taskCenter.lastEvent.value;
+  if (event?.item.sceneId === props.scene.id) void load();
+});
 onMounted(() => void load());
 </script>
 
@@ -411,6 +442,23 @@ onMounted(() => void load());
           <div class="suggestion-shot-head"><b>{{ index + 1 }}. 视频片段</b><el-input-number v-model="shot.suggestedDurationSeconds" :min="8" :max="15" :disabled="Boolean(selectedStoryboard?.acceptedAt)" /></div>
           <el-form-item label="标题"><el-input v-model="shot.title" :readonly="Boolean(selectedStoryboard?.acceptedAt)" /></el-form-item>
           <el-form-item label="完整分镜描述（2–4 个编号子镜头）"><el-input v-model="shot.direction" type="textarea" :rows="7" :readonly="Boolean(selectedStoryboard?.acceptedAt)" /></el-form-item>
+          <div class="strategy-grid">
+            <el-form-item label="开场锚点">
+              <el-select v-model="shot.anchorMode" :disabled="Boolean(selectedStoryboard?.acceptedAt)" @change="updateAnchorMode(index)">
+                <el-option label="纯文本开场" value="text_only" />
+                <el-option label="采用已有图片/上一片段尾帧" value="existing" />
+                <el-option label="生成独立开场锚点" value="generate" />
+              </el-select>
+            </el-form-item>
+            <el-form-item label="场景视觉基准">
+              <el-select v-model="shot.sceneLookUsage" :disabled="Boolean(selectedStoryboard?.acceptedAt)" @change="updateSceneLookUsage(index)">
+                <el-option label="关闭" value="off" />
+                <el-option label="只继承造型/环境（默认）" value="appearance_only" />
+                <el-option label="完整参考" value="full_reference" />
+                <el-option label="仅用于派生开场锚点" value="derive_anchor" />
+              </el-select>
+            </el-form-item>
+          </div>
         </article>
         <el-alert
           v-if="hasShotHistory && props.scene.shots.length !== storyboardDraft.shots.length"
@@ -454,7 +502,7 @@ header div, .option { display: grid; gap: 3px; }.stage { display: grid; gap: 8px
 .version-button { min-width: 150px; display: grid; gap: 2px; text-align: left; padding: 8px 10px; color: #cbd5e1; background: #111827; border: 1px solid #344155; border-radius: 7px; cursor: pointer; }
 .version-button.selected { color: #eaf3ff; border-color: #409eff; box-shadow: 0 0 0 1px #409eff44; }
 .version-button span { color: #7fb2eb; }.version-button small { color: #7e8a9d; }
-.look-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
+.look-grid, .strategy-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
 .suggestion-summary, .suggestion-shot-head { display: flex; gap: 10px; justify-content: space-between; align-items: center; flex-wrap: wrap; }
 .suggestion-shot { display: grid; gap: 7px; padding: 12px; border: 1px solid #2f3948; border-radius: 8px; background: #101722; }
 </style>

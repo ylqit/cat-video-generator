@@ -4,6 +4,7 @@ import type {
   CreativeWorkflowDto,
   HealthDto,
   JobDto,
+  PersistentTaskDto,
   PreviousTailStatus,
   ProjectGraph,
   ProjectSummary,
@@ -148,8 +149,17 @@ export const api = {
   reorderShots: (sceneId: string, ids: string[]) =>
     json<{ saved: boolean }>(`/scenes/${sceneId}/shot-order`, "PUT", { ids }),
   shot: (shotId: string) => request<ShotDto>(`/shots/${shotId}`),
-  promptPreview: (shotId: string) =>
-    request<ShotPromptPreview>(`/shots/${shotId}/prompt-preview`),
+  promptPreview: (
+    shotId: string,
+    target: "anchor" | "video" = "video",
+    regenerationInstruction?: string,
+  ) => {
+    const query = new URLSearchParams({ target });
+    if (regenerationInstruction) {
+      query.set("regeneration_instruction", regenerationInstruction);
+    }
+    return request<ShotPromptPreview>(`/shots/${shotId}/prompt-preview?${query.toString()}`);
+  },
   shotAssistContext: (shotId: string) =>
     request<ShotAssistContext>(`/shots/${shotId}/assist-context`),
   assistShot: (
@@ -264,6 +274,8 @@ export const api = {
     json(`/steps/${stepId}/reconcile`, "POST", { providerTaskId }),
   jobs: () => request<JobDto[]>("/jobs"),
   job: (jobId: string) => request<JobDto>(`/jobs/${jobId}`),
+  projectTasks: (projectId: string) =>
+    request<PersistentTaskDto[]>(`/projects/${projectId}/tasks`),
   canon: () => request<AssetDto[]>("/canon"),
 };
 

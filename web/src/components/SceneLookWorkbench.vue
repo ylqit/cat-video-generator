@@ -1,11 +1,10 @@
 <script setup lang="ts">
 import { ElMessage, ElMessageBox } from "element-plus";
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 
 import { api, assetContentUrl } from "../api/client";
 import type {
   AssetDto,
-  JobDto,
   LookReferenceBinding,
   LookReferencePurpose,
   SceneDto,
@@ -14,6 +13,7 @@ import type {
   SceneLookVersion,
   VisualProfileRevisionDto,
 } from "../api/types";
+import { registerTask, useTaskCenter } from "../tasks/taskCenter";
 
 const props = defineProps<{
   projectId: string;
@@ -32,6 +32,8 @@ const preview = ref<SceneLookPromptPreview | null>(null);
 const versions = ref<SceneLookVersion[]>([]);
 const selectedVersion = ref<SceneLookVersion | null>(null);
 const imageErrors = ref<Record<string, string>>({});
+const taskCenter = useTaskCenter();
+const versionGallery = ref<HTMLElement | null>(null);
 
 const usableAssets = computed(() => props.assets.filter(
   (item) => item.mediaType === "image"
@@ -49,6 +51,14 @@ const selectedIds = computed(() => new Set(
 ));
 const selectedAsset = computed(() => props.assets.find(
   (item) => item.id === props.scene.selectedLookAssetId,
+) ?? null);
+const sceneLookAssets = computed(() => props.assets.filter(
+  (item) => item.sceneId === props.scene.id && item.role === "scene_look",
+));
+const activeTask = computed(() => taskCenter.items.value.find(
+  (item) => item.sceneId === props.scene.id
+    && item.operationKey === "image:scene-look"
+    && ["queued", "pending", "submitting", "running", "restart_pending"].includes(item.status),
 ) ?? null);
 
 async function open() {
@@ -193,7 +203,7 @@ async function saveDraft(showMessage = true): Promise<SceneLookDraftEnvelope | n
     envelope.value.draft,
   );
   envelope.value = saved;
-  if (showMessage) ElMessage.success(`场景定妆草稿 Revision ${saved.revision} 已保存`);
+  if (showMessage) ElMessage.success(`场景视觉基准草稿 Revision ${saved.revision} 已保存`);
   emit("refreshed");
   return saved;
 }
@@ -205,16 +215,9 @@ async function previewPrompt() {
   });
 }
 
-async function waitJob(id: string): Promise<JobDto> {
-  for (;;) {
-    const job = await api.job(id);
-    if (["succeeded", "failed"].includes(job.status)) return job;
-    await new Promise((resolve) => window.setTimeout(resolve, 1200));
-  }
-}
-
 async function generate() {
-  await run(async () => {
+  errorText.value = "";
+  try {
     const saved = await saveDraft(false);
     if (!saved) return;
     preview.value = await api.previewSceneLookPrompt(props.scene.id);
@@ -237,21 +240,43 @@ async function generate() {
       + `${regenerate ? "重新生成并保留旧版本" : "生成新候选"}会产生一次 Seedream 费用。`,
       "生成确认",
     );
-    const accepted = await api.generateSceneLook(
+    const submitted = await api.generateSceneLook(
       props.scene.id,
       saved.revision,
       regenerate,
       reason,
     );
-    const job = await waitJob(accepted.jobId);
-    if (job.status === "failed") {
-      throw new Error(String(job.error?.message ?? "定妆图生成失败"));
-    }
-    versions.value = await api.sceneLookVersions(props.scene.id);
-    selectedVersion.value = versions.value[0] ?? null;
-    emit("refreshed");
-  });
+    registerTask(submitted.jobId, {
+      kind: "generate_scene_look",
+      label: regenerate ? `场景视觉基准 V${versions.value.length + 1}` : "场景视觉基准 V1",
+      projectId: props.projectId,
+      sceneId: props.scene.id,
+      operationKey: "image:scene-look",
+    });
+    ElMessage.success("场景视觉基准任务已提交，可关闭工作台继续操作");
+  } catch (error) {
+    errorText.value = error instanceof Error ? error.message : String(error);
+  }
 }
+
+async function refreshVersions() {
+  versions.value = await api.sceneLookVersions(props.scene.id);
+  selectedVersion.value = versions.value.find((item) => item.selected)
+    ?? versions.value[0]
+    ?? null;
+  emit("refreshed");
+}
+
+function scrollToVersions() {
+  versionGallery.value?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+watch(() => taskCenter.revision.value, () => {
+  const event = taskCenter.lastEvent.value;
+  if (event?.item.sceneId !== props.scene.id) return;
+  if (visible.value) void refreshVersions();
+  else emit("refreshed");
+});
 
 async function decide(version: SceneLookVersion, decision: "approved" | "rejected") {
   await run(async () => {
@@ -288,8 +313,10 @@ async function recordImageFailure(asset: AssetDto) {
 
 <template>
   <div class="look-entry">
-    <el-button size="small" type="primary" plain @click="open">打开定妆工作台</el-button>
-    <span v-if="selectedAsset">已选：{{ selectedAsset.displayName }}</span>
+    <el-button size="small" type="primary" plain @click="open">打开视觉基准工作台</el-button>
+    <el-tag v-if="activeTask" type="info">{{ activeTask.status }}</el-tag>
+    <span v-if="selectedAsset">当前已选：{{ selectedAsset.displayName }} · 共 {{ sceneLookAssets.length }} 个版本</span>
+    <span v-else>尚未选择批准版本 · 共 {{ sceneLookAssets.length }} 个版本</span>
     <el-image
       v-if="selectedAsset?.contentReady && !imageErrors[selectedAsset.id]"
       class="selected-thumb"
@@ -303,6 +330,17 @@ async function recordImageFailure(asset: AssetDto) {
   <el-dialog v-model="visible" title="场景视觉基准工作台" width="min(1180px, 96vw)" destroy-on-close>
     <div v-loading="busy" class="look-workbench">
       <el-alert v-if="errorText" type="error" :closable="false" :title="errorText" show-icon />
+      <section class="workbench-toolbar">
+        <div>
+          <b>{{ selectedVersion ? `当前查看 V${selectedVersion.attempt ?? '?'}` : '尚无视觉基准版本' }}</b>
+          <small>{{ selectedAsset ? `场景已选择 ${selectedAsset.displayName}` : '场景尚未选择批准版本' }} · {{ versions.length }} 个历史版本</small>
+          <small v-if="preview">当前 Prompt {{ preview.charCount }} 字 · {{ preview.referenceCount }} 张参考图</small>
+        </div>
+        <div>
+          <el-button @click="scrollToVersions">查看全部版本</el-button>
+          <el-button type="primary" :disabled="!envelope || Boolean(activeTask)" @click="generate">{{ versions.length ? '重试生成新候选' : '生成新候选' }}</el-button>
+        </div>
+      </section>
 
       <el-collapse v-if="profile" model-value="profile">
         <el-collapse-item name="profile" title="1. 角色与画风锁定（项目视觉档案，只读）">
@@ -320,7 +358,7 @@ async function recordImageFailure(asset: AssetDto) {
       </el-collapse>
 
       <section v-if="envelope" class="section">
-        <h3>2. 场景造型草稿 · Revision {{ envelope.revision }}</h3>
+        <h3>2. 场景视觉基准草稿 · Revision {{ envelope.revision }}</h3>
         <div class="form-grid">
           <el-form-item label="人物服装"><el-input v-model="envelope.draft.lookPlan.personWardrobe" /></el-form-item>
           <el-form-item label="人物配件"><el-input v-model="envelope.draft.lookPlan.personAccessories" /></el-form-item>
@@ -329,7 +367,7 @@ async function recordImageFailure(asset: AssetDto) {
           <el-form-item label="人物姿态"><el-input v-model="envelope.draft.lookPlan.personPose" /></el-form-item>
           <el-form-item label="猫咪姿态"><el-input v-model="envelope.draft.lookPlan.catPose" /></el-form-item>
           <el-form-item label="场景环境"><el-radio-group :model-value="envelope.draft.lookPlan.environmentStyle" @update:model-value="setEnvironment"><el-radio-button value="outdoor">户外</el-radio-button><el-radio-button value="indoor">室内</el-radio-button></el-radio-group></el-form-item>
-          <el-form-item label="定妆建议"><el-switch v-model="envelope.draft.lookPlan.imageRecommended" active-text="建议生成（不阻断视频）" /></el-form-item>
+          <el-form-item label="视觉基准建议"><el-switch v-model="envelope.draft.lookPlan.imageRecommended" active-text="建议生成（不阻断视频）" /></el-form-item>
         </div>
         <el-form-item label="构图与人猫空间关系"><el-input v-model="envelope.draft.lookPlan.composition" type="textarea" :rows="3" /></el-form-item>
         <el-form-item label="补充生成要求"><el-input v-model="envelope.draft.lookPlan.additionalInstructions" type="textarea" :rows="3" /></el-form-item>
@@ -359,7 +397,7 @@ async function recordImageFailure(asset: AssetDto) {
       </section>
 
       <section class="section prompt-section">
-        <div class="section-heading"><h3>4. 最终 Prompt 与付费前预检</h3><div><el-button :disabled="!envelope" @click="run(() => saveDraft().then(() => undefined))">保存草稿</el-button><el-button :disabled="!envelope" @click="previewPrompt">编译预览</el-button><el-button type="primary" :disabled="!preview || preview.warnings.length > 0" @click="generate">确认并生成</el-button></div></div>
+        <div class="section-heading"><h3>4. 最终 Prompt 与付费前预检</h3><div><el-button :disabled="!envelope" @click="run(() => saveDraft().then(() => undefined))">保存草稿</el-button><el-button :disabled="!envelope" @click="previewPrompt">编译预览</el-button><el-button type="primary" :disabled="!preview || preview.warnings.length > 0 || Boolean(activeTask)" @click="generate">确认并生成</el-button></div></div>
         <template v-if="preview">
           <el-alert v-for="warning in preview.warnings" :key="warning" type="warning" :closable="false" :title="warning" />
           <p>{{ healthModel }} · {{ preview.referenceCount }} 张参考 · {{ preview.charCount }} 字</p>
@@ -368,7 +406,7 @@ async function recordImageFailure(asset: AssetDto) {
         </template>
       </section>
 
-      <section class="section">
+      <section ref="versionGallery" class="section">
         <h3>5. 视觉基准版本画廊</h3>
         <div class="gallery">
           <div class="version-list">
@@ -403,6 +441,7 @@ async function recordImageFailure(asset: AssetDto) {
 <style scoped>
 .look-entry { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 7px; }.look-entry span { color: #91a2ba; }.selected-thumb { width: 64px; height: 72px; background: #090c11; }
 .look-workbench { min-height: 500px; display: grid; gap: 14px; }.section { padding: 14px; border: 1px solid #2b323f; border-radius: 9px; background: #11161e; }.section h3 { margin: 0 0 12px; }.section-heading,.revision-line { display: flex; align-items: center; justify-content: space-between; gap: 14px; }.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }.muted { color: #8d97a8; font-size: 12px; }.asset-group { margin-top: 14px; }.asset-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 9px; margin-top: 7px; }.asset-grid article { display: grid; gap: 6px; padding: 8px; border: 1px solid #2c3441; border-radius: 7px; }.asset-grid article.chosen { border-color: #409eff; }.asset-grid .el-image,.image-failure { width: 100%; height: 150px; background: #090c11; }.image-failure { display: grid; place-content: center; box-sizing: border-box; padding: 8px; color: #dc9d62; font-size: 11px; }.asset-grid small { color: #dc9d62; }.prompt-section pre,.version-detail pre { white-space: pre-wrap; max-height: 360px; overflow: auto; background: #090c11; padding: 12px; border-radius: 7px; }.gallery { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 12px; }.version-list { display: grid; align-content: start; gap: 6px; }.version-list button { display: grid; gap: 3px; text-align: left; color: #dce2ec; background: #0d1219; border: 1px solid #2b3442; border-radius: 7px; padding: 9px; cursor: pointer; }.version-list button.active { border-color: #409eff; }.version-list small { color: #8490a2; }.large-image { width: 100%; height: min(66vh, 720px); background: #080b0f; }.gallery-actions { display: flex; gap: 8px; margin: 10px 0; }.version-references { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 7px; margin: 10px 0; }.version-references > div { display: grid; gap: 4px; color: #8d97a8; font-size: 10px; }.version-references .el-image { width: 100%; height: 100px; background: #090c11; }
+.workbench-toolbar { position: sticky; top: 0; z-index: 3; display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid #3b4a60; border-radius: 9px; background: #101722ee; backdrop-filter: blur(8px); }.workbench-toolbar > div { display: grid; gap: 4px; }.workbench-toolbar > div:last-child { display: flex; flex-wrap: wrap; }.workbench-toolbar small { color: #8d9ab0; }
 .profile-summary { margin-top: 10px; color: #aeb8c8; line-height: 1.6; }.profile-summary p { margin: 5px 0; }
 @media (max-width: 800px) { .form-grid,.gallery { grid-template-columns: 1fr; }.section-heading,.revision-line { align-items: flex-start; flex-direction: column; } }
 </style>

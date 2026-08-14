@@ -37,12 +37,12 @@ from ..domain.contracts import (
 )
 from ..domain.creative_workflow import shot_snapshot_hash, story_source_hash
 from ..domain.prompts import (
+    CompiledPrompt,
     compile_anchor_prompt,
     compile_range_edit_prompt,
     compile_scene_look_prompt,
     compile_shot_assistance_prompt,
     compile_shot_suggestion_prompt,
-    compile_shot_video_prompt,
     compile_shot_video_prompt_parts,
     compile_story_diagnosis_prompt,
     compile_story_rewrite_prompt,
@@ -55,6 +55,7 @@ from ..domain.rendering import (
     SequenceStatus,
     SequenceTransition,
     SequenceTransitionType,
+    VideoInputPlan,
     build_edit_input_plan,
     build_shot_input_plan,
 )
@@ -84,6 +85,24 @@ from .ports import (
 class SuggestionResult:
     step_id: uuid.UUID
     output: ShotSuggestionOutput
+
+
+@dataclass(frozen=True, slots=True)
+class ShotGenerationSpec:
+    """One authoritative projection used by both preview and paid submission."""
+
+    target: ReferenceTarget
+    prompt: CompiledPrompt
+    creative_body: str
+    system_shell: str
+    input_plan: VideoInputPlan | None
+    sources: tuple[StoredAsset, ...]
+    descriptions: tuple[str, ...]
+    snapshot: dict[str, Any]
+    input_hash: str
+    source_revision_hash: str
+    blockers: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -656,7 +675,8 @@ class ProjectEditingService:
                 title=item.title,
                 direction=item.direction,
                 durationSeconds=item.suggested_duration_seconds,
-                anchorMode=AnchorMode.TEXT_ONLY,
+                anchorMode=item.anchor_mode,
+                sceneLookUsage=item.scene_look_usage,
             )
             for item in shots
         )
@@ -1394,50 +1414,52 @@ class ShotProductionService:
     def validate_scene_look_request(self, scene_id: uuid.UUID, draft_revision: int) -> None:
         scene = self._repository.get_scene(scene_id)
         if scene.look_draft is None:
-            raise RevisionConflictError("请先保存场景定妆草稿再生成")
+            raise RevisionConflictError("请先保存场景视觉基准草稿再生成")
         if scene.look_draft_revision != draft_revision:
-            raise RevisionConflictError("场景定妆草稿已更新，请重新预览后再生成")
+            raise RevisionConflictError("场景视觉基准草稿已更新，请重新预览后再生成")
         self._scene_look_inputs(scene_id, strict=True)
 
-    def preview_shot_prompt(self, shot_id: uuid.UUID) -> dict[str, Any]:
+    def preview_shot_prompt(
+        self,
+        shot_id: uuid.UUID,
+        *,
+        target: ReferenceTarget = ReferenceTarget.VIDEO,
+        regeneration_instruction: str | None = None,
+    ) -> dict[str, Any]:
+        if target is ReferenceTarget.BOTH:
+            raise ValueError("prompt preview target must be anchor or video")
         shot = self._repository.get_shot(shot_id)
-        profile = self._repository.get_visual_profile(shot.project_id)
         scene = self._repository.get_scene(shot.scene_id)
         project = self._repository.get_project(shot.project_id)
-        context = self._prompt_context(shot)
-        anchor, references, descriptions = self._resolve_video_inputs(
+        spec = self._compile_shot_generation(
             shot,
-            require_generated_anchor=False,
+            target=target,
+            regeneration_instruction=regeneration_instruction,
+            require_ready=False,
         )
-        plan = build_shot_input_plan(
-            resolution=self._resolution,
-            duration_seconds=shot.draft.duration_seconds,
-            anchor=None if anchor is None else _media_source(anchor),
-            references=tuple(_media_source(item) for item in references),
-        )
-        ordered_assets = (() if anchor is None else (anchor,)) + references
-        prompt_parts = compile_shot_video_prompt_parts(
-            context,
-            plan,
-            binding_descriptions=descriptions,
-            visual_profile=profile.draft,
-            semantic_aliases=_semantic_reference_aliases(ordered_assets),
-            strict_semantic_links=False,
-        )
-        prompt = prompt_parts.final
         local_analysis = analyze_shot_draft(shot.draft)
         return {
-            "prompt": prompt.text,
-            "creativeBody": prompt_parts.creative_body,
-            "systemShell": prompt_parts.system_shell.text,
-            "charCount": prompt.char_count,
-            "utf8Bytes": prompt.utf8_bytes,
-            "inputPlan": plan.model_dump(mode="json"),
+            "target": target.value,
+            "ready": not spec.blockers,
+            "blockers": list(spec.blockers),
+            "inputHash": spec.input_hash,
+            "sourceRevisionHash": spec.source_revision_hash,
+            "prompt": spec.prompt.text,
+            "creativeBody": spec.creative_body,
+            "systemShell": spec.system_shell,
+            "charCount": spec.prompt.char_count,
+            "utf8Bytes": spec.prompt.utf8_bytes,
+            "inputPlan": (
+                None
+                if spec.input_plan is None
+                else spec.input_plan.model_dump(mode="json")
+            ),
             "draftRevision": shot.draft_revision,
+            "anchorMode": shot.draft.anchor_mode.value,
             "sceneLookUsage": shot.draft.scene_look_usage.value,
             "localAnalysis": local_analysis.model_dump(mode="json", by_alias=True),
             "qualitativePacing": local_analysis.qualitative_pacing,
-            "linkWarnings": list(prompt_parts.link_warnings),
+            "linkWarnings": list(spec.warnings),
             "references": [
                 {
                     "index": index,
@@ -1448,15 +1470,47 @@ class ShotProductionService:
                     "sourceLayer": _shot_assist_asset_layer(
                         shot, scene, project, asset
                     ),
-                    "responsibility": descriptions[index - 1],
+                    "responsibility": spec.descriptions[index - 1],
                     "contentReady": asset.content_ready,
                 }
-                for index, asset in enumerate(ordered_assets, 1)
+                for index, asset in enumerate(spec.sources, 1)
             ],
             "previousTail": _tail_state_json(
                 _previous_tail_state(self._repository, shot)
             ),
         }
+
+    def validate_anchor_request(
+        self,
+        shot_id: uuid.UUID,
+        *,
+        allow_paid_generation: bool,
+    ) -> None:
+        self._require_paid_gateway(allow_paid_generation)
+        shot = self._repository.get_shot(shot_id)
+        self._compile_shot_generation(
+            shot,
+            target=ReferenceTarget.ANCHOR,
+            require_ready=True,
+        )
+
+    def validate_video_request(
+        self,
+        shot_id: uuid.UUID,
+        *,
+        allow_paid_generation: bool,
+    ) -> None:
+        if self._runtime_preflight is not None:
+            self._runtime_preflight.validate_for_video_generation(
+                allow_paid_generation=allow_paid_generation
+            )
+        self._require_paid_gateway(allow_paid_generation)
+        shot = self._repository.get_shot(shot_id)
+        self._compile_shot_generation(
+            shot,
+            target=ReferenceTarget.VIDEO,
+            require_ready=True,
+        )
 
     def generate_anchor(
         self,
@@ -1467,46 +1521,21 @@ class ShotProductionService:
         reason: str | None = None,
     ) -> dict[str, Any]:
         shot = self._repository.get_shot(shot_id)
-        if shot.draft.anchor_mode is not AnchorMode.GENERATE:
-            raise ValueError("the shot anchor mode is not generate")
         self._require_paid_gateway(allow_paid_generation)
-        reference_pairs = self._resolved_reference_pairs(
+        spec = self._compile_shot_generation(
             shot,
             target=ReferenceTarget.ANCHOR,
-        )
-        references = tuple(asset for _binding, asset in reference_pairs)
-        if len(references) > 14:
-            raise ValueError("Seedream最多允许14张参考图")
-        context = self._prompt_context(shot)
-        descriptions = tuple(
-            _video_reference_description(
-                index,
-                binding,
-                scene_look_usage=shot.draft.scene_look_usage,
-                asset=_asset,
-            )
-            for index, (binding, _asset) in enumerate(reference_pairs, 1)
-        )
-        profile = self._repository.get_visual_profile(shot.project_id)
-        prompt = compile_anchor_prompt(
-            context,
-            reference_descriptions=descriptions,
             regeneration_instruction=reason if regenerate else None,
-            visual_profile=profile.draft,
+            require_ready=True,
         )
-        snapshot = {
-            "shotCardId": str(shot.id),
-            "referenceAssetIds": [str(item.id) for item in references],
-            "durationSeconds": shot.draft.duration_seconds,
-        }
         step, _ = self._new_paid_step(
             shot,
             kind=StepKind.IMAGE,
             operation_key="image:anchor",
             model=self._gateway.image_model,
             purpose=PromptPurpose.IMAGE,
-            prompt=prompt.text,
-            snapshot=snapshot,
+            prompt=spec.prompt.text,
+            snapshot=spec.snapshot,
             force_new_attempt=regenerate,
             retry_reason=reason,
         )
@@ -1528,8 +1557,8 @@ class ShotProductionService:
         self._repository.update_step(step.id, status=StepStatus.SUBMITTING)
         try:
             result = self._gateway.generate_image(
-                prompt=prompt.text,
-                reference_paths=tuple(item.require_path() for item in references),
+                prompt=spec.prompt.text,
+                reference_paths=tuple(item.require_path() for item in spec.sources),
             )
             landed = self._asset_store.download(result.url, suffix=".png")
             qc = self._media_probe.inspect_image(landed.path)
@@ -1756,47 +1785,22 @@ class ShotProductionService:
             )
         self._require_paid_gateway(allow_paid_generation)
         shot = self._repository.get_shot(shot_id)
-        profile = self._repository.get_visual_profile(shot.project_id)
-        context = self._prompt_context(shot)
-        anchor, references, descriptions = self._resolve_video_inputs(shot)
-        plan = build_shot_input_plan(
-            resolution=self._resolution,
-            duration_seconds=shot.draft.duration_seconds,
-            anchor=None if anchor is None else _media_source(anchor),
-            references=tuple(_media_source(item) for item in references),
-        )
-        sources = (() if anchor is None else (anchor,)) + references
-        prompt = compile_shot_video_prompt(
-            context,
-            plan,
-            binding_descriptions=descriptions,
+        spec = self._compile_shot_generation(
+            shot,
+            target=ReferenceTarget.VIDEO,
             regeneration_instruction=reason if regenerate else None,
-            visual_profile=profile.draft,
-            semantic_aliases=_semantic_reference_aliases(sources),
+            require_ready=True,
         )
-        snapshot = {
-            "shotCardId": str(shot.id),
-            "visualProfileRevisionId": str(profile.id),
-            "visualProfileRevision": profile.revision,
-            "inputPlan": plan.model_dump(mode="json"),
-            "sourceAssetIds": [str(item.id) for item in sources],
-            "sourceAssets": [
-                {
-                    "assetId": str(item.id),
-                    "sha256": item.sha256,
-                    "semanticKey": item.semantic_key,
-                }
-                for item in sources
-            ],
-        }
+        if spec.input_plan is None:
+            raise RuntimeError("video generation specification has no input plan")
         step, _ = self._new_paid_step(
             shot,
             kind=StepKind.VIDEO,
             operation_key="video:shot",
             model=self._gateway.video_model,
             purpose=PromptPurpose.VIDEO,
-            prompt=prompt.text,
-            snapshot=snapshot,
+            prompt=spec.prompt.text,
+            snapshot=spec.snapshot,
             force_new_attempt=regenerate,
             retry_reason=reason,
         )
@@ -1805,9 +1809,9 @@ class ShotProductionService:
         self._repository.update_step(step.id, status=StepStatus.SUBMITTING)
         try:
             task = self._gateway.submit_video(
-                prompt=prompt.text,
-                input_plan=plan,
-                input_sources=tuple(item.require_path() for item in sources),
+                prompt=spec.prompt.text,
+                input_plan=spec.input_plan,
+                input_sources=tuple(item.require_path() for item in spec.sources),
             )
         except GatewayError as exc:
             status = StepStatus.SUBMISSION_UNKNOWN if exc.submission_unknown else StepStatus.FAILED
@@ -2326,6 +2330,147 @@ class ShotProductionService:
             for frame in frames:
                 frame.unlink(missing_ok=True)
 
+    def _compile_shot_generation(
+        self,
+        shot: StoredShot,
+        *,
+        target: ReferenceTarget,
+        regeneration_instruction: str | None = None,
+        require_ready: bool,
+    ) -> ShotGenerationSpec:
+        """Compile the exact assets, prompt and audit snapshot for one target."""
+
+        if target is ReferenceTarget.BOTH:
+            raise ValueError("generation target must be anchor or video")
+        profile = self._repository.get_visual_profile(shot.project_id)
+        scene = self._repository.get_scene(shot.scene_id)
+        project = self._repository.get_project(shot.project_id)
+        context = self._prompt_context(shot)
+        blockers: list[str] = []
+        warnings: tuple[str, ...] = ()
+
+        if target is ReferenceTarget.ANCHOR:
+            if shot.draft.anchor_mode is not AnchorMode.GENERATE:
+                blockers.append("当前锚点方式不是“生成新锚点”，无需提交锚点生成任务")
+            reference_pairs = self._resolved_reference_pairs(
+                shot,
+                target=ReferenceTarget.ANCHOR,
+            )
+            sources = tuple(asset for _binding, asset in reference_pairs)
+            if len(sources) > 14:
+                blockers.append("Seedream最多允许14张参考图")
+            descriptions = tuple(
+                _video_reference_description(
+                    index,
+                    binding,
+                    scene_look_usage=shot.draft.scene_look_usage,
+                    asset=asset,
+                )
+                for index, (binding, asset) in enumerate(reference_pairs, 1)
+            )
+            prompt = compile_anchor_prompt(
+                context,
+                reference_descriptions=descriptions,
+                regeneration_instruction=regeneration_instruction,
+                visual_profile=profile.draft,
+            )
+            creative_body = context.direction
+            system_shell = prompt.text
+            input_plan = None
+        else:
+            anchor, references, descriptions = self._resolve_video_inputs(
+                shot,
+                require_generated_anchor=False,
+            )
+            if (
+                shot.draft.anchor_mode is AnchorMode.GENERATE
+                and shot.selected_anchor_asset_id is None
+            ):
+                blockers.append("请先生成、批准并选择片段开场锚点")
+            sources = (() if anchor is None else (anchor,)) + references
+            input_plan = build_shot_input_plan(
+                resolution=self._resolution,
+                duration_seconds=shot.draft.duration_seconds,
+                anchor=None if anchor is None else _media_source(anchor),
+                references=tuple(_media_source(item) for item in references),
+            )
+            prompt_parts = compile_shot_video_prompt_parts(
+                context,
+                input_plan,
+                binding_descriptions=descriptions,
+                regeneration_instruction=regeneration_instruction,
+                visual_profile=profile.draft,
+                semantic_aliases=_semantic_reference_aliases(sources),
+                strict_semantic_links=False,
+            )
+            warnings = prompt_parts.link_warnings
+            blockers.extend(prompt_parts.link_warnings)
+            prompt = prompt_parts.final
+            creative_body = prompt_parts.creative_body
+            system_shell = prompt_parts.system_shell.text
+
+        source_assets = [
+            {
+                "assetId": str(item.id),
+                "sha256": item.sha256,
+                "semanticKey": item.semantic_key,
+            }
+            for item in sources
+        ]
+        source_revision_hash = _hash_json(
+            {
+                "target": target.value,
+                "projectId": str(project.id),
+                "projectTitle": project.title,
+                "scene": scene.draft.model_dump(mode="json", by_alias=True),
+                "selectedSceneLookAssetId": (
+                    None
+                    if scene.selected_look_asset_id is None
+                    else str(scene.selected_look_asset_id)
+                ),
+                "shot": shot.draft.model_dump(mode="json", by_alias=True),
+                "shotDraftRevision": shot.draft_revision,
+                "visualProfileRevisionId": str(profile.id),
+                "visualProfileHash": profile.profile_hash,
+                "sourceAssets": source_assets,
+            }
+        )
+        snapshot: dict[str, Any] = {
+            "generationTarget": target.value,
+            "sourceRevisionHash": source_revision_hash,
+            "shotCardId": str(shot.id),
+            "shotDraftRevision": shot.draft_revision,
+            "visualProfileRevisionId": str(profile.id),
+            "visualProfileRevision": profile.revision,
+            "sceneLookUsage": shot.draft.scene_look_usage.value,
+            "anchorMode": shot.draft.anchor_mode.value,
+            "sourceAssetIds": [item["assetId"] for item in source_assets],
+            "sourceAssets": source_assets,
+        }
+        if input_plan is None:
+            snapshot["referenceAssetIds"] = [item["assetId"] for item in source_assets]
+            snapshot["durationSeconds"] = shot.draft.duration_seconds
+        else:
+            snapshot["inputPlan"] = input_plan.model_dump(mode="json")
+        input_hash = _hash_json({"prompt": prompt.text, "snapshot": snapshot})
+        unique_blockers = tuple(dict.fromkeys(blockers))
+        if require_ready and unique_blockers:
+            raise ValueError("；".join(unique_blockers))
+        return ShotGenerationSpec(
+            target=target,
+            prompt=prompt,
+            creative_body=creative_body,
+            system_shell=system_shell,
+            input_plan=input_plan,
+            sources=sources,
+            descriptions=descriptions,
+            snapshot=snapshot,
+            input_hash=input_hash,
+            source_revision_hash=source_revision_hash,
+            blockers=unique_blockers,
+            warnings=warnings,
+        )
+
     def _new_paid_step(
         self,
         shot: StoredShot,
@@ -2547,7 +2692,7 @@ class ShotProductionService:
             draft.visual_profile_revision_id
         )
         if profile.project_id != scene.project_id:
-            raise ValueError("场景定妆引用了其他项目的视觉档案")
+            raise ValueError("场景视觉基准引用了其他项目的视觉档案")
         bindings: list[LookReferenceBinding] = []
         assets: list[StoredAsset] = []
         warnings: list[str] = []

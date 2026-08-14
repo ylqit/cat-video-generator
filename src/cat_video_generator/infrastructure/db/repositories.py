@@ -417,7 +417,7 @@ class SqlAlchemyWorkflowRepository:
             self._require_project(session, scene.production_run_id)
             if scene.look_draft_revision != expected_revision:
                 raise WorkflowConflictError(
-                    "场景定妆草稿已被更新，请重新加载后再保存"
+                    "场景视觉基准草稿已被更新，请重新加载后再保存"
                 )
             profile = _required(
                 session,
@@ -1923,6 +1923,7 @@ def _json_step(row: StoredStep) -> dict[str, Any]:
         "model": row.model,
         "inputSnapshot": row.input_snapshot,
         "error": row.error,
+        "createdAt": None if row.created_at is None else row.created_at.isoformat(),
     }
 
 

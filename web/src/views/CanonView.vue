@@ -62,7 +62,7 @@ onMounted(async () => {
     <el-alert
       type="info"
       :closable="false"
-      title="项目生成的定妆图、锚点和视频帧不会进入 Canon；它们只属于生成它们的视频项目。项目视觉档案请在对应项目的“项目设置”中管理。"
+      title="项目生成的场景视觉基准、锚点和视频帧不会进入 Canon；它们只属于生成它们的视频项目。项目视觉档案请在对应项目的“项目设置”中管理。"
     />
 
     <section v-for="group in groups" :key="group.key" class="canon-group">

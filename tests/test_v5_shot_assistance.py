@@ -27,6 +27,7 @@ from cat_video_generator.application.shot_queue import (
     ShotProductionService,
 )
 from cat_video_generator.domain.contracts import (
+    AnchorMode,
     ReferenceBinding,
     ReferenceRole,
     ReferenceTarget,
@@ -600,6 +601,107 @@ def test_prompt_preview_returns_free_rules_pacing_and_source_layers(tmp_path: Pa
     assert "正文由片段已确认正文注入" in preview["systemShell"]
     assert preview["references"] == []
     assert preview["previousTail"]["available"] is False
+    assert preview["target"] == "video"
+    assert preview["ready"] is True
+    assert preview["inputHash"]
+    assert preview["sourceRevisionHash"]
+
+    anchor_preview = service.preview_shot_prompt(
+        repository.shots[1].id,
+        target=ReferenceTarget.ANCHOR,
+    )
+    assert anchor_preview["target"] == "anchor"
+    assert anchor_preview["ready"] is False
+    assert "生成新锚点" in anchor_preview["blockers"][0]
+    assert anchor_preview["inputPlan"] is None
+    assert anchor_preview["inputHash"] != preview["inputHash"]
+
+    retry_preview = service.preview_shot_prompt(
+        repository.shots[1].id,
+        target=ReferenceTarget.ANCHOR,
+        regeneration_instruction="只修正柜门开场状态",
+    )
+    assert "只修正柜门开场状态" in retry_preview["prompt"]
+    assert retry_preview["inputHash"] != anchor_preview["inputHash"]
+    compiled = service._compile_shot_generation(
+        repository.shots[1],
+        target=ReferenceTarget.ANCHOR,
+        regeneration_instruction="只修正柜门开场状态",
+        require_ready=False,
+    )
+    assert retry_preview["prompt"] == compiled.prompt.text
+    assert retry_preview["inputHash"] == compiled.input_hash
+
+
+def test_derive_anchor_uses_scene_look_only_for_anchor_target(tmp_path: Path) -> None:
+    repository = _AssistRepository(tmp_path)
+    project_identity_path = tmp_path / "person.png"
+    project_identity_path.write_bytes(b"person")
+    project_identity = StoredAsset(
+        id=uuid.uuid4(),
+        project_id=repository.project.id,
+        scene_id=None,
+        shot_card_id=None,
+        step_id=None,
+        role="canon_reference",
+        media_type="image",
+        scope="canon",
+        status="approved",
+        path=project_identity_path,
+        sha256="c" * 64,
+        metadata={},
+        semantic_key="person:headshot",
+    )
+    repository.assets[project_identity.id] = project_identity
+    repository.project = replace(
+        repository.project,
+        default_reference_bindings=(
+            ReferenceBinding(
+                assetId=project_identity.id,
+                usage="generation_reference",
+                role="identity",
+                applyTo="both",
+            ),
+        ),
+    )
+    repository.scene = replace(
+        repository.scene,
+        selected_look_asset_id=repository.asset.id,
+    )
+    current = repository.shots[1]
+    current = replace(
+        current,
+        draft=current.draft.model_copy(
+            update={
+                "anchor_mode": AnchorMode.GENERATE,
+                "scene_look_usage": SceneLookUsage.DERIVE_ANCHOR,
+            }
+        ),
+    )
+    repository.shots = (repository.shots[0], current, repository.shots[2])
+    service = ShotProductionService(
+        repository=repository,  # type: ignore[arg-type]
+        gateway=None,
+        asset_store=object(),  # type: ignore[arg-type]
+        media_probe=object(),  # type: ignore[arg-type]
+        frame_extractor=None,
+        provider_name="fake",
+        resolution="720p",
+    )
+
+    anchor = service.preview_shot_prompt(current.id, target=ReferenceTarget.ANCHOR)
+    video = service.preview_shot_prompt(current.id, target=ReferenceTarget.VIDEO)
+
+    assert [item["assetId"] for item in anchor["references"]] == [
+        str(repository.asset.id),
+        str(project_identity.id),
+    ]
+    assert [item["assetId"] for item in video["references"]] == [
+        str(project_identity.id),
+    ]
+    assert anchor["ready"] is True
+    assert video["ready"] is False
+    assert video["blockers"] == ["请先生成、批准并选择片段开场锚点"]
 
 
 def test_generic_upload_cannot_claim_managed_identity_or_scene_role(tmp_path: Path) -> None:

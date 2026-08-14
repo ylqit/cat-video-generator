@@ -134,6 +134,8 @@ export interface ShotSuggestion {
   title: string;
   direction: string;
   suggestedDurationSeconds: number;
+  anchorMode?: AnchorMode;
+  sceneLookUsage?: SceneLookUsage;
 }
 
 export interface ShotSuggestionOutput {
@@ -225,6 +227,7 @@ export interface AttemptDto {
   model?: string | null;
   inputSnapshot: Record<string, unknown>;
   error?: Record<string, unknown> | null;
+  createdAt?: string | null;
   prompt?: PromptDto | null;
   reviews: Array<{
     id: string;
@@ -321,9 +324,30 @@ export interface JobDto {
   jobId: string;
   kind: string;
   status: "queued" | "running" | "succeeded" | "failed";
+  dedupKey?: string;
   context: Record<string, string>;
   result?: unknown;
   error?: Record<string, unknown> | null;
+  createdAt?: string | null;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+}
+
+export interface PersistentTaskDto {
+  stepId: string;
+  projectId: string;
+  sceneId?: string | null;
+  shotId?: string | null;
+  kind: string;
+  status: string;
+  attempt: number;
+  operationKey: string;
+  provider?: string | null;
+  providerTaskId?: string | null;
+  model?: string | null;
+  inputSnapshot: Record<string, unknown>;
+  error?: Record<string, unknown> | null;
+  createdAt?: string | null;
 }
 
 export interface HealthDto {
@@ -374,12 +398,19 @@ export interface PreviousTailStatus {
 }
 
 export interface ShotPromptPreview {
+  target: "anchor" | "video";
+  ready: boolean;
+  blockers: string[];
+  inputHash: string;
+  sourceRevisionHash: string;
   prompt: string;
   creativeBody: string;
   systemShell: string;
   charCount: number;
   utf8Bytes: number;
+  inputPlan?: Record<string, unknown> | null;
   draftRevision: number;
+  anchorMode: AnchorMode;
   sceneLookUsage: SceneLookUsage;
   localAnalysis: ShotLocalAnalysis;
   qualitativePacing: string;

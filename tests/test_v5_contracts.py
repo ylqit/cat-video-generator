@@ -51,6 +51,32 @@ def test_accept_suggestions_contract_defaults_and_parses_shot_revisions() -> Non
     )
 
     assert request.source_shot_revisions == {shot_id: 3}
+    assert request.shots[0].anchor_mode is contracts.AnchorMode.TEXT_ONLY
+    assert (
+        request.shots[0].scene_look_usage
+        is contracts.SceneLookUsage.APPEARANCE_ONLY
+    )
+
+
+def test_shot_suggestion_accepts_visual_strategy_and_validates_derive_anchor() -> None:
+    suggestion = contracts.ShotSuggestion(
+        title="准备开柜",
+        direction="1. 中景，小孩准备打开柜门。",
+        suggestedDurationSeconds=10,
+        anchorMode="generate",
+        sceneLookUsage="derive_anchor",
+    )
+
+    assert suggestion.anchor_mode is contracts.AnchorMode.GENERATE
+    assert suggestion.scene_look_usage is contracts.SceneLookUsage.DERIVE_ANCHOR
+
+    with pytest.raises(ValidationError, match="derive_anchor"):
+        contracts.ShotSuggestion(
+            title="准备开柜",
+            direction="1. 中景，小孩准备打开柜门。",
+            anchorMode="text_only",
+            sceneLookUsage="derive_anchor",
+        )
 
 
 def test_legacy_scene_look_boolean_maps_to_authoritative_usage() -> None:

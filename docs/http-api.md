@@ -62,12 +62,20 @@ GET    /api/v1/assets/{id}/content
 GET    /api/v1/canon
 GET    /api/v1/jobs
 GET    /api/v1/jobs/{id}
+GET    /api/v1/projects/{id}/tasks
 ```
 
-剧情诊断、剧情重写、分镜建议、片段多模态审稿、场景定妆、锚点、视频和区间重拍必须提交 `allowPaidGeneration=true`。锚点/视频请求的
+剧情诊断、剧情重写、分镜建议、片段多模态审稿、场景视觉基准、锚点、视频和区间重拍必须提交 `allowPaidGeneration=true`。锚点/视频请求的
 `regenerate=true`明确创建新 attempt，并可携带人工 reason；活跃任务或
 `submission_unknown`不得重做。Prompt 预览、编辑、人工审核、版本选择和总片本地合成
 不调用生成 Provider。
+
+所有长任务的 POST 只返回 `jobId`，不会等待 LLM、Seedream、Seedance 或本地合成完成。
+`GET /jobs` 提供当前进程内任务状态；`GET /projects/{id}/tasks` 从现有 `workflow_steps`
+返回可跨页面和服务重启恢复的持久任务。Web 全局任务中心合并两者：进程任务负责即时进度，
+持久步骤负责 Provider Task ID、等待审核、失败、待对账和重启后恢复。业务对话框不再轮询并遮挡页面。
+任务中心会对带 Task ID 的 queued/running 视频步骤节流调用现有 `resume` 查询；这只是查询原任务，
+不会重新提交 Seedance。`submission_unknown` 仍必须人工对账，不能自动重试。
 
 `POST /steps/{id}/accept-suggestions` 必须提交用户编辑后的 `lookPlan` 和 1～6 个
 `shots`；单片段场景严格为 1 个，多片段场景严格等于场景设置的 2～6 个。原始
@@ -92,17 +100,23 @@ revision，不同内容创建不可变 revision。`PUT /look-draft` 使用 `expe
 `providerOutput` 永久保留，`accept-shot-assistance` 只接受用户勾选且确实由该分析提出的字段或正文候选，
 保存 `acceptedOutput/acceptedAt`；草稿 Revision 已变化时返回 409。
 视觉审稿的候选图片只能来自当前实际输入上下文；即使客户端以其他顺序勾选，服务端仍按
-“批准锚点 → 片段自定义 → 场景定妆 → 项目 Canon → 可用上一片段尾帧”重排并按 SHA 去重。
+“批准锚点 → 片段自定义 → 场景视觉基准 → 项目 Canon → 可用上一片段尾帧”重排并按 SHA 去重。
 四个创作角色都使用 `ARK_PLANNING_MODEL`；`ARK_REVIEW_MODEL` 只用于生成后的视频抽帧诊断。
 
 `sceneLookUsage` 是片段场景视觉基准策略的权威字段：`off`、`appearance_only`、
 `full_reference`、`derive_anchor`。响应中的 `useSceneLook` 仅为 V5 兼容派生值。派生锚点时，
 场景视觉基准只进入 Seedream 锚点输入；锚点批准后不再重复进入 Seedance 视频输入。
 
-`prompt-preview` 分别返回 `creativeBody`、`systemShell`、实际参考图片及 `prompt`。素材职责由
-来源锁定：Canon 人物/猫咪为 identity、Canon 画风为 style、场景视觉基准为 scene、批准首帧为
-anchor；正文可使用内部语义标记，变更绑定后图片编号按实际输入重新编译，不输出不存在的
-`@图片N`。
+`GET /shots/{id}/prompt-preview?target=anchor|video` 分别编译锚点和视频目标，返回
+`ready`、`blockers`、`inputHash`、`sourceRevisionHash`、`creativeBody`、`systemShell`、实际参考图
+和最终 `prompt`。重新生成时可附 `regeneration_instruction`，确认页展示的 Prompt 与后台提交
+使用同一编译边界和同一修正说明。素材职责由来源锁定：Canon 人物/猫咪为 identity、Canon
+画风为 style、场景视觉基准为 scene、批准首帧为 anchor；正文可使用内部语义标记，变更绑定
+后图片编号按实际输入重新编译，不输出不存在的 `@图片N`。
+
+`derive_anchor` 的锚点预览包含“片段自定义 → 场景视觉基准 → 项目身份/画风”；批准锚点后的
+视频预览为“锚点 → 片段自定义 → 项目身份/画风”，场景视觉基准不重复提交。没有批准锚点时
+视频预览直接返回未就绪，POST 视频任务也在登记后台任务之前拒绝。
 
 批准片段视频后，系统尝试用本地 FFmpeg 生成可追溯 `shot_tail_frame`。下一片段可通过
 `adopt-previous-tail-anchor` 将其设为唯一批准锚点；如果上一片段更换批准视频，旧尾帧状态为

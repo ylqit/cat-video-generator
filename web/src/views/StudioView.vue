@@ -7,7 +7,6 @@ import { api, assetContentUrl } from "../api/client";
 import type {
   AnchorMode,
   AssetDto,
-  JobDto,
   LookReferencePurpose,
   ProjectGraph,
   ProjectSummary,
@@ -33,6 +32,8 @@ import VideoTimeline from "../components/VideoTimeline.vue";
 import CreativeWorkflowPanel from "../components/CreativeWorkflowPanel.vue";
 import SceneLookWorkbench from "../components/SceneLookWorkbench.vue";
 import ShotAssistancePanel from "../components/ShotAssistancePanel.vue";
+import ShotMediaVersions from "../components/ShotMediaVersions.vue";
+import { registerTask, rememberProject, useTaskCenter } from "../tasks/taskCenter";
 
 const route = useRoute();
 const router = useRouter();
@@ -48,7 +49,13 @@ const sequenceBuilderVisible = ref(false);
 const sceneVisible = ref(false);
 const shotVisible = ref(false);
 const assistConfirmVisible = ref(false);
-const promptPreview = ref<ShotPromptPreview | null>(null);
+const promptTarget = ref<"anchor" | "video">("video");
+const inspectorTab = ref("config");
+const anchorPromptPreview = ref<ShotPromptPreview | null>(null);
+const videoPromptPreview = ref<ShotPromptPreview | null>(null);
+const promptPreview = computed(() => promptTarget.value === "anchor"
+  ? anchorPromptPreview.value
+  : videoPromptPreview.value);
 const assistContext = ref<ShotAssistContext | null>(null);
 const assistAnalyses = ref<ShotAssistRecord[]>([]);
 const assistCandidateIds = ref<string[]>([]);
@@ -59,6 +66,7 @@ const projectProfile = ref<VisualProfileRevisionDto | null>(null);
 const projectProfileForm = ref<VisualProfileDraft | null>(null);
 const projectProfileReferenceIds = ref<string[]>([]);
 let polling: number | undefined;
+const taskCenter = useTaskCenter();
 
 function emptyLookPlan(): SceneLookPlan {
   return {
@@ -229,11 +237,31 @@ const shotFormFindings = computed(() => {
 
 function sceneLookUsageLabel(value: SceneLookUsage): string {
   return {
-    off: "关闭基础定妆",
+    off: "关闭场景视觉基准",
     appearance_only: "只继承造型（默认）",
     full_reference: "完整参考姿态与构图",
-    derive_anchor: "由基础定妆派生开场锚点",
+    derive_anchor: "由场景视觉基准派生开场锚点",
   }[value];
+}
+
+function shotReferenceSummary(shot: ShotDto, scene: SceneDto): string {
+  const existingAnchor = shot.referenceBindings.some(
+    (item) => item.usage === "approved_anchor",
+  );
+  const anchor = shot.selectedAnchorAssetId
+    ? "已选锚点"
+    : shot.anchorMode === "generate"
+      ? "待生成锚点"
+      : shot.anchorMode === "existing"
+        ? existingAnchor ? "已采用已有锚点" : "待选已有锚点"
+        : "无锚点";
+  const sceneLayer = scene.selectedLookAssetId && shot.sceneLookUsage !== "off"
+    ? sceneLookUsageLabel(shot.sceneLookUsage)
+    : "不使用场景基准";
+  const projectLayer = shot.inheritProjectReferences
+    ? `${graph.value?.project.defaultReferenceBindings.length ?? 0} 张项目继承`
+    : "项目继承关闭";
+  return `${anchor} / ${shot.referenceBindings.length} 张片段专用 / ${sceneLayer} / ${projectLayer}`;
 }
 
 function localDateText(): string {
@@ -254,12 +282,13 @@ async function loadGraph(projectId?: string) {
     graph.value = null;
     return;
   }
+  rememberProject(id);
   graph.value = await api.project(id);
   const requestedSequence = String(route.query.sequence ?? "");
   if (graph.value.sequences.some((item) => item.id === requestedSequence)) {
     selectedSequenceId.value = requestedSequence;
     selectedShotId.value = null;
-    await loadShotAssistance(null);
+    await Promise.all([loadShotAssistance(null), loadShotPrompts(null)]);
     return;
   }
   selectedSequenceId.value = null;
@@ -270,11 +299,15 @@ async function loadGraph(projectId?: string) {
     : selectedShotId.value && allShots.some((item) => item.id === selectedShotId.value)
       ? selectedShotId.value
       : allShots[0]?.id ?? null;
-  await loadShotAssistance(selectedShotId.value);
+  await Promise.all([
+    loadShotAssistance(selectedShotId.value),
+    loadShotPrompts(selectedShotId.value),
+  ]);
 }
 
 async function reloadGenerationInputs() {
-  promptPreview.value = null;
+  anchorPromptPreview.value = null;
+  videoPromptPreview.value = null;
   await loadGraph();
 }
 
@@ -290,8 +323,25 @@ async function selectShot(id: string) {
     path: "/studio",
     query: { project: graph.value?.project.id, shot: id },
   });
-  promptPreview.value = null;
-  await loadShotAssistance(id);
+  anchorPromptPreview.value = null;
+  videoPromptPreview.value = null;
+  await Promise.all([loadShotAssistance(id), loadShotPrompts(id)]);
+}
+
+async function loadShotPrompts(shotId?: string | null) {
+  if (!shotId) {
+    anchorPromptPreview.value = null;
+    videoPromptPreview.value = null;
+    return;
+  }
+  try {
+    [anchorPromptPreview.value, videoPromptPreview.value] = await Promise.all([
+      api.promptPreview(shotId, "anchor"),
+      api.promptPreview(shotId, "video"),
+    ]);
+  } catch (error) {
+    persistentError.value = error instanceof Error ? error.message : String(error);
+  }
 }
 
 async function loadShotAssistance(shotId?: string | null) {
@@ -311,7 +361,7 @@ async function loadShotAssistance(shotId?: string | null) {
 async function showSequence(id: string) {
   selectedSequenceId.value = id;
   selectedShotId.value = null;
-  await loadShotAssistance(null);
+  await Promise.all([loadShotAssistance(null), loadShotPrompts(null)]);
   await router.replace({
     path: "/studio",
     query: { project: graph.value?.project.id, sequence: id },
@@ -536,7 +586,7 @@ async function saveShot() {
 async function restoreCanonReferences() {
   if (!graph.value) return;
   await ElMessageBox.confirm(
-    "这会恢复项目视觉档案中的 Canon 人物、猫咪和画风参考，并从片段自定义集合移除误绑的场景定妆；不会删除任何历史生成记录。",
+    "这会恢复项目视觉档案中的 Canon 人物、猫咪和画风参考，并从片段自定义集合移除误绑的场景视觉基准；不会删除任何历史生成记录。",
     "恢复 Canon 默认引用",
   );
   await act(async () => {
@@ -546,21 +596,47 @@ async function restoreCanonReferences() {
   });
 }
 
+async function submitStudioTask(
+  submit: () => Promise<{ jobId: string }>,
+  options: {
+    kind: string;
+    label: string;
+    operationKey: string;
+    projectId: string;
+    sceneId?: string;
+    shotId?: string;
+  },
+) {
+  persistentError.value = "";
+  try {
+    const submitted = await submit();
+    registerTask(submitted.jobId, options);
+    ElMessage.success(`${options.label}已提交到全局任务中心，当前页面可以继续操作`);
+  } catch (error) {
+    persistentError.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
 async function runShotAssistance() {
   if (!selectedShot.value || !assistContext.value) return;
+  const shot = selectedShot.value;
+  const context = assistContext.value;
   assistConfirmVisible.value = false;
-  await act(async () => {
-    const accepted = await api.assistShot(
-      selectedShot.value!.id,
-      assistContext.value!.sourceDraftRevision,
+  await submitStudioTask(
+    () => api.assistShot(
+      shot.id,
+      context.sourceDraftRevision,
       assistCandidateIds.value,
-    );
-    const job = await waitJob(accepted.jobId);
-    if (job.status === "failed") {
-      throw new Error(String(job.error?.message ?? "LLM 创作分析失败；已保存的片段不受影响"));
-    }
-    await loadShotAssistance(selectedShot.value!.id);
-  });
+    ),
+    {
+      kind: "shot_assistance",
+      label: "片段视觉与 Prompt 审稿",
+      operationKey: "director:shot-assistance",
+      projectId: graph.value!.project.id,
+      sceneId: shot.sceneId,
+      shotId: shot.id,
+    },
+  );
 }
 
 async function applyShotAssistance(record: ShotAssistRecord, patch: ShotAssistPatch) {
@@ -581,7 +657,7 @@ async function adoptPreviousTail() {
   await act(async () => {
     await api.adoptPreviousTailAnchor(selectedShot.value!.id);
     await reloadGenerationInputs();
-    await showPrompt();
+    await showPrompt("video");
   });
 }
 
@@ -617,15 +693,43 @@ async function moveShot(scene: SceneDto, index: number, delta: number) {
 }
 
 
-async function showPrompt() {
+async function showPrompt(target: "anchor" | "video" = "video") {
   if (!selectedShot.value) return;
-  await act(async () => { promptPreview.value = await api.promptPreview(selectedShot.value!.id); });
+  promptTarget.value = target;
+  persistentError.value = "";
+  try {
+    const preview = await api.promptPreview(selectedShot.value.id, target);
+    if (target === "anchor") anchorPromptPreview.value = preview;
+    else videoPromptPreview.value = preview;
+  } catch (error) {
+    persistentError.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+function openPromptReview(target: "anchor" | "video") {
+  inspectorTab.value = "review";
+  void showPrompt(target);
+}
+
+function changePromptTarget(value: string | number | boolean | undefined) {
+  const target = value === "anchor" ? "anchor" : "video";
+  void showPrompt(target);
 }
 
 async function generate(kind: "anchor" | "video") {
-  if (!selectedShot.value) return;
+  if (!selectedShot.value || !graph.value) return;
+  const shot = selectedShot.value;
+  const preview = await api.promptPreview(shot.id, kind);
+  if (!preview.ready) {
+    persistentError.value = preview.blockers.join("；") || "当前生成输入尚未就绪";
+    ElMessage.warning(persistentError.value);
+    return;
+  }
+  if (kind === "anchor") anchorPromptPreview.value = preview;
+  else videoPromptPreview.value = preview;
+  promptTarget.value = kind;
   const operationKey = kind === "anchor" ? "image:anchor" : "video:shot";
-  const priorAttempts = selectedShot.value.attempts.filter(
+  const priorAttempts = shot.attempts.filter(
     (item) => item.operationKey === operationKey,
   );
   const regenerate = priorAttempts.length > 0;
@@ -642,6 +746,14 @@ async function generate(kind: "anchor" | "video") {
       ElMessage.warning("重新生成必须填写修正目标");
       return;
     }
+    const retryPreview = await api.promptPreview(shot.id, kind, reason);
+    if (!retryPreview.ready) {
+      persistentError.value = retryPreview.blockers.join("；") || "当前生成输入尚未就绪";
+      ElMessage.warning(persistentError.value);
+      return;
+    }
+    if (kind === "anchor") anchorPromptPreview.value = retryPreview;
+    else videoPromptPreview.value = retryPreview;
   }
   await ElMessageBox.confirm(
     kind === "anchor"
@@ -649,23 +761,35 @@ async function generate(kind: "anchor" | "video") {
       : `${action}当前视频片段会产生一次 Seedance 费用，是否继续？`,
     "付费确认",
   );
-  await act(async () => {
-    const accepted = kind === "anchor"
-      ? await api.generateAnchor(selectedShot.value!.id, regenerate, reason)
-      : await api.generateVideo(selectedShot.value!.id, regenerate, reason);
-    const job = await waitJob(accepted.jobId);
-    if (job.status === "failed") throw new Error(String(job.error?.message ?? "生成失败"));
-    await loadGraph();
-  });
+  await submitStudioTask(
+    () => kind === "anchor"
+      ? api.generateAnchor(shot.id, regenerate, reason)
+      : api.generateVideo(shot.id, regenerate, reason),
+    {
+      kind: kind === "anchor" ? "generate_anchor" : "generate_video",
+      label: kind === "anchor" ? "片段开场锚点" : "视频片段",
+      operationKey,
+      projectId: graph.value.project.id,
+      sceneId: shot.sceneId,
+      shotId: shot.id,
+    },
+  );
 }
 
 async function resumeAttempt(stepId: string) {
-  await act(async () => {
-    const accepted = await api.resumeStep(stepId);
-    const job = await waitJob(accepted.jobId);
-    if (job.status === "failed") throw new Error(String(job.error?.message ?? "继续查询失败"));
-    await loadGraph();
-  });
+  if (!graph.value || !selectedShot.value) return;
+  const shot = selectedShot.value;
+  await submitStudioTask(
+    () => api.resumeStep(stepId),
+    {
+      kind: "resume_step",
+      label: "恢复 Provider 任务查询",
+      operationKey: "resume",
+      projectId: graph.value.project.id,
+      sceneId: shot.sceneId,
+      shotId: shot.id,
+    },
+  );
 }
 
 async function reconcileAttempt(stepId: string) {
@@ -683,7 +807,18 @@ async function reconcileAttempt(stepId: string) {
   });
 }
 
-async function review(asset: AssetDto, decision: "approved" | "rejected") {
+async function review(
+  asset: AssetDto,
+  decision: "approved" | "rejected",
+  stale = false,
+) {
+  if (decision === "approved" && stale) {
+    await ElMessageBox.confirm(
+      "该媒体基于旧的片段文字、时长、锚点或参考图。批准后仍会设为当前版本，是否继续？",
+      "确认采用旧输入版本",
+      { type: "warning" },
+    );
+  }
   const reason = decision === "approved" ? "人工观看通过" : "人工观看未通过";
   await act(async () => {
     await api.reviewAsset(asset.id, decision, reason);
@@ -714,7 +849,7 @@ function isProjectDefault(assetId: string): boolean {
 async function toggleProjectDefault(asset: AssetDto) {
   if (!graph.value || !asset.contentReady) return;
   if (asset.role === "scene_look") {
-    ElMessage.warning("场景定妆只能通过场景视觉基准策略使用，不能保存为项目身份参考");
+    ElMessage.warning("场景视觉基准只能通过片段场景策略使用，不能保存为项目身份参考");
     return;
   }
   const references = graph.value.project.defaultReferenceBindings.filter(
@@ -839,17 +974,21 @@ function updateSequenceTransitionType(shotId: string, value: string) {
 
 async function buildSequence() {
   if (!graph.value) return;
-  await act(async () => {
-    const transitions = sequenceShots.value.slice(1).map((shot) => ({
-      afterShotId: shot.id,
-      transition: sequenceTransitions.value[shot.id] ?? { type: "cut", durationMs: 0 },
-    }));
-    const accepted = await api.buildSequence(graph.value!.project.id, transitions);
-    const job = await waitJob(accepted.jobId);
-    if (job.status === "failed") throw new Error(String(job.error?.message ?? "总片合成失败"));
-    sequenceBuilderVisible.value = false;
-    await loadGraph();
-  });
+  const projectId = graph.value.project.id;
+  const transitions = sequenceShots.value.slice(1).map((shot) => ({
+    afterShotId: shot.id,
+    transition: sequenceTransitions.value[shot.id] ?? { type: "cut", durationMs: 0 },
+  }));
+  sequenceBuilderVisible.value = false;
+  await submitStudioTask(
+    () => api.buildSequence(projectId, transitions),
+    {
+      kind: "build_sequence",
+      label: "本地成片合成",
+      operationKey: "sequence:build",
+      projectId,
+    },
+  );
 }
 
 async function decideSequence(sequence: SequenceDto, approve: boolean) {
@@ -861,20 +1000,19 @@ async function decideSequence(sequence: SequenceDto, approve: boolean) {
   });
 }
 
-async function selectVideoVersion(asset: AssetDto) {
+async function selectVideoVersion(asset: AssetDto, stale = false) {
   if (!selectedShot.value) return;
+  if (stale) {
+    await ElMessageBox.confirm(
+      "该版本基于旧输入。它仍可使用，但可能与当前 Prompt 或参考图不一致，是否继续选择？",
+      "选择历史版本",
+      { type: "warning" },
+    );
+  }
   await act(async () => {
     await api.selectVersion(selectedShot.value!.id, asset.id);
     await loadGraph();
   });
-}
-
-async function waitJob(id: string): Promise<JobDto> {
-  for (;;) {
-    const job = await api.job(id);
-    if (job.status === "succeeded" || job.status === "failed") return job;
-    await new Promise((resolve) => window.setTimeout(resolve, 1200));
-  }
 }
 
 async function act(fn: () => Promise<void>) {
@@ -890,6 +1028,13 @@ async function act(fn: () => Promise<void>) {
 }
 
 watch(() => route.query.project, () => void loadGraph());
+watch(() => route.query.shot, (shotId) => {
+  if (shotId && String(shotId) !== selectedShotId.value) void loadGraph();
+});
+watch(() => taskCenter.revision.value, () => {
+  const event = taskCenter.lastEvent.value;
+  if (event?.item.projectId === graph.value?.project.id) void loadGraph();
+});
 watch(() => shotForm.sceneLookUsage, (value) => {
   if (value === "derive_anchor") shotForm.anchorMode = "generate";
 });
@@ -909,7 +1054,7 @@ onMounted(async () => {
     if (route.query.project) await loadGraph();
   });
   polling = window.setInterval(() => {
-    if (route.query.project && !busy.value) void loadGraph();
+    if (route.query.project) void loadGraph();
   }, 10000);
 });
 onBeforeUnmount(() => window.clearInterval(polling));
@@ -955,7 +1100,7 @@ onBeforeUnmount(() => window.clearInterval(polling));
           <el-input v-model="uploadForm.displayName" size="small" placeholder="素材名称，如：伸缩鱼竿" />
           <input type="file" accept="image/*" @change="chooseUploadFile" />
           <el-button size="small" :disabled="!uploadForm.file" @click="uploadReference">上传</el-button>
-          <p class="source-hint">全局 Canon 只提供人物、猫咪和画风基准；上传、定妆、锚点和视频帧均只属于当前项目。</p>
+          <p class="source-hint">全局 Canon 只提供人物、猫咪和画风基准；上传素材、场景视觉基准、锚点和视频帧均只属于当前项目。</p>
           <b class="asset-group-title">全局 Canon 引用</b>
           <div class="asset-strip">
             <button
@@ -990,7 +1135,7 @@ onBeforeUnmount(() => window.clearInterval(polling));
           </template>
           <template v-if="projectGeneratedAssets.length">
             <b class="asset-group-title">当前项目生成媒体（只读）</b>
-            <p class="source-hint">场景定妆、锚点和视频帧按原场景/片段使用，不会进入全局 Canon 或项目身份档案。</p>
+            <p class="source-hint">场景视觉基准、锚点和视频帧按原场景/片段使用，不会进入全局 Canon 或项目身份档案。</p>
             <div class="asset-strip generated-assets">
               <div
                 v-for="asset in projectGeneratedAssets"
@@ -1035,7 +1180,7 @@ onBeforeUnmount(() => window.clearInterval(polling));
               </div>
             </header>
             <p class="source-text">{{ scene.sourceText }}</p>
-            <CreativeWorkflowPanel :scene="scene" @changed="loadGraph()" />
+            <CreativeWorkflowPanel :scene="scene" :project-id="graph.project.id" @changed="loadGraph()" />
             <div v-if="scene.lookPlan" class="look-plan">
               <b>场景造型方案</b>
               <span>人物服装：{{ scene.lookPlan.personWardrobe || '沿用 Canon' }}</span>
@@ -1048,15 +1193,15 @@ onBeforeUnmount(() => window.clearInterval(polling));
                 v-if="scene.lookPlan.imageRecommended"
                 type="warning"
                 :closable="false"
-                :title="`建议生成定妆图：${scene.lookPlan.recommendationReason || '造型或互动关系需要视觉确认'}`"
-              />
-              <SceneLookWorkbench
-                :project-id="graph.project.id"
-                :scene="scene"
-                :assets="graph.assets"
-                @refreshed="reloadGenerationInputs()"
+                :title="`建议生成场景视觉基准：${scene.lookPlan.recommendationReason || '造型或互动关系需要视觉确认'}`"
               />
             </div>
+            <SceneLookWorkbench
+              :project-id="graph.project.id"
+              :scene="scene"
+              :assets="graph.assets"
+              @refreshed="reloadGenerationInputs()"
+            />
             <div class="scene-actions">
               <el-button @click="editShot(scene.id)">手工添加视频片段</el-button>
             </div>
@@ -1091,9 +1236,10 @@ onBeforeUnmount(() => window.clearInterval(polling));
                 <p>{{ shot.direction }}</p>
                 <footer>
                   <span>
-                    {{ shot.anchorMode }} · {{ shot.status }} ·
-                    {{ shot.referenceBindings.length }} 自定义 / {{ shot.inheritProjectReferences ? '继承项目' : '不继承项目' }} /
-                    {{ sceneLookUsageLabel(shot.sceneLookUsage) }}
+                    {{ shot.status }} · {{ shotReferenceSummary(shot, scene) }}
+                    <template v-if="selectedShotId === shot.id && videoPromptPreview">
+                      / 实际提交 {{ videoPromptPreview.references.length }} 张
+                    </template>
                   </span>
                   <span>
                     <el-button text size="small" @click.stop="moveShot(scene, shotIndex, -1)">↑</el-button>
@@ -1113,26 +1259,32 @@ onBeforeUnmount(() => window.clearInterval(polling));
           <div class="panel-title">视频片段详情</div>
           <h3>{{ selectedShot.title }}</h3>
           <p class="direction">{{ selectedShot.direction }}</p>
-          <el-descriptions :column="1" size="small" border>
-            <el-descriptions-item label="时长">{{ selectedShot.durationSeconds }} 秒</el-descriptions-item>
-            <el-descriptions-item label="锚点">{{ selectedShot.anchorMode }}</el-descriptions-item>
-            <el-descriptions-item label="片段自定义">{{ selectedShot.referenceBindings.length }} 张（最高优先）</el-descriptions-item>
-            <el-descriptions-item label="场景视觉基准策略">{{ sceneLookUsageLabel(selectedShot.sceneLookUsage) }}{{ selectedScene?.selectedLookAssetId ? '' : '（当前无批准定妆）' }}</el-descriptions-item>
-            <el-descriptions-item label="项目默认">{{ selectedShot.inheritProjectReferences ? `${graph?.project.defaultReferenceBindings.length ?? 0} 张继承` : '继承关闭' }}</el-descriptions-item>
-            <el-descriptions-item label="状态">{{ selectedShot.status }}</el-descriptions-item>
-          </el-descriptions>
-          <div class="inspector-actions">
-            <el-button @click="showPrompt">查看最终 Prompt</el-button>
-            <el-button
-              v-if="assistContext?.previousTail.available || assistContext?.previousTail.stale"
-              :type="assistContext.previousTail.stale ? 'warning' : 'default'"
-              @click="adoptPreviousTail"
-            >{{ assistContext.previousTail.stale ? '尾帧已过期，重新采用' : '采用上一片段尾帧' }}</el-button>
-            <el-button v-if="selectedShot.anchorMode === 'generate'" @click="generate('anchor')">生成锚点</el-button>
-            <el-button type="primary" @click="generate('video')">生成视频片段</el-button>
-          </div>
-          <el-collapse>
-            <el-collapse-item title="片段自定义素材绑定" name="refs">
+          <el-tabs v-model="inspectorTab" stretch class="inspector-tabs">
+            <el-tab-pane label="生成配置" name="config">
+              <el-descriptions :column="1" size="small" border>
+                <el-descriptions-item label="时长">{{ selectedShot.durationSeconds }} 秒</el-descriptions-item>
+                <el-descriptions-item label="锚点">{{ selectedShot.anchorMode }}</el-descriptions-item>
+                <el-descriptions-item label="场景基准">{{ sceneLookUsageLabel(selectedShot.sceneLookUsage) }}{{ selectedScene?.selectedLookAssetId ? '' : '（当前无批准版本）' }}</el-descriptions-item>
+                <el-descriptions-item label="项目继承">{{ selectedShot.inheritProjectReferences ? `${graph?.project.defaultReferenceBindings.length ?? 0} 张` : '关闭' }}</el-descriptions-item>
+                <el-descriptions-item label="状态">{{ selectedShot.status }}</el-descriptions-item>
+              </el-descriptions>
+              <el-alert
+                v-if="selectedShot.anchorMode === 'generate' && !selectedShot.selectedAnchorAssetId"
+                type="warning"
+                title="该片段需要先生成、批准并选择开场锚点，之后才能提交视频。"
+                :closable="false"
+              />
+              <div class="inspector-actions">
+                <el-button @click="openPromptReview('video')">查看视频 Prompt</el-button>
+                <el-button
+                  v-if="assistContext?.previousTail.available || assistContext?.previousTail.stale"
+                  :type="assistContext.previousTail.stale ? 'warning' : 'default'"
+                  @click="adoptPreviousTail"
+                >{{ assistContext.previousTail.stale ? '尾帧已过期，重新采用' : '采用上一片段尾帧' }}</el-button>
+                <el-button v-if="selectedShot.anchorMode === 'generate'" @click="generate('anchor')">生成锚点</el-button>
+                <el-button type="primary" :disabled="videoPromptPreview ? !videoPromptPreview.ready : false" @click="generate('video')">生成视频片段</el-button>
+              </div>
+              <el-divider content-position="left">添加片段专用素材</el-divider>
               <el-select v-model="referenceForm.assetId" filterable placeholder="选择素材">
                 <el-option v-for="asset in selectableAssets" :key="asset.id" :label="`${String(asset.metadata.referenceRole ?? asset.role)} · ${String(asset.metadata.usage ?? asset.status)} · ${asset.semanticKey ?? asset.id.slice(0,8)}`" :value="asset.id" />
               </el-select>
@@ -1148,41 +1300,47 @@ onBeforeUnmount(() => window.clearInterval(polling));
                   <el-button text type="danger" size="small" @click="removeBinding(item.assetId)">移除</el-button>
                 </li>
               </ul>
-            </el-collapse-item>
-            <el-collapse-item title="Prompt 与 Provider 尝试" name="trace">
-              <div v-for="attempt in selectedShot.attempts" :key="attempt.id" class="attempt">
-                <b>#{{ attempt.attempt }} {{ attempt.operationKey }}</b>
-                <span>{{ attempt.status }} · {{ attempt.provider || '本地' }} · {{ attempt.providerTaskId || '未创建 Task' }}</span>
-                <pre v-if="attempt.prompt">{{ attempt.prompt.text }}</pre>
-                <details>
-                  <summary>输入快照</summary>
-                  <pre>{{ JSON.stringify(attempt.inputSnapshot, null, 2) }}</pre>
-                </details>
-                <details v-if="attempt.reviews.length">
-                  <summary>AI建议与人工审核证据</summary>
-                  <pre>{{ JSON.stringify(attempt.reviews, null, 2) }}</pre>
-                </details>
-                <el-alert v-if="attempt.error" type="error" :title="String(attempt.error.message ?? attempt.error.code)" :closable="false" />
-                <el-button
-                  v-if="['queued','running'].includes(attempt.status) && attempt.providerTaskId"
-                  size="small"
-                  @click="resumeAttempt(attempt.id)"
-                >继续查询原任务</el-button>
-                <el-button
-                  v-if="attempt.status === 'submission_unknown' && attempt.kind === 'video'"
-                  size="small"
-                  type="warning"
-                  @click="reconcileAttempt(attempt.id)"
-                >查询候选并对账</el-button>
-                <el-alert
-                  v-else-if="attempt.status === 'submission_unknown'"
-                  type="warning"
-                  title="同步请求结果未知，不能查询原任务或直接重提；请先在供应商账单中人工核对。"
-                  :closable="false"
-                />
+              <p class="source-hint">Canon 与项目默认属于继承层；场景视觉基准由片段策略控制；这里仅添加真正的片段覆盖素材。</p>
+            </el-tab-pane>
+
+            <el-tab-pane label="实际参考图" name="references">
+              <div class="reference-target-switch">
+                <el-radio-group v-model="promptTarget" size="small" @change="changePromptTarget">
+                  <el-radio-button value="anchor">锚点生成</el-radio-button>
+                  <el-radio-button value="video">视频生成</el-radio-button>
+                </el-radio-group>
+                <el-tag v-if="promptPreview" :type="promptPreview.ready ? 'success' : 'warning'">
+                  {{ promptPreview.ready ? `就绪 · ${promptPreview.references.length} 张` : '未就绪' }}
+                </el-tag>
               </div>
-            </el-collapse-item>
-            <el-collapse-item title="LLM 创作建议与相邻片段诊断" name="assist">
+              <el-alert v-for="blocker in promptPreview?.blockers ?? []" :key="blocker" type="warning" :title="blocker" :closable="false" />
+              <el-empty v-if="promptPreview && !promptPreview.references.length" description="该目标当前没有实际图片输入" />
+              <div v-for="item in promptPreview?.references ?? []" :key="item.assetId" class="prompt-reference">
+                <img v-if="item.contentReady" :src="assetContentUrl(item.assetId)" />
+                <div v-else class="missing-reference">图片不可读<br />{{ item.assetId }}</div>
+                <div>
+                  <b>{{ item.promptAlias }} · {{ item.displayName }}</b>
+                  <span>{{ item.subjectLabel }} · 来源：{{ item.sourceLayer }}</span>
+                  <small>{{ item.responsibility }}</small>
+                </div>
+              </div>
+              <p class="source-hint">以上顺序就是实际 Provider 输入顺序；素材或策略改变后会本地重新编译，不调用 Ark。</p>
+            </el-tab-pane>
+
+            <el-tab-pane label="锚点与视频版本" name="versions">
+              <ShotMediaVersions
+                :shot="selectedShot"
+                :anchor-preview="anchorPromptPreview"
+                :video-preview="videoPromptPreview"
+                @review="review"
+                @select="selectVideoVersion"
+                @resume="resumeAttempt"
+                @reconcile="reconcileAttempt"
+                @retry="generate"
+              />
+            </el-tab-pane>
+
+            <el-tab-pane label="LLM审稿与Prompt" name="review">
               <ShotAssistancePanel
                 :context="assistContext"
                 :records="assistAnalyses"
@@ -1190,45 +1348,28 @@ onBeforeUnmount(() => window.clearInterval(polling));
                 @apply="applyShotAssistance"
                 @adopt-tail="adoptPreviousTail"
               />
-            </el-collapse-item>
-          </el-collapse>
-          <div v-if="promptPreview" class="prompt-preview">
-            <b>当前编译 Prompt · {{ promptPreview.charCount }} 字</b>
-            <p>定性节奏：{{ promptPreview.qualitativePacing }}</p>
-            <el-alert v-for="warning in promptPreview.linkWarnings" :key="warning" type="warning" :title="warning" :closable="false" />
-            <el-alert v-for="finding in promptPreview.localAnalysis.findings" :key="finding.code" :type="finding.severity === 'warning' ? 'warning' : 'info'" :title="finding.message" :closable="false" />
-            <div v-for="item in promptPreview.references" :key="item.assetId" class="prompt-reference">
-              <img v-if="item.contentReady" :src="assetContentUrl(item.assetId)" />
-              <div><b>{{ item.promptAlias }} · {{ item.displayName }}</b><span>{{ item.subjectLabel }} · {{ item.sourceLayer }}</span><small>{{ item.responsibility }}</small></div>
-            </div>
-            <el-divider content-position="left">LLM 创作正文</el-divider>
-            <pre>{{ promptPreview.creativeBody }}</pre>
-            <el-divider content-position="left">系统技术外壳</el-divider>
-            <pre>{{ promptPreview.systemShell }}</pre>
-            <el-divider content-position="left">最终 Provider Prompt</el-divider>
-            <pre>{{ promptPreview.prompt }}</pre>
-          </div>
-          <div class="versions">
-            <h4>媒体版本</h4>
-            <div
-              v-for="asset in selectedShot.assets.filter(item => ['shot_anchor','shot_video','shot_video_edit'].includes(item.role))"
-              :key="asset.id"
-              class="version-card"
-            >
-              <img v-if="asset.mediaType === 'image'" :src="assetContentUrl(asset.id)" />
-              <video v-else controls :src="assetContentUrl(asset.id)" />
-              <span>{{ asset.role }} · {{ asset.status }}</span>
-              <div v-if="asset.status === 'candidate'">
-                <el-button size="small" type="success" @click="review(asset, 'approved')">批准并选择</el-button>
-                <el-button size="small" type="danger" @click="review(asset, 'rejected')">拒绝</el-button>
+              <div v-if="promptPreview" class="prompt-preview">
+                <div class="reference-target-switch">
+                  <el-radio-group v-model="promptTarget" size="small" @change="changePromptTarget">
+                    <el-radio-button value="anchor">锚点 Prompt</el-radio-button>
+                    <el-radio-button value="video">视频 Prompt</el-radio-button>
+                  </el-radio-group>
+                  <b>{{ promptPreview.charCount }} 字</b>
+                </div>
+                <p>定性节奏：{{ promptPreview.qualitativePacing }}</p>
+                <el-alert v-for="blocker in promptPreview.blockers" :key="blocker" type="warning" :title="blocker" :closable="false" />
+                <el-alert v-for="warning in promptPreview.linkWarnings" :key="warning" type="warning" :title="warning" :closable="false" />
+                <el-alert v-for="finding in promptPreview.localAnalysis.findings" :key="finding.code" :type="finding.severity === 'warning' ? 'warning' : 'info'" :title="finding.message" :closable="false" />
+                <el-divider content-position="left">LLM / 人工确认创作正文</el-divider>
+                <pre>{{ promptPreview.creativeBody }}</pre>
+                <el-divider content-position="left">系统技术外壳</el-divider>
+                <pre>{{ promptPreview.systemShell }}</pre>
+                <el-divider content-position="left">最终 Provider Prompt</el-divider>
+                <pre>{{ promptPreview.prompt }}</pre>
+                <small>输入哈希：{{ promptPreview.inputHash }} · 内容版本：{{ promptPreview.sourceRevisionHash }}</small>
               </div>
-              <el-button
-                v-else-if="asset.mediaType === 'video' && asset.status === 'approved' && asset.id !== selectedShot.selectedVideoAssetId"
-                size="small"
-                @click="selectVideoVersion(asset)"
-              >选择此历史版本</el-button>
-            </div>
-          </div>
+            </el-tab-pane>
+          </el-tabs>
         </template>
         <div v-else class="empty-state"><p>选择一个视频片段查看 Prompt、素材来源、任务和版本。</p></div>
       </aside>
@@ -1278,13 +1419,15 @@ onBeforeUnmount(() => window.clearInterval(polling));
     <VideoTimeline
       v-if="selectedShot && selectedVideo && !selectedSequence"
       :shot-id="selectedShot.id"
+      :project-id="graph!.project.id"
+      :scene-id="selectedShot.sceneId"
       :asset-id="selectedVideo.id"
       :src="assetContentUrl(selectedVideo.id)"
       :duration-ms="selectedVideoDurationMs"
       :direction="selectedShot.direction"
       :frames="selectedVideoFrames"
       :markers-ms="selectedVideoMarkersMs"
-      @completed="loadGraph()"
+      @submitted="loadGraph()"
     />
     <section v-else-if="selectedSequence && selectedSequenceAsset" class="master-timeline panel">
       <div>
@@ -1344,7 +1487,7 @@ onBeforeUnmount(() => window.clearInterval(polling));
         <el-alert
           type="info"
           :closable="false"
-          title="这里选择全局 Canon 作为本项目长期人物、猫咪和画风基准。保存会创建或复用不可变 Revision；场景定妆、锚点和视频帧不会写入该档案。"
+          title="这里选择全局 Canon 作为本项目长期人物、猫咪和画风基准。保存会创建或复用不可变 Revision；场景视觉基准、锚点和视频帧不会写入该档案。"
         />
         <template v-if="projectProfileForm && projectProfile">
           <p class="source-hint">当前 Revision {{ projectProfile.revision }} · {{ projectProfile.profileHash.slice(0, 16) }}</p>
@@ -1403,7 +1546,7 @@ onBeforeUnmount(() => window.clearInterval(polling));
         </div>
         <el-form-item label="构图与人猫空间关系"><el-input v-model="sceneForm.lookPlan.composition" type="textarea" :rows="2" /></el-form-item>
         <el-form-item label="补充生成要求"><el-input v-model="sceneForm.lookPlan.additionalInstructions" type="textarea" :rows="2" /></el-form-item>
-        <el-form-item label="定妆图建议"><el-switch v-model="sceneForm.lookPlan.imageRecommended" active-text="建议生成（只提醒，不阻断）" /></el-form-item>
+        <el-form-item label="场景视觉基准建议"><el-switch v-model="sceneForm.lookPlan.imageRecommended" active-text="建议生成（只提醒，不阻断）" /></el-form-item>
         <el-form-item label="建议原因"><el-input v-model="sceneForm.lookPlan.recommendationReason" type="textarea" :rows="2" /></el-form-item>
       </el-form>
       <template #footer><el-button @click="sceneVisible = false">取消</el-button><el-button type="primary" @click="saveScene">保存</el-button></template>
@@ -1420,12 +1563,12 @@ onBeforeUnmount(() => window.clearInterval(polling));
         <el-form-item label="参考继承">
           <el-checkbox v-model="shotForm.inheritProjectReferences">继承项目默认参考</el-checkbox>
           <el-select v-model="shotForm.sceneLookUsage" style="width: 100%; margin-top: 8px">
-            <el-option label="关闭：不引用基础定妆" value="off" />
+            <el-option label="关闭：不引用场景视觉基准" value="off" />
             <el-option label="只继承造型（默认）：忽略姿态、动作结果和构图" value="appearance_only" />
-            <el-option label="完整参考：起始状态与定妆图高度一致" value="full_reference" />
-            <el-option label="派生锚点：定妆图只用于生成本片段开场图" value="derive_anchor" />
+            <el-option label="完整参考：起始状态与视觉基准高度一致" value="full_reference" />
+            <el-option label="派生锚点：视觉基准只用于生成本片段开场图" value="derive_anchor" />
           </el-select>
-          <div class="source-hint">视频输入顺序：锚点 → 片段自定义 → 场景定妆 → 项目默认，再按资产 ID 和内容 SHA 去重。派生锚点获批后，基础定妆不会再次进入视频。</div>
+          <div class="source-hint">视频输入顺序：锚点 → 片段自定义 → 场景视觉基准 → 项目默认，再按资产 ID 和内容 SHA 去重。派生锚点获批后，场景视觉基准不会再次进入视频。</div>
         </el-form-item>
         <div class="shot-local-findings">
           <el-alert title="以下为免费本地检查；只提示，不自动改写。保存后可选择付费 LLM 分析当前及相邻片段。" type="info" :closable="false" />
@@ -1468,6 +1611,7 @@ onBeforeUnmount(() => window.clearInterval(polling));
 .scene-card { border-top: 1px solid #2b313d; padding: 18px 0; }.scene-card small { color: #7d8798; margin-left: 8px; }.order-chip { color: #68a8ff; margin-right: 10px; }.source-text { color: #aeb5c3; line-height: 1.7; white-space: pre-wrap; }.scene-actions { margin: 12px 0; }.look-plan { display: grid; gap: 5px; border-left: 3px solid #6d8fc7; padding: 10px 12px; background: #101722; color: #aeb8c8; font-size: 13px; }.look-actions { display: flex; gap: 8px; margin-top: 5px; }.look-actions .el-select { min-width: 260px; }.selected-look-preview { width: 160px; max-height: 220px; object-fit: contain; background: #090c11; border-radius: 7px; }.look-candidate { display: flex; gap: 10px; padding: 8px; border: 1px solid #4b3d25; border-radius: 7px; }.look-candidate img { width: 100px; height: 120px; object-fit: contain; background: #090c11; }.look-candidate > div { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
 .shots { display: grid; gap: 10px; }.shot-card { padding: 14px; background: #10141b; border: 1px solid #292f3b; border-radius: 10px; cursor: pointer; }.shot-card.selected { border-color: #4d96ff; box-shadow: 0 0 0 1px #4d96ff55; }.shot-card p, .direction { color: #b6bdca; font-size: 13px; line-height: 1.65; white-space: pre-wrap; }.shot-card footer { color: #768092; font-size: 12px; }
 .inspector h3 { margin: 4px 0 8px; }.inspector-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }.binding-row { display: flex; gap: 8px; margin: 8px 0; }.attempt { padding: 10px 0; border-bottom: 1px solid #292f3b; display: grid; gap: 5px; }.attempt span { color: #8992a3; font-size: 12px; } pre { white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto; background: #0c0f15; padding: 10px; border-radius: 8px; color: #cdd3dd; }
+.inspector-tabs :deep(.el-tab-pane) { display: grid; gap: 10px; }.reference-target-switch { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }.missing-reference { display: grid; place-content: center; width: 56px; height: 56px; padding: 3px; box-sizing: border-box; color: #d89b62; background: #0b0e14; font-size: 9px; text-align: center; word-break: break-all; }
 .asset-group-title { display: block; margin-top: 14px; color: #b7c0ce; font-size: 12px; }.asset-strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; margin-top: 10px; }.asset-strip button, .asset-strip .generated-asset { border: 1px solid #2b313d; border-radius: 6px; padding: 3px; background: #0c1017; color: #aab2c1; }.asset-strip button { cursor: pointer; }.asset-strip button.selected { border-color: #409eff; box-shadow: 0 0 0 1px #409eff66; }.asset-strip button.missing, .asset-strip .generated-asset.missing { border-color: #8b5e2b; cursor: default; }.asset-strip img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 4px; }.asset-strip button > span, .asset-strip .generated-asset > span { display: grid; place-content: center; aspect-ratio: 1; color: #d6a15e; font-size: 11px; }.asset-strip small { display: block; margin: 2px 0; color: #7f8999; font-size: 9px; }.generated-assets { max-height: 260px; overflow-y: auto; }.source-hint { color: #8791a2; font-size: 11px; line-height: 1.5; }.version-card { border: 1px solid #2b313d; border-radius: 8px; padding: 8px; margin: 8px 0; display: grid; gap: 6px; }.version-card img, .version-card video { width: 100%; max-height: 240px; object-fit: contain; background: #090b0f; }.empty-state { text-align: center; color: #8f98a7; padding: 80px 20px; }
 .scene-attempts { margin: 10px 0; }.attempt details summary, .master-timeline summary { color: #8fa7c9; cursor: pointer; font-size: 12px; }.sequence-panel, .master-timeline { margin-top: 16px; padding: 16px; }.sequence-heading h3, .master-timeline h3 { margin: 0; }.sequence-heading p, .master-timeline p { color: #9299a8; }.sequence-grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }.sequence-card { border: 1px solid #2b313d; border-radius: 9px; padding: 10px; display: grid; gap: 8px; }.sequence-card.selected { border-color: #4d96ff; }.sequence-open { border: 0; background: transparent; color: #e8eaf0; text-align: left; cursor: pointer; display: grid; gap: 4px; }.sequence-open span { color: #8490a3; font-size: 12px; }.master-timeline video { width: 100%; max-height: 560px; background: #080a0e; }
 .mode-row { align-items: end; }.look-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }.suggestion-summary, .suggestion-shot-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }.suggestion-shot { padding: 14px; margin: 10px 0; border: 1px solid #2b313d; border-radius: 9px; background: #10141b; }.suggestion-shot-head { margin-bottom: 10px; }

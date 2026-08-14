@@ -255,7 +255,7 @@ class ArkGateway:
         prompt: str,
         reference_paths: tuple[Path, ...],
     ) -> ImageResult:
-        """生成一张定妆图或开场视觉锚点。"""
+        """生成一张场景视觉基准图或开场视觉锚点。"""
 
         try:
             request: dict[str, Any] = {

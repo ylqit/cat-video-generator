@@ -49,7 +49,7 @@ describe("CanonView", () => {
 
     expect(wrapper.text()).toContain("全局 Canon 资产");
     expect(wrapper.text()).toContain("人物大头照");
-    expect(wrapper.text()).toContain("项目生成的定妆图、锚点和视频帧不会进入 Canon");
+    expect(wrapper.text()).toContain("项目生成的场景视觉基准、锚点和视频帧不会进入 Canon");
     expect(wrapper.text()).not.toContain("选择项目");
     expect(wrapper.text()).not.toContain("保存新 Revision");
     expect(apiMocks.canon).toHaveBeenCalledOnce();

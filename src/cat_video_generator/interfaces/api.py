@@ -12,7 +12,12 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..application.shot_queue import RevisionConflictError
-from ..domain.contracts import CURRENT_CONTRACT_VERSION, ReferenceRole, ReferenceUsage
+from ..domain.contracts import (
+    CURRENT_CONTRACT_VERSION,
+    ReferenceRole,
+    ReferenceTarget,
+    ReferenceUsage,
+)
 from ..domain.rendering import SequenceStatus
 from ..infrastructure.db.repositories import WorkflowConflictError
 from ..infrastructure.db.session import ALEMBIC_HEAD
@@ -440,8 +445,16 @@ def create_app(
         return repository.shot_trace(shot_id)
 
     @app.get("/api/v1/shots/{shot_id}/prompt-preview")
-    def shot_prompt_preview(shot_id: uuid.UUID) -> dict[str, Any]:
-        return container.production.preview_shot_prompt(shot_id)
+    def shot_prompt_preview(
+        shot_id: uuid.UUID,
+        target: ReferenceTarget = ReferenceTarget.VIDEO,
+        regeneration_instruction: str | None = None,
+    ) -> dict[str, Any]:
+        return container.production.preview_shot_prompt(
+            shot_id,
+            target=target,
+            regeneration_instruction=regeneration_instruction,
+        )
 
     @app.put("/api/v1/shots/{shot_id}/references")
     def update_references(shot_id: uuid.UUID, payload: ReferencesRequest) -> dict[str, Any]:
@@ -479,6 +492,10 @@ def create_app(
 
     @app.post("/api/v1/shots/{shot_id}/anchors")
     def generate_anchor(shot_id: uuid.UUID, payload: GenerateRequest) -> dict[str, Any]:
+        container.production.validate_anchor_request(
+            shot_id,
+            allow_paid_generation=payload.allow_paid_generation,
+        )
         return _submit(
             job_registry,
             kind="generate_anchor",
@@ -517,6 +534,10 @@ def create_app(
 
     @app.post("/api/v1/shots/{shot_id}/videos")
     def generate_video(shot_id: uuid.UUID, payload: GenerateRequest) -> dict[str, Any]:
+        container.production.validate_video_request(
+            shot_id,
+            allow_paid_generation=payload.allow_paid_generation,
+        )
         return _submit(
             job_registry,
             kind="generate_video",
@@ -549,7 +570,16 @@ def create_app(
 
     @app.post("/api/v1/shots/{shot_id}/versions/{asset_id}/select")
     def select_version(shot_id: uuid.UUID, asset_id: uuid.UUID) -> dict[str, Any]:
-        return _shot_json(repository.select_shot_asset(shot_id, kind="video", asset_id=asset_id))
+        asset = repository.get_asset(asset_id)
+        if asset.shot_card_id != shot_id:
+            raise ValueError("media version does not belong to the requested shot")
+        if asset.media_type == "video" and asset.role in {"shot_video", "shot_video_edit"}:
+            kind = "video"
+        elif asset.media_type == "image" and asset.role == "shot_anchor":
+            kind = "anchor"
+        else:
+            raise ValueError("asset is not a selectable shot anchor or video version")
+        return _shot_json(repository.select_shot_asset(shot_id, kind=kind, asset_id=asset_id))
 
     @app.post("/api/v1/shots/{shot_id}/range-edits")
     def range_edit(shot_id: uuid.UUID, payload: RangeEditRequest) -> dict[str, Any]:
@@ -607,12 +637,19 @@ def create_app(
 
     @app.post("/api/v1/steps/{step_id}/resume")
     def resume_step(step_id: uuid.UUID) -> dict[str, Any]:
+        step = repository.get_step(step_id)
         return _submit(
             job_registry,
             kind="resume_step",
             key=f"step:{step_id}:resume",
             fn=lambda: container.production.resume_step(step_id, wait=False),
-            context={"operationKey": "resume", "stepId": step_id},
+            context={
+                "projectId": step.project_id,
+                "sceneId": step.scene_id,
+                "shotId": step.shot_card_id,
+                "operationKey": "resume",
+                "stepId": step_id,
+            },
         )
 
     @app.get("/api/v1/steps/{step_id}/reconciliation-candidates")
@@ -642,6 +679,14 @@ def create_app(
             for item in repository.list_assets()
             if item.scope == "canon" and item.status == "approved"
         ]
+
+    @app.get("/api/v1/projects/{project_id}/tasks")
+    def project_tasks(project_id: uuid.UUID) -> list[dict[str, Any]]:
+        repository.get_project(project_id)
+        return [
+            _task_json(item)
+            for item in reversed(repository.list_steps(project_id=project_id))
+        ][:100]
 
     @app.get("/api/v1/jobs")
     def list_jobs() -> list[dict[str, Any]]:
@@ -762,6 +807,25 @@ def _creative_step_json(item: Any) -> dict[str, Any]:
         "providerOutput": item.input_snapshot.get("providerOutput"),
         "acceptedOutput": item.input_snapshot.get("acceptedOutput"),
         "acceptedAt": item.input_snapshot.get("acceptedAt"),
+        "error": item.error,
+        "createdAt": None if item.created_at is None else item.created_at.isoformat(),
+    }
+
+
+def _task_json(item: Any) -> dict[str, Any]:
+    return {
+        "stepId": str(item.id),
+        "projectId": str(item.project_id),
+        "sceneId": None if item.scene_id is None else str(item.scene_id),
+        "shotId": None if item.shot_card_id is None else str(item.shot_card_id),
+        "kind": item.kind.value,
+        "status": item.status.value,
+        "attempt": item.attempt,
+        "operationKey": item.operation_key,
+        "provider": item.provider,
+        "providerTaskId": item.provider_task_id,
+        "model": item.model,
+        "inputSnapshot": item.input_snapshot,
         "error": item.error,
         "createdAt": None if item.created_at is None else item.created_at.isoformat(),
     }

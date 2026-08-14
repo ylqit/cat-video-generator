@@ -13,7 +13,10 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -1153,6 +1156,36 @@ def main() -> None:
     if not sample_path.is_file():
         raise RuntimeError(f"local sample is missing: {sample_path}")
     database_canon = _verify_database_canon()
+    task_started = threading.Event()
+    task_release = threading.Event()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        task_registry = JobRegistry(executor=executor)
+
+        def _blocked_fixture_task() -> dict[str, bool]:
+            task_started.set()
+            if not task_release.wait(timeout=5):
+                raise TimeoutError("offline background task was not released")
+            return {"completed": True}
+
+        submitted_at = time.monotonic()
+        submitted_task = task_registry.submit(
+            kind="generate_video",
+            dedup_key="offline:nonblocking",
+            fn=_blocked_fixture_task,
+            context={"projectId": database_canon["projectId"]},
+        )
+        submit_elapsed_ms = round((time.monotonic() - submitted_at) * 1000)
+        _require(
+            submit_elapsed_ms < 500,
+            "background task submission blocked the request thread",
+        )
+        _require(task_started.wait(timeout=1), "background task did not start")
+        _require(
+            submitted_task.status in {"queued", "running"},
+            "background task was not exposed before completion",
+        )
+        task_release.set()
+    _require(submitted_task.status == "succeeded", "background task did not complete")
     with tempfile.TemporaryDirectory(prefix="cvg-v5-smoke-") as temporary:
         root = Path(temporary)
         fixtures = _fixtures(root, ffmpeg)
@@ -1570,7 +1603,7 @@ def main() -> None:
             "scene look references were not ordered by responsibility",
         )
         image_calls_before_look = gateway.image_submissions
-        look_result = production.generate_scene_look(
+        first_look_result = production.generate_scene_look(
             single_scene.id,
             allow_paid_generation=True,
             draft_revision=saved_single_scene.look_draft_revision,
@@ -1587,7 +1620,19 @@ def main() -> None:
             ),
             "fake Seedream received the wrong reference order",
         )
-        look_asset_id = uuid.UUID(look_result["assetId"])
+        second_look_result = production.generate_scene_look(
+            single_scene.id,
+            allow_paid_generation=True,
+            draft_revision=saved_single_scene.look_draft_revision,
+            regenerate=True,
+            reason="只调整共同环境亮度，保留角色身份和服装",
+        )
+        _require(
+            gateway.image_submissions == image_calls_before_look + 2,
+            "scene-look retry did not create a new fake Seedream request",
+        )
+        first_look_asset_id = uuid.UUID(first_look_result["assetId"])
+        look_asset_id = uuid.UUID(second_look_result["assetId"])
         api_container = SimpleNamespace(
             repository=repository,
             editing=editing,
@@ -1610,23 +1655,48 @@ def main() -> None:
             _require(versions_response.status_code == 200, "look versions API failed")
             versions = versions_response.json()
             _require(
-                versions and versions[0]["id"] == str(look_asset_id),
-                "look candidate was absent from the versions API",
+                len(versions) == 2
+                and versions[0]["id"] == str(look_asset_id)
+                and versions[1]["id"] == str(first_look_asset_id),
+                "scene-look retry versions were absent or out of order",
             )
-            content_response = api_client.get(f"/api/v1/assets/{look_asset_id}/content")
+            for asset_id in (first_look_asset_id, look_asset_id):
+                content_response = api_client.get(f"/api/v1/assets/{asset_id}/content")
+                _require(
+                    content_response.status_code == 200 and content_response.content,
+                    "look candidate content was not readable through the API",
+                )
+                review_response = api_client.post(
+                    f"/api/v1/assets/{asset_id}/review",
+                    json={
+                        "decision": "approved",
+                        "reason": "offline Web/API fixture",
+                        "select": True,
+                    },
+                )
+                _require(review_response.status_code == 200, "look review API failed")
+            for asset_id in (first_look_asset_id, look_asset_id):
+                selection_response = api_client.put(
+                    f"/api/v1/scenes/{single_scene.id}/look-asset",
+                    json={"assetId": str(asset_id)},
+                )
+                _require(
+                    selection_response.status_code == 200,
+                    "approved scene-look history could not be reselected",
+                )
+            tasks_response = api_client.get(f"/api/v1/projects/{project_id}/tasks")
+            _require(tasks_response.status_code == 200, "persistent task API failed")
             _require(
-                content_response.status_code == 200 and content_response.content,
-                "look candidate content was not readable through the API",
+                len(
+                    [
+                        item
+                        for item in tasks_response.json()
+                        if item["operationKey"] == "image:scene-look"
+                    ]
+                )
+                == 2,
+                "persistent task API did not expose both scene-look attempts",
             )
-            review_response = api_client.post(
-                f"/api/v1/assets/{look_asset_id}/review",
-                json={
-                    "decision": "approved",
-                    "reason": "offline Web/API fixture",
-                    "select": True,
-                },
-            )
-            _require(review_response.status_code == 200, "look review API failed")
             stale_acceptance = api_client.post(
                 f"/api/v1/steps/{assistance.step_id}/accept-shot-assistance",
                 json={
@@ -1666,7 +1736,14 @@ def main() -> None:
                 }
             ),
         )
-        derive_video_preview = production.preview_shot_prompt(third.id)
+        derive_anchor_preview = production.preview_shot_prompt(
+            third.id,
+            target=ReferenceTarget.ANCHOR,
+        )
+        derive_video_preview = production.preview_shot_prompt(
+            third.id,
+            target=ReferenceTarget.VIDEO,
+        )
         _require(
             [len(item["references"]) for item in (
                 appearance_preview,
@@ -1681,6 +1758,25 @@ def main() -> None:
             "忽略基准图中的姿态" in str(appearance_preview["prompt"])
             and "完整参考本场服装" in str(full_reference_preview["prompt"]),
             "appearance-only and full-reference responsibilities were not distinct",
+        )
+        _require(
+            derive_anchor_preview["target"] == "anchor"
+            and derive_anchor_preview["ready"] is True
+            and any(
+                item["sourceLayer"] == "scene_look"
+                for item in derive_anchor_preview["references"]
+            ),
+            "derive-anchor preview did not include the scene visual baseline",
+        )
+        _require(
+            derive_video_preview["target"] == "video"
+            and derive_video_preview["ready"] is False
+            and derive_video_preview["blockers"]
+            and all(
+                item["sourceLayer"] != "scene_look"
+                for item in derive_video_preview["references"]
+            ),
+            "derive-anchor video preview did not preflight the missing anchor correctly",
         )
         shots.append(third)
 
@@ -1718,7 +1814,16 @@ def main() -> None:
         )
         shots[2] = repository.update_shot(shots[2].id, generated_draft)
 
+        derive_anchor_preview = production.preview_shot_prompt(
+            shots[2].id,
+            target=ReferenceTarget.ANCHOR,
+        )
         anchor_result = production.generate_anchor(shots[2].id, allow_paid_generation=True)
+        anchor_step = repository.get_step(uuid.UUID(anchor_result["stepId"]))
+        _require(
+            anchor_step.input_snapshot["inputHash"] == derive_anchor_preview["inputHash"],
+            "anchor preview and paid request did not use the same input hash",
+        )
         _require(
             tuple(path.read_bytes() for path in gateway.image_references[-1])
             == tuple(
@@ -1738,12 +1843,33 @@ def main() -> None:
             reason="offline fixture",
             select=True,
         )
+        ready_derive_video_preview = production.preview_shot_prompt(
+            shots[2].id,
+            target=ReferenceTarget.VIDEO,
+        )
+        _require(
+            ready_derive_video_preview["ready"] is True
+            and ready_derive_video_preview["references"][0]["sourceLayer"] == "shot"
+            and all(
+                item["sourceLayer"] != "scene_look"
+                for item in ready_derive_video_preview["references"]
+            ),
+            "approved anchor did not replace the scene baseline in video inputs",
+        )
 
         approved_videos: list[uuid.UUID] = []
         for shot in shots:
-            preview = production.preview_shot_prompt(shot.id)
+            preview = production.preview_shot_prompt(
+                shot.id,
+                target=ReferenceTarget.VIDEO,
+            )
             _require(preview["prompt"].strip(), "compiled prompt is empty")
             result = production.generate_video(shot.id, allow_paid_generation=True)
+            generated_step = repository.get_step(uuid.UUID(result["stepId"]))
+            _require(
+                generated_step.input_snapshot["inputHash"] == preview["inputHash"],
+                "video preview and paid request did not use the same input hash",
+            )
             asset_id = uuid.UUID(result["assetId"])
             production.decide_asset(
                 asset_id,
@@ -2022,6 +2148,16 @@ def main() -> None:
                 "sceneLookDraftRevision": saved_single_scene.look_draft_revision,
                 "sceneLookPromptPreviewNoArk": True,
                 "lookCandidateWebApiReadReviewSelect": True,
+                "sceneLookVersionHistory": {
+                    "versions": 2,
+                    "retryPreservedHistory": True,
+                    "approvedHistoryReselectable": True,
+                },
+                "nonblockingTaskSubmission": {
+                    "submitElapsedMs": submit_elapsed_ms,
+                    "completedAfterRelease": True,
+                    "persistentWorkflowTasksVisible": True,
+                },
                 "shotAssistance": {
                     "saveBeforeAnalysis": True,
                     "failedAnalysisPreservedDraft": True,
@@ -2037,6 +2173,11 @@ def main() -> None:
                     "derive_anchor",
                 ],
                 "deriveAnchorDoesNotRepeatSceneLookInVideo": True,
+                "dualTargetPromptPreview": {
+                    "anchorIncludesSceneLook": True,
+                    "videoBlocksBeforeApprovedAnchor": True,
+                    "previewAndSubmissionHashesMatch": True,
+                },
                 "tailFrame": {
                     "automaticExtraction": True,
                     "adoptedByNextShot": True,
@@ -2049,7 +2190,7 @@ def main() -> None:
                     "style",
                 ],
                 "referencePrecedenceAndLimits": True,
-                "sampleInput": str(sample_path),
+                "sampleInput": str(Path("docs") / sample_path.name),
                 "sampleCompositeSha256": sample_master.sha256,
                 "localTransitions": ["cut", "fade_black", "cross_dissolve"],
                 "semanticAutoLink": True,
@@ -2060,7 +2201,7 @@ def main() -> None:
                     "migration/runtime visual-profile JSON canonicalization mismatch",
                     "legacy four-image Seedance input cap conflicting with V5 nine-image contract",
                 ],
-                "realArkCalls": 0,
+                "realArkNewGenerationCalls": 0,
         }
         diagnostics = Path(__file__).parents[1] / "var" / "diagnostics"
         diagnostics.mkdir(parents=True, exist_ok=True)
@@ -2086,109 +2227,149 @@ def _verify_database_canon() -> dict[str, Any]:
         assets = container.repository.list_assets()
         _require(len(assets) == 11, "database does not expose exactly 11 Canon assets")
         for asset in assets:
+            _require(asset.scope == "canon", "global Canon query leaked project media")
+            _require(asset.status == "approved", f"Canon is not approved: {asset.semantic_key}")
             _require(asset.content_ready, f"Canon content is missing: {asset.semantic_key}")
             digest = hashlib.sha256(asset.require_path().read_bytes()).hexdigest()
             _require(digest == asset.sha256, f"Canon content hash drifted: {asset.semantic_key}")
+        available_keys = {asset.semantic_key for asset in assets}
+        _require(
+            recommended_keys <= available_keys,
+            "recommended Canon identity/style set is incomplete",
+        )
         projects = container.repository.list_projects()
-        _require(projects, "Canon project-default verification requires one local project")
+        _require(projects, "local data-chain verification requires one project")
         project = next(
             (item for item in projects if item.title in {"湖泊钓鱼", "湖泊的鱼"}),
-            projects[0],
+            None,
         )
-        canon_restore = ProjectEditingService(
-            repository=container.repository,
-            director=None,
-            provider_name="offline-validation",
-        ).restore_project_canon_references(project.id)
+        _require(project is not None, "the 湖泊钓鱼 project is missing")
+        assert project is not None
+        profile = container.repository.get_visual_profile(project.id)
         _require(
-            canon_restore["referenceCount"] >= 5,
-            "project Canon restoration did not install the required identities and style",
-        )
-        project = container.repository.get_project(project.id)
-        current_profile = container.repository.get_visual_profile(project.id)
-        original_profile = container.repository.save_visual_profile(
-            project.id,
-            current_profile.draft,
-        )
-        edited_profile = original_profile.draft.model_copy(
-            update={
-                "person_body": (
-                    f"{original_profile.draft.person_body}；本地验收临时 Revision"
-                )
-            }
-        )
-        new_profile = container.repository.save_visual_profile(project.id, edited_profile)
-        _require(
-            new_profile.id != original_profile.id
-            and new_profile.revision > original_profile.revision,
-            "visual profile edit did not create an immutable revision",
-        )
-        _require(
-            container.repository.get_visual_profile_revision(original_profile.id).profile_hash
-            == original_profile.profile_hash,
-            "old visual profile revision changed",
-        )
-        restored_profile = container.repository.save_visual_profile(
-            project.id,
-            original_profile.draft,
-        )
-        _require(
-            restored_profile.id == original_profile.id,
-            "restoring identical visual profile content did not reuse the old revision",
+            len(profile.draft.reference_bindings) >= 3,
+            "湖泊钓鱼 visual profile has no complete identity/style references",
         )
         scenes = container.repository.list_scenes(project.id)
-        _require(scenes, "visual profile project has no scene for look-draft round trip")
-        scene = scenes[0]
-        draft = scene.look_draft or SceneLookDraft(
-            visualProfileRevisionId=original_profile.id,
-            lookPlan=scene.draft.look_plan or SceneLookPlan(),
-            referenceBindings=original_profile.draft.reference_bindings,
-        )
-        saved_scene = container.repository.save_scene_look_draft(
-            scene.id,
-            expected_revision=scene.look_draft_revision,
-            draft=draft,
+        _require(scenes, "湖泊钓鱼 has no scene")
+        scene = sorted(scenes, key=lambda item: item.order)[0]
+        project_assets = container.repository.list_assets(project_id=project.id)
+        scene_looks = [
+            asset
+            for asset in project_assets
+            if asset.scene_id == scene.id and asset.role == "scene_look"
+        ]
+        _require(
+            len(scene_looks) >= 2,
+            "湖泊钓鱼 does not expose both scene visual baseline versions",
         )
         _require(
-            saved_scene.look_draft is not None
-            and saved_scene.look_draft_revision == scene.look_draft_revision + 1,
-            "database scene look draft did not round trip",
+            scene.selected_look_asset_id is not None
+            and any(asset.id == scene.selected_look_asset_id for asset in scene_looks),
+            "湖泊钓鱼 selected scene visual baseline is missing from its history",
         )
-        original = project.default_reference_bindings
-        selected = tuple(
-            ReferenceBinding(
-                assetId=asset.id,
-                usage=ReferenceUsage.GENERATION_REFERENCE,
-                role=(
-                    ReferenceRole.STYLE
-                    if asset.semantic_key and asset.semantic_key.startswith("style:")
-                    else ReferenceRole.IDENTITY
-                ),
-                applyTo=ReferenceTarget.BOTH,
+        shots = sorted(container.repository.list_shots(scene.id), key=lambda item: item.order)
+        _require(len(shots) == 4, "湖泊钓鱼 does not contain the expected four clips")
+        dual_previews: list[dict[str, Any]] = []
+        for shot in shots:
+            anchor_preview = container.production.preview_shot_prompt(
+                shot.id,
+                target=ReferenceTarget.ANCHOR,
             )
-            for asset in assets
-            if asset.semantic_key in recommended_keys
-        )
-        _require(len(selected) == 5, "recommended Canon default set is not exactly five assets")
-        try:
-            saved = container.repository.update_project_default_references(
-                project.id,
-                list(selected),
+            video_preview = container.production.preview_shot_prompt(
+                shot.id,
+                target=ReferenceTarget.VIDEO,
             )
             _require(
-                saved.default_reference_bindings == selected,
-                "project Canon defaults were not persisted",
+                anchor_preview["inputHash"] and video_preview["inputHash"],
+                "湖泊钓鱼 dual-target preview has no input hash",
             )
-        finally:
-            container.repository.update_project_default_references(project.id, list(original))
+            dual_previews.append(
+                {
+                    "shotId": str(shot.id),
+                    "order": shot.order,
+                    "anchorMode": shot.draft.anchor_mode.value,
+                    "sceneLookUsage": shot.draft.scene_look_usage.value,
+                    "anchorReady": anchor_preview["ready"],
+                    "videoReady": video_preview["ready"],
+                    "anchorReferenceCount": len(anchor_preview["references"]),
+                    "videoReferenceCount": len(video_preview["references"]),
+                    "videoBlockers": video_preview["blockers"],
+                }
+            )
+        first_anchor_preview = container.production.preview_shot_prompt(
+            shots[0].id,
+            target=ReferenceTarget.ANCHOR,
+        )
+        first_video_preview = container.production.preview_shot_prompt(
+            shots[0].id,
+            target=ReferenceTarget.VIDEO,
+        )
+        if shots[0].draft.scene_look_usage is SceneLookUsage.DERIVE_ANCHOR:
+            _require(
+                any(
+                    item["sourceLayer"] == "scene_look"
+                    for item in first_anchor_preview["references"]
+                )
+                and all(
+                    item["sourceLayer"] != "scene_look"
+                    for item in first_video_preview["references"]
+                ),
+                "湖泊钓鱼 clip 1 repeats its scene baseline in the video target",
+            )
+        first_video_assets = [
+            asset
+            for asset in container.repository.list_assets(shot_id=shots[0].id)
+            if asset.media_type == "video"
+        ]
+        _require(first_video_assets, "湖泊钓鱼 clip 1 video history is empty")
+        second_video_steps = [
+            step
+            for step in container.repository.list_steps(
+                project_id=project.id,
+                shot_id=shots[1].id,
+            )
+            if step.operation_key == "video:shot"
+        ]
+        _require(
+            second_video_steps
+            and any(step.provider_task_id for step in second_video_steps),
+            "湖泊钓鱼 clip 2 has no recoverable Provider task",
+        )
+        first_video_step_ids = {
+            asset.step_id for asset in first_video_assets if asset.step_id is not None
+        }
+        first_video_steps = [
+            step
+            for step in container.repository.list_steps(
+                project_id=project.id,
+                shot_id=shots[0].id,
+            )
+            if step.id in first_video_step_ids
+        ]
         return {
             "assetsReadable": len(assets),
-            "recommendedDefaultsRoundTrip": len(selected),
-            "visualProfileRevisionRoundTrip": new_profile.revision,
-            "sceneLookDraftRevision": saved_scene.look_draft_revision,
+            "recommendedDefaultsPresent": len(recommended_keys),
+            "visualProfileRevision": profile.revision,
+            "sceneLookDraftRevision": scene.look_draft_revision,
             "projectId": str(project.id),
-            "restoredCanonReferenceCount": canon_restore["referenceCount"],
-            "cleanedMisboundShotCount": canon_restore["cleanedShotCount"],
+            "sceneVisualBaselineVersions": len(scene_looks),
+            "selectedSceneVisualBaselineId": str(scene.selected_look_asset_id),
+            "dualTargetPreviews": dual_previews,
+            "clip1VideoVersions": len(first_video_assets),
+            "clip1HasOldInputVersion": any(
+                step.input_snapshot.get("sourceRevisionHash")
+                != first_video_preview["sourceRevisionHash"]
+                for step in first_video_steps
+            ),
+            "clip2ProviderTasks": [
+                {
+                    "status": step.status.value,
+                    "recoverable": bool(step.provider_task_id),
+                }
+                for step in second_video_steps
+            ],
+            "readOnlyInspection": True,
         }
     finally:
         container.close()
