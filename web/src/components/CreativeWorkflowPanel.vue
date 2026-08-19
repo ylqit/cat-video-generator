@@ -9,9 +9,11 @@ import type {
   SceneDto,
   ShotSuggestionOutput,
   StoryDiagnosisOutput,
+  StoryExpansionOutput,
   StoryRewriteOutput,
   StoryRewriteStrategy,
 } from "../api/types";
+import { useRuntimeStatus } from "../runtimeStatus";
 import { registerTask, useTaskCenter } from "../tasks/taskCenter";
 
 const props = defineProps<{ scene: SceneDto; projectId?: string }>();
@@ -21,6 +23,8 @@ const workflow = ref<CreativeWorkflowDto | null>(null);
 const busy = ref(false);
 const error = ref("");
 const planningModel = ref("");
+const expansionStepId = ref("");
+const expansionDraft = ref<StoryExpansionOutput | null>(null);
 const diagnosisStepId = ref("");
 const diagnosisDraft = ref<StoryDiagnosisOutput | null>(null);
 const selectedStrategy = ref<StoryRewriteStrategy>("balanced");
@@ -31,6 +35,34 @@ const rewriteDraft = ref<StoryRewriteOutput | null>(null);
 const storyboardStepId = ref("");
 const storyboardDraft = ref<ShotSuggestionOutput | null>(null);
 const taskCenter = useTaskCenter();
+const runtimeStatus = useRuntimeStatus();
+const paidReady = computed(() => runtimeStatus.settings.value?.arkReady === true);
+function plannerConfirmation(action: string): string {
+  return `${action}。运行配置 revision ${runtimeStatus.settings.value?.current.revision ?? "未加载"}，本次会产生一次 Ark 规划模型费用。`;
+}
+
+function confirmedRuntimeRevision(): number {
+  const revision = runtimeStatus.settings.value?.current.revision;
+  if (revision === undefined) throw new Error("运行配置尚未加载");
+  return revision;
+}
+
+const expansionVersions = computed(() => workflow.value?.stages.expansion ?? []);
+const acceptedExpansion = computed(() => workflow.value?.stages.expansion.find(
+  (item) => Boolean(item.acceptedAt)
+    && (item.acceptedOutput as { acceptedStoryHash?: string } | undefined)?.acceptedStoryHash
+      === workflow.value?.currentStoryHash,
+) ?? null);
+const selectedExpansion = computed(() => expansionVersions.value.find(
+  (item) => item.stepId === expansionStepId.value,
+) ?? null);
+const expansionRunning = computed(() => expansionVersions.value.some(
+  (item) => ["pending", "submitting", "queued", "running"].includes(item.status),
+) || taskCenter.items.value.some(
+  (item) => item.sceneId === props.scene.id
+    && item.operationKey === "director:story-expansion"
+    && ["queued", "pending", "submitting", "running", "restart_pending"].includes(item.status),
+));
 
 const diagnosisVersions = computed(() => workflow.value?.stages.diagnosis ?? []);
 
@@ -53,13 +85,30 @@ const rewriteEligibleDiagnosis = computed(() => {
     ? activeDiagnosis.value
     : null;
 });
+const rewriteVersions = computed(() => workflow.value?.stages.rewrite ?? []);
 const acceptedRewrite = computed(() => workflow.value?.stages.rewrite.find(
   (item) => Boolean(item.acceptedAt)
     && (item.acceptedOutput as { acceptedStoryHash?: string } | undefined)?.acceptedStoryHash
       === workflow.value?.currentStoryHash,
 ) ?? null);
-const storyReady = computed(() => Boolean(acceptedRewrite.value)
-  || Boolean((activeDiagnosis.value?.acceptedOutput as { preserveOriginal?: boolean } | undefined)?.preserveOriginal));
+const selectedRewrite = computed(() => rewriteVersions.value.find(
+  (item) => item.stepId === rewriteStepId.value,
+) ?? null);
+const selectedRewriteAccepted = computed(() => Boolean(selectedRewrite.value?.acceptedAt));
+const selectedRewriteStale = computed(() => Boolean(
+  selectedRewrite.value?.sourceHash
+  && selectedRewrite.value.sourceHash !== workflow.value?.currentStoryHash
+  && (selectedRewrite.value.acceptedOutput as { acceptedStoryHash?: string } | undefined)
+    ?.acceptedStoryHash !== workflow.value?.currentStoryHash,
+));
+const rewriteRunning = computed(() => rewriteVersions.value.some(
+  (item) => ["pending", "submitting", "queued", "running"].includes(item.status),
+) || taskCenter.items.value.some(
+  (item) => item.sceneId === props.scene.id
+    && item.operationKey === "director:story-rewrite"
+    && ["queued", "pending", "submitting", "running", "restart_pending"].includes(item.status),
+));
+const storyReady = computed(() => Boolean(workflow.value?.currentStory.trim()));
 const storyboardVersions = computed(() => workflow.value?.stages.storyboard ?? []);
 const selectedStoryboard = computed(() => storyboardVersions.value.find(
   (item) => item.stepId === storyboardStepId.value,
@@ -74,12 +123,29 @@ const hasShotHistory = computed(() => props.scene.shots.some(
 
 async function load() {
   workflow.value = await api.creativeWorkflow(props.scene.id);
+  const expansion = expansionVersions.value.find(
+    (item) => item.stepId === expansionStepId.value,
+  ) ?? expansionVersions.value.find(
+    (item) => item.status === "succeeded" && !item.acceptedAt && Boolean(item.providerOutput),
+  ) ?? expansionVersions.value[0] ?? null;
+  selectExpansionVersion(expansion);
   const selected = diagnosisVersions.value.find(
     (item) => item.stepId === diagnosisStepId.value,
   ) ?? diagnosisVersions.value.find(
     (item) => Boolean(item.providerOutput || item.acceptedOutput),
   ) ?? activeDiagnosis.value;
   selectDiagnosisVersion(selected ?? null);
+  const rewrite = rewriteVersions.value.find(
+    (item) => item.stepId === rewriteStepId.value,
+  ) ?? rewriteVersions.value.find(
+    (item) => item.status === "succeeded"
+      && !item.acceptedAt
+      && item.sourceHash === workflow.value?.currentStoryHash
+      && Boolean(item.providerOutput),
+  ) ?? rewriteVersions.value.find(
+    (item) => Boolean(item.providerOutput || item.acceptedOutput),
+  ) ?? rewriteVersions.value[0] ?? null;
+  selectRewriteVersion(rewrite);
   const storyboard = storyboardVersions.value.find(
     (item) => item.stepId === storyboardStepId.value,
   ) ?? storyboardVersions.value.find(
@@ -88,6 +154,18 @@ async function load() {
   selectStoryboardVersion(storyboard);
   const health = await api.health();
   planningModel.value = health.arkPlanningModel ?? "未配置";
+}
+
+function selectExpansionVersion(item: CreativeStepRecord | null) {
+  expansionStepId.value = item?.stepId ?? "";
+  if (!item) {
+    expansionDraft.value = null;
+    return;
+  }
+  const accepted = item.acceptedOutput as unknown as StoryExpansionOutput | null | undefined;
+  const provider = item.providerOutput as unknown as StoryExpansionOutput | null | undefined;
+  const output = accepted?.expandedStory ? accepted : provider;
+  expansionDraft.value = output ? structuredClone(toRaw(output)) : null;
 }
 
 function storyboardState(item: CreativeStepRecord): string {
@@ -146,6 +224,24 @@ function diagnosisState(item: CreativeStepRecord): string {
   return item.status;
 }
 
+function rewriteState(item: CreativeStepRecord): string {
+  const acceptedStoryHash = (item.acceptedOutput as {
+    acceptedStoryHash?: string;
+  } | null | undefined)?.acceptedStoryHash;
+  if (acceptedStoryHash && acceptedStoryHash === workflow.value?.currentStoryHash) return "当前采用";
+  if (item.sourceHash && item.sourceHash !== workflow.value?.currentStoryHash) return "基于旧剧情";
+  if (item.acceptedAt) return "历史已采用";
+  if (item.status === "succeeded") return "待确认";
+  if (item.status === "failed") return "生成失败";
+  return ({
+    pending: "等待提交",
+    submitting: "提交中",
+    queued: "排队中",
+    running: "生成中",
+    submission_unknown: "提交状态待确认",
+  } as Record<string, string>)[item.status] ?? item.status;
+}
+
 function selectDiagnosisVersion(item: CreativeStepRecord | null) {
   diagnosisStepId.value = item?.stepId ?? "";
   diagnosisInstructions.value = "";
@@ -170,6 +266,18 @@ function selectDiagnosisVersion(item: CreativeStepRecord | null) {
     ?? output?.rewriteOptions.find((option) => option.strategy === "balanced")?.strategy
     ?? output?.rewriteOptions[0]?.strategy
     ?? "balanced";
+}
+
+function selectRewriteVersion(item: CreativeStepRecord | null) {
+  rewriteStepId.value = item?.stepId ?? "";
+  if (!item) {
+    rewriteDraft.value = null;
+    return;
+  }
+  const accepted = item.acceptedOutput as unknown as StoryRewriteOutput | null | undefined;
+  const provider = item.providerOutput as unknown as StoryRewriteOutput | null | undefined;
+  const output = accepted?.rewrittenStory ? accepted : provider;
+  rewriteDraft.value = output ? structuredClone(toRaw(output)) : null;
 }
 
 async function perform(action: () => Promise<void>) {
@@ -203,14 +311,45 @@ async function submitBackground(
 }
 
 async function diagnose() {
+  const runtimeRevision = confirmedRuntimeRevision();
   await ElMessageBox.confirm(
-    `剧情医生将把当前原始剧情和项目角色档案发送给 ${planningModel.value}。本次不分析图片，但会产生一次 Ark 规划模型费用。`,
+    plannerConfirmation(`剧情医生将把当前原始剧情和项目角色档案发送给 ${planningModel.value}，本次不分析图片`),
     "剧情诊断付费确认",
   );
-  await submitBackground(() => api.diagnoseStory(props.scene.id), {
+  await submitBackground(() => api.diagnoseStory(props.scene.id, runtimeRevision), {
     kind: "story_diagnosis",
     label: "剧情诊断",
     operationKey: "director:story-diagnosis",
+  });
+}
+
+async function expandStory() {
+  if (expansionRunning.value) {
+    ElMessage.info("剧情扩写仍在后台生成，请完成后选择版本");
+    return;
+  }
+  const runtimeRevision = confirmedRuntimeRevision();
+  await ElMessageBox.confirm(
+    plannerConfirmation(`剧情编剧会把当前一句话主题发送给 ${planningModel.value}，扩写为完整剧情`),
+    "主题扩写付费确认",
+  );
+  await submitBackground(() => api.expandStory(props.scene.id, runtimeRevision), {
+    kind: "story_expansion",
+    label: "剧情扩写",
+    operationKey: "director:story-expansion",
+  });
+}
+
+async function acceptExpansion() {
+  if (!expansionDraft.value || !expansionStepId.value) {
+    ElMessage.warning("当前版本没有可接受的扩写剧情");
+    return;
+  }
+  await perform(async () => {
+    await api.acceptStoryExpansion(expansionStepId.value, expansionDraft.value!);
+    await load();
+    emit("changed");
+    ElMessage.success("扩写剧情已设为当前批准剧情，可直接进入分镜或继续诊断");
   });
 }
 
@@ -231,15 +370,24 @@ async function acceptDiagnosis() {
 }
 
 async function rewrite() {
-  if (!rewriteEligibleDiagnosis.value) return;
+  if (rewriteRunning.value) {
+    ElMessage.info("剧情重写仍在生成，请在任务完成后选择结果版本");
+    return;
+  }
+  if (!rewriteEligibleDiagnosis.value) {
+    ElMessage.warning("请先接受一个包含重写策略的当前剧情诊断版本");
+    return;
+  }
+  const runtimeRevision = confirmedRuntimeRevision();
   await ElMessageBox.confirm(
-    `剧本编辑将使用已接受诊断调用 ${planningModel.value}，重写完整剧情但不拆镜头。本次会产生一次 Ark 规划模型费用。`,
+    plannerConfirmation(`剧本编辑将使用已接受诊断调用 ${planningModel.value}，重写完整剧情但不拆镜头`),
     "剧情重写付费确认",
   );
   await submitBackground(
     () => api.rewriteStory(
       props.scene.id,
       rewriteEligibleDiagnosis.value!.stepId,
+      runtimeRevision,
     ),
     {
       kind: "story_rewrite",
@@ -249,15 +397,15 @@ async function rewrite() {
   );
 }
 
-function editRewriteHistory() {
-  const latest = workflow.value?.stages.rewrite[0];
-  if (!latest?.providerOutput) return;
-  rewriteStepId.value = latest.stepId;
-  rewriteDraft.value = structuredClone(latest.providerOutput as unknown as StoryRewriteOutput);
-}
-
 async function acceptRewrite() {
-  if (!rewriteDraft.value || !rewriteStepId.value) return;
+  if (!rewriteDraft.value || !rewriteStepId.value) {
+    ElMessage.warning("当前版本没有可接受的剧情重写稿");
+    return;
+  }
+  if (selectedRewriteStale.value) {
+    ElMessage.warning("该版本基于旧剧情，只能查看，不能覆盖当前剧情");
+    return;
+  }
   await perform(async () => {
     await api.acceptStoryRewrite(rewriteStepId.value, rewriteDraft.value!);
     rewriteDraft.value = null;
@@ -268,11 +416,12 @@ async function acceptRewrite() {
 }
 
 async function runStoryboard() {
+  const runtimeRevision = confirmedRuntimeRevision();
   await ElMessageBox.confirm(
-    `分镜导演将使用当前批准剧情调用 ${planningModel.value}，生成 ${props.scene.targetShotCount} 个可编辑视频片段。本次会产生一次 Ark 规划模型费用。`,
+    plannerConfirmation(`分镜导演将使用当前批准剧情调用 ${planningModel.value}，生成 ${props.scene.targetShotCount} 个可编辑视频片段`),
     "分镜导演付费确认",
   );
-  await submitBackground(() => api.suggestShots(props.scene.id), {
+  await submitBackground(() => api.suggestShots(props.scene.id, runtimeRevision), {
     kind: "shot_suggestions",
     label: "分镜导演",
     operationKey: "director:shot-suggestions",
@@ -300,9 +449,8 @@ async function acceptStoryboard() {
 }
 
 watch(() => [props.scene.id, props.scene.sourceText], () => void load());
-watch(() => taskCenter.revision.value, () => {
-  const event = taskCenter.lastEvent.value;
-  if (event?.item.sceneId === props.scene.id) void load();
+watch(() => taskCenter.sceneSignals.value[props.scene.id]?.revision ?? 0, () => {
+  void load();
 });
 onMounted(() => void load());
 </script>
@@ -321,14 +469,55 @@ onMounted(() => void load());
       <template v-if="workflow && workflow.currentStory !== workflow.originalStory">
         <b>下一阶段实际采用的当前批准剧情</b>
         <p>{{ workflow.currentStory }}</p>
-        <small>来源：{{ workflow.currentStorySource === 'accepted_rewrite' ? '人工接受的剧情重写稿' : '当前场景人工稿' }} · Step {{ workflow.currentStorySourceStepId || '无' }}</small>
+        <small>来源：{{ workflow.currentStorySource === 'accepted_rewrite' ? '人工接受的剧情重写稿' : workflow.currentStorySource === 'accepted_expansion' ? '人工接受的主题扩写稿' : '当前场景人工稿' }} · Step {{ workflow.currentStorySourceStepId || '无' }}</small>
       </template>
       <small>原稿保存在首个诊断输入快照；编辑或接受重写不会覆盖历史 Prompt 和媒体版本。</small>
     </div>
 
     <div class="stage">
-      <div class="stage-head"><b>2. 剧情诊断</b><el-tag :type="activeDiagnosis ? 'success' : acceptedDiagnosis ? 'warning' : 'info'">{{ activeDiagnosis ? '当前稿已接受' : acceptedDiagnosis ? '旧稿已接受，需重跑' : '待确认' }}</el-tag></div>
-      <div class="actions"><el-button type="primary" plain @click="diagnose">{{ workflow?.stages.diagnosis.length ? '生成新诊断版本' : '运行剧情医生' }}</el-button></div>
+      <div class="stage-head">
+        <div><b>主题入口：AI 剧情扩写（可选）</b><small>一句话主题使用这里；已经提供完整剧情可直接进入下方诊断。</small></div>
+        <el-tag :type="acceptedExpansion ? 'success' : expansionRunning ? 'warning' : 'info'">{{ acceptedExpansion ? '当前已采用' : expansionRunning ? '生成中' : '可选' }}</el-tag>
+      </div>
+      <div class="actions">
+        <el-button type="primary" plain :disabled="expansionRunning || !paidReady" @click="expandStory">{{ expansionRunning ? '剧情扩写生成中' : expansionVersions.length ? '生成新扩写版本' : '把主题扩写成完整剧情' }}</el-button>
+      </div>
+      <div v-if="expansionVersions.length" class="version-list" aria-label="剧情扩写版本">
+        <button
+          v-for="item in expansionVersions"
+          :key="item.stepId"
+          type="button"
+          class="version-button"
+          :class="{ selected: item.stepId === expansionStepId }"
+          @click="selectExpansionVersion(item)"
+        >
+          <b>扩写 V{{ item.attempt }}</b>
+          <span>{{ item.acceptedAt ? '历史已采用' : item.status === 'succeeded' ? '待确认' : item.status }}</span>
+          <small>{{ item.createdAt ? new Date(item.createdAt).toLocaleString() : '未记录时间' }}</small>
+        </button>
+      </div>
+      <el-alert
+        v-if="selectedExpansion?.sourceHash && selectedExpansion.sourceHash !== workflow?.currentStoryHash && !selectedExpansion?.acceptedAt"
+        type="warning"
+        title="该扩写版本基于旧主题，只能查看。"
+        :closable="false"
+      />
+      <template v-if="expansionDraft">
+        <el-input v-model="expansionDraft.expandedStory" type="textarea" :rows="9" :readonly="Boolean(selectedExpansion?.acceptedAt)" />
+        <el-input v-model="expansionDraft.creativeSummary" type="textarea" :rows="2" :readonly="Boolean(selectedExpansion?.acceptedAt)" />
+        <ul><li v-for="item in expansionDraft.unresolvedQuestions" :key="item">待决定：{{ item }}</li></ul>
+        <el-button
+          v-if="!selectedExpansion?.acceptedAt"
+          type="success"
+          :disabled="selectedExpansion?.status !== 'succeeded' || selectedExpansion?.sourceHash !== workflow?.currentStoryHash"
+          @click="acceptExpansion"
+        >接受人工编辑后的完整剧情</el-button>
+      </template>
+    </div>
+
+    <div class="stage">
+      <div class="stage-head"><b>2. 剧情诊断（可选）</b><el-tag :type="activeDiagnosis ? 'success' : acceptedDiagnosis ? 'warning' : 'info'">{{ activeDiagnosis ? '当前稿已接受' : acceptedDiagnosis ? '旧稿已接受，需重跑' : '可跳过' }}</el-tag></div>
+      <div class="actions"><el-button type="primary" plain :disabled="!paidReady" @click="diagnose">{{ workflow?.stages.diagnosis.length ? '生成新诊断版本' : '运行剧情医生' }}</el-button></div>
       <div v-if="diagnosisVersions.length" class="version-list" aria-label="剧情诊断版本">
         <button
           v-for="item in diagnosisVersions"
@@ -380,22 +569,68 @@ onMounted(() => void load());
     </div>
 
     <div class="stage">
-      <div class="stage-head"><b>3. 剧情重写</b><el-tag :type="acceptedRewrite ? 'success' : 'info'">{{ acceptedRewrite ? '已接受' : '待确认' }}</el-tag></div>
-      <div class="actions"><el-button :disabled="!rewriteEligibleDiagnosis" type="primary" plain @click="rewrite">{{ workflow?.stages.rewrite.length ? '重新重写' : '运行剧本编辑' }}</el-button><el-button v-if="workflow?.stages.rewrite[0] && !acceptedRewrite" @click="editRewriteHistory">编辑最近结果</el-button></div>
+      <div class="stage-head"><b>3. 剧情重写（可选）</b><el-tag :type="acceptedRewrite ? 'success' : rewriteRunning ? 'warning' : 'info'">{{ acceptedRewrite ? '已接受' : rewriteRunning ? '生成中' : '可跳过' }}</el-tag></div>
+      <div class="actions">
+        <el-button
+          :disabled="!rewriteEligibleDiagnosis || rewriteRunning || !paidReady"
+          type="primary"
+          plain
+          @click="rewrite"
+        >{{ rewriteRunning ? '剧情重写生成中' : rewriteVersions.length ? '生成新重写版本' : '运行剧本编辑' }}</el-button>
+      </div>
+      <div v-if="rewriteVersions.length" class="version-list" aria-label="剧情重写版本">
+        <button
+          v-for="item in rewriteVersions"
+          :key="item.stepId"
+          type="button"
+          class="version-button"
+          :class="{ selected: item.stepId === rewriteStepId }"
+          @click="selectRewriteVersion(item)"
+        >
+          <b>重写 V{{ item.attempt }}</b>
+          <span>{{ rewriteState(item) }}</span>
+          <small>{{ item.createdAt ? new Date(item.createdAt).toLocaleString() : '未记录时间' }}</small>
+        </button>
+      </div>
+      <el-alert
+        v-if="selectedRewriteStale"
+        type="warning"
+        title="该版本基于旧剧情，只能查看；请基于当前剧情生成新版本。"
+        :closable="false"
+      />
+      <el-alert
+        v-else-if="selectedRewrite?.status === 'failed'"
+        type="error"
+        :title="String(selectedRewrite.error?.message ?? '该剧情重写版本生成失败，可生成新版本重试。')"
+        :closable="false"
+      />
+      <el-alert
+        v-else-if="selectedRewrite && ['pending', 'submitting', 'queued', 'running'].includes(selectedRewrite.status)"
+        type="info"
+        title="剧情重写仍在后台生成，完成后将自动显示可编辑结果。"
+        :closable="false"
+      />
       <template v-if="rewriteDraft">
-        <el-input v-model="rewriteDraft.rewrittenStory" type="textarea" :rows="9" />
+        <el-input v-model="rewriteDraft.rewrittenStory" type="textarea" :rows="9" :readonly="selectedRewriteAccepted || selectedRewriteStale" />
         <b>LLM 修改摘要</b>
         <ul><li v-for="item in rewriteDraft.changeSummary" :key="item">{{ item }}</li></ul>
         <ul><li v-for="item in rewriteDraft.unresolvedQuestions" :key="item">待决定：{{ item }}</li></ul>
-        <el-button type="success" @click="acceptRewrite">接受人工编辑后的完整剧情</el-button>
+        <el-button
+          v-if="!selectedRewriteAccepted"
+          type="success"
+          :disabled="selectedRewrite?.status !== 'succeeded' || selectedRewriteStale"
+          @click="acceptRewrite"
+        >接受人工编辑后的完整剧情</el-button>
       </template>
+      <el-empty v-else-if="selectedRewrite?.status === 'succeeded'" description="该版本没有可编辑输出" />
     </div>
 
     <div class="stage">
       <div class="stage-head"><b>4. 分镜导演</b><el-tag :type="storyboardVersions.some(item => storyboardState(item) === '当前采用') ? 'success' : 'info'">{{ storyboardVersions.some(item => storyboardState(item) === '当前采用') ? '当前片段已同步' : '待执行' }}</el-tag></div>
       <p>只读取当前批准剧情，严格按场景目标数量生成可编辑视频片段。</p>
-      <el-button type="primary" :disabled="!storyReady" @click="runStoryboard">{{ storyboardVersions.length ? '生成新分镜版本' : '运行分镜导演' }}</el-button>
-      <el-alert v-if="!storyReady" type="info" title="先接受剧情重写，或在剧情诊断中明确选择保留原稿。" :closable="false" />
+      <el-button type="primary" :disabled="!storyReady || !paidReady" @click="runStoryboard">{{ storyboardVersions.length ? '生成新分镜版本' : '运行分镜导演' }}</el-button>
+      <el-alert v-if="!storyReady" type="info" title="请先保存一段主题扩写稿或完整剧情。" :closable="false" />
+      <el-alert v-else type="info" title="分镜是唯一必经创作步骤；点击运行即确认使用上方当前剧情，剧情诊断与重写均可按需跳过。" :closable="false" />
       <div v-if="storyboardVersions.length" class="version-list" aria-label="分镜版本">
         <button
           v-for="item in storyboardVersions"
@@ -480,7 +715,7 @@ onMounted(() => void load());
       <p>在每个片段保存后逐次确认，LLM 实际查看所选图片；建议仍需在右侧逐项接受。</p>
     </div>
 
-    <el-collapse v-if="workflow && (workflow.stages.diagnosis.length || workflow.stages.rewrite.length || workflow.stages.storyboard.length)">
+    <el-collapse v-if="workflow && (workflow.stages.expansion.length || workflow.stages.diagnosis.length || workflow.stages.rewrite.length || workflow.stages.storyboard.length)">
       <el-collapse-item title="四阶段历史、原稿与接受稿" name="history">
         <template v-for="(records, stage) in workflow.stages" :key="stage">
           <article v-for="item in records" :key="item.stepId" class="history">

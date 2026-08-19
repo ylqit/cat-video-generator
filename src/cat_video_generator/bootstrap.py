@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from sqlalchemy import Engine, text
 
 from .application.canon import CanonRepairService
-from .application.shot_queue import ProjectEditingService, SequenceService, ShotProductionService
+from .application.sequence_service import SequenceService
+from .application.shot_queue import ProjectEditingService, ShotProductionService
 from .config import DatabaseOperation, DatabaseSettings, RuntimeSettings, load_local_env
-from .infrastructure.ark.gateway import ArkGateway
+from .infrastructure.ark.runtime import RuntimeArkGateway, RuntimeConfigurationManager
 from .infrastructure.db.repositories import SqlAlchemyWorkflowRepository
 from .infrastructure.db.session import (
     ALEMBIC_HEAD,
@@ -30,6 +32,7 @@ class RuntimeContainer:
     sequences: SequenceService
     canon: CanonRepairService
     runtime_settings: RuntimeSettings
+    runtime_configuration: RuntimeConfigurationManager
     alembic_revision: str
 
     def close(self) -> None:
@@ -62,7 +65,11 @@ def build_runtime_container() -> RuntimeContainer:
         create_session_factory(engine),
         asset_root=runtime.asset_root,
     )
-    gateway = _optional_gateway(runtime)
+    runtime_configuration = RuntimeConfigurationManager(
+        runtime,
+        Path("var/config/runtime-settings.json"),
+    )
+    gateway = RuntimeArkGateway(runtime_configuration)
     store = LocalAssetStore(
         work_root=runtime.work_root,
         asset_root=runtime.asset_root,
@@ -80,7 +87,7 @@ def build_runtime_container() -> RuntimeContainer:
         editing=ProjectEditingService(
             repository=repository,
             director=gateway,
-            provider_name=runtime.provider_profile,
+            provider_name=runtime_configuration.provider_profile,
         ),
         production=ShotProductionService(
             repository=repository,
@@ -88,10 +95,10 @@ def build_runtime_container() -> RuntimeContainer:
             asset_store=store,
             media_probe=probe,
             frame_extractor=extractor,
-            provider_name=runtime.provider_profile,
-            resolution=runtime.ark_video_resolution,
-            runtime_preflight=runtime,
-            enable_video_advice=runtime.video_semantic_review_mode == "diagnostic",
+            provider_name=runtime_configuration.provider_profile,
+            resolution=runtime_configuration.video_resolution,
+            runtime_preflight=runtime_configuration,
+            enable_video_advice=runtime_configuration.semantic_review_enabled,
             poll_interval_seconds=runtime.ark_poll_interval_seconds,
             task_timeout_seconds=runtime.ark_task_timeout_seconds,
         ),
@@ -99,11 +106,12 @@ def build_runtime_container() -> RuntimeContainer:
             repository=repository,
             asset_store=store,
             media_probe=probe,
-            resolution=runtime.ark_video_resolution,
-            runtime_preflight=runtime,
+            resolution=runtime_configuration.video_resolution,
+            runtime_preflight=runtime_configuration,
         ),
         canon=CanonRepairService(repository=repository, asset_store=store),
         runtime_settings=runtime,
+        runtime_configuration=runtime_configuration,
         alembic_revision=ALEMBIC_HEAD,
     )
 
@@ -143,11 +151,3 @@ def _ready_engine(database: DatabaseSettings) -> Engine:
         engine.dispose()
         raise
     return engine
-
-
-def _optional_gateway(runtime: RuntimeSettings) -> ArkGateway | None:
-    try:
-        runtime.validate_for_ark_access()
-    except ValueError:
-        return None
-    return ArkGateway(runtime)

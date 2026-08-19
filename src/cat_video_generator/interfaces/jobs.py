@@ -24,10 +24,13 @@ logger = logging.getLogger(__name__)
 PAID_KINDS = frozenset(
     {
         "story_diagnosis",
+        "story_expansion",
         "story_rewrite",
         "shot_suggestions",
         "shot_assistance",
+        "visual_asset_plan",
         "generate_anchor",
+        "generate_reference_image",
         "generate_scene_look",
         "generate_video",
         "range_edit",

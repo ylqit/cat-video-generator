@@ -15,6 +15,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ...application.ports import (
     LandedAsset,
+    ProjectReadModel,
+    ShotGenerationReadModel,
     StoredAsset,
     StoredProject,
     StoredPrompt,
@@ -25,8 +27,10 @@ from ...application.ports import (
     StoredStep,
     StoredVisualProfileRevision,
 )
+from ...application.read_models import project_graph_projection
 from ...domain.contracts import (
     CURRENT_CONTRACT_VERSION,
+    AcceptedVisualAssetPlan,
     AnchorMode,
     LookReferenceBinding,
     LookReferencePurpose,
@@ -55,6 +59,7 @@ from ...domain.workflow import (
     transition_step,
     validate_prompt_purpose,
 )
+from ..ark.runtime import current_execution_snapshot
 from .models import (
     Asset,
     ProductionRun,
@@ -299,6 +304,178 @@ class SqlAlchemyWorkflowRepository:
     def get_project(self, project_id: uuid.UUID) -> StoredProject:
         with self._sessions() as session:
             return _project_checked(_required(session, ProductionRun, project_id))
+
+    def project_read_model(self, project_id: uuid.UUID) -> ProjectReadModel:
+        """Load one complete production projection without repository fan-out."""
+
+        with self._sessions() as session:
+            project_row = self._require_project(session, project_id)
+            if project_row.current_visual_profile_revision_id is None:
+                raise RecordNotFoundError("project has no current visual profile")
+            profile_row = _required(
+                session,
+                VisualProfileRevision,
+                project_row.current_visual_profile_revision_id,
+            )
+            scene_rows = tuple(
+                session.execute(
+                    select(Scene)
+                    .where(Scene.production_run_id == project_id)
+                    .order_by(Scene.sort_order)
+                ).scalars()
+            )
+            scene_ids = [row.id for row in scene_rows]
+            shot_rows = (
+                tuple(
+                    session.execute(
+                        select(ShotCard)
+                        .where(ShotCard.scene_id.in_(scene_ids))
+                        .order_by(ShotCard.scene_id, ShotCard.sort_order)
+                    ).scalars()
+                )
+                if scene_ids
+                else ()
+            )
+            step_rows = tuple(
+                session.execute(
+                    select(WorkflowStep)
+                    .where(WorkflowStep.production_run_id == project_id)
+                    .order_by(WorkflowStep.created_at, WorkflowStep.attempt)
+                ).scalars()
+            )
+            step_ids = [row.id for row in step_rows]
+            prompt_rows = (
+                tuple(
+                    session.execute(
+                        select(PromptRecord)
+                        .where(PromptRecord.step_id.in_(step_ids))
+                        .order_by(PromptRecord.created_at)
+                    ).scalars()
+                )
+                if step_ids
+                else ()
+            )
+            review_rows = (
+                tuple(
+                    session.execute(
+                        select(Review)
+                        .where(Review.step_id.in_(step_ids))
+                        .order_by(Review.created_at)
+                    ).scalars()
+                )
+                if step_ids
+                else ()
+            )
+            asset_rows = tuple(
+                session.execute(
+                    select(Asset)
+                    .where(
+                        or_(
+                            Asset.production_run_id == project_id,
+                            Asset.scope == "canon",
+                        )
+                    )
+                    .order_by(Asset.created_at)
+                ).scalars()
+            )
+            sequence_rows = tuple(
+                session.execute(
+                    select(VideoSequence)
+                    .where(VideoSequence.production_run_id == project_id)
+                    .order_by(VideoSequence.revision)
+                ).scalars()
+            )
+            return ProjectReadModel(
+                project=_project_checked(project_row),
+                visual_profile=_visual_profile(profile_row),
+                scenes=tuple(_scene(row) for row in scene_rows),
+                shots=tuple(_shot(row, project_id) for row in shot_rows),
+                steps=tuple(_step(row) for row in step_rows),
+                prompts=tuple(_prompt(row) for row in prompt_rows),
+                assets=tuple(_asset(row, self._asset_root) for row in asset_rows),
+                reviews=tuple(_review(row) for row in review_rows),
+                sequences=tuple(_sequence(row) for row in sequence_rows),
+            )
+
+    def shot_generation_read_model(
+        self,
+        shot_id: uuid.UUID,
+    ) -> ShotGenerationReadModel:
+        """Load one shot workspace without reading unrelated project history."""
+
+        with self._sessions() as session:
+            shot_row = _required(session, ShotCard, shot_id)
+            scene_row = _required(session, Scene, shot_row.scene_id)
+            project_row = self._require_project(session, scene_row.production_run_id)
+            if project_row.current_visual_profile_revision_id is None:
+                raise RecordNotFoundError("project has no current visual profile")
+            profile_row = _required(
+                session,
+                VisualProfileRevision,
+                project_row.current_visual_profile_revision_id,
+            )
+            scene_shot_rows = tuple(
+                session.execute(
+                    select(ShotCard)
+                    .where(ShotCard.scene_id == scene_row.id)
+                    .order_by(ShotCard.sort_order)
+                ).scalars()
+            )
+            step_rows = tuple(
+                session.execute(
+                    select(WorkflowStep)
+                    .where(WorkflowStep.shot_card_id == shot_id)
+                    .order_by(WorkflowStep.created_at, WorkflowStep.attempt)
+                ).scalars()
+            )
+            step_ids = [row.id for row in step_rows]
+            prompt_rows = (
+                tuple(
+                    session.execute(
+                        select(PromptRecord)
+                        .where(PromptRecord.step_id.in_(step_ids))
+                        .order_by(PromptRecord.created_at)
+                    ).scalars()
+                )
+                if step_ids
+                else ()
+            )
+            review_rows = (
+                tuple(
+                    session.execute(
+                        select(Review)
+                        .where(Review.step_id.in_(step_ids))
+                        .order_by(Review.created_at)
+                    ).scalars()
+                )
+                if step_ids
+                else ()
+            )
+            asset_rows = tuple(
+                session.execute(
+                    select(Asset)
+                    .where(
+                        or_(
+                            Asset.production_run_id == project_row.id,
+                            Asset.scope == "canon",
+                        )
+                    )
+                    .order_by(Asset.created_at)
+                ).scalars()
+            )
+            return ShotGenerationReadModel(
+                project=_project_checked(project_row),
+                visual_profile=_visual_profile(profile_row),
+                scene=_scene(scene_row),
+                shot=_shot(shot_row, project_row.id),
+                scene_shots=tuple(
+                    _shot(row, project_row.id) for row in scene_shot_rows
+                ),
+                steps=tuple(_step(row) for row in step_rows),
+                prompts=tuple(_prompt(row) for row in prompt_rows),
+                assets=tuple(_asset(row, self._asset_root) for row in asset_rows),
+                reviews=tuple(_review(row) for row in review_rows),
+            )
 
     def add_scene(self, project_id: uuid.UUID, draft: SceneDraft) -> StoredScene:
         with self._sessions.begin() as session:
@@ -608,6 +785,90 @@ class SqlAlchemyWorkflowRepository:
             step.input_snapshot_json = snapshot
             return _scene(scene)
 
+    def accept_story_expansion(
+        self,
+        *,
+        step_id: uuid.UUID,
+        expected_source_hash: str,
+        accepted_output: dict[str, Any],
+        expanded_story: str,
+    ) -> StoredScene:
+        with self._sessions.begin() as session:
+            step = _required(session, WorkflowStep, step_id)
+            if (
+                StepKind(step.kind) is not StepKind.DIRECTOR
+                or StepStatus(step.status) is not StepStatus.SUCCEEDED
+                or step.operation_key != "director:story-expansion"
+                or step.scene_id is None
+                or step.shot_card_id is not None
+            ):
+                raise ValueError("step is not a succeeded story expansion")
+            snapshot = dict(step.input_snapshot_json)
+            if "acceptedAt" in snapshot:
+                raise WorkflowConflictError("该剧情扩写已经接受过")
+            scene = _required(session, Scene, step.scene_id)
+            current_hash = story_source_hash(_scene(scene).draft)
+            if (
+                snapshot.get("sourceHash") != expected_source_hash
+                or current_hash != expected_source_hash
+            ):
+                raise WorkflowConflictError("场景剧情已变化，旧扩写稿不能再接受")
+            scene.source_text = expanded_story
+            shots = session.execute(
+                select(ShotCard).where(ShotCard.scene_id == scene.id)
+            ).scalars()
+            for shot in shots:
+                shot.selected_anchor_asset_id = None
+                shot.selected_video_asset_id = None
+                shot.status = ShotStatus.READY.value
+            self._invalidate_project_sequence(session, scene.production_run_id)
+            snapshot["acceptedOutput"] = accepted_output
+            snapshot["acceptedAt"] = datetime.now(timezone.utc).isoformat()
+            step.input_snapshot_json = snapshot
+            return _scene(scene)
+
+    def accept_visual_asset_plan(
+        self,
+        *,
+        step_id: uuid.UUID,
+        expected_shot_snapshot_hash: str,
+        accepted_output: AcceptedVisualAssetPlan,
+    ) -> StoredStep:
+        with self._sessions.begin() as session:
+            step = _required(session, WorkflowStep, step_id)
+            if (
+                StepKind(step.kind) is not StepKind.DIRECTOR
+                or StepStatus(step.status) is not StepStatus.SUCCEEDED
+                or step.operation_key != "director:visual-asset-plan"
+                or step.scene_id is None
+                or step.shot_card_id is not None
+            ):
+                raise ValueError("step is not a succeeded visual asset plan")
+            snapshot = dict(step.input_snapshot_json)
+            if "acceptedAt" in snapshot:
+                raise WorkflowConflictError("该视觉资产规划已经接受过")
+            scene = _required(session, Scene, step.scene_id)
+            rows = session.execute(
+                select(ShotCard)
+                .where(ShotCard.scene_id == scene.id)
+                .order_by(ShotCard.sort_order)
+            ).scalars()
+            current_hash = shot_snapshot_hash(
+                (row.id, row.draft_revision, _shot(row, scene.production_run_id).draft)
+                for row in rows
+            )
+            if (
+                snapshot.get("shotSnapshotHash") != expected_shot_snapshot_hash
+                or current_hash != expected_shot_snapshot_hash
+            ):
+                raise WorkflowConflictError("视频片段已经变化，旧视觉资产规划不能再接受")
+            snapshot["acceptedOutput"] = accepted_output.model_dump(
+                mode="json", by_alias=True
+            )
+            snapshot["acceptedAt"] = datetime.now(timezone.utc).isoformat()
+            step.input_snapshot_json = snapshot
+            return _step(step)
+
     def accept_scene_suggestions(
         self,
         *,
@@ -758,7 +1019,8 @@ class SqlAlchemyWorkflowRepository:
         *,
         step_id: uuid.UUID,
         source_draft_revision: int,
-        patch: ShotAssistPatch,
+        patch: ShotAssistPatch | None,
+        accepted_anchor_brief: str | None,
     ) -> StoredShot:
         with self._sessions.begin() as session:
             step = _required(session, WorkflowStep, step_id)
@@ -770,8 +1032,16 @@ class SqlAlchemyWorkflowRepository:
             ):
                 raise ValueError("step is not a succeeded shot-assistance analysis")
             snapshot = dict(step.input_snapshot_json)
-            if "acceptedAt" in snapshot:
-                raise WorkflowConflictError("该片段创作建议已经接受过")
+            if patch is not None and (
+                snapshot.get("acceptedPatchAt")
+                or bool(snapshot.get("acceptedOutput"))
+            ):
+                raise WorkflowConflictError("该片段字段修改已经接受过")
+            if accepted_anchor_brief is not None and (
+                snapshot.get("acceptedAnchorBriefAt")
+                or bool(snapshot.get("acceptedAnchorBrief"))
+            ):
+                raise WorkflowConflictError("该开场静态画面稿已经接受过")
             recorded_revision = snapshot.get("sourceDraftRevision")
             if recorded_revision != source_draft_revision:
                 raise WorkflowConflictError("接受请求与分析来源版本不一致")
@@ -779,8 +1049,39 @@ class SqlAlchemyWorkflowRepository:
             scene = _required(session, Scene, row.scene_id)
             if row.draft_revision != source_draft_revision:
                 raise WorkflowConflictError("片段草稿已更新，旧分析不能再接受")
+            current_anchor_brief = next(
+                (
+                    str(item.input_snapshot_json["acceptedAnchorBrief"]).strip()
+                    for item in session.execute(
+                        select(WorkflowStep)
+                        .where(
+                            WorkflowStep.shot_card_id == row.id,
+                            WorkflowStep.status == StepStatus.SUCCEEDED.value,
+                            WorkflowStep.operation_key.in_(
+                                ("editor:anchor-brief", "director:shot-assistance")
+                            ),
+                        )
+                        .order_by(WorkflowStep.created_at.desc())
+                    ).scalars()
+                    if item.input_snapshot_json.get("acceptedDraftRevision")
+                    == source_draft_revision
+                    and str(
+                        item.input_snapshot_json.get("acceptedAnchorBrief") or ""
+                    ).strip()
+                ),
+                None,
+            )
+            normalized_anchor_brief = (
+                None
+                if accepted_anchor_brief is None
+                else accepted_anchor_brief.strip()
+            )
+            anchor_brief_changed = (
+                normalized_anchor_brief is not None
+                and normalized_anchor_brief != current_anchor_brief
+            )
             current = _shot(row, scene.production_run_id).draft
-            updated = apply_shot_assist_patch(current, patch)
+            updated = current if patch is None else apply_shot_assist_patch(current, patch)
             self._validate_reference_bindings(
                 session,
                 project_id=scene.production_run_id,
@@ -790,15 +1091,150 @@ class SqlAlchemyWorkflowRepository:
             _write_shot_draft(row, updated)
             if changed:
                 row.draft_revision += 1
+            if changed or anchor_brief_changed:
+                had_selection = (
+                    row.selected_anchor_asset_id is not None
+                    or row.selected_video_asset_id is not None
+                )
                 row.selected_anchor_asset_id = None
                 row.selected_video_asset_id = None
                 row.status = ShotStatus.READY.value
-                self._invalidate_project_sequence(session, scene.production_run_id)
-            snapshot["acceptedOutput"] = patch.model_dump(mode="json", by_alias=True)
-            snapshot["acceptedAt"] = datetime.now(timezone.utc).isoformat()
+                if had_selection:
+                    self._invalidate_project_sequence(session, scene.production_run_id)
+            accepted_at = datetime.now(timezone.utc).isoformat()
+            if patch is not None:
+                snapshot["acceptedOutput"] = patch.model_dump(
+                    mode="json", by_alias=True
+                )
+                snapshot["acceptedPatchAt"] = accepted_at
+            if normalized_anchor_brief is not None:
+                snapshot["acceptedAnchorBrief"] = normalized_anchor_brief
+                snapshot["acceptedAnchorBriefAt"] = accepted_at
+            snapshot["acceptedAt"] = accepted_at
             snapshot["acceptedDraftRevision"] = row.draft_revision
             step.input_snapshot_json = snapshot
             return _shot(row, scene.production_run_id)
+
+    def save_manual_anchor_brief(
+        self,
+        *,
+        shot_id: uuid.UUID,
+        source_draft_revision: int,
+        brief: str,
+        input_hash: str,
+    ) -> StoredStep:
+        """Persist one accepted human-authored opening brief without a provider call."""
+
+        normalized = brief.strip()
+        if not normalized:
+            raise ValueError("开场静态画面稿不能为空")
+        now = datetime.now(timezone.utc)
+        operation_key = "editor:anchor-brief"
+        with self._sessions.begin() as session:
+            shot = _required(session, ShotCard, shot_id)
+            scene = _required(session, Scene, shot.scene_id)
+            if shot.draft_revision != source_draft_revision:
+                raise WorkflowConflictError("片段草稿已更新，请基于最新版本重新保存开场静态画面稿")
+
+            accepted_steps = list(
+                session.execute(
+                    select(WorkflowStep)
+                    .where(
+                        WorkflowStep.shot_card_id == shot_id,
+                        WorkflowStep.status == StepStatus.SUCCEEDED.value,
+                        WorkflowStep.operation_key.in_(
+                            (operation_key, "director:shot-assistance")
+                        ),
+                    )
+                    .order_by(WorkflowStep.created_at.desc())
+                ).scalars()
+            )
+            current = next(
+                (
+                    item
+                    for item in accepted_steps
+                    if item.input_snapshot_json.get("acceptedDraftRevision")
+                    == source_draft_revision
+                    and str(
+                        item.input_snapshot_json.get("acceptedAnchorBrief") or ""
+                    ).strip()
+                ),
+                None,
+            )
+            current_brief = (
+                None
+                if current is None
+                else str(current.input_snapshot_json["acceptedAnchorBrief"]).strip()
+            )
+            if current is not None and current_brief == normalized:
+                return _step(current)
+
+            attempt = int(
+                session.scalar(
+                    select(func.coalesce(func.max(WorkflowStep.attempt), 0)).where(
+                        WorkflowStep.shot_card_id == shot_id,
+                        WorkflowStep.operation_key == operation_key,
+                    )
+                )
+                or 0
+            ) + 1
+            idempotency_key = hashlib.sha256(
+                "|".join(
+                    (
+                        str(scene.production_run_id),
+                        str(shot_id),
+                        operation_key,
+                        str(source_draft_revision),
+                        input_hash,
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            step = WorkflowStep(
+                id=uuid.uuid4(),
+                production_run_id=scene.production_run_id,
+                scene_id=scene.id,
+                shot_card_id=shot_id,
+                kind=StepKind.DIRECTOR.value,
+                status=StepStatus.SUCCEEDED.value,
+                attempt=attempt,
+                operation_key=operation_key,
+                idempotency_key=idempotency_key,
+                provider="manual",
+                model="human-editor",
+                input_hash=input_hash,
+                input_snapshot_json={
+                    "source": "manual",
+                    "sourceDraftRevision": source_draft_revision,
+                    "acceptedDraftRevision": source_draft_revision,
+                    "acceptedAnchorBrief": normalized,
+                    "acceptedAnchorBriefAt": now.isoformat(),
+                    "acceptedAt": now.isoformat(),
+                },
+                completed_at=now,
+            )
+            session.add(step)
+            session.flush()
+            session.add(
+                PromptRecord(
+                    step_id=step.id,
+                    purpose=PromptPurpose.DIRECTOR.value,
+                    model="human-editor",
+                    prompt_text=normalized,
+                    sha256=hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+                )
+            )
+
+            if current_brief != normalized:
+                had_selection = (
+                    shot.selected_anchor_asset_id is not None
+                    or shot.selected_video_asset_id is not None
+                )
+                shot.selected_anchor_asset_id = None
+                shot.selected_video_asset_id = None
+                shot.status = ShotStatus.READY.value
+                if had_selection:
+                    self._invalidate_project_sequence(session, scene.production_run_id)
+            return _step(step)
 
     def delete_shot(self, shot_id: uuid.UUID) -> None:
         with self._sessions.begin() as session:
@@ -875,6 +1311,18 @@ class SqlAlchemyWorkflowRepository:
             )
             return int(value) + 1
 
+    def next_project_attempt(self, *, project_id: uuid.UUID, operation_key: str) -> int:
+        with self._sessions() as session:
+            value = session.scalar(
+                select(func.coalesce(func.max(WorkflowStep.attempt), 0)).where(
+                    WorkflowStep.production_run_id == project_id,
+                    WorkflowStep.scene_id.is_(None),
+                    WorkflowStep.shot_card_id.is_(None),
+                    WorkflowStep.operation_key == operation_key,
+                )
+            )
+            return int(value) + 1
+
     def create_step_with_prompt(
         self,
         *,
@@ -894,6 +1342,10 @@ class SqlAlchemyWorkflowRepository:
         if not prompt_text.strip() or not operation_key.strip():
             raise ValueError("operation key and prompt are required")
         validate_prompt_purpose(kind, purpose, generation_intent=True)
+        runtime_snapshot = current_execution_snapshot()
+        persisted_snapshot = dict(input_snapshot)
+        if runtime_snapshot is not None:
+            persisted_snapshot["runtimeConfiguration"] = runtime_snapshot
         prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
         key_material = "|".join(
             (
@@ -902,6 +1354,7 @@ class SqlAlchemyWorkflowRepository:
                 operation_key,
                 str(attempt),
                 input_hash,
+                "" if runtime_snapshot is None else str(runtime_snapshot["revision"]),
             )
         )
         idempotency_key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
@@ -922,7 +1375,7 @@ class SqlAlchemyWorkflowRepository:
                     provider=provider,
                     model=model,
                     input_hash=input_hash,
-                    input_snapshot_json=input_snapshot,
+                    input_snapshot_json=persisted_snapshot,
                 )
                 .on_conflict_do_nothing(index_elements=["idempotency_key"])
                 .returning(WorkflowStep.id)
@@ -1011,6 +1464,17 @@ class SqlAlchemyWorkflowRepository:
             if shot_id is not None:
                 query = query.where(WorkflowStep.shot_card_id == shot_id)
             rows = session.execute(query.order_by(WorkflowStep.created_at)).scalars()
+            return tuple(_step(row) for row in rows)
+
+    def task_center_steps(self, *, limit: int = 300) -> tuple[StoredStep, ...]:
+        """Return recent durable work in one query for the global task center."""
+
+        with self._sessions() as session:
+            rows = session.execute(
+                select(WorkflowStep)
+                .order_by(WorkflowStep.created_at.desc())
+                .limit(limit)
+            ).scalars()
             return tuple(_step(row) for row in rows)
 
     def get_prompt(self, step_id: uuid.UUID) -> StoredPrompt | None:
@@ -1277,43 +1741,42 @@ class SqlAlchemyWorkflowRepository:
             return _sequence(row)
 
     def project_graph(self, project_id: uuid.UUID) -> dict[str, Any]:
-        project = self.get_project(project_id)
-        scenes = self.list_scenes(project_id)
-        return {
-            "project": _json_project(project),
-            "assets": [
-                _json_asset(item)
-                for item in self.list_assets(project_id=project_id, include_canon=True)
-            ],
-            "scenes": [
-                {
-                    **_json_scene(scene),
-                    "attempts": [
-                        self._step_trace(step)
-                        for step in self.list_steps(
-                            project_id=project_id,
-                            scene_id=scene.id,
-                        )
-                        if step.shot_card_id is None
-                    ],
-                    "shots": [self.shot_trace(shot.id) for shot in self.list_shots(scene.id)],
-                }
-                for scene in scenes
-            ],
-            "sequences": [_json_sequence(item) for item in self.list_sequences(project_id)],
-        }
+        return project_graph_projection(self.project_read_model(project_id))
 
     def shot_trace(self, shot_id: uuid.UUID) -> dict[str, Any]:
         shot = self.get_shot(shot_id)
-        steps = self.list_steps(project_id=shot.project_id, shot_id=shot_id)
+        model = self.project_read_model(shot.project_id)
+        current = next(item for item in model.shots if item.id == shot_id)
+        prompts = {item.step_id: item for item in model.prompts}
+        reviews_by_step: dict[uuid.UUID, list[StoredReview]] = {}
+        for review in model.reviews:
+            reviews_by_step.setdefault(review.step_id, []).append(review)
+        steps = [item for item in model.steps if item.shot_card_id == shot_id]
         return {
-            **_json_shot(shot),
-            "assets": [_json_asset(item) for item in self.list_assets(shot_id=shot_id)],
-            "attempts": [self._step_trace(step) for step in steps],
+            **_json_shot(current),
+            "assets": [
+                _json_asset(item) for item in model.assets if item.shot_card_id == shot_id
+            ],
+            "attempts": [
+                self._step_trace_loaded(
+                    step,
+                    prompts.get(step.id),
+                    tuple(reviews_by_step.get(step.id, [])),
+                )
+                for step in steps
+            ],
         }
 
     def _step_trace(self, step: StoredStep) -> dict[str, Any]:
         prompt = self.get_prompt(step.id)
+        return self._step_trace_loaded(step, prompt, self.list_reviews(step.id))
+
+    @staticmethod
+    def _step_trace_loaded(
+        step: StoredStep,
+        prompt: StoredPrompt | None,
+        reviews: tuple[StoredReview, ...],
+    ) -> dict[str, Any]:
         return {
             **_json_step(step),
             "prompt": (
@@ -1336,7 +1799,7 @@ class SqlAlchemyWorkflowRepository:
                     "warnings": list(review.warnings),
                     "evidence": review.evidence,
                 }
-                for review in self.list_reviews(step.id)
+                for review in reviews
             ],
         }
 
@@ -1503,6 +1966,15 @@ class SqlAlchemyWorkflowRepository:
                 raise ValueError("定妆参考图片不可用；请先修复或重新上传")
             if asset.sha256 in hashes:
                 continue
+            expected_purpose = (
+                asset.metadata_json.get("referencePurpose")
+                if asset.role in {"generated_reference", "external_reference"}
+                else None
+            )
+            if expected_purpose is not None and binding.purpose.value != expected_purpose:
+                raise ValueError(
+                    f"asset {asset.id} has fixed look purpose {expected_purpose}"
+                )
             hashes.add(asset.sha256)
             result.append(binding)
         return result
@@ -1582,6 +2054,12 @@ def _default_visual_profile(session: Session) -> VisualProfileDraft:
 def _expected_reference_role(asset: Asset) -> ReferenceRole | None:
     if asset.role == "scene_look":
         return ReferenceRole.SCENE
+    if asset.role in {"generated_reference", "external_reference"}:
+        value = asset.metadata_json.get("referenceRole")
+        try:
+            return ReferenceRole(value) if isinstance(value, str) else None
+        except ValueError:
+            return None
     semantic_key = asset.semantic_key or ""
     if asset.scope == "canon" and semantic_key.startswith(("person:", "cat:")):
         return ReferenceRole.IDENTITY
@@ -1856,43 +2334,6 @@ def _sequence(row: VideoSequence) -> StoredSequence:
     )
 
 
-def _json_project(row: StoredProject) -> dict[str, Any]:
-    return {
-        "id": str(row.id),
-        "title": row.title,
-        "contentDate": row.content_date.isoformat(),
-        "status": row.status.value,
-        "selectedSequenceId": None
-        if row.selected_sequence_id is None
-        else str(row.selected_sequence_id),
-        "contractVersion": CURRENT_CONTRACT_VERSION,
-        "visualProfileRevisionId": (
-            None
-            if row.visual_profile_revision_id is None
-            else str(row.visual_profile_revision_id)
-        ),
-        "defaultReferenceBindings": [
-            item.model_dump(mode="json", by_alias=True)
-            for item in row.default_reference_bindings
-        ],
-    }
-
-
-def _json_scene(row: StoredScene) -> dict[str, Any]:
-    return {
-        "id": str(row.id),
-        "order": row.order,
-        **row.draft.model_dump(mode="json", by_alias=True),
-        "status": row.status.value,
-        "selectedLookAssetId": (
-            None
-            if row.selected_look_asset_id is None
-            else str(row.selected_look_asset_id)
-        ),
-        "lookDraftRevision": row.look_draft_revision,
-    }
-
-
 def _json_shot(row: StoredShot) -> dict[str, Any]:
     return {
         "id": str(row.id),
@@ -1909,8 +2350,6 @@ def _json_shot(row: StoredShot) -> dict[str, Any]:
         if row.selected_video_asset_id is None
         else str(row.selected_video_asset_id),
     }
-
-
 def _json_step(row: StoredStep) -> dict[str, Any]:
     return {
         "id": str(row.id),
@@ -1925,8 +2364,6 @@ def _json_step(row: StoredStep) -> dict[str, Any]:
         "error": row.error,
         "createdAt": None if row.created_at is None else row.created_at.isoformat(),
     }
-
-
 def _json_asset(row: StoredAsset) -> dict[str, Any]:
     return {
         "id": str(row.id),
@@ -1947,16 +2384,4 @@ def _json_asset(row: StoredAsset) -> dict[str, Any]:
         "visualProfileRevisionId": row.metadata.get("visualProfileRevisionId"),
         "lookDraftRevision": row.metadata.get("lookDraftRevision"),
         "createdAt": None if row.created_at is None else row.created_at.isoformat(),
-    }
-
-
-def _json_sequence(row: StoredSequence) -> dict[str, Any]:
-    return {
-        "id": str(row.id),
-        "projectId": str(row.project_id),
-        "revision": row.revision,
-        "parentSequenceId": None if row.parent_sequence_id is None else str(row.parent_sequence_id),
-        "renderedAssetId": None if row.rendered_asset_id is None else str(row.rendered_asset_id),
-        "status": row.status.value,
-        "plan": row.plan.model_dump(mode="json"),
     }

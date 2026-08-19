@@ -15,18 +15,30 @@ const props = defineProps<{
   shot?: ShotDto | null;
 }>();
 const emit = defineEmits<{
-  apply: [record: ShotAssistRecord, patch: ShotAssistPatch];
+  apply: [
+    record: ShotAssistRecord,
+    patch: ShotAssistPatch | null,
+    acceptedAnchorBrief: string | null,
+  ];
   adoptTail: [];
 }>();
 
 const selectedFields = ref<string[]>([]);
 const selectedCreativeBody = ref("");
 const selectedStepId = ref("");
+const selectedAnchorBrief = ref("");
 const failedImages = ref<Set<string>>(new Set());
 const record = computed(() => (
   props.records.find((item) => item.stepId === selectedStepId.value)
   ?? props.records[0]
   ?? null
+));
+const anchorBriefAlreadyAccepted = computed(() => Boolean(
+  record.value?.acceptedAnchorBriefAt || record.value?.acceptedAnchorBrief,
+));
+const patchAlreadyAccepted = computed(() => Boolean(
+  record.value?.acceptedPatchAt
+  || (record.value?.acceptedOutput && Object.keys(record.value.acceptedOutput).length),
 ));
 const creativeBodies = computed(() => {
   const analysis = record.value?.analysis;
@@ -75,7 +87,25 @@ const fieldLabels: Record<string, string> = {
 watch(
   () => props.records.map((item) => item.stepId),
   (ids) => {
-    if (!ids.includes(selectedStepId.value)) selectedStepId.value = ids[0] ?? "";
+    const selected = props.records.find((item) => item.stepId === selectedStepId.value);
+    const latestActionable = props.records.find((item) => (
+      item.analysis
+      && !item.stale
+      && (
+        !Boolean(item.acceptedAnchorBriefAt || item.acceptedAnchorBrief)
+        || !Boolean(
+          item.acceptedPatchAt
+          || (item.acceptedOutput && Object.keys(item.acceptedOutput).length),
+        )
+      )
+    ));
+    if (latestActionable && latestActionable.stepId !== selectedStepId.value) {
+      selectedStepId.value = latestActionable.stepId;
+    } else if (!selected || selected.stale) {
+      selectedStepId.value = props.records.find((item) => item.analysis && !item.stale)?.stepId
+        ?? ids[0]
+        ?? "";
+    }
   },
   { immediate: true },
 );
@@ -87,17 +117,24 @@ watch(
       ?? record.value?.analysis?.creativeBody
       ?? creativeBodies.value[0]?.body
       ?? "";
-    selectedFields.value = patchEntries.value.map(([key]) => key);
+    selectedAnchorBrief.value = record.value?.analysis?.anchorBrief ?? "";
+    selectedFields.value = [];
   },
   { immediate: true },
 );
 
-function applySelected() {
+function applySelectedFields() {
   if (!record.value?.analysis) return;
   const patch = Object.fromEntries(
     patchEntries.value.filter(([key]) => selectedFields.value.includes(key)),
   ) as ShotAssistPatch;
-  if (Object.keys(patch).length) emit("apply", record.value, patch);
+  const selectedPatch = Object.keys(patch).length ? patch : null;
+  if (selectedPatch) emit("apply", record.value, selectedPatch, null);
+}
+
+function applyAnchorBrief() {
+  if (!record.value?.analysis || !selectedAnchorBrief.value.trim()) return;
+  emit("apply", record.value, null, selectedAnchorBrief.value.trim());
 }
 
 function currentValue(key: string): unknown {
@@ -179,6 +216,25 @@ function imageFailed(assetId: string) {
             <pre>{{ item.body }}</pre>
           </label>
         </div>
+        <div v-if="record.analysis.anchorBrief" class="anchor-brief-block">
+          <div>
+            <b>开场静态画面稿</b>
+            <small>只用于 Seedream 首帧；不得包含完整动作过程、声音或收尾结果。</small>
+          </div>
+          <el-input
+            v-model="selectedAnchorBrief"
+            type="textarea"
+            :rows="6"
+            :disabled="anchorBriefAlreadyAccepted"
+            maxlength="4000"
+            show-word-limit
+          />
+          <el-button
+            type="primary"
+            :disabled="record.stale || anchorBriefAlreadyAccepted || !selectedAnchorBrief.trim()"
+            @click="applyAnchorBrief"
+          >{{ anchorBriefAlreadyAccepted ? '静态稿已采用' : '采用该静态画面稿' }}</el-button>
+        </div>
         <div class="patch-block">
           <b>选择要应用的字段</b>
           <el-checkbox-group v-model="selectedFields">
@@ -189,7 +245,11 @@ function imageFailed(assetId: string) {
             </div>
           </el-checkbox-group>
           <span v-if="!patchEntries.length">本次分析没有提出字段改写。</span>
-          <el-button type="primary" :disabled="record.stale || Boolean(record.acceptedAt) || selectedFields.length === 0" @click="applySelected">{{ record.acceptedAt ? '已接受' : '应用勾选字段' }}</el-button>
+          <el-button
+            type="primary"
+            :disabled="record.stale || patchAlreadyAccepted || selectedFields.length === 0"
+            @click="applySelectedFields"
+          >{{ patchAlreadyAccepted ? '字段修改已接受' : '接受所选字段修改' }}</el-button>
         </div>
       </template>
     </div>
@@ -198,7 +258,8 @@ function imageFailed(assetId: string) {
 </template>
 
 <style scoped>
-.shot-assistance-panel, .context-block, .analysis-block, .patch-block, .creative-candidates { display: grid; gap: 8px; }
+.shot-assistance-panel, .context-block, .analysis-block, .patch-block, .creative-candidates, .anchor-brief-block { display: grid; gap: 8px; }
+.anchor-brief-block { padding: 10px; border: 1px solid #31577d; border-radius: 8px; background: #101a25; }.anchor-brief-block small { display: block; color: #8fa4bc; margin-top: 3px; }
 .history-select { display: grid; gap: 5px; color: #9eabc0; }.history-select select { background: #111722; color: #e7eaf0; border: 1px solid #344056; padding: 7px; }
 .diff-row { display: grid; grid-template-columns: 140px 1fr 1fr; gap: 8px; align-items: start; border: 1px solid #293344; border-radius: 7px; padding: 8px; }.diff-row small { color: #8791a2; }
 .tail-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }

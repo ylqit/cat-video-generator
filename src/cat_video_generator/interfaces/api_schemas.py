@@ -9,7 +9,9 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..domain.contracts import (
+    AcceptedVisualAssetPlan,
     ReferenceBinding,
+    ReferenceImageDraft,
     SceneDraft,
     SceneLookDraft,
     SceneLookPlan,
@@ -17,6 +19,7 @@ from ..domain.contracts import (
     ShotCardDraft,
     ShotSuggestion,
     StoryDiagnosisOutput,
+    StoryExpansionOutput,
     StoryProjectInput,
     StoryRewriteOutput,
     StoryRewriteStrategy,
@@ -27,6 +30,16 @@ from ..domain.rendering import SequenceTransition
 
 class ApiModel(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True, str_strip_whitespace=True)
+
+
+class UpdateRuntimeSettingsRequest(ApiModel):
+    expected_revision: int = Field(alias="expectedRevision", ge=0)
+    planning_model: str = Field(alias="planningModel", min_length=1, max_length=200)
+    image_model: str = Field(alias="imageModel", min_length=1, max_length=200)
+    video_model: str = Field(alias="videoModel", min_length=1, max_length=200)
+    review_model: str = Field(alias="reviewModel", min_length=1, max_length=200)
+    video_resolution: Literal["480p", "720p"] = Field(alias="videoResolution")
+    semantic_review_enabled: bool = Field(alias="semanticReviewEnabled")
 
 
 class CreateProjectRequest(ApiModel):
@@ -59,6 +72,18 @@ class DiagnoseStoryRequest(ApiModel):
     allow_paid_generation: bool = Field(alias="allowPaidGeneration")
 
 
+class ExpandStoryRequest(ApiModel):
+    allow_paid_generation: bool = Field(alias="allowPaidGeneration")
+
+
+class AcceptStoryExpansionRequest(ApiModel):
+    expansion: StoryExpansionOutput
+
+
+class PlanVisualAssetsRequest(ApiModel):
+    allow_paid_generation: bool = Field(alias="allowPaidGeneration")
+
+
 class AcceptStoryDiagnosisRequest(ApiModel):
     diagnosis: StoryDiagnosisOutput
     selected_strategy: StoryRewriteStrategy | None = Field(
@@ -81,6 +106,10 @@ class AcceptStoryRewriteRequest(ApiModel):
     rewrite: StoryRewriteOutput
 
 
+class AcceptVisualAssetPlanRequest(ApiModel):
+    plan: AcceptedVisualAssetPlan
+
+
 class AssistShotRequest(ApiModel):
     source_draft_revision: int = Field(alias="sourceDraftRevision", ge=1)
     candidate_asset_ids: list[UUID] = Field(
@@ -93,7 +122,16 @@ class AssistShotRequest(ApiModel):
 
 class AcceptShotAssistanceRequest(ApiModel):
     source_draft_revision: int = Field(alias="sourceDraftRevision", ge=1)
-    patch: ShotAssistPatch
+    patch: ShotAssistPatch | None = None
+    accepted_anchor_brief: Annotated[
+        str | None,
+        Field(default=None, alias="acceptedAnchorBrief", min_length=1, max_length=4_000),
+    ]
+
+
+class SaveAnchorBriefRequest(ApiModel):
+    source_draft_revision: int = Field(alias="sourceDraftRevision", ge=1)
+    brief: Annotated[str, Field(min_length=1, max_length=4_000)]
 
 
 class AcceptSuggestionsRequest(ApiModel):
@@ -142,6 +180,10 @@ class GenerateRequest(ApiModel):
     allow_paid_generation: bool = Field(alias="allowPaidGeneration")
     regenerate: bool = False
     reason: Annotated[str | None, Field(max_length=1000)] = None
+    expected_input_hash: Annotated[
+        str | None,
+        Field(default=None, alias="expectedInputHash", min_length=64, max_length=64),
+    ] = None
 
     @property
     def retry_reason(self) -> str | None:
@@ -152,6 +194,10 @@ class GenerateRequest(ApiModel):
 
 class GenerateSceneLookRequest(GenerateRequest):
     draft_revision: int = Field(alias="draftRevision", ge=1)
+
+
+class GenerateReferenceImageRequest(GenerateRequest):
+    draft: ReferenceImageDraft
 
 
 class ReviewRequest(ApiModel):

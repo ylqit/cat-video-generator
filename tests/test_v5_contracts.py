@@ -13,6 +13,7 @@ from cat_video_generator.domain.prompts import (
 from cat_video_generator.domain.rendering import (
     MediaSource,
     ProjectSequencePlan,
+    ProviderMediaRole,
     SequenceClip,
     SequenceTransition,
     build_shot_input_plan,
@@ -214,28 +215,36 @@ def _image_source(index: int) -> MediaSource:
 
 
 @pytest.mark.parametrize("resolution", ["480p", "720p"])
-def test_v5_video_input_contract_allows_nine_images_total(resolution: str) -> None:
+def test_v5_video_input_contract_allows_anchor_as_only_media(resolution: str) -> None:
     anchor = _image_source(1)
-    references = tuple(_image_source(index) for index in range(2, 10))
 
     plan = build_shot_input_plan(
         resolution=resolution,
         duration_seconds=10,
         anchor=anchor,
-        references=references,
     )
 
-    assert len(plan.bindings) == 9
-    assert [binding.ordinal for binding in plan.bindings] == list(range(1, 10))
+    assert len(plan.bindings) == 1
+    assert plan.bindings[0].provider_role is ProviderMediaRole.FIRST_FRAME
 
 
-def test_v5_video_input_contract_rejects_tenth_image() -> None:
-    with pytest.raises(ValueError, match="最多允许8项附加参考素材"):
+def test_v5_video_input_contract_rejects_reference_media_with_first_frame() -> None:
+    with pytest.raises(ValueError, match="首帧模式不能同时提交普通参考图片"):
         build_shot_input_plan(
             resolution="480p",
             duration_seconds=10,
             anchor=_image_source(1),
-            references=tuple(_image_source(index) for index in range(2, 11)),
+            references=(_image_source(2),),
+        )
+
+
+def test_v5_video_reference_mode_rejects_tenth_image() -> None:
+    with pytest.raises(ValueError, match="最多允许9项参考素材"):
+        build_shot_input_plan(
+            resolution="480p",
+            duration_seconds=10,
+            anchor=None,
+            references=tuple(_image_source(index) for index in range(1, 11)),
         )
 
 

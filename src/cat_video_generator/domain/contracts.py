@@ -83,8 +83,28 @@ class LookReferencePurpose(StrEnum):
     CAT_IDENTITY = "cat_identity"
     STYLE = "style"
     WARDROBE = "wardrobe"
+    ENVIRONMENT = "environment"
     PROP = "prop"
     COMPOSITION = "composition"
+
+
+class VisualAssetPurpose(StrEnum):
+    WARDROBE = "wardrobe"
+    ENVIRONMENT = "environment"
+    PROP = "prop"
+    COMPOSITION = "composition"
+
+
+class VisualAssetScope(StrEnum):
+    PROJECT = "project"
+    SCENE = "scene"
+
+
+class VisualAssetAction(StrEnum):
+    GENERATE = "generate"
+    UPLOAD = "upload"
+    EXISTING = "existing"
+    SKIP = "skip"
 
 
 class ReferenceBinding(StrictModel):
@@ -292,6 +312,110 @@ class StoryRewriteOutput(StrictModel):
     )
 
 
+class StoryExpansionOutput(StrictModel):
+    expanded_story: Annotated[
+        str,
+        Field(alias="expandedStory", min_length=1, max_length=12_000),
+    ]
+    creative_summary: Annotated[
+        str,
+        Field(alias="creativeSummary", min_length=1, max_length=2_000),
+    ]
+    unresolved_questions: list[
+        Annotated[str, Field(min_length=1, max_length=1_000)]
+    ] = Field(
+        default_factory=list,
+        alias="unresolvedQuestions",
+        max_length=20,
+    )
+
+
+class VisualAssetSuggestion(StrictModel):
+    suggestion_key: Annotated[
+        str,
+        Field(alias="suggestionKey", min_length=1, max_length=100, pattern=r"^[a-z0-9_-]+$"),
+    ]
+    display_name: Annotated[str, Field(alias="displayName", min_length=1, max_length=120)]
+    purpose: VisualAssetPurpose
+    target_scope: VisualAssetScope = Field(alias="targetScope")
+    rationale: Annotated[str, Field(min_length=1, max_length=2_000)]
+    prompt: Annotated[str, Field(min_length=1, max_length=6_000)]
+    reference_asset_ids: list[UUID] = Field(
+        default_factory=list,
+        alias="referenceAssetIds",
+        max_length=14,
+    )
+
+
+class VisualAssetPlanOutput(StrictModel):
+    overall_assessment: Annotated[
+        str,
+        Field(alias="overallAssessment", min_length=1, max_length=4_000),
+    ]
+    suggestions: list[VisualAssetSuggestion] = Field(default_factory=list, max_length=12)
+    text_only_items: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(
+        default_factory=list,
+        alias="textOnlyItems",
+        max_length=20,
+    )
+
+    @model_validator(mode="after")
+    def validate_suggestion_keys(self) -> VisualAssetPlanOutput:
+        keys = [item.suggestion_key for item in self.suggestions]
+        if len(keys) != len(set(keys)):
+            raise ValueError("visual asset suggestion keys must be unique")
+        return self
+
+
+class VisualAssetPlanSelection(StrictModel):
+    suggestion_key: Annotated[
+        str,
+        Field(alias="suggestionKey", min_length=1, max_length=100),
+    ]
+    action: VisualAssetAction
+    display_name: Annotated[str, Field(alias="displayName", min_length=1, max_length=120)]
+    purpose: VisualAssetPurpose
+    target_scope: VisualAssetScope = Field(alias="targetScope")
+    prompt: Annotated[str, Field(min_length=1, max_length=6_000)]
+    reference_asset_ids: list[UUID] = Field(
+        default_factory=list,
+        alias="referenceAssetIds",
+        max_length=14,
+    )
+    existing_asset_id: UUID | None = Field(default=None, alias="existingAssetId")
+
+    @model_validator(mode="after")
+    def validate_action_source(self) -> VisualAssetPlanSelection:
+        if self.action is VisualAssetAction.EXISTING and self.existing_asset_id is None:
+            raise ValueError("existing action requires existingAssetId")
+        if self.action is not VisualAssetAction.EXISTING and self.existing_asset_id is not None:
+            raise ValueError("existingAssetId is only valid for existing action")
+        return self
+
+
+class AcceptedVisualAssetPlan(StrictModel):
+    selections: list[VisualAssetPlanSelection] = Field(max_length=12)
+
+    @model_validator(mode="after")
+    def validate_selection_keys(self) -> AcceptedVisualAssetPlan:
+        keys = [item.suggestion_key for item in self.selections]
+        if len(keys) != len(set(keys)):
+            raise ValueError("accepted visual asset selection keys must be unique")
+        return self
+
+
+class ReferenceImageDraft(StrictModel):
+    display_name: Annotated[str, Field(alias="displayName", min_length=1, max_length=120)]
+    purpose: VisualAssetPurpose
+    prompt: Annotated[str, Field(min_length=1, max_length=6_000)]
+    reference_asset_ids: list[UUID] = Field(
+        default_factory=list,
+        alias="referenceAssetIds",
+        max_length=14,
+    )
+    source_revision: Annotated[str, Field(alias="sourceRevision", min_length=1, max_length=160)]
+
+
 class ShotSuggestion(StrictModel):
     title: Annotated[str, Field(min_length=1, max_length=100)]
     direction: Annotated[str, Field(min_length=1, max_length=6_000)]
@@ -494,6 +618,10 @@ class ShotAssistAnalysis(StrictModel):
         alias="creativeAlternatives",
         max_length=2,
     )
+    anchor_brief: Annotated[
+        str | None,
+        Field(default=None, alias="anchorBrief", min_length=1, max_length=4_000),
+    ]
     patch: ShotAssistPatch | None = None
 
 

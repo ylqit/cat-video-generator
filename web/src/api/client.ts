@@ -1,23 +1,29 @@
 import type {
   AssetDto,
+  AcceptedVisualAssetPlan,
   CreativeStepRecord,
   CreativeWorkflowDto,
   HealthDto,
   JobDto,
   PersistentTaskDto,
+  TaskCenterDto,
   PreviousTailStatus,
   ProductionBoardDto,
   ProjectGraph,
   ProjectSummary,
   ReferenceBinding,
+  ReferenceImageDraft,
   ReferenceRole,
   ReferenceUsage,
+  RuntimeProductionConfig,
+  RuntimeSettingsDto,
   SceneLookDraftDto,
   SceneLookDraftEnvelope,
   SceneDto,
   SceneLookPlan,
   SceneLookPromptPreview,
   SceneLookVersion,
+  SceneVisualAssetsDto,
   SequenceDto,
   SequenceTransitionDto,
   ShotAssistContext,
@@ -29,8 +35,10 @@ import type {
   ShotSuggestion,
   ShotSuggestionOutput,
   StoryDiagnosisOutput,
+  StoryExpansionOutput,
   StoryRewriteOutput,
   StoryRewriteStrategy,
+  VisualAssetPurpose,
   VisualProfileDraft,
   VisualProfileRevisionDto,
 } from "./types";
@@ -67,8 +75,37 @@ function json<T>(path: string, method: string, body?: unknown): Promise<T> {
   });
 }
 
+function paidJson<T>(path: string, body: unknown, confirmedRevision?: number): Promise<T> {
+  if (confirmedRevision === undefined) {
+    return Promise.reject(new ApiError(409, "运行配置尚未加载，请刷新页面后重新确认"));
+  }
+  return request<T>(path, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-CVG-Runtime-Config-Revision": String(confirmedRevision),
+    },
+    body: JSON.stringify(body),
+  });
+}
+
 export const api = {
   health: () => request<HealthDto>("/health"),
+  runtimeSettings: () => request<RuntimeSettingsDto>("/runtime-settings"),
+  updateRuntimeSettings: (
+    expectedRevision: number,
+    config: Omit<RuntimeProductionConfig, "revision" | "updatedAt" | "usingOverride">,
+  ) => json<RuntimeSettingsDto>("/runtime-settings", "PUT", {
+    expectedRevision,
+    ...config,
+  }),
+  restoreRuntimeSettings: (expectedRevision: number) => request<RuntimeSettingsDto>(
+    "/runtime-settings/override",
+    {
+      method: "DELETE",
+      headers: { "X-CVG-Runtime-Config-Revision": String(expectedRevision) },
+    },
+  ),
   projects: () => request<ProjectSummary[]>("/projects"),
   project: (id: string) => request<ProjectGraph>(`/projects/${id}`),
   productionBoard: (id: string) =>
@@ -106,10 +143,16 @@ export const api = {
     json<{ saved: boolean }>(`/projects/${projectId}/scene-order`, "PUT", { ids }),
   creativeWorkflow: (sceneId: string) =>
     request<CreativeWorkflowDto>(`/scenes/${sceneId}/creative-workflow`),
-  diagnoseStory: (sceneId: string) =>
-    json<{ jobId: string }>(`/scenes/${sceneId}/story-diagnoses`, "POST", {
+  expandStory: (sceneId: string, runtimeRevision?: number) =>
+    paidJson<{ jobId: string }>(`/scenes/${sceneId}/story-expansions`, {
       allowPaidGeneration: true,
-    }),
+    }, runtimeRevision),
+  acceptStoryExpansion: (stepId: string, expansion: StoryExpansionOutput) =>
+    json<SceneDto>(`/steps/${stepId}/accept-story-expansion`, "POST", { expansion }),
+  diagnoseStory: (sceneId: string, runtimeRevision?: number) =>
+    paidJson<{ jobId: string }>(`/scenes/${sceneId}/story-diagnoses`, {
+      allowPaidGeneration: true,
+    }, runtimeRevision),
   acceptStoryDiagnosis: (
     stepId: string,
     diagnosis: StoryDiagnosisOutput,
@@ -122,17 +165,17 @@ export const api = {
     additionalInstructions,
     preserveOriginal,
   }),
-  rewriteStory: (sceneId: string, diagnosisStepId: string) =>
-    json<{ jobId: string }>(`/scenes/${sceneId}/story-rewrites`, "POST", {
+  rewriteStory: (sceneId: string, diagnosisStepId: string, runtimeRevision?: number) =>
+    paidJson<{ jobId: string }>(`/scenes/${sceneId}/story-rewrites`, {
       diagnosisStepId,
       allowPaidGeneration: true,
-    }),
+    }, runtimeRevision),
   acceptStoryRewrite: (stepId: string, rewrite: StoryRewriteOutput) =>
     json<SceneDto>(`/steps/${stepId}/accept-story-rewrite`, "POST", { rewrite }),
-  suggestShots: (sceneId: string) =>
-    json<{ jobId: string }>(`/scenes/${sceneId}/shot-suggestions`, "POST", {
+  suggestShots: (sceneId: string, runtimeRevision?: number) =>
+    paidJson<{ jobId: string }>(`/scenes/${sceneId}/shot-suggestions`, {
       allowPaidGeneration: true,
-    }),
+    }, runtimeRevision),
   acceptSuggestions: (
     stepId: string,
     lookPlan: SceneLookPlan | null,
@@ -145,6 +188,16 @@ export const api = {
     applyMode,
     sourceShotRevisions,
   }),
+  planVisualAssets: (sceneId: string, runtimeRevision?: number) =>
+    paidJson<{ jobId: string }>(`/scenes/${sceneId}/visual-asset-plans`, {
+      allowPaidGeneration: true,
+    }, runtimeRevision),
+  acceptVisualAssetPlan: (stepId: string, plan: AcceptedVisualAssetPlan) =>
+    json<CreativeStepRecord>(`/steps/${stepId}/accept-visual-asset-plan`, "POST", {
+      plan,
+    }),
+  sceneVisualAssets: (sceneId: string) =>
+    request<SceneVisualAssetsDto>(`/scenes/${sceneId}/visual-assets`),
   addShot: (sceneId: string, body: Record<string, unknown>) =>
     json<ShotDto>(`/scenes/${sceneId}/shots`, "POST", body),
   updateShot: (shotId: string, body: Record<string, unknown>) =>
@@ -155,6 +208,11 @@ export const api = {
   shot: (shotId: string) => request<ShotDto>(`/shots/${shotId}`),
   shotGenerationWorkspace: (shotId: string) =>
     request<ShotGenerationWorkspaceDto>(`/shots/${shotId}/generation-workspace`),
+  saveAnchorBrief: (shotId: string, sourceDraftRevision: number, brief: string) =>
+    json<ShotGenerationWorkspaceDto>(`/shots/${shotId}/anchor-briefs`, "POST", {
+      sourceDraftRevision,
+      brief,
+    }),
   promptPreview: (
     shotId: string,
     target: "anchor" | "video" = "video",
@@ -172,20 +230,23 @@ export const api = {
     shotId: string,
     sourceDraftRevision: number,
     candidateAssetIds: string[],
-  ) => json<{ jobId: string }>(`/shots/${shotId}/assist`, "POST", {
+    runtimeRevision?: number,
+  ) => paidJson<{ jobId: string }>(`/shots/${shotId}/assist`, {
     sourceDraftRevision,
     candidateAssetIds,
     allowPaidGeneration: true,
-  }),
+  }, runtimeRevision),
   shotAssistAnalyses: (shotId: string) =>
     request<ShotAssistRecord[]>(`/shots/${shotId}/assist-analyses`),
   acceptShotAssistance: (
     stepId: string,
     sourceDraftRevision: number,
-    patch: ShotAssistPatch,
+    patch: ShotAssistPatch | null,
+    acceptedAnchorBrief?: string | null,
   ) => json<ShotDto>(`/steps/${stepId}/accept-shot-assistance`, "POST", {
     sourceDraftRevision,
     patch,
+    acceptedAnchorBrief,
   }),
   previousTail: (shotId: string) =>
     request<PreviousTailStatus>(`/shots/${shotId}/previous-tail`),
@@ -226,30 +287,78 @@ export const api = {
     form.append("file", file);
     return request<AssetDto>(`/projects/${projectId}/references`, { method: "POST", body: form });
   },
-  generateAnchor: (shotId: string, regenerate = false, reason?: string) =>
-    json<{ jobId: string }>(`/shots/${shotId}/anchors`, "POST", {
+  uploadVisualReference: async (
+    target: { projectId: string; sceneId?: string | null },
+    purpose: VisualAssetPurpose,
+    displayName: string,
+    file: File,
+  ) => {
+    const form = new FormData();
+    form.append("purpose", purpose);
+    form.append("displayName", displayName.trim() || file.name.replace(/\.[^.]+$/, ""));
+    form.append("file", file);
+    const path = target.sceneId
+      ? `/scenes/${target.sceneId}/visual-references`
+      : `/projects/${target.projectId}/visual-references`;
+    return request<AssetDto>(path, { method: "POST", body: form });
+  },
+  generateAnchor: (
+    shotId: string,
+    regenerate = false,
+    reason?: string,
+    expectedInputHash?: string,
+    runtimeRevision?: number,
+  ) =>
+    paidJson<{ jobId: string }>(`/shots/${shotId}/anchors`, {
       allowPaidGeneration: true,
       regenerate,
       reason,
-    }),
+      expectedInputHash,
+    }, runtimeRevision),
   generateSceneLook: (
     sceneId: string,
     draftRevision: number,
     regenerate = false,
     reason?: string,
+    runtimeRevision?: number,
   ) =>
-    json<{ jobId: string }>(`/scenes/${sceneId}/look-images`, "POST", {
+    paidJson<{ jobId: string }>(`/scenes/${sceneId}/look-images`, {
       allowPaidGeneration: true,
       draftRevision,
       regenerate,
       reason,
-    }),
-  generateVideo: (shotId: string, regenerate = false, reason?: string) =>
-    json<{ jobId: string }>(`/shots/${shotId}/videos`, "POST", {
+    }, runtimeRevision),
+  generateReferenceImage: (
+    target: { projectId: string; sceneId?: string | null },
+    draft: ReferenceImageDraft,
+    regenerate = false,
+    reason?: string,
+    runtimeRevision?: number,
+  ) => paidJson<{ jobId: string; operationKey: string }>(
+    target.sceneId
+      ? `/scenes/${target.sceneId}/reference-images`
+      : `/projects/${target.projectId}/reference-images`,
+    {
       allowPaidGeneration: true,
       regenerate,
       reason,
-    }),
+      draft,
+    },
+    runtimeRevision,
+  ),
+  generateVideo: (
+    shotId: string,
+    regenerate = false,
+    reason?: string,
+    expectedInputHash?: string,
+    runtimeRevision?: number,
+  ) =>
+    paidJson<{ jobId: string }>(`/shots/${shotId}/videos`, {
+      allowPaidGeneration: true,
+      regenerate,
+      reason,
+      expectedInputHash,
+    }, runtimeRevision),
   reviewAsset: (assetId: string, decision: "approved" | "rejected", reason: string) =>
     json(`/assets/${assetId}/review`, "POST", { decision, reason, select: true }),
   selectVersion: (shotId: string, assetId: string) =>
@@ -263,7 +372,8 @@ export const api = {
       instruction: string;
       allowPaidGeneration: true;
     },
-  ) => json<{ jobId: string }>(`/shots/${shotId}/range-edits`, "POST", body),
+    runtimeRevision?: number,
+  ) => paidJson<{ jobId: string }>(`/shots/${shotId}/range-edits`, body, runtimeRevision),
   buildSequence: (
     projectId: string,
     transitions: Array<{ afterShotId: string; transition: SequenceTransitionDto }>,
@@ -280,6 +390,7 @@ export const api = {
     json(`/steps/${stepId}/reconcile`, "POST", { providerTaskId }),
   jobs: () => request<JobDto[]>("/jobs"),
   job: (jobId: string) => request<JobDto>(`/jobs/${jobId}`),
+  taskCenter: () => request<TaskCenterDto>("/task-center"),
   projectTasks: (projectId: string) =>
     request<PersistentTaskDto[]>(`/projects/${projectId}/tasks`),
   canon: () => request<AssetDto[]>("/canon"),

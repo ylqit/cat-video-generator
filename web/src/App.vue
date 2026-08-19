@@ -4,10 +4,15 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
 import { api } from "./api/client";
-import type { HealthDto } from "./api/types";
+import {
+  startRuntimeStatus,
+  stopRuntimeStatus,
+  useRuntimeStatus,
+} from "./runtimeStatus";
 import {
   clearCompletedTasks,
   registerTask,
+  requestWorkspaceRefresh,
   startTaskCenter,
   stopTaskCenter,
   useTaskCenter,
@@ -16,11 +21,11 @@ import type { TaskCenterItem } from "./tasks/taskCenter";
 
 const route = useRoute();
 const router = useRouter();
-const health = ref<HealthDto | null>(null);
-const unreachable = ref(false);
 const taskDrawerVisible = ref(false);
 const taskCenter = useTaskCenter();
-let timer: number | undefined;
+const runtimeStatus = useRuntimeStatus();
+const health = runtimeStatus.health;
+const unreachable = runtimeStatus.unreachable;
 const statusText = computed(() => {
   if (unreachable.value) return "后端不可达";
   if (!health.value) return "检查中…";
@@ -29,15 +34,6 @@ const statusText = computed(() => {
     : `迁移不一致 · ${health.value.alembicRevision}`;
 });
 const statusColor = computed(() => unreachable.value ? "#f56c6c" : health.value?.ready ? "#67c23a" : "#e6a23c");
-
-async function checkHealth() {
-  try {
-    health.value = await api.health();
-    unreachable.value = false;
-  } catch {
-    unreachable.value = true;
-  }
-}
 
 function taskStatusText(task: Pick<TaskCenterItem, "status" | "kind" | "providerTaskId">): string {
   if (task.status === "running" && [
@@ -68,10 +64,19 @@ function taskStatusType(status: string): "success" | "warning" | "danger" | "inf
   return "info";
 }
 
-function openTask(projectId?: string, shotId?: string) {
+async function openTask(projectId?: string, shotId?: string) {
   if (!projectId) return;
   taskDrawerVisible.value = false;
-  void router.push({ path: "/studio", query: { project: projectId, shot: shotId } });
+  if (shotId) {
+    await router.push({
+      name: "shot-generation-workspace",
+      params: { projectId, shotId },
+    });
+    requestWorkspaceRefresh(projectId, shotId);
+    return;
+  }
+  await router.push({ path: "/studio", query: { project: projectId } });
+  requestWorkspaceRefresh(projectId);
 }
 
 async function resumeTask(stepId: string, projectId?: string, shotId?: string) {
@@ -91,16 +96,15 @@ async function resumeTask(stepId: string, projectId?: string, shotId?: string) {
 }
 
 onMounted(() => {
-  void checkHealth();
+  startRuntimeStatus();
   startTaskCenter();
-  timer = window.setInterval(checkHealth, 30000);
 });
 onBeforeUnmount(() => {
-  window.clearInterval(timer);
+  stopRuntimeStatus();
   stopTaskCenter();
 });
 
-watch(() => taskCenter.lastEvent.value, (event) => {
+watch(() => taskCenter.lastNotification.value, (event) => {
   if (!event || !["awaiting_review", "succeeded", "failed", "submission_unknown"].includes(event.item.status)) return;
   const tagType = taskStatusType(event.item.status);
   const notificationType = tagType === "danger" ? "error" : tagType;
@@ -121,6 +125,7 @@ watch(() => taskCenter.lastEvent.value, (event) => {
         <el-menu-item index="/studio">镜头生产</el-menu-item>
         <el-menu-item index="/projects">项目列表</el-menu-item>
         <el-menu-item index="/canon">Canon 资产</el-menu-item>
+        <el-menu-item index="/settings">系统设置</el-menu-item>
       </el-menu>
       <button class="task-trigger" type="button" @click="taskDrawerVisible = true">
         <span>全局任务</span>

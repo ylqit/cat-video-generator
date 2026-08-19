@@ -93,6 +93,10 @@ class VideoInputPlan(StrictModel):
                 raise ValueError("一次镜头生成最多使用一张first_frame")
             if first_frames and self.bindings[0] is not first_frames[0]:
                 raise ValueError("first_frame必须是第一项素材")
+            if first_frames and len(self.bindings) != 1:
+                raise ValueError(
+                    "Seedance首帧模式不能同时提交普通参考图片或参考视频"
+                )
             if any(item.modality is MediaModality.VIDEO for item in self.bindings):
                 raise ValueError("初始镜头生成不接收前序完整视频")
         else:
@@ -184,12 +188,14 @@ def build_shot_input_plan(
 ) -> VideoInputPlan:
     if resolution not in {"480p", "720p"}:
         raise ValueError(f"不支持的视频分辨率{resolution}")
-    # V5 treats the Seedance allowance as nine image inputs in total.  A
-    # selected anchor occupies the first slot; the remaining slots are regular
-    # references.  Resolution changes output quality, not this input contract.
-    maximum_references = 8 if anchor is not None else 9
-    if len(references) > maximum_references:
-        raise ValueError(f"当前模型输入档案最多允许{maximum_references}项附加参考素材")
+    # Seedance exposes first-frame generation and reference-media generation as
+    # mutually exclusive request modes.  Identity, wardrobe, environment and
+    # style references must be resolved while producing the approved anchor;
+    # once it is used as FIRST_FRAME, it is the only provider media input.
+    if anchor is not None and references:
+        raise ValueError("Seedance首帧模式不能同时提交普通参考图片")
+    if len(references) > 9:
+        raise ValueError("当前模型输入档案最多允许9项参考素材")
     sources = (() if anchor is None else (anchor,)) + references
     if any(source.media_type != "image" for source in sources):
         raise ValueError("镜头生成的锚点与参考素材必须是图片")

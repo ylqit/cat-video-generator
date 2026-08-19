@@ -12,8 +12,13 @@ export type LookReferencePurpose =
   | "cat_identity"
   | "style"
   | "wardrobe"
+  | "environment"
   | "prop"
   | "composition";
+
+export type VisualAssetPurpose = "wardrobe" | "environment" | "prop" | "composition";
+export type VisualAssetScope = "project" | "scene";
+export type VisualAssetAction = "generate" | "upload" | "existing" | "skip";
 
 export interface ReferenceBinding {
   assetId: string;
@@ -176,6 +181,51 @@ export interface StoryRewriteOutput {
   unresolvedQuestions: string[];
 }
 
+export interface StoryExpansionOutput {
+  expandedStory: string;
+  creativeSummary: string;
+  unresolvedQuestions: string[];
+}
+
+export interface VisualAssetSuggestion {
+  suggestionKey: string;
+  displayName: string;
+  purpose: VisualAssetPurpose;
+  targetScope: VisualAssetScope;
+  rationale: string;
+  prompt: string;
+  referenceAssetIds: string[];
+}
+
+export interface VisualAssetPlanOutput {
+  overallAssessment: string;
+  suggestions: VisualAssetSuggestion[];
+  textOnlyItems: string[];
+}
+
+export interface VisualAssetPlanSelection {
+  suggestionKey: string;
+  action: VisualAssetAction;
+  displayName: string;
+  purpose: VisualAssetPurpose;
+  targetScope: VisualAssetScope;
+  prompt: string;
+  referenceAssetIds: string[];
+  existingAssetId?: string | null;
+}
+
+export interface AcceptedVisualAssetPlan {
+  selections: VisualAssetPlanSelection[];
+}
+
+export interface ReferenceImageDraft {
+  displayName: string;
+  purpose: VisualAssetPurpose;
+  prompt: string;
+  referenceAssetIds: string[];
+  sourceRevision: string;
+}
+
 export interface CreativeStepRecord {
   stepId: string;
   operationKey: string;
@@ -183,6 +233,7 @@ export interface CreativeStepRecord {
   attempt: number;
   model?: string | null;
   sourceHash?: string | null;
+  shotSnapshotHash?: string | null;
   providerOutput?: Record<string, unknown> | null;
   acceptedOutput?: Record<string, unknown> | null;
   acceptedAt?: string | null;
@@ -195,13 +246,19 @@ export interface CreativeWorkflowDto {
   originalStory: string;
   currentStory: string;
   currentStoryHash: string;
-  currentStorySource: "scene_draft" | "preserved_original" | "accepted_rewrite";
+  currentStorySource:
+    | "scene_draft"
+    | "preserved_original"
+    | "accepted_expansion"
+    | "accepted_rewrite";
   currentStorySourceStepId?: string | null;
   currentShotSnapshotHash: string;
   stages: {
+    expansion: CreativeStepRecord[];
     diagnosis: CreativeStepRecord[];
     rewrite: CreativeStepRecord[];
     storyboard: CreativeStepRecord[];
+    visualAssets?: CreativeStepRecord[];
   };
   reviews: CreativeStepRecord[];
 }
@@ -350,6 +407,11 @@ export interface PersistentTaskDto {
   createdAt?: string | null;
 }
 
+export interface TaskCenterDto {
+  runtimeJobs: JobDto[];
+  persistentTasks: PersistentTaskDto[];
+}
+
 export interface HealthDto {
   ready: boolean;
   databaseReady: boolean;
@@ -367,6 +429,62 @@ export interface HealthDto {
   localCompositionReady?: boolean;
   configurationWarnings?: string[];
   generationConfigurationValid?: boolean;
+  provider?: string;
+  providerMode?: "ark";
+  realArkCalls?: number | null;
+  runtimeConfigRevision?: number;
+  runtimeConfigUpdatedAt?: string | null;
+  runtimeConfigUsingOverride?: boolean;
+}
+
+export type RuntimeModelRole = "planning" | "image" | "video" | "review";
+
+export interface RuntimeModelCatalogEntry {
+  id: string;
+  role: RuntimeModelRole;
+  displayName: string;
+  supportedResolutions: string[];
+  supportedInputModes: string[];
+}
+
+export interface RuntimeProductionConfig {
+  planningModel: string;
+  imageModel: string;
+  videoModel: string;
+  reviewModel: string;
+  videoResolution: "480p" | "720p";
+  semanticReviewEnabled: boolean;
+  revision: number;
+  updatedAt: string | null;
+  usingOverride: boolean;
+}
+
+export interface RuntimeSettingsDto {
+  current: RuntimeProductionConfig;
+  deploymentDefaults: RuntimeProductionConfig;
+  modelCatalog: RuntimeModelCatalogEntry[];
+  arkApiKeyConfigured: boolean;
+  arkReady: boolean;
+  ffmpegAvailable: boolean;
+  ffprobeAvailable: boolean;
+  databaseReady: boolean;
+  videoGenerationReady: boolean;
+  localCompositionReady: boolean;
+  databaseManagedSeparately: boolean;
+  diagnostics: {
+    provider: string;
+    arkBaseUrlProfile: string;
+    directorRequestTimeoutSeconds: number;
+    reviewRequestTimeoutSeconds: number;
+    videoApiTimeoutSeconds: number;
+    pollIntervalSeconds: number;
+    taskTimeoutSeconds: number;
+    imageRequestTimeoutSeconds: number;
+    workRoot: string;
+    assetRoot: string;
+    configurationWarnings: string[];
+    configurationIssues: string[];
+  };
 }
 
 export interface ShotRuleFinding {
@@ -397,8 +515,22 @@ export interface PreviousTailStatus {
   stale: boolean;
 }
 
+export type ProviderInputMode = "text_only" | "reference_media" | "first_frame";
+
+export interface ShotPromptReference {
+  index: number;
+  assetId: string;
+  displayName: string;
+  promptAlias: string;
+  subjectLabel: string;
+  sourceLayer: "shot" | "scene_look" | "project" | "previous_tail" | "candidate";
+  responsibility: string;
+  contentReady: boolean;
+}
+
 export interface ShotPromptPreview {
   target: "anchor" | "video";
+  providerInputMode: ProviderInputMode;
   ready: boolean;
   blockers: string[];
   inputHash: string;
@@ -415,24 +547,25 @@ export interface ShotPromptPreview {
   localAnalysis: ShotLocalAnalysis;
   qualitativePacing: string;
   linkWarnings: string[];
-  references: Array<{
-    index: number;
-    assetId: string;
-    displayName: string;
-    promptAlias: string;
-    subjectLabel: string;
-    sourceLayer: "shot" | "scene_look" | "project" | "previous_tail" | "candidate";
-    responsibility: string;
-    contentReady: boolean;
-  }>;
+  actualInputCount: number;
+  references: ShotPromptReference[];
+  actualInputs: ShotPromptReference[];
   previousTail: PreviousTailStatus;
 }
 
 export type ProductionNextAction =
   | "open_scene_look"
+  | "write_anchor_brief"
+  | "assistance_running"
+  | "review_assistance"
   | "generate_anchor"
+  | "anchor_generating"
   | "open_task"
   | "generate_video"
+  | "video_generating"
+  | "review_anchor"
+  | "review_video"
+  | "completed"
   | "review_media"
   | "open_versions"
   | "fix_inputs";
@@ -452,6 +585,11 @@ export interface ShotProductionSummaryDto {
   stateLabel: string;
   nextAction: ProductionNextAction;
   primaryActionLabel: string;
+  providerInputMode: ProviderInputMode;
+  actualInputCount: number;
+  actualInputs: ShotPromptReference[];
+  upstreamLineage: string[];
+  ready: boolean;
   blockers: string[];
   referenceCounts: {
     custom: number;
@@ -467,10 +605,12 @@ export interface ShotProductionSummaryDto {
   anchorVersionCount: number;
   videoVersionCount: number;
   activeTaskCount: number;
+  latestActionableTask?: AttemptDto | null;
   previewAssetId?: string | null;
   previewMediaType?: "image" | "video" | null;
   usesSceneLook: boolean;
   inputHash: string;
+  currentInputHash: string;
 }
 
 export interface SceneProductionSummaryDto {
@@ -478,11 +618,14 @@ export interface SceneProductionSummaryDto {
   selectedLookAssetId?: string | null;
   lookVersionCount: number;
   lookStatus: string;
+  lookRecommended: boolean;
+  lookRecommendationReason?: string | null;
   shots: ShotProductionSummaryDto[];
 }
 
 export interface ProductionBoardDto {
   projectId: string;
+  projectGraph: ProjectGraph;
   scenes: SceneProductionSummaryDto[];
 }
 
@@ -493,21 +636,55 @@ export interface ReferenceSlotDto {
   items: Array<ShotPromptPreview["references"][number] & { asset: AssetDto }>;
 }
 
+export interface AnchorBriefVersionDto {
+  stepId: string;
+  version: number;
+  source: "manual" | "llm";
+  brief: string;
+  sourceDraftRevision: number;
+  acceptedDraftRevision: number;
+  acceptedAt?: string | null;
+  createdAt?: string | null;
+  stale: boolean;
+  current: boolean;
+}
+
 export interface ShotGenerationWorkspaceDto {
+  projectId: string;
   shot: ShotDto;
   scene: {
     id: string;
     title: string;
     selectedLookAssetId?: string | null;
   };
+  assets: AssetDto[];
+  generationSpec: {
+    providerInputMode: ProviderInputMode;
+    actualInputCount: number;
+    actualInputs: ShotPromptReference[];
+    ready: boolean;
+    blockers: string[];
+    warnings: string[];
+    inputHash: string;
+    sourceRevisionHash: string;
+  };
   anchorPreview: ShotPromptPreview;
   videoPreview: ShotPromptPreview;
+  actualInputs: ShotPromptReference[];
+  upstreamLineage: AssetDto[];
   referenceSlots: {
     anchor: ReferenceSlotDto[];
     video: ReferenceSlotDto[];
   };
   previousTail: PreviousTailStatus;
   activeTasks: AttemptDto[];
+  anchorVersions: VisualAssetVersion[];
+  videoVersions: VisualAssetVersion[];
+  anchorBrief?: AnchorBriefVersionDto | null;
+  anchorBriefVersions: AnchorBriefVersionDto[];
+  nextAction: ProductionNextAction;
+  nextActionLabel: string;
+  blockers: string[];
 }
 
 export interface ShotAssistPatch {
@@ -543,6 +720,7 @@ export interface ShotAssistAnalysis {
     body: string;
     rationale: string;
   }>;
+  anchorBrief?: string | null;
   patch?: ShotAssistPatch | null;
 }
 
@@ -553,9 +731,28 @@ export interface ShotAssistRecord {
   stale: boolean;
   analysis?: ShotAssistAnalysis | null;
   acceptedOutput?: ShotAssistPatch | null;
+  acceptedAnchorBrief?: string | null;
+  acceptedPatchAt?: string | null;
+  acceptedAnchorBriefAt?: string | null;
   acceptedAt?: string | null;
   error?: Record<string, unknown> | null;
   createdAt?: string | null;
+}
+
+export interface VisualAssetVersion extends AssetDto {
+  attempt?: number | null;
+  prompt?: PromptDto | null;
+  inputSnapshot: Record<string, unknown>;
+}
+
+export interface SceneVisualAssetsDto {
+  sceneId: string;
+  lookDraftRevision: number;
+  selectedReferenceAssetIds: string[];
+  canon: AssetDto[];
+  project: VisualAssetVersion[];
+  scene: VisualAssetVersion[];
+  plans: CreativeStepRecord[];
 }
 
 export interface ShotAssistContext {

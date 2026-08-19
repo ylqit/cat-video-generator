@@ -699,9 +699,86 @@ def test_derive_anchor_uses_scene_look_only_for_anchor_target(tmp_path: Path) ->
     assert [item["assetId"] for item in video["references"]] == [
         str(project_identity.id),
     ]
-    assert anchor["ready"] is True
+    assert anchor["ready"] is False
+    assert "接受开场静态画面稿" in anchor["blockers"][0]
     assert video["ready"] is False
     assert video["blockers"] == ["请先生成、批准并选择片段开场锚点"]
+
+
+def test_approved_anchor_is_the_only_seedance_video_image(tmp_path: Path) -> None:
+    repository = _AssistRepository(tmp_path)
+    identity_path = tmp_path / "person.png"
+    identity_path.write_bytes(b"person")
+    identity = StoredAsset(
+        id=uuid.uuid4(),
+        project_id=repository.project.id,
+        scene_id=None,
+        shot_card_id=None,
+        step_id=None,
+        role="canon_reference",
+        media_type="image",
+        scope="canon",
+        status="approved",
+        path=identity_path,
+        sha256="c" * 64,
+        metadata={},
+        semantic_key="person:headshot",
+    )
+    anchor_path = tmp_path / "approved-anchor.png"
+    anchor_path.write_bytes(b"anchor")
+    anchor = StoredAsset(
+        id=uuid.uuid4(),
+        project_id=repository.project.id,
+        scene_id=repository.scene.id,
+        shot_card_id=repository.shots[1].id,
+        step_id=None,
+        role="shot_anchor",
+        media_type="image",
+        scope="shot",
+        status="approved",
+        path=anchor_path,
+        sha256="d" * 64,
+        metadata={},
+        semantic_key=f"shot:{repository.shots[1].id}:anchor",
+    )
+    repository.assets.update({identity.id: identity, anchor.id: anchor})
+    repository.project = replace(
+        repository.project,
+        default_reference_bindings=(
+            ReferenceBinding(
+                assetId=identity.id,
+                usage="generation_reference",
+                role="identity",
+                applyTo="both",
+            ),
+        ),
+    )
+    current = replace(
+        repository.shots[1],
+        selected_anchor_asset_id=anchor.id,
+        draft=repository.shots[1].draft.model_copy(
+            update={"anchor_mode": AnchorMode.GENERATE}
+        ),
+    )
+    repository.shots = (repository.shots[0], current, repository.shots[2])
+    service = ShotProductionService(
+        repository=repository,  # type: ignore[arg-type]
+        gateway=None,
+        asset_store=object(),  # type: ignore[arg-type]
+        media_probe=object(),  # type: ignore[arg-type]
+        frame_extractor=None,
+        provider_name="fake",
+        resolution="720p",
+    )
+
+    preview = service.preview_shot_prompt(current.id, target=ReferenceTarget.VIDEO)
+
+    assert preview["ready"] is True
+    assert [item["assetId"] for item in preview["references"]] == [str(anchor.id)]
+    assert [item["provider_role"] for item in preview["inputPlan"]["bindings"]] == [
+        "first_frame"
+    ]
+    assert "@图片2" not in preview["prompt"]
 
 
 def test_generic_upload_cannot_claim_managed_identity_or_scene_role(tmp_path: Path) -> None:

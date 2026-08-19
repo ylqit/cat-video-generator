@@ -4,9 +4,11 @@ import { computed, reactive, ref, watch } from "vue";
 import { assetContentUrl } from "../api/client";
 import type {
   AnchorMode,
+  AnchorBriefVersionDto,
   AssetDto,
   AttemptDto,
   PreviousTailStatus,
+  ProductionNextAction,
   ReferenceBinding,
   ReferenceRole,
   ReferenceSlotDto,
@@ -19,6 +21,7 @@ import type {
   ShotDto,
   ShotPromptPreview,
 } from "../api/types";
+import { useRuntimeStatus } from "../runtimeStatus";
 import ShotAssistancePanel from "./ShotAssistancePanel.vue";
 import ShotMediaVersions from "./ShotMediaVersions.vue";
 
@@ -26,7 +29,7 @@ type OpeningStrategy = "text" | "previous_tail" | "existing" | "derived" | "dire
 
 const props = defineProps<{
   shot: ShotDto;
-  scene: SceneDto;
+  scene: Pick<SceneDto, "id" | "title" | "selectedLookAssetId">;
   allAssets: AssetDto[];
   selectableAssets: AssetDto[];
   anchorPreview: ShotPromptPreview | null;
@@ -34,6 +37,14 @@ const props = defineProps<{
   referenceSlots?: { anchor: ReferenceSlotDto[]; video: ReferenceSlotDto[] } | null;
   previousTail?: PreviousTailStatus | null;
   activeTasks?: AttemptDto[];
+  activeOperations?: string[];
+  providerName?: string | null;
+  anchorBrief?: AnchorBriefVersionDto | null;
+  anchorBriefVersions?: AnchorBriefVersionDto[];
+  nextAction?: ProductionNextAction;
+  nextActionLabel?: string;
+  workspaceBlockers?: string[];
+  anchorBriefSaving?: boolean;
   assistContext: ShotAssistContext | null;
   assistRecords: ShotAssistRecord[];
 }>();
@@ -54,7 +65,13 @@ const emit = defineEmits<{
     sceneLookUsage: SceneLookUsage;
     inheritProjectReferences: boolean;
   }];
-  applyAssistance: [record: ShotAssistRecord, patch: ShotAssistPatch];
+  applyAssistance: [
+    record: ShotAssistRecord,
+    patch: ShotAssistPatch | null,
+    acceptedAnchorBrief: string | null,
+  ];
+  saveAnchorBrief: [brief: string];
+  requestAssistance: [];
 }>();
 
 const activeTab = ref("opening");
@@ -72,6 +89,10 @@ const binding = reactive({
   applyTo: "video" as ReferenceTarget,
 });
 const existingAnchorAssetId = ref("");
+const anchorBriefDraft = ref("");
+const anchorBriefEditor = ref<{ focus: () => void } | null>(null);
+const runtimeStatus = useRuntimeStatus();
+const paidReady = computed(() => runtimeStatus.settings.value?.arkReady === true);
 
 watch(() => props.shot.id, () => {
   activeTab.value = "opening";
@@ -83,6 +104,16 @@ watch(
   ([anchorMode, sceneLookUsage, inheritProjectReferences]) => {
     Object.assign(settings, { anchorMode, sceneLookUsage, inheritProjectReferences });
   },
+);
+watch(
+  () => [props.shot.id, props.anchorBrief?.stepId] as const,
+  ([shotId, stepId], previous) => {
+    if (shotId !== previous?.[0] || stepId !== previous?.[1]) {
+      anchorBriefDraft.value = props.anchorBrief?.brief ?? "";
+      if (stepId && previous && stepId !== previous[1]) activeTab.value = "opening";
+    }
+  },
+  { immediate: true },
 );
 
 const openingStrategy = computed<OpeningStrategy>({
@@ -114,6 +145,14 @@ const openingStrategy = computed<OpeningStrategy>({
 const currentPrompt = computed(() => referenceTarget.value === "anchor"
   ? props.anchorPreview
   : props.videoPreview);
+const videoIsFirstFrame = computed(() => props.videoPreview?.providerInputMode === "first_frame");
+const bindingAllowed = computed(() => !videoIsFirstFrame.value
+  || !["video", "both"].includes(binding.applyTo));
+const providerModeLabel = computed(() => ({
+  first_frame: "以批准开场图起镜",
+  reference_media: "使用多张参考素材",
+  text_only: "纯文本生成",
+})[props.videoPreview?.providerInputMode ?? "text_only"]);
 const slots = computed(() => props.referenceSlots?.[referenceTarget.value]
   ?? groupPreviewReferences(currentPrompt.value, referenceTarget.value));
 const mediaCandidates = computed(() => props.shot.assets.filter((item) => (
@@ -147,30 +186,76 @@ const tailState = computed(() => {
 const activeAnchorTask = computed(() => props.activeTasks?.some(
   (item) => item.operationKey === "image:anchor"
     && ["queued", "pending", "submitting", "running", "restart_pending"].includes(item.status),
-) ?? false);
+) || props.activeOperations?.includes("image:anchor") || false);
 const activeVideoTask = computed(() => props.activeTasks?.some(
   (item) => ["video:shot", "video:range-edit"].includes(item.operationKey)
     && ["queued", "pending", "submitting", "running", "restart_pending"].includes(item.status),
-) ?? false);
+) || props.activeOperations?.some((item) => ["video:shot", "video:range-edit"].includes(item)) || false);
 const needsAnchor = computed(() => settings.anchorMode === "generate"
   && !props.shot.selectedAnchorAssetId);
+const normalizedBrief = computed(() => anchorBriefDraft.value.trim());
+const briefDirty = computed(() => normalizedBrief.value !== (props.anchorBrief?.brief ?? ""));
+const briefSourceLabel = computed(() => {
+  if (!props.anchorBrief) return "尚未保存";
+  return props.anchorBrief.source === "manual" ? "人工静态稿" : "已接受的 LLM 建议";
+});
+const pendingAssistance = computed(() => props.assistRecords.find((item) => (
+  !item.stale
+  && Boolean(item.analysis?.anchorBrief)
+  && !item.acceptedAnchorBrief
+)) ?? null);
 const primaryAction = computed(() => {
-  if (activeAnchorTask.value) return { label: "开场图生成中", target: "anchor" as const, disabled: true };
-  if (activeVideoTask.value) return { label: "视频生成中", target: "video" as const, disabled: true };
-  if (needsAnchor.value) return {
+  if (activeAnchorTask.value) return {
+    label: "开场图生成中",
+    target: "none" as const,
+    disabled: true,
+  };
+  if (activeVideoTask.value) return {
+    label: "视频生成中",
+    target: "none" as const,
+    disabled: true,
+  };
+  const action = props.nextAction ?? (needsAnchor.value ? "generate_anchor" : "generate_video");
+  if (needsAnchor.value && (briefDirty.value || action === "write_anchor_brief")) return {
+    label: props.anchorBrief ? "保存修改后的静态画面稿" : "保存开场静态画面稿",
+    target: "save_brief" as const,
+    disabled: !normalizedBrief.value || Boolean(props.anchorBriefSaving),
+  };
+  if (action === "review_assistance") return { label: "查看并接受开场建议", target: "review_assistance" as const, disabled: false };
+  if (action === "review_anchor") return { label: "审核开场图", target: "review_anchor" as const, disabled: false };
+  if (action === "review_video" || action === "completed") return { label: action === "completed" ? "查看已批准视频" : "审核视频", target: "review_video" as const, disabled: false };
+  if (action === "generate_anchor") return {
     label: "生成片段开场图",
     target: "anchor" as const,
     disabled: !props.anchorPreview?.ready,
   };
-  return {
+  if (action === "generate_video") return {
     label: props.shot.selectedVideoAssetId ? "重新生成视频片段" : "生成视频片段",
     target: "video" as const,
     disabled: !props.videoPreview?.ready,
   };
+  return {
+    label: props.nextActionLabel ?? (activeAnchorTask.value ? "开场图生成中" : activeVideoTask.value ? "视频生成中" : "检查生成输入"),
+    target: "none" as const,
+    disabled: true,
+  };
 });
-const currentBlockers = computed(() => primaryAction.value.target === "anchor"
-  ? props.anchorPreview?.blockers ?? []
-  : props.videoPreview?.blockers ?? []);
+const currentBlockers = computed(() => props.workspaceBlockers?.length
+  ? props.workspaceBlockers
+  : primaryAction.value.target === "anchor"
+    ? props.anchorPreview?.blockers ?? []
+    : props.videoPreview?.blockers ?? []);
+const primaryReferenceCount = computed(() => primaryAction.value.target === "anchor"
+  ? props.anchorPreview?.actualInputCount ?? 0
+  : props.videoPreview?.actualInputCount ?? 0);
+const primaryActionCostsArk = computed(() => ["anchor", "video"].includes(primaryAction.value.target));
+const primaryStatusCopy = computed(() => {
+  if (activeAnchorTask.value || activeVideoTask.value) return "任务已进入后台，可继续浏览或切换页面";
+  if (primaryAction.value.disabled) return currentBlockers.value[0] || primaryAction.value.label;
+  if (primaryAction.value.target === "save_brief") return "保存人工静态稿不会调用 Ark";
+  if (["review_assistance", "review_anchor", "review_video"].includes(primaryAction.value.target)) return "已有结果等待人工确认";
+  return "当前输入已完成付费前预检";
+});
 const subshots = computed(() => {
   const matches = [...props.shot.direction.matchAll(/(?:^|\n)\s*(\d+)\s*[.、．]\s*([\s\S]*?)(?=(?:\n\s*\d+\s*[.、．])|$)/g)];
   if (!matches.length) return [{ ordinal: 1, text: props.shot.direction }];
@@ -256,8 +341,47 @@ function saveCurrentSettings() {
   });
 }
 
-function forwardAssistance(record: ShotAssistRecord, patch: ShotAssistPatch) {
-  emit("applyAssistance", record, patch);
+function switchToReferenceMedia() {
+  settings.anchorMode = "text_only";
+  settings.sceneLookUsage = "appearance_only";
+  referenceTarget.value = "video";
+  saveCurrentSettings();
+}
+
+function forwardAssistance(
+  record: ShotAssistRecord,
+  patch: ShotAssistPatch | null,
+  acceptedAnchorBrief: string | null,
+) {
+  emit("applyAssistance", record, patch, acceptedAnchorBrief);
+}
+
+function saveBrief() {
+  if (normalizedBrief.value) emit("saveAnchorBrief", normalizedBrief.value);
+}
+
+function focusBriefEditor() {
+  activeTab.value = "opening";
+  requestAnimationFrame(() => anchorBriefEditor.value?.focus());
+}
+
+function handlePrimaryAction() {
+  if (primaryAction.value.disabled) return;
+  if (primaryAction.value.target === "save_brief") saveBrief();
+  else if (primaryAction.value.target === "anchor" || primaryAction.value.target === "video") emit("generate", primaryAction.value.target);
+  else if (primaryAction.value.target === "review_assistance") activeTab.value = "prompt";
+  else if (primaryAction.value.target === "review_anchor") {
+    previewKind.value = "anchor";
+    activeTab.value = "versions";
+  } else if (primaryAction.value.target === "review_video") {
+    previewKind.value = "video";
+    activeTab.value = "versions";
+  }
+}
+
+function loadBriefVersion(item: AnchorBriefVersionDto) {
+  anchorBriefDraft.value = item.brief;
+  focusBriefEditor();
 }
 
 function forwardReview(asset: AssetDto, decision: "approved" | "rejected", stale: boolean) {
@@ -267,6 +391,12 @@ function forwardReview(asset: AssetDto, decision: "approved" | "rejected", stale
 function forwardSelection(asset: AssetDto, stale: boolean) {
   emit("selectVersion", asset, stale);
 }
+
+function isSyntheticFixture(asset: AssetDto | null | undefined): boolean {
+  if (!asset) return false;
+  return asset.metadata.syntheticFixture === true
+    || String(asset.metadata.providerUrl ?? "").startsWith("cvg-fake://");
+}
 </script>
 
 <template>
@@ -275,9 +405,11 @@ function forwardSelection(asset: AssetDto, stale: boolean) {
       <div>
         <span class="eyebrow">片段 {{ shot.order }} · {{ scene.title }}</span>
         <h2>{{ shot.title }}</h2>
-        <p>{{ shot.durationSeconds }} 秒 · {{ anchorModeLabel(shot.anchorMode) }} · {{ sceneLookLabel(shot.sceneLookUsage) }}</p>
+        <p>{{ shot.durationSeconds }} 秒 · {{ providerModeLabel }} · {{ sceneLookLabel(shot.sceneLookUsage) }}</p>
       </div>
       <div class="header-actions">
+        <el-tag type="info">{{ providerName || 'volcengine-ark-standard' }} · revision {{ runtimeStatus.settings.value?.current.revision ?? '未加载' }}</el-tag>
+        <router-link to="/settings">前往系统设置</router-link>
         <el-button @click="emit('edit')">编辑片段</el-button>
         <el-button @click="emit('close')">返回制作看板</el-button>
       </div>
@@ -296,6 +428,9 @@ function forwardSelection(asset: AssetDto, stale: boolean) {
         </div>
 
         <div class="media-canvas">
+          <div v-if="isSyntheticFixture(selectedMedia)" class="fixture-watermark">
+            测试占位结果 · 不代表 Seedream / Seedance 画面质量
+          </div>
           <template v-if="selectedMedia?.contentReady">
             <img v-if="selectedMedia.mediaType === 'image'" :src="assetContentUrl(selectedMedia.id)" />
             <video v-else controls preload="metadata" :src="assetContentUrl(selectedMedia.id)" />
@@ -307,6 +442,10 @@ function forwardSelection(asset: AssetDto, stale: boolean) {
           <div v-else class="empty-preview">
             <b>{{ previewKind === "anchor" ? "尚无片段开场图" : "尚无视频版本" }}</b>
             <span>{{ currentBlockers[0] || "完成右侧设置后即可生成。" }}</span>
+            <div v-if="previewKind === 'anchor' && needsAnchor" class="empty-preview-actions">
+              <el-button type="primary" plain @click="focusBriefEditor">填写静态画面稿</el-button>
+              <el-button :disabled="!paidReady" @click="emit('requestAssistance')">使用 LLM 优化</el-button>
+            </div>
           </div>
         </div>
 
@@ -321,6 +460,7 @@ function forwardSelection(asset: AssetDto, stale: boolean) {
             <img v-if="asset.mediaType === 'image' && asset.contentReady" :src="assetContentUrl(asset.id)" />
             <video v-else-if="asset.contentReady" muted preload="metadata" :src="assetContentUrl(asset.id)" />
             <span>V{{ index + 1 }} · {{ asset.status }}</span>
+            <small v-if="isSyntheticFixture(asset)">测试占位</small>
           </button>
         </div>
 
@@ -385,9 +525,59 @@ function forwardSelection(asset: AssetDto, stale: boolean) {
               </template>
               <el-button @click="saveCurrentSettings">保存开场策略</el-button>
 
-              <el-divider content-position="left">开场目标与锚点 Prompt</el-divider>
-              <p class="creative-copy">{{ anchorPreview?.creativeBody || shot.direction }}</p>
-              <el-alert v-for="blocker in anchorPreview?.blockers ?? []" :key="blocker" type="warning" :title="blocker" :closable="false" />
+              <el-divider content-position="left">开场静态画面稿</el-divider>
+              <section class="anchor-brief-editor">
+                <div class="section-title">
+                  <div>
+                    <b>{{ briefSourceLabel }}</b>
+                    <small>Revision {{ shot.draftRevision }} · 只描述动作开始前的稳定画面，不写动作过程、声音或结尾。</small>
+                  </div>
+                  <el-tag :type="anchorBrief ? 'success' : 'info'">{{ anchorBrief ? `已保存 V${anchorBrief.version}` : '待填写' }}</el-tag>
+                </div>
+                <el-input
+                  ref="anchorBriefEditor"
+                  v-model="anchorBriefDraft"
+                  type="textarea"
+                  :rows="9"
+                  maxlength="4000"
+                  show-word-limit
+                  placeholder="描述人物和猫咪的位置、姿态与视线，环境、服装、关键道具的初始状态，以及景别、机位和构图。"
+                />
+                <div class="anchor-brief-actions">
+                  <el-button
+                    type="primary"
+                    :loading="anchorBriefSaving"
+                    :disabled="!normalizedBrief || (!briefDirty && Boolean(anchorBrief))"
+                    @click="saveBrief"
+                  >保存静态画面稿（不调用 Ark）</el-button>
+                  <el-button :disabled="!paidReady" @click="emit('requestAssistance')">
+                    让 LLM 分析并优化（产生 Ark 费用）
+                  </el-button>
+                  <el-button v-if="pendingAssistance" type="warning" plain @click="activeTab = 'prompt'">有 LLM 建议待确认</el-button>
+                </div>
+                <details v-if="anchorBriefVersions?.length" class="brief-history">
+                  <summary>查看静态稿历史（{{ anchorBriefVersions.length }}）</summary>
+                  <article v-for="item in [...anchorBriefVersions].reverse()" :key="item.stepId">
+                    <div>
+                      <b>V{{ item.version }} · {{ item.source === 'manual' ? '人工' : 'LLM' }}</b>
+                      <el-tag v-if="item.current" type="success" size="small">当前采用</el-tag>
+                      <el-tag v-else-if="item.stale" type="warning" size="small">旧片段稿</el-tag>
+                    </div>
+                    <p>{{ item.brief }}</p>
+                    <el-button v-if="!item.current" size="small" @click="loadBriefVersion(item)">载入为新稿</el-button>
+                  </article>
+                </details>
+              </section>
+
+              <el-divider content-position="left">开场图 Prompt 预览</el-divider>
+              <p class="creative-copy">{{ normalizedBrief || "保存静态画面稿后，将在这里编译开场图 Prompt。" }}</p>
+              <el-alert
+                v-for="blocker in (anchorPreview?.blockers ?? []).filter((item) => !item.includes('填写并保存开场静态画面稿'))"
+                :key="blocker"
+                type="warning"
+                :title="blocker"
+                :closable="false"
+              />
               <details v-if="anchorPreview" class="expert-panel">
                 <summary>查看锚点完整 Prompt 与输入哈希</summary>
                 <pre>{{ anchorPreview.prompt }}</pre>
@@ -404,9 +594,22 @@ function forwardSelection(asset: AssetDto, stale: boolean) {
                   <el-radio-button value="video">视频输入</el-radio-button>
                 </el-radio-group>
                 <el-tag :type="currentPrompt?.ready ? 'success' : 'warning'">
-                  {{ currentPrompt?.ready ? `${currentPrompt.references.length} 张实际提交` : "输入未就绪" }}
+                  {{ currentPrompt?.ready ? `${currentPrompt.actualInputCount} 张实际提交` : "输入未就绪" }}
                 </el-tag>
               </div>
+              <el-alert
+                v-if="referenceTarget === 'video' && videoIsFirstFrame"
+                type="info"
+                :closable="false"
+                title="当前视频采用首帧独占输入，Provider 只接收 1 张批准开场图，不能再混入普通参考媒体。新增图片可用于重新生成开场图，或明确切换到多参考图模式。"
+              >
+                <template #default>
+                  <div class="inline-controls">
+                    <el-button size="small" @click="referenceTarget = 'anchor'; binding.applyTo = 'anchor'">把素材用于开场图</el-button>
+                    <el-button size="small" type="warning" plain @click="switchToReferenceMedia">切换为多参考图模式</el-button>
+                  </div>
+                </template>
+              </el-alert>
               <el-alert v-for="blocker in currentPrompt?.blockers ?? []" :key="blocker" type="warning" :title="blocker" :closable="false" />
               <section v-for="slot in slots" :key="`${slot.target}:${slot.key}`" class="reference-slot">
                 <div class="slot-heading"><b>{{ slot.label }}</b><span>{{ slot.items.length }} 张</span></div>
@@ -435,10 +638,10 @@ function forwardSelection(asset: AssetDto, stale: boolean) {
                 </el-select>
                 <el-select v-model="binding.applyTo">
                   <el-option label="开场图" value="anchor" />
-                  <el-option label="视频" value="video" />
-                  <el-option label="两者" value="both" />
+                  <el-option label="视频" value="video" :disabled="videoIsFirstFrame" />
+                  <el-option label="两者" value="both" :disabled="videoIsFirstFrame" />
                 </el-select>
-                <el-button :disabled="!binding.assetId" @click="bindCustomReference">添加</el-button>
+                <el-button :disabled="!binding.assetId || !bindingAllowed" @click="bindCustomReference">添加</el-button>
               </div>
               <div v-if="shot.referenceBindings.length" class="binding-list">
                 <span v-for="item in shot.referenceBindings" :key="`${item.assetId}:${item.applyTo}`">
@@ -489,7 +692,11 @@ function forwardSelection(asset: AssetDto, stale: boolean) {
               </el-descriptions>
               <el-checkbox v-model="settings.inheritProjectReferences">继承项目人物、猫咪和画风参考</el-checkbox>
               <el-button @click="saveCurrentSettings">保存生成设置</el-button>
-              <el-alert type="info" :closable="false" title="保存和 Prompt 预览不会调用 Ark；点击底部生成按钮时才进行付费确认。" />
+              <el-alert
+                type="info"
+                :closable="false"
+                title="保存和 Prompt 预览不会调用 Ark；点击底部生成按钮时才进行付费确认。"
+              />
             </div>
           </el-tab-pane>
 
@@ -498,6 +705,7 @@ function forwardSelection(asset: AssetDto, stale: boolean) {
               :shot="shot"
               :anchor-preview="anchorPreview"
               :video-preview="videoPreview"
+              :active-operations="activeOperations"
               @review="forwardReview"
               @select="forwardSelection"
               @resume="emit('resume', $event)"
@@ -511,13 +719,13 @@ function forwardSelection(asset: AssetDto, stale: boolean) {
 
     <footer class="workspace-footer">
       <div>
-        <b>{{ primaryAction.disabled ? currentBlockers[0] || primaryAction.label : "当前输入已完成付费前预检" }}</b>
+        <b>{{ primaryStatusCopy }}</b>
         <span>
-          {{ primaryAction.target === "anchor" ? anchorPreview?.references.length ?? 0 : videoPreview?.references.length ?? 0 }} 张实际参考图
-          · 点击生成将产生一次 Ark 费用
+          {{ primaryReferenceCount }} 张实际参考图
+          · {{ primaryActionCostsArk ? `点击生成将使用 ${primaryAction.target === 'anchor' ? runtimeStatus.settings.value?.current.imageModel : runtimeStatus.settings.value?.current.videoModel} 并产生一次 Ark 费用` : "本操作不产生生成费用" }}
         </span>
       </div>
-      <el-button type="primary" size="large" :disabled="primaryAction.disabled" @click="emit('generate', primaryAction.target)">{{ primaryAction.label }}</el-button>
+      <el-button type="primary" size="large" :disabled="primaryAction.disabled || (primaryActionCostsArk && !paidReady)" @click="handlePrimaryAction">{{ primaryAction.label }}</el-button>
     </footer>
   </div>
 </template>
@@ -534,13 +742,23 @@ function forwardSelection(asset: AssetDto, stale: boolean) {
 .setup-panel { min-width: 0; padding: 10px 18px 18px; overflow: auto; max-height: calc(100vh - 176px); }
 .media-canvas { position: relative; min-height: 420px; display: grid; place-items: center; overflow: hidden; border: 1px solid #2b3544; border-radius: 12px; background: #070a0f; }
 .media-canvas img, .media-canvas video { width: 100%; height: 100%; max-height: 68vh; object-fit: contain; }
+.fixture-watermark { position: absolute; top: 12px; right: 12px; z-index: 2; max-width: calc(100% - 24px); padding: 7px 10px; color: #ffe0a3; border: 1px solid #a8782f; border-radius: 6px; background: #2b210ee8; font-size: 12px; text-align: center; }
 .baseline-watermark { position: absolute; top: 12px; left: 12px; z-index: 1; padding: 6px 9px; border-radius: 6px; color: #d9e8ff; background: #182438e6; font-size: 12px; }
 .empty-preview { display: grid; gap: 7px; place-items: center; color: #8c98aa; text-align: center; }
 .empty-preview b { color: #dce4ef; font-size: 18px; }
+.empty-preview-actions, .anchor-brief-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.anchor-brief-editor { display: grid; gap: 10px; padding: 12px; border: 1px solid #31577d; border-radius: 10px; background: #101a25; }
+.anchor-brief-editor small { display: block; margin-top: 4px; color: #8fa4bc; }
+.brief-history { border-top: 1px solid #2d4057; padding-top: 8px; }
+.brief-history summary { cursor: pointer; color: #b9c9dc; }
+.brief-history article { display: grid; gap: 7px; margin-top: 8px; padding: 9px; border: 1px solid #29384c; border-radius: 7px; background: #0d151f; }
+.brief-history article > div { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
+.brief-history p { margin: 0; max-height: 140px; overflow: auto; white-space: pre-wrap; color: #b8c3d2; }
 .candidate-strip { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; }
 .candidate-strip button { width: 112px; flex: 0 0 auto; display: grid; gap: 5px; padding: 6px; color: #9ea9ba; background: #101722; border: 1px solid #2d3746; border-radius: 8px; cursor: pointer; }
 .candidate-strip button.active { border-color: #409eff; }
 .candidate-strip img, .candidate-strip video { width: 100%; height: 82px; object-fit: cover; background: #080b10; }
+.candidate-strip small { color: #e4b45f; font-size: 10px; }
 .continuity-card { display: grid; grid-template-columns: auto auto auto minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 11px; border: 1px solid #304057; border-radius: 9px; background: #111a27; }
 .continuity-card img { width: 72px; height: 56px; object-fit: cover; border-radius: 6px; background: #080b10; }
 .tail-empty { display: grid; place-items: center; width: 72px; height: 56px; color: #68768a; border-radius: 6px; background: #080b10; font-size: 11px; }

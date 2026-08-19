@@ -24,9 +24,12 @@ docs/LibTV
 !/docs/checklists/v5-shot-assistance-upgrade.md
 !/docs/checklists/v5-staged-creative-workflow.md
 !/docs/checklists/v5-nonblocking-media-workflow.md
+!/docs/checklists/v5-professional-visual-assets.md
+!/docs/checklists/v5-architecture-convergence.md
 !/docs/workflows/
 /docs/workflows/*
 !/docs/workflows/tutorial-adaptation.md
+!/docs/workflows/kite-production-runbook.md
 
 # Web frontend
 /node_modules/

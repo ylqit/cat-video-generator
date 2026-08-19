@@ -12,11 +12,15 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel
+
 from ..domain.contracts import (
+    AcceptedVisualAssetPlan,
     AnchorMode,
     LookReferenceBinding,
     LookReferencePurpose,
     ReferenceBinding,
+    ReferenceImageDraft,
     ReferenceRole,
     ReferenceTarget,
     ReferenceUsage,
@@ -30,9 +34,12 @@ from ..domain.contracts import (
     ShotSuggestion,
     ShotSuggestionOutput,
     StoryDiagnosisOutput,
+    StoryExpansionOutput,
     StoryProjectInput,
     StoryRewriteOutput,
     StoryRewriteStrategy,
+    VisualAssetPlanOutput,
+    VisualAssetPurpose,
     VisualProfileDraft,
 )
 from ..domain.creative_workflow import shot_snapshot_hash, story_source_hash
@@ -40,27 +47,29 @@ from ..domain.prompts import (
     CompiledPrompt,
     compile_anchor_prompt,
     compile_range_edit_prompt,
+    compile_reference_image_prompt,
     compile_scene_look_prompt,
     compile_shot_assistance_prompt,
     compile_shot_suggestion_prompt,
     compile_shot_video_prompt_parts,
     compile_story_diagnosis_prompt,
+    compile_story_expansion_prompt,
     compile_story_rewrite_prompt,
     compile_video_review_prompt,
+    compile_visual_asset_plan_prompt,
 )
 from ..domain.rendering import (
     MediaSource,
-    ProjectSequencePlan,
-    SequenceClip,
-    SequenceStatus,
-    SequenceTransition,
-    SequenceTransitionType,
-    VideoInputPlan,
     build_edit_input_plan,
     build_shot_input_plan,
 )
 from ..domain.shot_assistance import analyze_shot_draft
 from ..domain.workflow import PromptPurpose, StepKind, StepStatus
+from .generation_specs import (
+    ProviderInputMode,
+    ShotCompilationContext,
+    ShotGenerationSpec,
+)
 from .ports import (
     AssetStore,
     DirectorGateway,
@@ -68,16 +77,23 @@ from .ports import (
     GatewayError,
     MediaGateway,
     MediaProbe,
+    ProjectReadModel,
     RuntimePreflight,
+    ShotGenerationReadModel,
     ShotQueueStore,
     StoredAsset,
     StoredProject,
     StoredScene,
-    StoredSequence,
     StoredShot,
     StoredStep,
     StoredVisualProfileRevision,
     VideoTaskResult,
+)
+from .read_models import (
+    asset_projection,
+    project_graph_projection,
+    shot_projection,
+    step_projection,
 )
 
 
@@ -92,27 +108,15 @@ class SuggestionResult:
 
 
 @dataclass(frozen=True, slots=True)
-class ShotGenerationSpec:
-    """One authoritative projection used by both preview and paid submission."""
-
-    target: ReferenceTarget
-    prompt: CompiledPrompt
-    creative_body: str
-    system_shell: str
-    input_plan: VideoInputPlan | None
-    sources: tuple[StoredAsset, ...]
-    descriptions: tuple[str, ...]
-    snapshot: dict[str, Any]
-    input_hash: str
-    source_revision_hash: str
-    blockers: tuple[str, ...] = ()
-    warnings: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
 class StoryDiagnosisResult:
     step_id: uuid.UUID
     output: StoryDiagnosisOutput
+
+
+@dataclass(frozen=True, slots=True)
+class StoryExpansionResult:
+    step_id: uuid.UUID
+    output: StoryExpansionOutput
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +129,12 @@ class StoryRewriteResult:
 class ShotAssistanceResult:
     step_id: uuid.UUID
     analysis: ShotAssistAnalysis
+
+
+@dataclass(frozen=True, slots=True)
+class VisualAssetPlanResult:
+    step_id: uuid.UUID
+    output: VisualAssetPlanOutput
 
 
 class RevisionConflictError(ValueError):
@@ -158,6 +168,33 @@ class ShotAssistCandidate:
     responsibility: str
 
 
+@dataclass(frozen=True, slots=True)
+class AcceptedAnchorBrief:
+    step_id: uuid.UUID
+    text: str
+    source: str
+    source_draft_revision: int
+    accepted_draft_revision: int
+    accepted_at: str | None
+    created_at: str | None
+    stale: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceImageSpec:
+    project: StoredProject
+    scene: StoredScene | None
+    profile: StoredVisualProfileRevision
+    draft: ReferenceImageDraft
+    scope: str
+    operation_key: str
+    sources: tuple[StoredAsset, ...]
+    descriptions: tuple[str, ...]
+    prompt: CompiledPrompt
+    snapshot: dict[str, Any]
+    input_hash: str
+
+
 class ProjectEditingService:
     def __init__(
         self,
@@ -178,6 +215,83 @@ class ProjectEditingService:
             content_date=content_date or date.today(),
         )
         return {"projectId": str(project.id), "sceneCount": 1}
+
+    def expand_story(
+        self,
+        scene_id: uuid.UUID,
+        *,
+        allow_paid_generation: bool,
+    ) -> StoryExpansionResult:
+        self._require_paid_director(
+            allow_paid_generation,
+            "story expansion requires explicit paid-generation permission",
+        )
+        scene = self._repository.get_scene(scene_id)
+        project = self._repository.get_project(scene.project_id)
+        profile = self._repository.get_visual_profile(project.id)
+        self._assert_scene_stage_available(
+            project_id=project.id,
+            scene_id=scene.id,
+            operation_key="director:story-expansion",
+        )
+        prompt = compile_story_expansion_prompt(
+            project_title=project.title,
+            scene=scene.draft,
+            visual_profile=profile.draft,
+        )
+        snapshot = {
+            "sourceHash": story_source_hash(scene.draft),
+            "scene": scene.draft.model_dump(mode="json", by_alias=True),
+            "visualProfileRevisionId": str(profile.id),
+            "visualProfileHash": profile.profile_hash,
+        }
+        step = self._run_scene_director_stage(
+            project_id=project.id,
+            scene_id=scene.id,
+            operation_key="director:story-expansion",
+            prompt=prompt,
+            snapshot=snapshot,
+            output_type=StoryExpansionOutput,
+            output_name="StoryExpansionOutput",
+        )
+        return StoryExpansionResult(
+            step_id=step.id,
+            output=StoryExpansionOutput.model_validate(
+                step.input_snapshot.get("providerOutput")
+            ),
+        )
+
+    def accept_story_expansion(
+        self,
+        step_id: uuid.UUID,
+        *,
+        expansion: StoryExpansionOutput,
+    ) -> StoredScene:
+        step = self._repository.get_step(step_id)
+        self._validate_scene_stage_step(
+            step,
+            operation_key="director:story-expansion",
+        )
+        assert step.scene_id is not None
+        scene = self._repository.get_scene(step.scene_id)
+        expected_hash = str(step.input_snapshot.get("sourceHash") or "")
+        if story_source_hash(scene.draft) != expected_hash:
+            raise RevisionConflictError(
+                "scene story changed after expansion; generate a new expansion"
+            )
+        expanded_draft = scene.draft.model_copy(
+            update={"source_text": expansion.expanded_story}
+        )
+        accepted_output = {
+            **expansion.model_dump(mode="json", by_alias=True),
+            "acceptedStoryHash": story_source_hash(expanded_draft),
+        }
+        return self._repository.accept_story_expansion(
+            step_id=step.id,
+            expected_source_hash=expected_hash,
+            accepted_output=accepted_output,
+            expanded_story=expansion.expanded_story,
+        )
 
     def diagnose_story(
         self,
@@ -403,6 +517,164 @@ class ProjectEditingService:
             rewritten_story=rewrite.rewritten_story,
         )
 
+    def plan_visual_assets(
+        self,
+        scene_id: uuid.UUID,
+        *,
+        allow_paid_generation: bool,
+    ) -> VisualAssetPlanResult:
+        self._require_paid_director(
+            allow_paid_generation,
+            "visual asset planning requires explicit paid-generation permission",
+        )
+        scene = self._repository.get_scene(scene_id)
+        project = self._repository.get_project(scene.project_id)
+        profile = self._repository.get_visual_profile(project.id)
+        shots = tuple(sorted(self._repository.list_shots(scene.id), key=lambda item: item.order))
+        if not shots:
+            raise ValueError("视觉资产规划需要先接受分镜并建立视频片段")
+        current_shot_hash = shot_snapshot_hash(
+            (item.id, item.draft_revision, item.draft) for item in shots
+        )
+        accepted_storyboard = next(
+            (
+                step
+                for step in reversed(
+                    self._repository.list_steps(
+                        project_id=project.id,
+                        scene_id=scene.id,
+                    )
+                )
+                if step.operation_key == "director:shot-suggestions"
+                and step.status is StepStatus.SUCCEEDED
+                and isinstance(step.input_snapshot.get("acceptedOutput"), dict)
+                and step.input_snapshot["acceptedOutput"].get("appliedShotSnapshotHash")
+                == current_shot_hash
+            ),
+            None,
+        )
+        if accepted_storyboard is None:
+            raise ValueError("视觉资产规划需要当前视频片段来自已接受的分镜版本")
+        self._assert_scene_stage_available(
+            project_id=project.id,
+            scene_id=scene.id,
+            operation_key="director:visual-asset-plan",
+        )
+        existing_assets = tuple(
+            asset
+            for asset in self._repository.list_assets(
+                project_id=project.id,
+                include_canon=True,
+            )
+            if asset.media_type == "image"
+            and asset.status in {"approved", "ready"}
+            and asset.content_ready
+        )
+        prompt = compile_visual_asset_plan_prompt(
+            project_title=project.title,
+            scene=scene.draft,
+            shot_summaries=tuple(
+                f"{item.order}. {item.draft.title}"
+                f"（{item.draft.duration_seconds}秒）：{item.draft.direction}"
+                for item in shots
+            ),
+            visual_profile=profile.draft,
+            existing_assets=tuple(
+                f"assetId={asset.id}；名称={asset.display_name}；scope={asset.scope}；"
+                f"职责={asset.reference_purpose or asset.role}"
+                for asset in existing_assets
+            ),
+        )
+        snapshot = {
+            "sceneStoryHash": story_source_hash(scene.draft),
+            "shotSnapshotHash": current_shot_hash,
+            "storyboardStepId": str(accepted_storyboard.id),
+            "visualProfileRevisionId": str(profile.id),
+            "visualProfileHash": profile.profile_hash,
+            "existingAssetIds": [str(item.id) for item in existing_assets],
+        }
+        step = self._run_scene_director_stage(
+            project_id=project.id,
+            scene_id=scene.id,
+            operation_key="director:visual-asset-plan",
+            prompt=prompt,
+            snapshot=snapshot,
+            output_type=VisualAssetPlanOutput,
+            output_name="VisualAssetPlanOutput",
+        )
+        return VisualAssetPlanResult(
+            step_id=step.id,
+            output=VisualAssetPlanOutput.model_validate(
+                step.input_snapshot.get("providerOutput")
+            ),
+        )
+
+    def accept_visual_asset_plan(
+        self,
+        step_id: uuid.UUID,
+        *,
+        plan: AcceptedVisualAssetPlan,
+    ) -> StoredStep:
+        step = self._repository.get_step(step_id)
+        self._validate_scene_stage_step(
+            step,
+            operation_key="director:visual-asset-plan",
+        )
+        assert step.scene_id is not None
+        scene = self._repository.get_scene(step.scene_id)
+        current_shot_hash = shot_snapshot_hash(
+            (item.id, item.draft_revision, item.draft)
+            for item in self._repository.list_shots(scene.id)
+        )
+        expected_hash = str(step.input_snapshot.get("shotSnapshotHash") or "")
+        if current_shot_hash != expected_hash:
+            raise RevisionConflictError(
+                "video clips changed after visual asset planning; generate a new plan"
+            )
+        output = VisualAssetPlanOutput.model_validate(
+            step.input_snapshot.get("providerOutput")
+        )
+        proposed = {item.suggestion_key: item for item in output.suggestions}
+        proposed_keys = set(proposed)
+        selected_keys = {item.suggestion_key for item in plan.selections}
+        if not selected_keys.issubset(proposed_keys):
+            raise ValueError("accepted visual assets must come from this planning version")
+        for item in plan.selections:
+            source = proposed[item.suggestion_key]
+            if (
+                item.purpose is not source.purpose
+                or item.target_scope is not source.target_scope
+                or item.display_name != source.display_name
+            ):
+                raise ValueError(
+                    "visual asset identity, purpose, and scope are fixed by the planning version"
+                )
+        available_ids = {
+            item.id
+            for item in self._repository.list_assets(
+                project_id=scene.project_id,
+                include_canon=True,
+            )
+            if item.media_type == "image"
+            and item.status in {"approved", "ready"}
+            and item.content_ready
+        }
+        referenced_ids = {
+            asset_id
+            for item in plan.selections
+            for asset_id in (
+                *item.reference_asset_ids,
+                *(() if item.existing_asset_id is None else (item.existing_asset_id,)),
+            )
+        }
+        if not referenced_ids.issubset(available_ids):
+            raise ValueError("accepted visual asset plan contains unavailable references")
+        return self._repository.accept_visual_asset_plan(
+            step_id=step.id,
+            expected_shot_snapshot_hash=expected_hash,
+            accepted_output=plan,
+        )
+
     def creative_workflow(self, scene_id: uuid.UUID) -> dict[str, Any]:
         scene = self._repository.get_scene(scene_id)
         current_shots = self._repository.list_shots(scene.id)
@@ -414,19 +686,22 @@ class ProjectEditingService:
             scene_id=scene.id,
         )
         stage_keys = {
+            "expansion": "director:story-expansion",
             "diagnosis": "director:story-diagnosis",
             "rewrite": "director:story-rewrite",
             "storyboard": "director:shot-suggestions",
+            "visualAssets": "director:visual-asset-plan",
         }
-        diagnosis_steps = [
+        source_steps = [
             item
             for item in steps
-            if item.operation_key == "director:story-diagnosis"
+            if item.operation_key
+            in {"director:story-expansion", "director:story-diagnosis"}
         ]
         first_scene_snapshot = (
             None
-            if not diagnosis_steps
-            else diagnosis_steps[0].input_snapshot.get("scene")
+            if not source_steps
+            else source_steps[0].input_snapshot.get("scene")
         )
         original_story = (
             first_scene_snapshot.get("sourceText")
@@ -445,6 +720,13 @@ class ProjectEditingService:
                 and accepted.get("acceptedStoryHash") == current_hash
             ):
                 current_source = "accepted_rewrite"
+                current_source_step_id = str(step.id)
+                break
+            if (
+                step.operation_key == "director:story-expansion"
+                and accepted.get("acceptedStoryHash") == current_hash
+            ):
+                current_source = "accepted_expansion"
                 current_source_step_id = str(step.id)
                 break
             if (
@@ -523,6 +805,9 @@ class ProjectEditingService:
         project = self._repository.get_project(scene.project_id)
         profile = self._repository.get_visual_profile(project.id)
         approved_story_step = self._approved_story_step(scene)
+        approved_story_step_id = (
+            None if approved_story_step is None else str(approved_story_step.id)
+        )
         prior_steps = [
             item
             for item in self._repository.list_steps(
@@ -569,7 +854,7 @@ class ProjectEditingService:
                 "prompt": prompt,
                 "project": str(project.id),
                 "scene": scene.draft.model_dump(mode="json", by_alias=True),
-                "approvedStoryStepId": str(approved_story_step.id),
+                "approvedStoryStepId": approved_story_step_id,
                 "visualProfileRevisionId": str(profile.id),
                 "visualProfileHash": profile.profile_hash,
             }
@@ -591,7 +876,7 @@ class ProjectEditingService:
             input_snapshot={
                 "scene": scene.draft.model_dump(mode="json", by_alias=True),
                 "sourceHash": story_source_hash(scene.draft),
-                "approvedStoryStepId": str(approved_story_step.id),
+                "approvedStoryStepId": approved_story_step_id,
                 "visualProfileRevisionId": str(profile.id),
                 "visualProfileHash": profile.profile_hash,
             },
@@ -625,7 +910,7 @@ class ProjectEditingService:
         snapshot = {
             "scene": scene.draft.model_dump(mode="json", by_alias=True),
             "sourceHash": story_source_hash(scene.draft),
-            "approvedStoryStepId": str(approved_story_step.id),
+            "approvedStoryStepId": approved_story_step_id,
             "visualProfileRevisionId": str(profile.id),
             "visualProfileHash": profile.profile_hash,
             "providerOutput": result.payload,
@@ -756,7 +1041,7 @@ class ProjectEditingService:
         operation_key: str,
         prompt: str,
         snapshot: dict[str, Any],
-        output_type: type[StoryDiagnosisOutput] | type[StoryRewriteOutput],
+        output_type: type[BaseModel],
         output_name: str,
     ) -> StoredStep:
         if self._director is None:
@@ -850,7 +1135,7 @@ class ProjectEditingService:
         if "acceptedAt" in step.input_snapshot:
             raise RevisionConflictError("creative workflow step has already been accepted")
 
-    def _approved_story_step(self, scene: StoredScene) -> StoredStep:
+    def _approved_story_step(self, scene: StoredScene) -> StoredStep | None:
         current_hash = story_source_hash(scene.draft)
         steps = reversed(
             self._repository.list_steps(
@@ -868,15 +1153,20 @@ class ProjectEditingService:
             ):
                 return step
             if (
+                step.operation_key == "director:story-expansion"
+                and accepted.get("acceptedStoryHash") == current_hash
+            ):
+                return step
+            if (
                 step.operation_key == "director:story-diagnosis"
                 and accepted.get("preserveOriginal") is True
                 and step.input_snapshot.get("sourceHash") == current_hash
             ):
                 return step
-        raise ValueError(
-            "storyboard generation requires an accepted story rewrite or an explicit "
-            "preserve-original decision"
-        )
+        # Starting the paid storyboard action is itself the user's explicit
+        # approval to use the currently saved Scene.sourceText.  A prior LLM
+        # diagnosis or rewrite is optional and should not become a hidden gate.
+        return None
 
     def assist_shot(
         self,
@@ -1202,14 +1492,24 @@ class ProjectEditingService:
             if step.operation_key != "director:shot-assistance":
                 continue
             source_revision = step.input_snapshot.get("sourceDraftRevision")
+            accepted_revision = step.input_snapshot.get("acceptedDraftRevision")
             records.append(
                 {
                     "stepId": str(step.id),
                     "status": step.status.value,
                     "sourceDraftRevision": source_revision,
-                    "stale": source_revision != shot.draft_revision,
+                    "stale": (
+                        accepted_revision != shot.draft_revision
+                        if step.input_snapshot.get("acceptedAt")
+                        else source_revision != shot.draft_revision
+                    ),
                     "analysis": step.input_snapshot.get("providerOutput"),
                     "acceptedOutput": step.input_snapshot.get("acceptedOutput"),
+                    "acceptedAnchorBrief": step.input_snapshot.get("acceptedAnchorBrief"),
+                    "acceptedPatchAt": step.input_snapshot.get("acceptedPatchAt"),
+                    "acceptedAnchorBriefAt": step.input_snapshot.get(
+                        "acceptedAnchorBriefAt"
+                    ),
                     "acceptedAt": step.input_snapshot.get("acceptedAt"),
                     "error": step.error,
                     "createdAt": (
@@ -1224,7 +1524,8 @@ class ProjectEditingService:
         step_id: uuid.UUID,
         *,
         source_draft_revision: int,
-        patch: ShotAssistPatch,
+        patch: ShotAssistPatch | None,
+        accepted_anchor_brief: str | None = None,
     ) -> StoredShot:
         step = self._repository.get_step(step_id)
         if (
@@ -1242,7 +1543,13 @@ class ProjectEditingService:
         analysis = ShotAssistAnalysis.model_validate(
             step.input_snapshot.get("providerOutput")
         )
-        selected = patch.model_dump(mode="json", by_alias=True, exclude_none=True)
+        if patch is None and not (accepted_anchor_brief or "").strip():
+            raise ValueError("至少接受一项片段修改或开场静态画面稿")
+        selected = (
+            {}
+            if patch is None
+            else patch.model_dump(mode="json", by_alias=True, exclude_none=True)
+        )
         proposed = (
             {}
             if analysis.patch is None
@@ -1277,10 +1584,48 @@ class ProjectEditingService:
                 continue
             if proposed.get(key) != value:
                 raise ValueError("只能接受该次LLM分析实际提出的字段值")
+        static_brief = None
+        if accepted_anchor_brief is not None:
+            static_brief = accepted_anchor_brief.strip()
+            if not static_brief:
+                raise ValueError("开场静态画面稿不能为空")
+            if len(static_brief) > 4_000:
+                raise ValueError("开场静态画面稿不能超过4000字")
+            if analysis.anchor_brief is None:
+                raise ValueError("该次分析没有提出开场静态画面稿，请重新审稿")
         return self._repository.accept_shot_assistance(
             step_id=step.id,
             source_draft_revision=source_draft_revision,
             patch=patch,
+            accepted_anchor_brief=static_brief,
+        )
+
+    def save_anchor_brief(
+        self,
+        shot_id: uuid.UUID,
+        *,
+        source_draft_revision: int,
+        brief: str,
+    ) -> StoredStep:
+        normalized = brief.strip()
+        if not normalized:
+            raise ValueError("开场静态画面稿不能为空")
+        if len(normalized) > 4_000:
+            raise ValueError("开场静态画面稿不能超过4000字")
+        shot = self._repository.get_shot(shot_id)
+        if shot.draft_revision != source_draft_revision:
+            raise RevisionConflictError("片段草稿已更新，请基于最新版本重新保存开场静态画面稿")
+        return self._repository.save_manual_anchor_brief(
+            shot_id=shot_id,
+            source_draft_revision=source_draft_revision,
+            brief=normalized,
+            input_hash=_hash_json(
+                {
+                    "shotId": str(shot_id),
+                    "sourceDraftRevision": source_draft_revision,
+                    "brief": normalized,
+                }
+            ),
         )
 
 
@@ -1312,6 +1657,18 @@ class ShotProductionService:
         self._poll_interval_seconds = poll_interval_seconds
         self._task_timeout_seconds = task_timeout_seconds
 
+    @property
+    def _video_resolution(self) -> str:
+        if self._runtime_preflight is not None:
+            return self._runtime_preflight.video_resolution
+        return self._resolution
+
+    @property
+    def _semantic_review_enabled(self) -> bool:
+        if self._runtime_preflight is not None:
+            return self._runtime_preflight.semantic_review_enabled
+        return self._enable_video_advice
+
     def import_reference(
         self,
         *,
@@ -1320,10 +1677,23 @@ class ShotProductionService:
         usage: str,
         role: str,
         display_name: str | None = None,
+        scope: str = "project",
+        scene_id: uuid.UUID | None = None,
+        purpose: VisualAssetPurpose | None = None,
     ) -> StoredAsset:
         if usage not in {"approved_anchor", "generation_reference"}:
             raise ValueError("unsupported reference usage")
-        if role not in {"style", "prop", "composition"}:
+        if scope not in {"project", "scene"}:
+            raise ValueError("uploaded reference scope must be project or scene")
+        if scope == "scene":
+            if scene_id is None or self._repository.get_scene(scene_id).project_id != project_id:
+                raise ValueError("scene reference must belong to the selected project")
+        elif scene_id is not None:
+            raise ValueError("project reference cannot be attached to a scene")
+        expected_role = None if purpose is None else _reference_role_for_purpose(purpose).value
+        if expected_role is not None and role != expected_role:
+            raise ValueError("uploaded visual reference role must match its declared purpose")
+        if purpose is None and role not in {"style", "prop", "composition"}:
             raise ValueError(
                 "uploaded generic references may only use style, prop, or composition; "
                 "identity and scene responsibilities come from managed sources"
@@ -1334,16 +1704,17 @@ class ShotProductionService:
             landed=landed,
             role="external_reference",
             media_type="image",
-            scope="project",
+            scope=scope,
             status="approved" if usage == "approved_anchor" else "ready",
             project_id=project_id,
-            scene_id=None,
+            scene_id=scene_id,
             shot_id=None,
             step_id=None,
             semantic_key=f"external:{landed.sha256[:16]}",
             metadata={
                 "usage": usage,
                 "referenceRole": role,
+                **({} if purpose is None else {"referencePurpose": purpose.value}),
                 "displayName": (display_name or path.stem).strip(),
                 "qc": qc,
             },
@@ -1432,18 +1803,46 @@ class ShotProductionService:
     ) -> dict[str, Any]:
         if target is ReferenceTarget.BOTH:
             raise ValueError("prompt preview target must be anchor or video")
-        shot = self._repository.get_shot(shot_id)
-        scene = self._repository.get_scene(shot.scene_id)
-        project = self._repository.get_project(shot.project_id)
+        read_model = self._repository.shot_generation_read_model(shot_id)
+        shot = read_model.shot
+        compilation = self._shot_compilation_context(
+            shot,
+            shot_read_model=read_model,
+        )
         spec = self._compile_shot_generation(
             shot,
             target=target,
             regeneration_instruction=regeneration_instruction,
             require_ready=False,
+            compilation=compilation,
         )
+        return self._prompt_preview_projection(
+            shot=shot,
+            compilation=compilation,
+            spec=spec,
+            previous_tail=_tail_state_json(
+                _previous_tail_state_from_shot_read_model(read_model)
+            ),
+        )
+
+    def _prompt_preview_projection(
+        self,
+        *,
+        shot: StoredShot,
+        compilation: ShotCompilationContext,
+        spec: ShotGenerationSpec,
+        previous_tail: dict[str, Any],
+    ) -> dict[str, Any]:
         local_analysis = analyze_shot_draft(shot.draft)
+        references = self._spec_reference_projection(
+            shot=shot,
+            scene=compilation.scene,
+            project=compilation.project,
+            spec=spec,
+        )
         return {
-            "target": target.value,
+            "target": spec.target.value,
+            "providerInputMode": spec.provider_input_mode.value,
             "ready": not spec.blockers,
             "blockers": list(spec.blockers),
             "inputHash": spec.input_hash,
@@ -1464,24 +1863,669 @@ class ShotProductionService:
             "localAnalysis": local_analysis.model_dump(mode="json", by_alias=True),
             "qualitativePacing": local_analysis.qualitative_pacing,
             "linkWarnings": list(spec.warnings),
-            "references": [
-                {
-                    "index": index,
-                    "assetId": str(asset.id),
-                    "displayName": asset.display_name,
-                    "promptAlias": f"@图片{index}",
-                    "subjectLabel": _asset_subject_label(asset),
-                    "sourceLayer": _shot_assist_asset_layer(
-                        shot, scene, project, asset
+            "actualInputCount": spec.actual_input_count,
+            "references": references,
+            "actualInputs": references,
+            "previousTail": previous_tail,
+        }
+
+    @staticmethod
+    def _spec_reference_projection(
+        *,
+        shot: StoredShot,
+        scene: StoredScene,
+        project: StoredProject,
+        spec: ShotGenerationSpec,
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "index": index,
+                "assetId": str(asset.id),
+                "displayName": asset.display_name,
+                "promptAlias": f"@图片{index}",
+                "subjectLabel": _asset_subject_label(asset),
+                "sourceLayer": _shot_assist_asset_layer(shot, scene, project, asset),
+                "responsibility": spec.descriptions[index - 1],
+                "contentReady": asset.content_ready,
+            }
+            for index, asset in enumerate(spec.sources, 1)
+        ]
+
+    def production_board(self, project_id: uuid.UUID) -> dict[str, Any]:
+        """Build the production board from the same specs used for submission."""
+
+        read_model = self._repository.project_read_model(project_id)
+        graph = project_graph_projection(read_model)
+        scenes_by_id = {item.id: item for item in read_model.scenes}
+        shots_by_id = {item.id: item for item in read_model.shots}
+        assets_by_id = {item["id"]: item for item in graph["assets"]}
+        for graph_scene in graph["scenes"]:
+            for graph_shot in graph_scene["shots"]:
+                assets_by_id.update({item["id"]: item for item in graph_shot["assets"]})
+        active_statuses = {"pending", "submitting", "queued", "running"}
+        actionable_statuses = active_statuses | {
+            "awaiting_review",
+            "submission_unknown",
+            "failed",
+        }
+        scene_summaries: list[dict[str, Any]] = []
+        for scene_data in graph["scenes"]:
+            scene = scenes_by_id[uuid.UUID(scene_data["id"])]
+            scene_look_versions = [
+                item
+                for item in graph["assets"]
+                if item.get("sceneId") == scene_data["id"]
+                and item.get("role") == "scene_look"
+            ]
+            shot_summaries: list[dict[str, Any]] = []
+            for shot_data in scene_data["shots"]:
+                shot = shots_by_id[uuid.UUID(shot_data["id"])]
+                compilation = self._shot_compilation_context(
+                    shot,
+                    read_model=read_model,
+                )
+                spec = self._compile_shot_generation(
+                    shot,
+                    target=ReferenceTarget.VIDEO,
+                    require_ready=False,
+                    compilation=compilation,
+                )
+                references = self._spec_reference_projection(
+                    shot=shot,
+                    scene=scene,
+                    project=read_model.project,
+                    spec=spec,
+                )
+                latest_attempts_by_operation: dict[str, dict[str, Any]] = {}
+                for item in reversed(shot_data["attempts"]):
+                    latest_attempts_by_operation.setdefault(item["operationKey"], item)
+                latest_attempts = list(latest_attempts_by_operation.values())
+                active_attempts = [
+                    item
+                    for item in latest_attempts
+                    if item["status"] in active_statuses
+                ]
+                active_anchor = next(
+                    (
+                        item
+                        for item in active_attempts
+                        if item["operationKey"] == "image:anchor"
                     ),
-                    "responsibility": spec.descriptions[index - 1],
-                    "contentReady": asset.content_ready,
+                    None,
+                )
+                active_video = next(
+                    (
+                        item
+                        for item in active_attempts
+                        if item["operationKey"] in {"video:shot", "video:range-edit"}
+                    ),
+                    None,
+                )
+                anchor_assets = [
+                    item for item in shot_data["assets"] if item["role"] == "shot_anchor"
+                ]
+                video_assets = [
+                    item
+                    for item in shot_data["assets"]
+                    if item["role"] in {"shot_video", "shot_video_edit"}
+                ]
+                selected_anchor = assets_by_id.get(shot_data.get("selectedAnchorAssetId"))
+                if (
+                    selected_anchor is None
+                    and spec.provider_input_mode is ProviderInputMode.FIRST_FRAME
+                    and spec.sources
+                ):
+                    # An adopted previous tail is stored as an approved-anchor
+                    # binding, not in selected_anchor_asset_id.  The compiled spec
+                    # is the authority for the effective Provider opening input.
+                    selected_anchor = assets_by_id.get(str(spec.sources[0].id))
+                opening_asset_id = selected_anchor["id"] if selected_anchor else None
+                selected_video = assets_by_id.get(shot_data.get("selectedVideoAssetId"))
+                candidate_video = next(
+                    (
+                        item
+                        for item in reversed(video_assets)
+                        if item["status"] == "candidate"
+                    ),
+                    None,
+                )
+                selected_video_step = next(
+                    (
+                        item
+                        for item in shot_data["attempts"]
+                        if selected_video
+                        and item["id"] == selected_video.get("producingStepId")
+                    ),
+                    None,
+                )
+                selected_snapshot = (
+                    selected_video_step.get("inputSnapshot", {})
+                    if selected_video_step
+                    else {}
+                )
+                generated_spec_hash = selected_snapshot.get("sourceRevisionHash")
+                stale = bool(
+                    selected_video
+                    and generated_spec_hash is not None
+                    and generated_spec_hash != spec.source_revision_hash
+                )
+                needs_anchor = (
+                    shot.draft.anchor_mode in {AnchorMode.GENERATE, AnchorMode.EXISTING}
+                    and spec.provider_input_mode is not ProviderInputMode.FIRST_FRAME
+                )
+                if active_anchor:
+                    state, next_action = "generating_anchor", "open_task"
+                    state_label, action_label = "开场图生成中", "查看生成任务"
+                elif active_video:
+                    state, next_action = "generating_video", "open_task"
+                    state_label, action_label = "视频生成中", "查看生成任务"
+                elif selected_video and stale:
+                    state, next_action = "stale", "open_versions"
+                    state_label, action_label = "基于旧输入", "查看并决定是否重做"
+                elif selected_video:
+                    state, next_action = "approved", "open_versions"
+                    state_label, action_label = "已批准", "查看视频版本"
+                elif candidate_video:
+                    state, next_action = "awaiting_review", "review_media"
+                    state_label, action_label = "等待审核", "审核视频版本"
+                elif needs_anchor:
+                    state, next_action = "needs_opening", "generate_anchor"
+                    state_label = "待设计开场"
+                    action_label = (
+                        "生成片段开场图"
+                        if shot.draft.anchor_mode is AnchorMode.GENERATE
+                        else "选择已有开场图"
+                    )
+                elif spec.blockers:
+                    state, next_action = "blocked", "fix_inputs"
+                    state_label, action_label = "生成条件未完成", "检查生成输入"
+                else:
+                    state, next_action = "ready_video", "generate_video"
+                    state_label, action_label = "可以生成视频", "生成视频片段"
+
+                counts = {
+                    "custom": sum(
+                        item["sourceLayer"] == "shot"
+                        and item["assetId"] != opening_asset_id
+                        for item in references
+                    ),
+                    "scene": sum(item["sourceLayer"] == "scene_look" for item in references),
+                    "project": sum(item["sourceLayer"] == "project" for item in references),
+                    "opening": int(spec.provider_input_mode is ProviderInputMode.FIRST_FRAME),
+                    "person": sum(
+                        str(assets_by_id.get(item["assetId"], {}).get("semanticKey") or "")
+                        .startswith("person:")
+                        for item in references
+                    ),
+                    "cat": sum(
+                        str(assets_by_id.get(item["assetId"], {}).get("semanticKey") or "")
+                        .startswith("cat:")
+                        for item in references
+                    ),
+                    "style": sum(
+                        str(assets_by_id.get(item["assetId"], {}).get("semanticKey") or "")
+                        .startswith("style:")
+                        for item in references
+                    ),
+                    "prop": sum(
+                        item["sourceLayer"] not in {"project", "scene_look"}
+                        and item["assetId"] != opening_asset_id
+                        for item in references
+                    ),
+                    "total": spec.actual_input_count,
                 }
-                for index, asset in enumerate(spec.sources, 1)
-            ],
-            "previousTail": _tail_state_json(
-                _previous_tail_state(self._repository, shot)
+                preview_asset = (
+                    selected_video
+                    or selected_anchor
+                    or candidate_video
+                    or (anchor_assets[-1] if anchor_assets else None)
+                    or assets_by_id.get(scene_data.get("selectedLookAssetId"))
+                )
+                latest_actionable = next(
+                    (
+                        item
+                        for item in latest_attempts
+                        if item["status"] in actionable_statuses
+                    ),
+                    None,
+                )
+                upstream_lineage: list[str] = []
+                if selected_anchor and selected_anchor.get("producingStepId"):
+                    anchor_step = next(
+                        (
+                            item
+                            for item in shot_data["attempts"]
+                            if item["id"] == selected_anchor["producingStepId"]
+                        ),
+                        None,
+                    )
+                    source_ids = (anchor_step or {}).get("inputSnapshot", {}).get(
+                        "sourceAssetIds",
+                        [],
+                    )
+                    if isinstance(source_ids, list):
+                        upstream_lineage = [str(item) for item in source_ids]
+                shot_summaries.append(
+                    {
+                        "shotId": shot_data["id"],
+                        "sceneId": scene_data["id"],
+                        "state": state,
+                        "stateLabel": state_label,
+                        "nextAction": next_action,
+                        "primaryActionLabel": action_label,
+                        "providerInputMode": spec.provider_input_mode.value,
+                        "actualInputCount": spec.actual_input_count,
+                        "actualInputs": references,
+                        "upstreamLineage": upstream_lineage,
+                        "ready": spec.ready,
+                        "blockers": list(spec.blockers),
+                        "referenceCounts": counts,
+                        "anchorVersionCount": len(anchor_assets),
+                        "videoVersionCount": len(video_assets),
+                        "activeTaskCount": len(active_attempts),
+                        "latestActionableTask": latest_actionable,
+                        "previewAssetId": preview_asset["id"] if preview_asset else None,
+                        "previewMediaType": (
+                            preview_asset["mediaType"] if preview_asset else None
+                        ),
+                        "usesSceneLook": any(
+                            item["sourceLayer"] == "scene_look" for item in references
+                        ),
+                        "inputHash": spec.input_hash,
+                        "currentInputHash": spec.input_hash,
+                    }
+                )
+            scene_summaries.append(
+                {
+                    "sceneId": scene_data["id"],
+                    "selectedLookAssetId": scene_data.get("selectedLookAssetId"),
+                    "lookVersionCount": len(scene_look_versions),
+                    "lookStatus": (
+                        assets_by_id.get(
+                            scene_data.get("selectedLookAssetId"),
+                            {},
+                        ).get("status")
+                        if scene_data.get("selectedLookAssetId")
+                        else "optional"
+                    ),
+                    "lookRecommended": bool(
+                        scene.draft.look_plan and scene.draft.look_plan.image_recommended
+                    ),
+                    "lookRecommendationReason": (
+                        scene.draft.look_plan.recommendation_reason
+                        if scene.draft.look_plan
+                        else None
+                    ),
+                    "shots": shot_summaries,
+                }
+            )
+        return {
+            "projectId": str(project_id),
+            "projectGraph": graph,
+            "scenes": scene_summaries,
+        }
+
+    def generation_workspace(self, shot_id: uuid.UUID) -> dict[str, Any]:
+        """Load and compile a shot workspace from one batch read."""
+
+        read_model = self._repository.shot_generation_read_model(shot_id)
+        shot = read_model.shot
+        compilation = self._shot_compilation_context(
+            shot,
+            shot_read_model=read_model,
+        )
+        previous_tail_state = _previous_tail_state_from_shot_read_model(read_model)
+        previous_tail = _tail_state_json(previous_tail_state)
+        anchor_spec = self._compile_shot_generation(
+            shot,
+            target=ReferenceTarget.ANCHOR,
+            require_ready=False,
+            compilation=compilation,
+        )
+        video_spec = self._compile_shot_generation(
+            shot,
+            target=ReferenceTarget.VIDEO,
+            require_ready=False,
+            compilation=compilation,
+        )
+        anchor_preview = self._prompt_preview_projection(
+            shot=shot,
+            compilation=compilation,
+            spec=anchor_spec,
+            previous_tail=previous_tail,
+        )
+        video_preview = self._prompt_preview_projection(
+            shot=shot,
+            compilation=compilation,
+            spec=video_spec,
+            previous_tail=previous_tail,
+        )
+        prompts_by_step = {item.step_id: item for item in read_model.prompts}
+        reviews_by_step: dict[uuid.UUID, list[Any]] = {}
+        for review in read_model.reviews:
+            reviews_by_step.setdefault(review.step_id, []).append(review)
+        shot_steps = list(read_model.steps)
+        attempt_projections = [
+            step_projection(
+                item,
+                prompt=prompts_by_step.get(item.id),
+                reviews=reviews_by_step.get(item.id, []),
+            )
+            for item in shot_steps
+        ]
+        shot_assets = [
+            item for item in read_model.assets if item.shot_card_id == shot.id
+        ]
+        assets_by_id = {str(item.id): item for item in read_model.assets}
+
+        def reference_slots(
+            preview: dict[str, Any],
+            target: str,
+        ) -> list[dict[str, Any]]:
+            grouped: dict[str, list[dict[str, Any]]] = {
+                "person": [],
+                "cat": [],
+                "style": [],
+                "scene": [],
+                "prop": [],
+                "opening": [],
+                "custom": [],
+            }
+            for reference in preview["references"]:
+                asset = assets_by_id[reference["assetId"]]
+                semantic_key = asset.semantic_key or ""
+                if reference["assetId"] == str(shot.selected_anchor_asset_id):
+                    key = "opening"
+                elif reference["sourceLayer"] == "scene_look":
+                    key = "scene"
+                elif semantic_key.startswith("person:"):
+                    key = "person"
+                elif semantic_key.startswith("cat:"):
+                    key = "cat"
+                elif semantic_key.startswith("style:"):
+                    key = "style"
+                elif reference["sourceLayer"] == "shot":
+                    key = "custom"
+                else:
+                    key = "prop"
+                grouped[key].append(
+                    {**reference, "asset": asset_projection(asset)}
+                )
+            labels = {
+                "person": "人物身份",
+                "cat": "猫咪身份",
+                "style": "系列画风",
+                "scene": "场景视觉基准",
+                "prop": "道具与构图",
+                "opening": "批准开场图",
+                "custom": "片段专用素材",
+            }
+            return [
+                {"key": key, "label": labels[key], "target": target, "items": items}
+                for key, items in grouped.items()
+                if items
+            ]
+
+        def version_projection(asset: StoredAsset) -> dict[str, Any]:
+            step = next((item for item in shot_steps if item.id == asset.step_id), None)
+            return {
+                **asset_projection(asset),
+                "attempt": None if step is None else step.attempt,
+                "prompt": (
+                    None
+                    if step is None or prompts_by_step.get(step.id) is None
+                    else step_projection(
+                        step,
+                        prompt=prompts_by_step[step.id],
+                    )["prompt"]
+                ),
+                "inputSnapshot": {} if step is None else step.input_snapshot,
+            }
+
+        anchor_versions = [
+            version_projection(item)
+            for item in shot_assets
+            if item.role in {"shot_anchor", "shot_tail_frame"}
+        ]
+        video_versions = [
+            version_projection(item)
+            for item in shot_assets
+            if item.role in {"shot_video", "shot_video_edit"}
+        ]
+        upstream_lineage: list[dict[str, Any]] = []
+        if shot.selected_anchor_asset_id is not None:
+            selected_anchor = compilation.assets_by_id.get(shot.selected_anchor_asset_id)
+            anchor_step = next(
+                (
+                    item
+                    for item in shot_steps
+                    if selected_anchor is not None and item.id == selected_anchor.step_id
+                ),
+                None,
+            )
+            source_ids = (
+                anchor_step.input_snapshot.get("sourceAssetIds", [])
+                if anchor_step is not None
+                else []
+            )
+            if isinstance(source_ids, list):
+                upstream_lineage = [
+                    asset_projection(assets_by_id[str(asset_id)])
+                    for asset_id in source_ids
+                    if str(asset_id) in assets_by_id
+                ]
+        active_statuses = {
+            StepStatus.PENDING,
+            StepStatus.SUBMITTING,
+            StepStatus.QUEUED,
+            StepStatus.RUNNING,
+            StepStatus.SUBMISSION_UNKNOWN,
+            StepStatus.FAILED,
+        }
+        latest_steps_by_operation: dict[str, StoredStep] = {}
+        for item in reversed(shot_steps):
+            latest_steps_by_operation.setdefault(item.operation_key, item)
+        latest_step_ids = {item.id for item in latest_steps_by_operation.values()}
+
+        brief_records = self._anchor_brief_records(shot, compilation=compilation)
+        current_brief = next(
+            (item for item in reversed(brief_records) if not item.stale),
+            None,
+        )
+        anchor_brief_versions = [
+            {
+                "stepId": str(item.step_id),
+                "version": index,
+                "source": item.source,
+                "brief": item.text,
+                "sourceDraftRevision": item.source_draft_revision,
+                "acceptedDraftRevision": item.accepted_draft_revision,
+                "acceptedAt": item.accepted_at,
+                "createdAt": item.created_at,
+                "stale": item.stale,
+                "current": current_brief is not None
+                and item.step_id == current_brief.step_id,
+            }
+            for index, item in enumerate(brief_records, 1)
+        ]
+
+        running_statuses = {
+            StepStatus.PENDING,
+            StepStatus.SUBMITTING,
+            StepStatus.QUEUED,
+            StepStatus.RUNNING,
+        }
+        active_anchor_step = next(
+            (
+                item
+                for item in reversed(shot_steps)
+                if item.operation_key == "image:anchor"
+                and item.status in running_statuses
             ),
+            None,
+        )
+        active_video_step = next(
+            (
+                item
+                for item in reversed(shot_steps)
+                if item.operation_key in {"video:shot", "video:range-edit"}
+                and item.status in running_statuses
+            ),
+            None,
+        )
+        active_assistance_step = next(
+            (
+                item
+                for item in reversed(shot_steps)
+                if item.operation_key == "director:shot-assistance"
+                and item.input_snapshot.get("sourceDraftRevision")
+                == shot.draft_revision
+                and item.status in running_statuses
+            ),
+            None,
+        )
+        reviewable_assistance = next(
+            (
+                item
+                for item in reversed(shot_steps)
+                if item.operation_key == "director:shot-assistance"
+                and item.status is StepStatus.SUCCEEDED
+                and item.input_snapshot.get("sourceDraftRevision")
+                == shot.draft_revision
+                and isinstance(item.input_snapshot.get("providerOutput"), dict)
+                and not str(
+                    item.input_snapshot.get("acceptedAnchorBrief") or ""
+                ).strip()
+            ),
+            None,
+        )
+        anchor_candidate = next(
+            (
+                item
+                for item in reversed(shot_assets)
+                if item.role == "shot_anchor" and item.status == "candidate"
+            ),
+            None,
+        )
+        video_candidate = next(
+            (
+                item
+                for item in reversed(shot_assets)
+                if item.role in {"shot_video", "shot_video_edit"}
+                and item.status == "candidate"
+            ),
+            None,
+        )
+
+        if shot.draft.anchor_mode is AnchorMode.GENERATE and shot.selected_anchor_asset_id is None:
+            if active_anchor_step is not None:
+                next_action = "anchor_generating"
+                next_label = "开场图生成中"
+                next_blockers = ["开场图正在后台生成，可离开本页面继续其他工作"]
+            elif anchor_candidate is not None:
+                next_action = "review_anchor"
+                next_label = "审核开场图"
+                next_blockers = []
+            elif current_brief is None and active_assistance_step is not None:
+                next_action = "assistance_running"
+                next_label = "LLM 正在生成建议"
+                next_blockers = ["分析完成后可逐项查看；也可以现在直接填写手工静态稿"]
+            elif current_brief is None and reviewable_assistance is not None:
+                next_action = "review_assistance"
+                next_label = "查看并接受开场建议"
+                next_blockers = []
+            elif current_brief is None:
+                next_action = "write_anchor_brief"
+                next_label = "保存开场静态画面稿"
+                next_blockers = ["请先描述当前片段动作开始前的稳定画面"]
+            elif anchor_spec.ready:
+                next_action = "generate_anchor"
+                next_label = "生成片段开场图"
+                next_blockers = []
+            else:
+                next_action = "fix_inputs"
+                next_label = "修复开场图输入"
+                next_blockers = list(anchor_spec.blockers)
+        elif active_video_step is not None:
+            next_action = "video_generating"
+            next_label = "视频生成中"
+            next_blockers = ["视频正在后台生成，可离开本页面继续其他工作"]
+        elif shot.selected_video_asset_id is not None:
+            next_action = "completed"
+            next_label = "当前片段已批准"
+            next_blockers = []
+        elif video_candidate is not None:
+            next_action = "review_video"
+            next_label = "审核视频"
+            next_blockers = []
+        elif video_spec.ready:
+            next_action = "generate_video"
+            next_label = "生成视频片段"
+            next_blockers = []
+        else:
+            next_action = "fix_inputs"
+            next_label = "修复视频输入"
+            next_blockers = list(video_spec.blockers)
+
+        anchor_brief = (
+            None
+            if current_brief is None
+            else next(
+                item for item in anchor_brief_versions if item["current"]
+            )
+        )
+        return {
+            "projectId": str(shot.project_id),
+            "shot": shot_projection(
+                shot,
+                assets=shot_assets,
+                attempts=attempt_projections,
+            ),
+            "scene": {
+                "id": str(compilation.scene.id),
+                "title": compilation.scene.draft.title,
+                "selectedLookAssetId": (
+                    None
+                    if compilation.scene.selected_look_asset_id is None
+                    else str(compilation.scene.selected_look_asset_id)
+                ),
+            },
+            "assets": [asset_projection(item) for item in read_model.assets],
+            "generationSpec": {
+                "providerInputMode": video_spec.provider_input_mode.value,
+                "actualInputCount": video_spec.actual_input_count,
+                "actualInputs": video_preview["actualInputs"],
+                "ready": video_spec.ready,
+                "blockers": list(video_spec.blockers),
+                "warnings": list(video_spec.warnings),
+                "inputHash": video_spec.input_hash,
+                "sourceRevisionHash": video_spec.source_revision_hash,
+            },
+            "anchorPreview": anchor_preview,
+            "videoPreview": video_preview,
+            "actualInputs": video_preview["actualInputs"],
+            "upstreamLineage": upstream_lineage,
+            "referenceSlots": {
+                "anchor": reference_slots(anchor_preview, "anchor"),
+                "video": reference_slots(video_preview, "video"),
+            },
+            "anchorVersions": anchor_versions,
+            "videoVersions": video_versions,
+            "anchorBrief": anchor_brief,
+            "anchorBriefVersions": anchor_brief_versions,
+            "nextAction": next_action,
+            "nextActionLabel": next_label,
+            "blockers": next_blockers,
+            "previousTail": previous_tail,
+            "activeTasks": [
+                projection
+                for step, projection in zip(
+                    shot_steps,
+                    attempt_projections,
+                    strict=True,
+                )
+                if step.id in latest_step_ids and step.status in active_statuses
+            ],
         }
 
     def validate_anchor_request(
@@ -1489,20 +2533,26 @@ class ShotProductionService:
         shot_id: uuid.UUID,
         *,
         allow_paid_generation: bool,
+        expected_input_hash: str | None = None,
+        regeneration_instruction: str | None = None,
     ) -> None:
         self._require_paid_gateway(allow_paid_generation)
         shot = self._repository.get_shot(shot_id)
-        self._compile_shot_generation(
+        spec = self._compile_shot_generation(
             shot,
             target=ReferenceTarget.ANCHOR,
+            regeneration_instruction=regeneration_instruction,
             require_ready=True,
         )
+        self._assert_expected_input_hash(spec, expected_input_hash)
 
     def validate_video_request(
         self,
         shot_id: uuid.UUID,
         *,
         allow_paid_generation: bool,
+        expected_input_hash: str | None = None,
+        regeneration_instruction: str | None = None,
     ) -> None:
         if self._runtime_preflight is not None:
             self._runtime_preflight.validate_for_video_generation(
@@ -1510,11 +2560,13 @@ class ShotProductionService:
             )
         self._require_paid_gateway(allow_paid_generation)
         shot = self._repository.get_shot(shot_id)
-        self._compile_shot_generation(
+        spec = self._compile_shot_generation(
             shot,
             target=ReferenceTarget.VIDEO,
+            regeneration_instruction=regeneration_instruction,
             require_ready=True,
         )
+        self._assert_expected_input_hash(spec, expected_input_hash)
 
     def generate_anchor(
         self,
@@ -1523,6 +2575,7 @@ class ShotProductionService:
         allow_paid_generation: bool,
         regenerate: bool = False,
         reason: str | None = None,
+        expected_input_hash: str | None = None,
     ) -> dict[str, Any]:
         shot = self._repository.get_shot(shot_id)
         self._require_paid_gateway(allow_paid_generation)
@@ -1532,6 +2585,7 @@ class ShotProductionService:
             regeneration_instruction=reason if regenerate else None,
             require_ready=True,
         )
+        self._assert_expected_input_hash(spec, expected_input_hash)
         step, _ = self._new_paid_step(
             shot,
             kind=StepKind.IMAGE,
@@ -1580,6 +2634,7 @@ class ShotProductionService:
                 metadata={
                     "qc": qc,
                     "providerUrl": result.url,
+                    "syntheticFixture": self._provider_name == "local-fake-provider",
                     "advisories": (
                         ["画面边缘大面积接近纯黑，请人工确认是否存在异常黑边"]
                         if qc.get("blackBorderDetected")
@@ -1750,6 +2805,7 @@ class ShotProductionService:
                 metadata={
                     "qc": qc,
                     "providerUrl": result.url,
+                    "syntheticFixture": self._provider_name == "local-fake-provider",
                     "visualProfileRevisionId": str(inputs.profile.id),
                     "visualProfileRevision": inputs.profile.revision,
                     "lookDraftRevision": scene.look_draft_revision,
@@ -1775,6 +2831,297 @@ class ShotProductionService:
             )
             raise
 
+    def validate_reference_image_request(
+        self,
+        *,
+        project_id: uuid.UUID,
+        scene_id: uuid.UUID | None,
+        scope: str,
+        draft: ReferenceImageDraft,
+        allow_paid_generation: bool,
+    ) -> str:
+        self._require_paid_gateway(allow_paid_generation)
+        return self._compile_reference_image(
+            project_id=project_id,
+            scene_id=scene_id,
+            scope=scope,
+            draft=draft,
+        ).operation_key
+
+    def generate_reference_image(
+        self,
+        *,
+        project_id: uuid.UUID,
+        scene_id: uuid.UUID | None,
+        scope: str,
+        draft: ReferenceImageDraft,
+        allow_paid_generation: bool,
+        regenerate: bool = False,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        self._require_paid_gateway(allow_paid_generation)
+        spec = self._compile_reference_image(
+            project_id=project_id,
+            scene_id=scene_id,
+            scope=scope,
+            draft=draft,
+            regeneration_instruction=reason if regenerate else None,
+        )
+        steps = [
+            item
+            for item in self._repository.list_steps(project_id=project_id)
+            if item.operation_key == spec.operation_key
+            and item.scene_id == scene_id
+            and item.shot_card_id is None
+        ]
+        unresolved = next(
+            (item for item in steps if item.status is StepStatus.SUBMISSION_UNKNOWN),
+            None,
+        )
+        if regenerate and unresolved is not None:
+            raise ValueError(
+                f"step {unresolved.id} is submission_unknown; reconcile it before regeneration"
+            )
+        previous = steps[-1] if steps else None
+        if regenerate and previous is not None and previous.status in {
+            StepStatus.PENDING,
+            StepStatus.SUBMITTING,
+            StepStatus.QUEUED,
+            StepStatus.RUNNING,
+        }:
+            raise ValueError(f"step {previous.id} is still active and cannot be regenerated")
+        existing = [
+            item
+            for item in steps
+            if item.input_snapshot.get("inputHash") == spec.input_hash
+        ]
+        if regenerate:
+            attempt = (
+                self._repository.next_scene_attempt(
+                    scene_id=scene_id,
+                    operation_key=spec.operation_key,
+                )
+                if scene_id is not None
+                else self._repository.next_project_attempt(
+                    project_id=project_id,
+                    operation_key=spec.operation_key,
+                )
+            )
+            snapshot = {
+                **spec.snapshot,
+                "retryOfStepId": None if previous is None else str(previous.id),
+                "retryReason": reason or "explicit regeneration",
+            }
+        else:
+            attempt = (
+                existing[-1].attempt
+                if existing
+                else (
+                    self._repository.next_scene_attempt(
+                        scene_id=scene_id,
+                        operation_key=spec.operation_key,
+                    )
+                    if scene_id is not None
+                    else self._repository.next_project_attempt(
+                        project_id=project_id,
+                        operation_key=spec.operation_key,
+                    )
+                )
+            )
+            snapshot = spec.snapshot
+        snapshot = {**snapshot, "inputHash": spec.input_hash}
+        step, _ = self._repository.create_step_with_prompt(
+            project_id=project_id,
+            scene_id=scene_id,
+            shot_id=None,
+            kind=StepKind.IMAGE,
+            operation_key=spec.operation_key,
+            attempt=attempt,
+            provider=self._provider_name,
+            model=self._gateway.image_model,
+            input_hash=spec.input_hash,
+            input_snapshot=snapshot,
+            purpose=PromptPurpose.IMAGE,
+            prompt_text=spec.prompt.text,
+        )
+        if step.status is not StepStatus.PENDING:
+            asset = next(
+                (
+                    item
+                    for item in self._repository.list_assets(project_id=project_id)
+                    if item.step_id == step.id and item.role == "generated_reference"
+                ),
+                None,
+            )
+            return {
+                "stepId": str(step.id),
+                "assetId": None if asset is None else str(asset.id),
+                "reused": True,
+                "status": step.status.value,
+            }
+        self._repository.update_step(step.id, status=StepStatus.SUBMITTING)
+        try:
+            result = self._gateway.generate_image(
+                prompt=spec.prompt.text,
+                reference_paths=tuple(item.require_path() for item in spec.sources),
+            )
+            landed = self._asset_store.download(result.url, suffix=".png")
+            qc = self._media_probe.inspect_image(landed.path)
+            role = _reference_role_for_purpose(spec.draft.purpose)
+            asset = self._repository.add_asset(
+                landed=landed,
+                role="generated_reference",
+                media_type="image",
+                scope=spec.scope,
+                status="candidate",
+                project_id=project_id,
+                scene_id=scene_id,
+                shot_id=None,
+                step_id=step.id,
+                semantic_key=(
+                    f"{spec.scope}:{scene_id or project_id}:reference:"
+                    f"{spec.draft.purpose.value}:{step.attempt}"
+                ),
+                metadata={
+                    "displayName": spec.draft.display_name,
+                    "referenceRole": role.value,
+                    "referencePurpose": spec.draft.purpose.value,
+                    "purpose": spec.draft.purpose.value,
+                    "creativePrompt": spec.draft.prompt,
+                    "promptSha256": hashlib.sha256(
+                        spec.prompt.text.encode("utf-8")
+                    ).hexdigest(),
+                    "sourceRevision": spec.draft.source_revision,
+                    "referenceAssetIds": [str(item.id) for item in spec.sources],
+                    "providerModel": result.model,
+                    "providerUrl": result.url,
+                    "syntheticFixture": self._provider_name == "local-fake-provider",
+                    "qc": qc,
+                },
+            )
+            self._repository.update_step(step.id, status=StepStatus.AWAITING_REVIEW)
+            return {
+                "stepId": str(step.id),
+                "assetId": str(asset.id),
+                "status": "awaiting_review",
+            }
+        except GatewayError as exc:
+            status = StepStatus.SUBMISSION_UNKNOWN if exc.submission_unknown else StepStatus.FAILED
+            self._repository.update_step(step.id, status=status, error=_error_payload(exc))
+            raise
+        except Exception as exc:
+            self._repository.update_step(
+                step.id,
+                status=StepStatus.FAILED,
+                error=_error_payload(exc),
+            )
+            raise
+
+    def _compile_reference_image(
+        self,
+        *,
+        project_id: uuid.UUID,
+        scene_id: uuid.UUID | None,
+        scope: str,
+        draft: ReferenceImageDraft,
+        regeneration_instruction: str | None = None,
+    ) -> ReferenceImageSpec:
+        if scope not in {"project", "scene"}:
+            raise ValueError("generated reference scope must be project or scene")
+        if scope == "scene" and scene_id is None:
+            raise ValueError("scene reference image requires a scene")
+        if scope == "project" and scene_id is not None:
+            raise ValueError("project reference image cannot be attached to a scene")
+        project = self._repository.get_project(project_id)
+        scene = None if scene_id is None else self._repository.get_scene(scene_id)
+        if scene is not None and scene.project_id != project.id:
+            raise ValueError("scene belongs to another project")
+        profile = self._repository.get_visual_profile(project.id)
+        available = {
+            item.id: item
+            for item in self._repository.list_assets(
+                project_id=project.id,
+                include_canon=True,
+            )
+        }
+        unknown = set(draft.reference_asset_ids).difference(available)
+        if unknown:
+            raise ValueError("reference image inputs must belong to this project or Canon")
+        selected_sources: list[StoredAsset] = []
+        seen_hashes: set[str] = set()
+        for asset_id in draft.reference_asset_ids:
+            asset = available[asset_id]
+            if (
+                asset.media_type != "image"
+                or asset.status not in {"approved", "ready"}
+                or not asset.content_ready
+            ):
+                raise ValueError(f"reference image input {asset.id} is unavailable")
+            if asset.sha256 in seen_hashes:
+                continue
+            seen_hashes.add(asset.sha256)
+            selected_sources.append(asset)
+        sources = list(
+            _order_reference_image_sources(
+                draft.purpose,
+                tuple(selected_sources),
+            )
+        )
+        if len(sources) > 14:
+            raise ValueError("Seedream最多允许14张参考图")
+        descriptions = tuple(
+            _reference_image_input_description(
+                index,
+                purpose=draft.purpose,
+                asset=asset,
+            )
+            for index, asset in enumerate(sources, 1)
+        )
+        prompt = compile_reference_image_prompt(
+            purpose=draft.purpose,
+            display_name=draft.display_name,
+            creative_prompt=draft.prompt,
+            reference_descriptions=descriptions,
+            visual_profile=profile.draft,
+            regeneration_instruction=regeneration_instruction,
+        )
+        identity = hashlib.sha256(
+            f"{draft.source_revision}|{draft.purpose.value}|{draft.display_name}".encode(
+                "utf-8"
+            )
+        ).hexdigest()[:12]
+        operation_key = f"image:reference:{draft.purpose.value}:{identity}"
+        snapshot = {
+            "scope": scope,
+            "projectId": str(project.id),
+            "sceneId": None if scene is None else str(scene.id),
+            "displayName": draft.display_name,
+            "purpose": draft.purpose.value,
+            "creativePrompt": draft.prompt,
+            "referenceRole": _reference_role_for_purpose(draft.purpose).value,
+            "sourceRevision": draft.source_revision,
+            "visualProfileRevisionId": str(profile.id),
+            "referenceAssetIds": [str(item.id) for item in sources],
+            "references": [
+                {"assetId": str(item.id), "sha256": item.sha256, "ordinal": index}
+                for index, item in enumerate(sources, 1)
+            ],
+        }
+        input_hash = _hash_json({"prompt": prompt.text, "snapshot": snapshot})
+        return ReferenceImageSpec(
+            project=project,
+            scene=scene,
+            profile=profile,
+            draft=draft,
+            scope=scope,
+            operation_key=operation_key,
+            sources=tuple(sources),
+            descriptions=descriptions,
+            prompt=prompt,
+            snapshot=snapshot,
+            input_hash=input_hash,
+        )
+
     def generate_video(
         self,
         shot_id: uuid.UUID,
@@ -1782,6 +3129,7 @@ class ShotProductionService:
         allow_paid_generation: bool,
         regenerate: bool = False,
         reason: str | None = None,
+        expected_input_hash: str | None = None,
     ) -> dict[str, Any]:
         if self._runtime_preflight is not None:
             self._runtime_preflight.validate_for_video_generation(
@@ -1795,6 +3143,7 @@ class ShotProductionService:
             regeneration_instruction=reason if regenerate else None,
             require_ready=True,
         )
+        self._assert_expected_input_hash(spec, expected_input_hash)
         if spec.input_plan is None:
             raise RuntimeError("video generation specification has no input plan")
         step, _ = self._new_paid_step(
@@ -2007,6 +3356,7 @@ class ShotProductionService:
             metadata={
                 "sourceVideoAssetId": str(source_video.id),
                 "sourceVideoSha256": source_video.sha256,
+                "syntheticFixture": source_video.metadata.get("syntheticFixture") is True,
                 "timestampMs": timestamp_ms,
                 "qc": qc,
             },
@@ -2117,7 +3467,7 @@ class ShotProductionService:
                 path.unlink(missing_ok=True)
         provider_duration = min(13, max(4, math.ceil((end_ms - start_ms) / 1000)))
         plan = build_edit_input_plan(
-            resolution=self._resolution,
+            resolution=self._video_resolution,
             duration_seconds=provider_duration,
             source_video=_media_source(source),
             before_frame=_media_source(boundary_assets[0]),
@@ -2200,7 +3550,7 @@ class ShotProductionService:
                     4,
                     round(int(step.input_snapshot["targetDurationMs"]) / 1000),
                 ),
-                expected_resolution=self._resolution,
+                expected_resolution=self._video_resolution,
                 minimum_duration_seconds=1,
                 maximum_duration_seconds=15,
                 duration_tolerance_ms=5000,
@@ -2219,7 +3569,7 @@ class ShotProductionService:
         qc = self._media_probe.inspect_video(
             landed.path,
             expected_duration_seconds=shot.draft.duration_seconds,
-            expected_resolution=self._resolution,
+            expected_resolution=self._video_resolution,
         )
         if not qc.get("passed"):
             self._repository.update_step(
@@ -2242,6 +3592,7 @@ class ShotProductionService:
             metadata={
                 "qc": qc,
                 "providerUrl": (None if step.operation_key == "video:range-edit" else video_url),
+                "syntheticFixture": self._provider_name == "local-fake-provider",
                 "providerSegmentUrl": (
                     video_url if step.operation_key == "video:range-edit" else None
                 ),
@@ -2294,11 +3645,12 @@ class ShotProductionService:
                     semantic_key=f"shot:{shot.id}:video:{asset.id}:frame:{ordinal}",
                     metadata={
                         "sourceVideoAssetId": str(asset.id),
+                        "syntheticFixture": asset.metadata.get("syntheticFixture") is True,
                         "ordinal": ordinal,
                         "frameCount": len(frames),
                     },
                 )
-            if not self._enable_video_advice or self._gateway is None:
+            if not self._semantic_review_enabled or self._gateway is None:
                 return
             result = self._gateway.diagnose_video_frames(
                 prompt=compile_video_review_prompt(self._prompt_context(shot)),
@@ -2341,15 +3693,19 @@ class ShotProductionService:
         target: ReferenceTarget,
         regeneration_instruction: str | None = None,
         require_ready: bool,
+        compilation: ShotCompilationContext | None = None,
     ) -> ShotGenerationSpec:
         """Compile the exact assets, prompt and audit snapshot for one target."""
 
         if target is ReferenceTarget.BOTH:
             raise ValueError("generation target must be anchor or video")
-        profile = self._repository.get_visual_profile(shot.project_id)
-        scene = self._repository.get_scene(shot.scene_id)
-        project = self._repository.get_project(shot.project_id)
-        context = self._prompt_context(shot)
+        compilation = compilation or self._shot_compilation_context(shot)
+        if compilation.shot.id != shot.id:
+            raise ValueError("shot compilation context does not match requested shot")
+        profile = compilation.visual_profile
+        scene = compilation.scene
+        project = compilation.project
+        context = self._prompt_context(shot, compilation=compilation)
         blockers: list[str] = []
         warnings: tuple[str, ...] = ()
 
@@ -2359,6 +3715,8 @@ class ShotProductionService:
             reference_pairs = self._resolved_reference_pairs(
                 shot,
                 target=ReferenceTarget.ANCHOR,
+                strict=False,
+                compilation=compilation,
             )
             sources = tuple(asset for _binding, asset in reference_pairs)
             if len(sources) > 14:
@@ -2372,19 +3730,37 @@ class ShotProductionService:
                 )
                 for index, (binding, asset) in enumerate(reference_pairs, 1)
             )
+            anchor_brief, anchor_brief_step_id = self._accepted_anchor_brief(
+                shot,
+                compilation=compilation,
+            )
+            if anchor_brief is None:
+                blockers.append(
+                    "请先填写并保存开场静态画面稿，或使用可选的 LLM 创作分析生成建议"
+                )
+                anchor_brief = "尚未接受开场静态画面稿"
             prompt = compile_anchor_prompt(
                 context,
+                anchor_brief=anchor_brief,
                 reference_descriptions=descriptions,
                 regeneration_instruction=regeneration_instruction,
                 visual_profile=profile.draft,
             )
-            creative_body = context.direction
+            creative_body = anchor_brief
             system_shell = prompt.text
             input_plan = None
+            provider_input_mode = (
+                ProviderInputMode.REFERENCE_MEDIA
+                if sources
+                else ProviderInputMode.TEXT_ONLY
+            )
         else:
+            anchor_brief_step_id = None
             anchor, references, descriptions = self._resolve_video_inputs(
                 shot,
                 require_generated_anchor=False,
+                strict=False,
+                compilation=compilation,
             )
             if (
                 shot.draft.anchor_mode is AnchorMode.GENERATE
@@ -2392,8 +3768,10 @@ class ShotProductionService:
             ):
                 blockers.append("请先生成、批准并选择片段开场锚点")
             sources = (() if anchor is None else (anchor,)) + references
+            if shot.draft.anchor_mode is AnchorMode.EXISTING and anchor is None:
+                blockers.append("请先选择一张已批准的片段开场图")
             input_plan = build_shot_input_plan(
-                resolution=self._resolution,
+                resolution=self._video_resolution,
                 duration_seconds=shot.draft.duration_seconds,
                 anchor=None if anchor is None else _media_source(anchor),
                 references=tuple(_media_source(item) for item in references),
@@ -2412,6 +3790,27 @@ class ShotProductionService:
             prompt = prompt_parts.final
             creative_body = prompt_parts.creative_body
             system_shell = prompt_parts.system_shell.text
+            provider_input_mode = (
+                ProviderInputMode.FIRST_FRAME
+                if anchor is not None
+                else (
+                    ProviderInputMode.REFERENCE_MEDIA
+                    if references
+                    else ProviderInputMode.TEXT_ONLY
+                )
+            )
+
+        for source in sources:
+            if _is_synthetic_fixture(source):
+                blockers.append(
+                    f"素材“{source.display_name}”是历史测试占位，不能用于真实 Ark 生成"
+                )
+            elif source.media_type != "image":
+                blockers.append(f"素材“{source.display_name}”不是可用图片")
+            elif source.status not in {"approved", "ready"}:
+                blockers.append(f"素材“{source.display_name}”尚未批准")
+            elif not source.content_ready:
+                blockers.append(f"素材“{source.display_name}”文件不可读取")
 
         source_assets = [
             {
@@ -2437,10 +3836,14 @@ class ShotProductionService:
                 "visualProfileRevisionId": str(profile.id),
                 "visualProfileHash": profile.profile_hash,
                 "sourceAssets": source_assets,
+                "anchorBriefStepId": (
+                    None if target is ReferenceTarget.VIDEO else anchor_brief_step_id
+                ),
             }
         )
         snapshot: dict[str, Any] = {
             "generationTarget": target.value,
+            "providerInputMode": provider_input_mode.value,
             "sourceRevisionHash": source_revision_hash,
             "shotCardId": str(shot.id),
             "shotDraftRevision": shot.draft_revision,
@@ -2450,6 +3853,9 @@ class ShotProductionService:
             "anchorMode": shot.draft.anchor_mode.value,
             "sourceAssetIds": [item["assetId"] for item in source_assets],
             "sourceAssets": source_assets,
+            "anchorBriefStepId": (
+                None if target is ReferenceTarget.VIDEO else anchor_brief_step_id
+            ),
         }
         if input_plan is None:
             snapshot["referenceAssetIds"] = [item["assetId"] for item in source_assets]
@@ -2462,6 +3868,7 @@ class ShotProductionService:
             raise ValueError("；".join(unique_blockers))
         return ShotGenerationSpec(
             target=target,
+            provider_input_mode=provider_input_mode,
             prompt=prompt,
             creative_body=creative_body,
             system_shell=system_shell,
@@ -2562,49 +3969,67 @@ class ShotProductionService:
         shot: StoredShot,
         *,
         require_generated_anchor: bool = True,
+        strict: bool = True,
+        compilation: ShotCompilationContext | None = None,
     ) -> tuple[StoredAsset | None, tuple[StoredAsset, ...], tuple[str, ...]]:
+        def resolve(asset_id: uuid.UUID) -> StoredAsset:
+            if compilation is not None:
+                return compilation.assets_by_id[asset_id]
+            return self._repository.get_asset(asset_id)
+
         explicit_pairs = [
-            (binding, self._repository.get_asset(binding.asset_id))
+            (binding, resolve(binding.asset_id))
             for binding in shot.draft.reference_bindings
         ]
         anchor: StoredAsset | None = None
         if shot.draft.anchor_mode is AnchorMode.EXISTING:
             anchor = next(
-                asset
-                for binding, asset in explicit_pairs
-                if binding.usage is ReferenceUsage.APPROVED_ANCHOR
+                (
+                    asset
+                    for binding, asset in explicit_pairs
+                    if binding.usage is ReferenceUsage.APPROVED_ANCHOR
+                ),
+                None,
             )
         elif shot.draft.anchor_mode is AnchorMode.GENERATE:
             if shot.selected_anchor_asset_id is None:
                 if require_generated_anchor:
                     raise ValueError("generated anchor must be approved and selected before video")
             else:
-                anchor = self._repository.get_asset(shot.selected_anchor_asset_id)
+                anchor = resolve(shot.selected_anchor_asset_id)
         if anchor is not None and (
             anchor.media_type != "image"
             or anchor.status not in {"approved", "ready"}
             or not anchor.content_ready
         ):
-            raise ValueError("the selected anchor is missing, damaged, or not approved")
-        generation_pairs = list(
-            self._resolved_reference_pairs(shot, target=ReferenceTarget.VIDEO)
-        )
+            if strict:
+                raise ValueError("the selected anchor is missing, damaged, or not approved")
+        # Seedance first-frame input and ordinary reference media are distinct,
+        # mutually exclusive request modes.  The anchor was already generated
+        # from the selected identity, style, scene and prop inputs, so sending
+        # those sources again would both conflict visually and be rejected by
+        # Ark before task creation.
         if anchor is not None:
-            generation_pairs = [
-                pair
-                for pair in generation_pairs
-                if pair[1].id != anchor.id and pair[1].sha256 != anchor.sha256
-            ]
-        references = tuple(asset for _binding, asset in generation_pairs)
-        ordered = (() if anchor is None else (anchor,)) + references
-        if len(ordered) > 9:
-            raise ValueError("Seedance最多允许9张图片输入（含锚点）")
-        descriptions = (
-            ()
-            if anchor is None
-            else ("@图片1=本片段开场锚点，只锁定动作开始前的可见状态",)
+            return (
+                anchor,
+                (),
+                (
+                    "@图片1=本片段已批准开场锚点；它是本次Seedance唯一图片输入，"
+                    "锁定动作开始前已经确认的人物、猫咪、服装、环境、道具和构图状态",
+                ),
+            )
+        generation_pairs = list(
+            self._resolved_reference_pairs(
+                shot,
+                target=ReferenceTarget.VIDEO,
+                strict=strict,
+                compilation=compilation,
+            )
         )
-        descriptions += tuple(
+        references = tuple(asset for _binding, asset in generation_pairs)
+        if len(references) > 9:
+            raise ValueError("Seedance最多允许9张普通参考图片输入")
+        descriptions = tuple(
             _video_reference_description(
                 index,
                 binding,
@@ -2613,28 +4038,41 @@ class ShotProductionService:
             )
             for index, (binding, _asset) in enumerate(
                 generation_pairs,
-                1 if anchor is None else 2,
+                1,
             )
         )
-        return anchor, references, descriptions
+        return None, references, descriptions
 
     def _resolved_reference_pairs(
         self,
         shot: StoredShot,
         *,
         target: ReferenceTarget,
+        strict: bool = True,
+        compilation: ShotCompilationContext | None = None,
     ) -> tuple[tuple[ReferenceBinding, StoredAsset], ...]:
         resolved: list[tuple[ReferenceBinding, StoredAsset]] = []
         seen_ids: set[uuid.UUID] = set()
         seen_hashes: set[str] = set()
-        for binding in self._reference_bindings(shot, target=target):
-            asset = self._repository.get_asset(binding.asset_id)
+        for binding in self._reference_bindings(
+            shot,
+            target=target,
+            compilation=compilation,
+        ):
+            asset = (
+                compilation.assets_by_id[binding.asset_id]
+                if compilation is not None
+                else self._repository.get_asset(binding.asset_id)
+            )
             if (
                 asset.media_type != "image"
                 or asset.status not in {"approved", "ready"}
                 or not asset.content_ready
             ):
-                raise ValueError("a selected generation reference is unavailable or not an image")
+                if strict:
+                    raise ValueError(
+                        "a selected generation reference is unavailable or not an image"
+                    )
             if asset.id in seen_ids or asset.sha256 in seen_hashes:
                 continue
             seen_ids.add(asset.id)
@@ -2647,25 +4085,139 @@ class ShotProductionService:
         shot: StoredShot,
         *,
         target: ReferenceTarget,
+        compilation: ShotCompilationContext | None = None,
     ) -> tuple[ReferenceBinding, ...]:
-        project = self._repository.get_project(shot.project_id)
-        scene = self._repository.get_scene(shot.scene_id)
+        project = (
+            compilation.project
+            if compilation is not None
+            else self._repository.get_project(shot.project_id)
+        )
+        scene = (
+            compilation.scene
+            if compilation is not None
+            else self._repository.get_scene(shot.scene_id)
+        )
         return tuple(
             item
             for item in _merge_generation_references(
                 custom=tuple(shot.draft.reference_bindings),
+                scene_references=self._scene_reference_bindings(scene),
                 scene_look_asset_id=scene.selected_look_asset_id,
+                has_approved_anchor=(
+                    shot.selected_anchor_asset_id is not None
+                    or any(
+                        item.usage is ReferenceUsage.APPROVED_ANCHOR
+                        for item in shot.draft.reference_bindings
+                    )
+                ),
                 project_defaults=_project_reference_bindings(
                     self._repository,
                     shot,
                     scene,
                     project,
+                    profile=(
+                        compilation.visual_profile if compilation is not None else None
+                    ),
+                    assets_by_id=(
+                        compilation.assets_by_id if compilation is not None else None
+                    ),
                 ),
                 inherit_project_references=shot.draft.inherit_project_references,
                 scene_look_usage=shot.draft.scene_look_usage,
                 target=target,
             )
             if item.apply_to in {target, ReferenceTarget.BOTH}
+        )
+
+    def _accepted_anchor_brief(
+        self,
+        shot: StoredShot,
+        *,
+        compilation: ShotCompilationContext | None = None,
+    ) -> tuple[str | None, str | None]:
+        current = next(
+            (
+                item
+                for item in reversed(
+                    self._anchor_brief_records(shot, compilation=compilation)
+                )
+                if not item.stale
+            ),
+            None,
+        )
+        if current is not None:
+            return current.text, str(current.step_id)
+        return None, None
+
+    def _anchor_brief_records(
+        self,
+        shot: StoredShot,
+        *,
+        compilation: ShotCompilationContext | None = None,
+    ) -> tuple[AcceptedAnchorBrief, ...]:
+        records: list[AcceptedAnchorBrief] = []
+        steps = (
+            compilation.shot_steps
+            if compilation is not None
+            else self._repository.list_steps(project_id=shot.project_id, shot_id=shot.id)
+        )
+        for step in steps:
+            if step.operation_key not in {
+                "editor:anchor-brief",
+                "director:shot-assistance",
+            }:
+                continue
+            value = step.input_snapshot.get("acceptedAnchorBrief")
+            if not isinstance(value, str) or not value.strip():
+                continue
+            accepted_revision = step.input_snapshot.get("acceptedDraftRevision")
+            source_revision = step.input_snapshot.get("sourceDraftRevision")
+            if not isinstance(accepted_revision, int) or not isinstance(source_revision, int):
+                continue
+            records.append(
+                AcceptedAnchorBrief(
+                    step_id=step.id,
+                    text=value.strip(),
+                    source=(
+                        "manual"
+                        if step.operation_key == "editor:anchor-brief"
+                        else "llm"
+                    ),
+                    source_draft_revision=source_revision,
+                    accepted_draft_revision=accepted_revision,
+                    accepted_at=(
+                        step.input_snapshot.get("acceptedAnchorBriefAt")
+                        or step.input_snapshot.get("acceptedAt")
+                    ),
+                    created_at=(
+                        None if step.created_at is None else step.created_at.isoformat()
+                    ),
+                    stale=accepted_revision != shot.draft_revision,
+                )
+            )
+        return tuple(records)
+
+    def _scene_reference_bindings(
+        self,
+        scene: StoredScene,
+    ) -> tuple[ReferenceBinding, ...]:
+        if scene.look_draft is None:
+            return ()
+        role_by_purpose = {
+            LookReferencePurpose.WARDROBE: ReferenceRole.SCENE,
+            LookReferencePurpose.ENVIRONMENT: ReferenceRole.SCENE,
+            LookReferencePurpose.PROP: ReferenceRole.PROP,
+            LookReferencePurpose.COMPOSITION: ReferenceRole.COMPOSITION,
+        }
+        return tuple(
+            ReferenceBinding(
+                assetId=item.asset_id,
+                usage=ReferenceUsage.GENERATION_REFERENCE,
+                role=role_by_purpose[item.purpose],
+                applyTo=ReferenceTarget.BOTH,
+            )
+            for item in scene.look_draft.reference_bindings
+            if item.purpose in role_by_purpose
         )
 
     def _default_scene_look_draft(self, scene: StoredScene) -> SceneLookDraft:
@@ -2744,9 +4296,22 @@ class ShotProductionService:
             warnings=tuple(warnings),
         )
 
-    def _prompt_context(self, shot: StoredShot) -> ShotPromptContext:
-        scene = self._repository.get_scene(shot.scene_id)
-        project = self._repository.get_project(shot.project_id)
+    def _prompt_context(
+        self,
+        shot: StoredShot,
+        *,
+        compilation: ShotCompilationContext | None = None,
+    ) -> ShotPromptContext:
+        scene = (
+            compilation.scene
+            if compilation is not None
+            else self._repository.get_scene(shot.scene_id)
+        )
+        project = (
+            compilation.project
+            if compilation is not None
+            else self._repository.get_project(shot.project_id)
+        )
         return ShotPromptContext(
             project_title=project.title,
             scene_title=scene.draft.title,
@@ -2757,9 +4322,66 @@ class ShotProductionService:
             duration_seconds=shot.draft.duration_seconds,
         )
 
+    def _shot_compilation_context(
+        self,
+        shot: StoredShot,
+        *,
+        read_model: ProjectReadModel | None = None,
+        shot_read_model: ShotGenerationReadModel | None = None,
+    ) -> ShotCompilationContext:
+        if shot_read_model is not None:
+            return ShotCompilationContext(
+                project=shot_read_model.project,
+                scene=shot_read_model.scene,
+                shot=shot_read_model.shot,
+                visual_profile=shot_read_model.visual_profile,
+                assets_by_id={item.id: item for item in shot_read_model.assets},
+                shot_steps=shot_read_model.steps,
+            )
+        if read_model is None:
+            return ShotCompilationContext(
+                project=self._repository.get_project(shot.project_id),
+                scene=self._repository.get_scene(shot.scene_id),
+                shot=shot,
+                visual_profile=self._repository.get_visual_profile(shot.project_id),
+                assets_by_id={
+                    item.id: item
+                    for item in self._repository.list_assets(
+                        project_id=shot.project_id,
+                        include_canon=True,
+                    )
+                },
+                shot_steps=self._repository.list_steps(
+                    project_id=shot.project_id,
+                    shot_id=shot.id,
+                ),
+            )
+        scene = next(item for item in read_model.scenes if item.id == shot.scene_id)
+        current_shot = next(item for item in read_model.shots if item.id == shot.id)
+        return ShotCompilationContext(
+            project=read_model.project,
+            scene=scene,
+            shot=current_shot,
+            visual_profile=read_model.visual_profile,
+            assets_by_id={item.id: item for item in read_model.assets},
+            shot_steps=tuple(
+                item for item in read_model.steps if item.shot_card_id == shot.id
+            ),
+        )
+
     def _require_gateway(self) -> None:
         if self._gateway is None:
             raise GatewayUnavailableError("Ark media gateway is not configured")
+
+    @staticmethod
+    def _assert_expected_input_hash(
+        spec: ShotGenerationSpec,
+        expected_input_hash: str | None,
+    ) -> None:
+        if expected_input_hash is not None and spec.input_hash != expected_input_hash:
+            raise RevisionConflictError(
+                "生成输入已变化，请重新查看实际素材与 Prompt 后再确认费用"
+            )
 
     def _require_paid_gateway(self, allowed: bool) -> None:
         if not allowed:
@@ -2767,137 +4389,18 @@ class ShotProductionService:
         self._require_gateway()
 
 
-class SequenceService:
-    def __init__(
-        self,
-        *,
-        repository: ShotQueueStore,
-        asset_store: AssetStore,
-        media_probe: MediaProbe,
-        resolution: str,
-        runtime_preflight: RuntimePreflight | None = None,
-    ) -> None:
-        self._repository = repository
-        self._asset_store = asset_store
-        self._media_probe = media_probe
-        self._resolution = resolution
-        self._runtime_preflight = runtime_preflight
-
-    def build_project_sequence(
-        self,
-        project_id: uuid.UUID,
-        *,
-        transitions: dict[uuid.UUID, SequenceTransition] | None = None,
-    ) -> StoredSequence:
-        if self._runtime_preflight is not None:
-            self._runtime_preflight.validate_for_local_composition()
-        scenes = self._repository.list_scenes(project_id)
-        selected: list[tuple[StoredShot, StoredAsset, int]] = []
-        for scene in scenes:
-            for shot in self._repository.list_shots(scene.id):
-                if shot.selected_video_asset_id is None:
-                    continue
-                asset = self._repository.get_asset(shot.selected_video_asset_id)
-                duration_ms = int(asset.metadata.get("qc", {}).get("durationMs") or 0)
-                if duration_ms <= 0:
-                    raise ValueError("selected video is missing QC duration")
-                selected.append((shot, asset, duration_ms))
-        if not selected:
-            raise ValueError("a project sequence requires at least one approved shot video")
-        transitions = transitions or {}
-        valid_transition_ids = {item[0].id for item in selected[1:]}
-        unknown = set(transitions) - valid_transition_ids
-        if unknown:
-            raise ValueError("sequence transition references a non-following shot")
-        clips: list[SequenceClip] = []
-        cursor = 0
-        for order, (shot, asset, duration_ms) in enumerate(selected, 1):
-            transition = None if order == 1 else transitions.get(shot.id, SequenceTransition())
-            overlap = (
-                transition.duration_ms
-                if transition is not None
-                and transition.type is SequenceTransitionType.CROSS_DISSOLVE
-                else 0
-            )
-            timeline_start = cursor - overlap
-            clips.append(
-                SequenceClip(
-                    order=order,
-                    shot_card_id=shot.id,
-                    source_asset_id=asset.id,
-                    source_start_ms=0,
-                    source_end_ms=duration_ms,
-                    timeline_start_ms=timeline_start,
-                    timeline_end_ms=timeline_start + duration_ms,
-                    transitionFromPrevious=transition,
-                )
-            )
-            cursor = timeline_start + duration_ms
-        plan = ProjectSequencePlan(duration_ms=cursor, clips=clips)
-        landed = self._asset_store.compose_sequence(
-            tuple(item[1].require_path() for item in selected),
-            plan,
-        )
-        qc = self._media_probe.inspect_video(
-            landed.path,
-            expected_duration_seconds=round(cursor / 1000),
-            expected_resolution=self._resolution,
-            minimum_duration_seconds=1,
-            maximum_duration_seconds=max(15, math.ceil(cursor / 1000) + 1),
-            duration_tolerance_ms=1500,
-        )
-        if not qc.get("passed"):
-            raise ValueError(f"project sequence QC failed: {qc.get('failures')}")
-        asset = self._repository.add_asset(
-            landed=landed,
-            role="project_sequence",
-            media_type="video",
-            scope="project",
-            status="candidate",
-            project_id=project_id,
-            scene_id=None,
-            shot_id=None,
-            step_id=None,
-            semantic_key=f"project:{project_id}:sequence",
-            metadata={
-                "qc": qc,
-                "audioPolicy": "transition_plan",
-                "transitions": [
-                    (
-                        None
-                        if item.transition_from_previous is None
-                        else item.transition_from_previous.model_dump(
-                            mode="json",
-                            by_alias=True,
-                        )
-                    )
-                    for item in plan.clips
-                ],
-            },
-        )
-        project = self._repository.get_project(project_id)
-        prior_sequences = self._repository.list_sequences(project_id)
-        parent_sequence_id = project.selected_sequence_id or (
-            prior_sequences[-1].id if prior_sequences else None
-        )
-        return self._repository.create_sequence(
-            project_id=project_id,
-            plan=plan,
-            parent_sequence_id=parent_sequence_id,
-            rendered_asset_id=asset.id,
-            status=SequenceStatus.CONTENT_REVIEW,
-        )
-
-
 def _project_reference_bindings(
     repository: ShotQueueStore,
     shot: StoredShot,
     scene: StoredScene,
     project: StoredProject,
+    *,
+    profile: StoredVisualProfileRevision | None = None,
+    assets_by_id: Any | None = None,
 ) -> tuple[ReferenceBinding, ...]:
     bindings = project.default_reference_bindings
     if not bindings:
-        profile = repository.get_visual_profile(shot.project_id)
+        profile = profile or repository.get_visual_profile(shot.project_id)
         bindings = tuple(
             ReferenceBinding(
                 assetId=item.asset_id,
@@ -2924,7 +4427,11 @@ def _project_reference_bindings(
     )
     filtered: list[ReferenceBinding] = []
     for binding in bindings:
-        asset = repository.get_asset(binding.asset_id)
+        asset = (
+            assets_by_id[binding.asset_id]
+            if assets_by_id is not None
+            else repository.get_asset(binding.asset_id)
+        )
         if (
             expected_style is not None
             and asset.semantic_key in {"style:outdoor", "style:indoor"}
@@ -2935,10 +4442,86 @@ def _project_reference_bindings(
     return tuple(filtered)
 
 
+def _reference_role_for_purpose(purpose: VisualAssetPurpose) -> ReferenceRole:
+    return {
+        VisualAssetPurpose.WARDROBE: ReferenceRole.SCENE,
+        VisualAssetPurpose.ENVIRONMENT: ReferenceRole.SCENE,
+        VisualAssetPurpose.PROP: ReferenceRole.PROP,
+        VisualAssetPurpose.COMPOSITION: ReferenceRole.COMPOSITION,
+    }[purpose]
+
+
+def _order_reference_image_sources(
+    purpose: VisualAssetPurpose,
+    assets: tuple[StoredAsset, ...],
+) -> tuple[StoredAsset, ...]:
+    """Apply the provider-facing responsibility order without changing selection.
+
+    User choices remain authoritative.  This ordering only prevents identity and
+    style inputs from moving ahead of the design reference they are meant to
+    support.
+    """
+
+    def family(asset: StoredAsset) -> str:
+        semantic = asset.semantic_key or ""
+        if semantic.startswith("person:") or semantic.startswith("cat:"):
+            return "identity"
+        if semantic.startswith("style:"):
+            return "style"
+        role = str(asset.metadata.get("referenceRole") or asset.reference_purpose or asset.role)
+        if role == "identity":
+            return "identity"
+        if role == "style":
+            return "style"
+        return "design"
+
+    priorities = {
+        VisualAssetPurpose.WARDROBE: {"design": 0, "identity": 1, "style": 2},
+        VisualAssetPurpose.ENVIRONMENT: {"design": 0, "style": 1, "identity": 2},
+        VisualAssetPurpose.PROP: {"design": 0, "style": 1, "identity": 2},
+        VisualAssetPurpose.COMPOSITION: {"design": 0, "style": 1, "identity": 2},
+    }[purpose]
+    indexed = enumerate(assets)
+    return tuple(
+        asset
+        for _index, asset in sorted(
+            indexed,
+            key=lambda item: (priorities[family(item[1])], item[0]),
+        )
+    )
+
+
+def _reference_image_input_description(
+    index: int,
+    *,
+    purpose: VisualAssetPurpose,
+    asset: StoredAsset,
+) -> str:
+    semantic = asset.semantic_key or ""
+    if semantic.startswith("person:") or semantic.startswith("cat:"):
+        responsibility = (
+            "只锁定长期角色外观，忽略原图服装、姿态和背景"
+            if purpose is VisualAssetPurpose.WARDROBE
+            else "只锁定长期角色外观，不要求角色出现在本张设定图"
+        )
+    elif semantic.startswith("style:"):
+        responsibility = "只锁定线条、材质、色彩和光线"
+    else:
+        responsibility = {
+            VisualAssetPurpose.WARDROBE: "只参考服装与配件设计，不改写角色身份",
+            VisualAssetPurpose.ENVIRONMENT: "只参考空间、家具、出入口、光线和环境色调",
+            VisualAssetPurpose.PROP: "只参考道具的结构、尺寸、图案和颜色",
+            VisualAssetPurpose.COMPOSITION: "只参考机位、主体占位和空间层次",
+        }[purpose]
+    return f"@图片{index}={_asset_subject_label(asset)}；{responsibility}"
+
+
 def _merge_generation_references(
     *,
     custom: tuple[ReferenceBinding, ...],
+    scene_references: tuple[ReferenceBinding, ...],
     scene_look_asset_id: uuid.UUID | None,
+    has_approved_anchor: bool,
     project_defaults: tuple[ReferenceBinding, ...],
     inherit_project_references: bool,
     scene_look_usage: SceneLookUsage,
@@ -2957,6 +4540,15 @@ def _merge_generation_references(
         scene_look_usage is SceneLookUsage.DERIVE_ANCHOR
         and target is ReferenceTarget.ANCHOR
     )
+    if target is ReferenceTarget.VIDEO and has_approved_anchor:
+        include_scene_look = False
+    if include_scene_look:
+        ordered.extend(
+            item
+            for item in scene_references
+            if item.usage is ReferenceUsage.GENERATION_REFERENCE
+            and item.asset_id != scene_look_asset_id
+        )
     if include_scene_look and scene_look_asset_id is not None:
         ordered.append(
             ReferenceBinding(
@@ -3001,6 +4593,7 @@ def _creative_step_json(step: StoredStep) -> dict[str, Any]:
         "attempt": step.attempt,
         "model": step.model,
         "sourceHash": step.input_snapshot.get("sourceHash"),
+        "shotSnapshotHash": step.input_snapshot.get("shotSnapshotHash"),
         "providerOutput": step.input_snapshot.get("providerOutput"),
         "acceptedOutput": step.input_snapshot.get("acceptedOutput"),
         "acceptedAt": step.input_snapshot.get("acceptedAt"),
@@ -3020,6 +4613,7 @@ def _scene_look_reference_description(
         LookReferencePurpose.CAT_IDENTITY: "只锁定猫咪脸部、毛色分区、虎斑、眼睛、尾巴和体型",
         LookReferencePurpose.STYLE: "只锁定线条、材质、色彩、自然光和景深，不改写角色身份",
         LookReferencePurpose.WARDROBE: "只参考本场景服装款式和材质，不替换人物身份",
+        LookReferencePurpose.ENVIRONMENT: "只参考空间结构、固定家具、出入口、光线和环境色调",
         LookReferencePurpose.PROP: "只参考关键道具的外观、结构和比例",
         LookReferencePurpose.COMPOSITION: "只参考构图、机位和主体空间关系",
     }
@@ -3055,9 +4649,15 @@ def _video_reference_description(
         ReferenceRole.PROP: "本片段道具外观、结构和比例",
         ReferenceRole.COMPOSITION: "本片段构图、机位和主体空间关系",
     }
+    responsibility = responsibilities[binding.role]
+    purpose = "" if asset is None else str(asset.metadata.get("referencePurpose") or "")
+    if purpose == "wardrobe":
+        responsibility = "只继承本场服装与配件，不改变人物脸、发型、年龄、猫咪毛色或体型"
+    elif purpose == "environment":
+        responsibility = "只继承空间结构、固定家具、出入口、光线和环境色调"
     subject = _asset_subject_label(asset) if asset is not None else responsibilities[binding.role]
     return (
-        f"@图片{index}={subject}；{responsibilities[binding.role]}；"
+        f"@图片{index}={subject}；{responsibility}；"
         "只承担已声明职责，不改写其他主体或长期身份"
     )
 
@@ -3076,6 +4676,11 @@ def _asset_subject_label(asset: StoredAsset | None) -> str:
         return f"场景视觉基准（{asset.display_name}）"
     if asset.role in {"shot_anchor", "shot_tail_frame"}:
         return f"片段开场状态（{asset.display_name}）"
+    purpose = str(asset.metadata.get("referencePurpose") or "")
+    if purpose == "wardrobe":
+        return f"当场服装与配件“{asset.display_name}”"
+    if purpose == "environment":
+        return f"场景环境“{asset.display_name}”"
     role = str(asset.metadata.get("referenceRole") or asset.reference_purpose or asset.role)
     names = {
         "prop": "道具",
@@ -3127,6 +4732,7 @@ def _order_look_bindings(
                 LookReferencePurpose.CAT_IDENTITY,
                 LookReferencePurpose.STYLE,
                 LookReferencePurpose.WARDROBE,
+                LookReferencePurpose.ENVIRONMENT,
                 LookReferencePurpose.PROP,
                 LookReferencePurpose.COMPOSITION,
             )
@@ -3159,6 +4765,8 @@ def _shot_assist_asset_layer(
     if shot.selected_anchor_asset_id == asset.id:
         return "shot"
     if scene.selected_look_asset_id == asset.id:
+        return "scene_look"
+    if asset.scope == "scene" and asset.scene_id == scene.id:
         return "scene_look"
     if any(binding.asset_id == asset.id for binding in shot.draft.reference_bindings):
         return "shot"
@@ -3213,6 +4821,71 @@ def _previous_tail_state(repository: ShotQueueStore, shot: StoredShot) -> Previo
     return PreviousTailState(previous, source_video_id, active, bound, stale)
 
 
+def _previous_tail_state_from_read_model(
+    read_model: ProjectReadModel,
+    shot: StoredShot,
+) -> PreviousTailState:
+    return _previous_tail_state_from_loaded(
+        shot,
+        scene_shots=tuple(
+            item for item in read_model.shots if item.scene_id == shot.scene_id
+        ),
+        assets=read_model.assets,
+    )
+
+
+def _previous_tail_state_from_shot_read_model(
+    read_model: ShotGenerationReadModel,
+) -> PreviousTailState:
+    return _previous_tail_state_from_loaded(
+        read_model.shot,
+        scene_shots=read_model.scene_shots,
+        assets=read_model.assets,
+    )
+
+
+def _previous_tail_state_from_loaded(
+    shot: StoredShot,
+    *,
+    scene_shots: tuple[StoredShot, ...],
+    assets: tuple[StoredAsset, ...],
+) -> PreviousTailState:
+    ordered = sorted(scene_shots, key=lambda item: item.order)
+    current_index = next(index for index, item in enumerate(ordered) if item.id == shot.id)
+    if current_index == 0:
+        return PreviousTailState(None, None, None, None, False)
+    previous = ordered[current_index - 1]
+    assets_by_id = {item.id: item for item in assets}
+    source_video_id = previous.selected_video_asset_id
+    bound = next(
+        (
+            assets_by_id.get(binding.asset_id)
+            for binding in shot.draft.reference_bindings
+            if binding.usage is ReferenceUsage.APPROVED_ANCHOR
+            and assets_by_id.get(binding.asset_id) is not None
+            and assets_by_id[binding.asset_id].role == "shot_tail_frame"
+        ),
+        None,
+    )
+    source_id_text = None if source_video_id is None else str(source_video_id)
+    stale = bool(
+        bound is not None
+        and bound.metadata.get("sourceVideoAssetId") != source_id_text
+    )
+    active = next(
+        (
+            asset
+            for asset in reversed(assets)
+            if asset.shot_card_id == previous.id
+            and asset.role == "shot_tail_frame"
+            and asset.metadata.get("sourceVideoAssetId") == source_id_text
+            and asset.content_ready
+        ),
+        None,
+    )
+    return PreviousTailState(previous, source_video_id, active, bound, stale)
+
+
 def _tail_state_json(state: PreviousTailState) -> dict[str, Any]:
     if state.previous_shot is None:
         return {"available": False, "reason": "first_shot", "stale": False}
@@ -3226,6 +4899,14 @@ def _tail_state_json(state: PreviousTailState) -> dict[str, Any]:
         "boundAssetId": None if state.bound is None else str(state.bound.id),
         "stale": state.stale,
     }
+
+
+def _is_synthetic_fixture(asset: StoredAsset) -> bool:
+    provider_url = str(asset.metadata.get("providerUrl", ""))
+    return (
+        asset.metadata.get("syntheticFixture") is True
+        or provider_url.startswith("cvg-fake://")
+    )
 
 
 def _media_source(asset: StoredAsset) -> MediaSource:

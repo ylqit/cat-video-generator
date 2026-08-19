@@ -12,7 +12,7 @@ const workflow: CreativeWorkflowDto = {
   currentStorySource: "scene_draft",
   currentStorySourceStepId: null,
   currentShotSnapshotHash: "empty-shot-snapshot",
-  stages: { diagnosis: [], rewrite: [], storyboard: [] },
+  stages: { expansion: [], diagnosis: [], rewrite: [], storyboard: [] },
   reviews: [],
 };
 

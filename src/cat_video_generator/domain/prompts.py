@@ -11,6 +11,7 @@ from .contracts import (
     SceneLookPlan,
     ShotCardDraft,
     ShotPromptContext,
+    VisualAssetPurpose,
     VisualProfileDraft,
 )
 from .rendering import VideoInputPlan
@@ -52,6 +53,24 @@ def _compiled(text: str) -> CompiledPrompt:
         char_count=len(normalized),
         utf8_bytes=len(normalized.encode("utf-8")),
     )
+
+
+def compile_story_expansion_prompt(
+    *,
+    project_title: str,
+    scene: SceneDraft,
+    visual_profile: VisualProfileDraft,
+) -> str:
+    return f"""你是治愈系生活短片的剧情编剧。把用户的一句话主题扩写为一份完整、连续、尚未拆分镜头的场景剧情。
+【项目】{project_title}
+【场景】{scene.title}
+【一句话主题】{scene.source_text}
+【补充口述】{scene.context_note or '无'}
+【目标视频片段数】{scene.target_shot_count}
+【长期人物】{visual_profile.person_identity}；{visual_profile.person_hair}；{visual_profile.person_body}
+【长期猫咪】{visual_profile.cat_identity}
+
+扩写必须围绕一个明确的生活目标，形成起因、连续行动、人猫互动、可见结果和温和收尾。猫咪是主要观察和行动对象，人物承担手部和工具操作；保持道具位置和状态连续，不增加与主题无关的第二个事件。这里只写剧情，不写机位、景别、精确秒点、Provider Prompt 或素材编号。输出完整剧情、创作摘要和仍需人工决定的问题。""".strip()
 
 
 def compile_story_diagnosis_prompt(
@@ -167,6 +186,7 @@ def compile_shot_suggestion_prompt(
 def compile_anchor_prompt(
     context: ShotPromptContext,
     *,
+    anchor_brief: str,
     reference_descriptions: tuple[str, ...],
     regeneration_instruction: str | None = None,
     series_profile: SeriesVisualProfile = DEFAULT_SERIES_VISUAL_PROFILE,
@@ -181,6 +201,9 @@ def compile_anchor_prompt(
         stylePositive=style_profile.positive_features,
         styleNegative=style_profile.excluded_features,
     )
+    static_brief = anchor_brief.strip()
+    if not static_brief:
+        raise PromptCompilationError("开场锚点必须使用已确认的静态画面稿")
     refs = "；".join(reference_descriptions) or "没有附加参考图，严格按文字设定生成。"
     retry = (
         ""
@@ -192,9 +215,83 @@ def compile_anchor_prompt(
 【主体】{profile.person_identity}；{profile.person_hair}；{profile.person_body}；{profile.cat_identity}。全图人物与猫咪数量准确，不复制角色。
 【定稿画风】{'、'.join(profile.style_positive)}；排除{'、'.join(profile.style_negative)}。
 【素材职责】{refs}任何画风或道具参考不得改写人物和猫咪身份。
-【场景】{context.scene_title}。{context.scene_text}
-【当前镜头】{context.shot_title}：{context.direction}
-【限制】不要提前绘制动作结果，不要文字、编号、边框、UI、Logo或水印。{retry}"""
+【场景与片段】{context.scene_title} · {context.shot_title}。
+【人工确认的开场静态画面稿】{static_brief}
+【限制】这是一张静态起始状态图，不要注入后续动作链、镜头运动、声音或收尾结果；不要文字、编号、边框、UI、Logo或水印。{retry}"""
+    )
+
+
+def compile_visual_asset_plan_prompt(
+    *,
+    project_title: str,
+    scene: SceneDraft,
+    shot_summaries: tuple[str, ...],
+    visual_profile: VisualProfileDraft,
+    existing_assets: tuple[str, ...],
+) -> str:
+    shots = "\n".join(shot_summaries) or "尚无视频片段。"
+    assets = "\n".join(existing_assets) or "除全局 Canon 外尚无项目或场景参考资产。"
+    return f"""你是二维治愈生活短片的视觉资产规划师。
+只规划后续真正值得复用或影响动作可行性的图片，不能自动调用图片模型。
+
+【项目】{project_title}
+【已批准场景剧情】{scene.title}：{scene.source_text}
+【已确认视频片段】
+{shots}
+【长期人物】{visual_profile.person_identity}；{visual_profile.person_hair}；{visual_profile.person_body}
+【长期猫咪】{visual_profile.cat_identity}
+【系列画风】{'、'.join(visual_profile.style_positive)}
+【已有资产】
+{assets}
+
+全局人物、猫咪和画风 Canon 已存在，不得建议复制新的身份包。
+请分析换装、空间结构、跨片段复用、道具状态变化和动作接触关系，
+只在必要时建议 wardrobe、environment、prop、composition 四类图片。
+每项指定 project 或 scene 归属、说明理由，并给出可编辑的 Seedream 图片 Prompt。
+环境图默认为空场景或仅保留固定家具；服装图采用中性稳定姿态且不得改变身份；
+道具图清晰完整、无遮挡；小型一次性物件列入 textOnlyItems，不要拆成独立资产。
+referenceAssetIds 只能从已有资产中选择，不能虚构 UUID。""".strip()
+
+
+def compile_reference_image_prompt(
+    *,
+    purpose: VisualAssetPurpose,
+    display_name: str,
+    creative_prompt: str,
+    reference_descriptions: tuple[str, ...],
+    visual_profile: VisualProfileDraft,
+    regeneration_instruction: str | None = None,
+) -> CompiledPrompt:
+    responsibilities = {
+        VisualAssetPurpose.WARDROBE: (
+            "生成中性稳定姿态的服装/配件造型参考；身份图只锁定脸、发型、年龄和体型，"
+            "本图只定义当场穿着，不表现剧情高潮或动作结果"
+        ),
+        VisualAssetPurpose.ENVIRONMENT: (
+            "生成无人物、无猫咪的环境设定图，只定义空间结构、固定家具、出入口、光线和色调"
+        ),
+        VisualAssetPurpose.PROP: (
+            "生成单个或一组强关联关键道具的清晰完整设定图，结构、尺寸、图案和颜色可辨，"
+            "不使用手部、猫爪或复杂背景遮挡"
+        ),
+        VisualAssetPurpose.COMPOSITION: (
+            "生成构图与空间关系参考，只定义机位、主体占位和环境层次，不锁定剧情结果"
+        ),
+    }
+    refs = "；".join(reference_descriptions) or "没有附加图片参考。"
+    retry = (
+        ""
+        if not regeneration_instruction
+        else f"\n【本次修正】{regeneration_instruction.strip()}；其他已批准设计保持不变。"
+    )
+    return _compiled(
+        f"""【任务】生成一张无字9:16竖屏“{display_name}”视觉参考图。
+【资产职责】{responsibilities[purpose]}。
+【用户确认的设计稿】{creative_prompt.strip()}
+【输入图片职责】{refs}
+【身份边界】长期人物为{visual_profile.person_identity}；{visual_profile.person_hair}；{visual_profile.person_body}。长期猫咪为{visual_profile.cat_identity}。任何服装、环境、道具或构图参考不得改变人物与猫咪身份。
+【画风】{'、'.join(visual_profile.style_positive)}；排除{'、'.join(visual_profile.style_negative)}。
+【限制】不要字幕、说明文字、编号、拼贴边框、UI、Logo或水印。{retry}"""
     )
 
 
@@ -411,6 +508,8 @@ full_reference还是derive_anchor，并说明是否需要独立开场锚点。
 必要时再给出保守版和稳定版两个候选正文。缩短时优先删除重复建立、次要道具动作和冗余反应；
 延长时只增加观察、动作完成过程、互动反馈或稳定收尾，不增加第二个故事事件。
 猫咪是主要观察和行动对象，人物承担手部和工具操作。不要为子镜头编造精确秒点。
+同时输出anchorBrief：它必须是当前片段动作发生前的一张静态画面说明，只写可见主体、服装、环境、
+道具初始位置、姿态、构图和光线；不得包含动作过程、镜头运动、声音、后续结果或多个时间状态。
 patch只给出确有必要且等待用户勾选接受的字段修改稿，
 且direction必须与creativeBody完全一致。""".strip()
 

@@ -8,6 +8,7 @@ const props = defineProps<{
   shot: ShotDto;
   anchorPreview: ShotPromptPreview | null;
   videoPreview: ShotPromptPreview | null;
+  activeOperations?: string[];
 }>();
 const emit = defineEmits<{
   review: [asset: AssetDto, decision: "approved" | "rejected", stale: boolean];
@@ -54,6 +55,12 @@ const versions = computed<MediaVersionEntry[]>(() => {
     return Number(right.attempt?.attempt ?? 0) - Number(left.attempt?.attempt ?? 0);
   });
 });
+const hasAnchorVersion = computed(() => versions.value.some((item) => item.kind === "anchor"));
+const hasVideoVersion = computed(() => versions.value.some((item) => item.kind === "video"));
+const anchorGenerationActive = computed(() => props.activeOperations?.includes("image:anchor") ?? false);
+const videoGenerationActive = computed(() => props.activeOperations?.some(
+  (item) => ["video:shot", "video:range-edit"].includes(item),
+) ?? false);
 
 function currentHash(entry: MediaVersionEntry): string | undefined {
   return entry.kind === "anchor"
@@ -79,6 +86,13 @@ function statusText(entry: MediaVersionEntry): string {
   return entry.asset?.status ?? entry.attempt?.status ?? "unknown";
 }
 
+function isSyntheticFixture(entry: MediaVersionEntry): boolean {
+  return entry.asset?.metadata.syntheticFixture === true
+    || String(entry.asset?.metadata.providerUrl ?? "").startsWith("cvg-fake://")
+    || entry.attempt?.provider === "local-fake-provider"
+    || String(entry.attempt?.model ?? "").startsWith("fake-");
+}
+
 function referenceCount(entry: MediaVersionEntry): number {
   const snapshot = entry.attempt?.inputSnapshot;
   const sources = snapshot?.sourceAssets ?? snapshot?.references ?? snapshot?.sourceAssetIds;
@@ -95,7 +109,21 @@ function versionTitle(entry: MediaVersionEntry): string {
   <section class="media-versions">
     <div class="version-heading">
       <div><b>锚点与视频版本</b><small>运行中任务、历史媒体和审核状态统一展示</small></div>
-      <el-tag>{{ versions.length }} 个版本/任务</el-tag>
+      <div class="version-heading-actions">
+        <el-button
+          v-if="hasAnchorVersion"
+          size="small"
+          :disabled="anchorGenerationActive"
+          @click="emit('retry', 'anchor')"
+        >{{ anchorGenerationActive ? '开场图生成中' : '生成新开场候选' }}</el-button>
+        <el-button
+          v-if="hasVideoVersion"
+          size="small"
+          :disabled="videoGenerationActive"
+          @click="emit('retry', 'video')"
+        >{{ videoGenerationActive ? '视频生成中' : '生成新视频候选' }}</el-button>
+        <el-tag>{{ versions.length }} 个版本/任务</el-tag>
+      </div>
     </div>
     <el-empty v-if="!versions.length" description="还没有锚点或视频生成记录" />
     <article
@@ -109,13 +137,17 @@ function versionTitle(entry: MediaVersionEntry): string {
         <div>
           <el-tag v-if="isSelected(entry)" type="success" size="small">当前选中</el-tag>
           <el-tag v-if="isStale(entry)" type="warning" size="small">基于旧输入</el-tag>
+          <el-tag v-if="isSyntheticFixture(entry)" type="warning" size="small">历史测试占位 · 禁止用于新生成</el-tag>
           <el-tag size="small">{{ statusText(entry) }}</el-tag>
         </div>
       </div>
       <small>{{ entry.attempt?.model || '历史模型未记录' }} · {{ entry.asset?.createdAt || entry.attempt?.createdAt || '时间未记录' }} · {{ referenceCount(entry) }} 张输入图</small>
       <template v-if="entry.asset?.contentReady">
-        <img v-if="entry.asset.mediaType === 'image'" :src="assetContentUrl(entry.asset.id)" />
-        <video v-else controls preload="metadata" :src="assetContentUrl(entry.asset.id)" />
+        <div class="version-media">
+          <span v-if="isSyntheticFixture(entry)">本地测试占位 · 不代表真实模型质量</span>
+          <img v-if="entry.asset.mediaType === 'image'" :src="assetContentUrl(entry.asset.id)" />
+          <video v-else controls preload="metadata" :src="assetContentUrl(entry.asset.id)" />
+        </div>
       </template>
       <el-alert
         v-else-if="entry.asset"
@@ -173,5 +205,5 @@ function versionTitle(entry: MediaVersionEntry): string {
 </template>
 
 <style scoped>
-.media-versions { display: grid; gap: 10px; }.version-heading, .version-actions { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }.version-heading > div { display: grid; gap: 3px; }.version-heading small, .media-version-card > small { color: #8290a4; }.media-version-card { display: grid; gap: 8px; padding: 10px; border: 1px solid #303b4c; border-radius: 8px; background: #101721; }.media-version-card.selected { border-color: #67c23a; }.media-version-card.stale { box-shadow: inset 3px 0 #e6a23c; }.media-version-card img, .media-version-card video { width: 100%; max-height: 360px; object-fit: contain; background: #080b10; border-radius: 6px; }.running-copy { margin: 0; color: #91a0b4; }.media-version-card pre { max-height: 260px; overflow: auto; white-space: pre-wrap; }
+.media-versions { display: grid; gap: 10px; }.version-heading, .version-heading-actions, .version-actions { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }.version-heading > div:not(.version-heading-actions) { display: grid; gap: 3px; }.version-heading small, .media-version-card > small { color: #8290a4; }.media-version-card { display: grid; gap: 8px; padding: 10px; border: 1px solid #303b4c; border-radius: 8px; background: #101721; }.media-version-card.selected { border-color: #67c23a; }.media-version-card.stale { box-shadow: inset 3px 0 #e6a23c; }.version-media { position: relative; display: grid; place-items: center; }.version-media > span { position: absolute; top: 8px; right: 8px; z-index: 1; padding: 5px 7px; color: #ffe0a3; border: 1px solid #a8782f; border-radius: 5px; background: #2b210ee8; font-size: 10px; }.media-version-card img, .media-version-card video { width: 100%; max-height: 360px; object-fit: contain; background: #080b10; border-radius: 6px; }.running-copy { margin: 0; color: #91a0b4; }.media-version-card pre { max-height: 260px; overflow: auto; white-space: pre-wrap; }
 </style>

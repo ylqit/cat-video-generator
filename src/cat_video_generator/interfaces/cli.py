@@ -68,7 +68,7 @@ def doctor() -> None:
 
 @app.command("api")
 def serve_api(
-    host: str = typer.Option("127.0.0.1", "--host"),
+    host: str = typer.Option("0.0.0.0", "--host"),
     port: int = typer.Option(8765, "--port", min=1, max=65535),
     static_dir: Path | None = typer.Option(None, "--static-dir"),
 ) -> None:

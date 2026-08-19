@@ -3,6 +3,7 @@ import { ElMessageBox } from "element-plus";
 import { computed, ref, watch } from "vue";
 
 import { api } from "../api/client";
+import { useRuntimeStatus } from "../runtimeStatus";
 import { registerTask } from "../tasks/taskCenter";
 
 const props = defineProps<{
@@ -17,6 +18,8 @@ const props = defineProps<{
   markersMs?: number[];
 }>();
 const emit = defineEmits<{ submitted: [] }>();
+const runtimeStatus = useRuntimeStatus();
+const paidReady = computed(() => runtimeStatus.settings.value?.arkReady === true);
 
 const startMs = ref(0);
 const endMs = ref(Math.min(props.durationMs, 4000));
@@ -86,24 +89,35 @@ async function submit() {
     return;
   }
   const wholeShot = startMs.value <= 100 && endMs.value >= props.durationMs - 100;
+  const runtimeRevision = runtimeStatus.settings.value?.current.revision;
+  if (runtimeRevision === undefined) {
+    message.value = "运行配置尚未加载，请稍后重试";
+    return;
+  }
   await ElMessageBox.confirm(
-    wholeShot
-      ? "当前选区覆盖完整镜头，将创建整镜头新版本并产生一次 Seedance 费用，是否继续？"
-      : "区间重拍会产生一次 Seedance 费用，是否继续？",
+    `${wholeShot
+      ? "当前选区覆盖完整镜头，将创建整镜头新版本"
+      : "区间重拍"}，模型 ${runtimeStatus.settings.value?.current.videoModel ?? "未加载"} · revision ${runtimeStatus.settings.value?.current.revision ?? "未加载"}，会产生一次 Seedance 费用，是否继续？`,
     "付费确认",
   );
   busy.value = true;
   message.value = "";
   try {
     const accepted = wholeShot
-      ? await api.generateVideo(props.shotId, true, `完整镜头重做：${instruction.value}`)
+      ? await api.generateVideo(
+          props.shotId,
+          true,
+          `完整镜头重做：${instruction.value}`,
+          undefined,
+          runtimeRevision,
+        )
       : await api.rangeEdit(props.shotId, {
           sourceAssetId: props.assetId,
           startMs: startMs.value,
           endMs: endMs.value,
           instruction: instruction.value,
           allowPaidGeneration: true,
-        });
+        }, runtimeRevision);
     registerTask(accepted.jobId, {
       kind: wholeShot ? "generate_video" : "range_edit",
       label: wholeShot ? "完整视频片段重做" : "片段区间重拍",
@@ -168,7 +182,7 @@ async function submit() {
         <el-slider v-model="endMs" :min="500" :max="durationMs" :step="100" />
         <el-switch v-model="loopSelection" active-text="循环播放选区" />
         <el-input v-model="instruction" type="textarea" :rows="3" placeholder="只描述需要修复的一项问题，例如：让钓线始终连接人物手中的线轴，不经过猫咪身体。" />
-        <el-button type="primary" :disabled="!instruction.trim()" @click="submit">
+        <el-button type="primary" :disabled="!instruction.trim() || !paidReady" @click="submit">
           {{ startMs <= 100 && endMs >= durationMs - 100 ? "重做完整镜头" : "生成区间新版本" }}
         </el-button>
         <el-alert v-if="message" :title="message" type="info" :closable="false" />

@@ -30,13 +30,6 @@ class DatabaseOperation(StrEnum):
 
 
 _STANDARD_URL = "https://ark.cn-beijing.volces.com/api/v3"
-_IMAGE_MODEL = "doubao-seedream-5-0-260128"
-_VIDEO_MODELS = frozenset(
-    {
-        "doubao-seedance-2-0-mini-260615",
-        "doubao-seedance-2-0-260128",
-    }
-)
 _SSL_MODES = {"disable", "require", "verify-ca", "verify-full"}
 _SCHEMA_PATTERN = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 _SOURCE_PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -241,12 +234,6 @@ class RuntimeSettings:
             )
         ):
             issues.append("Ark图片、视频和规划模型都必须配置")
-        if self.ark_image_model != _IMAGE_MODEL:
-            issues.append(f"当前生产只允许图片模型{_IMAGE_MODEL}")
-        if self.ark_video_model not in _VIDEO_MODELS:
-            issues.append(
-                "ARK_VIDEO_MODEL必须使用已登记能力档案：" + "、".join(sorted(_VIDEO_MODELS))
-            )
         if self.ark_video_resolution not in {"480p", "720p"}:
             issues.append("ARK_VIDEO_RESOLUTION必须是480p或720p")
         if issues:
@@ -293,6 +280,8 @@ class RuntimeSettings:
         )
         return {
             "provider": self.provider_profile,
+            "providerMode": "ark",
+            "realArkCalls": None,
             "arkApiKeyConfigured": bool(self.ark_api_key),
             "arkBaseUrlProfile": ("standard" if self.ark_base_url == _STANDARD_URL else "unknown"),
             "arkImageModel": self.ark_image_model,

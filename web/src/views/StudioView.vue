@@ -34,7 +34,9 @@ import VideoTimeline from "../components/VideoTimeline.vue";
 import CreativeWorkflowPanel from "../components/CreativeWorkflowPanel.vue";
 import SceneLookWorkbench from "../components/SceneLookWorkbench.vue";
 import ShotGenerationWorkspace from "../components/ShotGenerationWorkspace.vue";
-import { registerTask, rememberProject, useTaskCenter } from "../tasks/taskCenter";
+import VisualAssetWorkbench from "../components/VisualAssetWorkbench.vue";
+import { useRuntimeStatus } from "../runtimeStatus";
+import { registerTask, useTaskCenter } from "../tasks/taskCenter";
 
 const route = useRoute();
 const router = useRouter();
@@ -52,8 +54,8 @@ const sequenceBuilderVisible = ref(false);
 const sceneVisible = ref(false);
 const shotVisible = ref(false);
 const assistConfirmVisible = ref(false);
+const anchorBriefSaving = ref(false);
 const assetDrawerVisible = ref(false);
-const shotWorkspaceVisible = ref(false);
 const anchorPromptPreview = ref<ShotPromptPreview | null>(null);
 const videoPromptPreview = ref<ShotPromptPreview | null>(null);
 const assistContext = ref<ShotAssistContext | null>(null);
@@ -66,6 +68,12 @@ const projectProfile = ref<VisualProfileRevisionDto | null>(null);
 const projectProfileForm = ref<VisualProfileDraft | null>(null);
 const projectProfileReferenceIds = ref<string[]>([]);
 const taskCenter = useTaskCenter();
+const runtimeStatus = useRuntimeStatus();
+let generationWorkspaceRequest = 0;
+let shotAssistanceRequest = 0;
+const workspaceRoute = computed(() => route.name === "shot-generation-workspace");
+const routeProjectId = computed(() => String(route.params.projectId ?? route.query.project ?? ""));
+const routeShotId = computed(() => String(route.params.shotId ?? route.query.shot ?? ""));
 
 function emptyLookPlan(): SceneLookPlan {
   return {
@@ -114,6 +122,9 @@ const uploadForm = reactive({
 });
 
 const selectedShot = computed<ShotDto | null>(() => {
+  if (workspaceRoute.value && generationWorkspace.value?.shot) {
+    return generationWorkspace.value.shot;
+  }
   if (!graph.value || !selectedShotId.value) return null;
   for (const scene of graph.value.scenes) {
     const shot = scene.shots.find((item) => item.id === selectedShotId.value);
@@ -146,14 +157,31 @@ const selectableAssets = computed(() => graph.value?.assets.filter(
   (item) => item.mediaType === "image"
     && item.contentReady
     && ["canon", "project"].includes(item.scope),
+) ?? generationWorkspace.value?.assets.filter(
+  (item) => item.mediaType === "image"
+    && item.contentReady
+    && ["canon", "project"].includes(item.scope),
 ) ?? []);
-const selectedScene = computed<SceneDto | null>(() => {
+const selectedScene = computed<Pick<SceneDto, "id" | "title" | "selectedLookAssetId"> | null>(() => {
+  if (workspaceRoute.value && generationWorkspace.value?.scene) {
+    return generationWorkspace.value.scene;
+  }
   if (!graph.value || !selectedShot.value) return null;
   return graph.value.scenes.find((item) => item.id === selectedShot.value?.sceneId) ?? null;
 });
+const currentShotActiveOperations = computed(() => {
+  const shotId = routeShotId.value || selectedShotId.value;
+  if (!shotId) return [];
+  const active = new Set(["queued", "pending", "submitting", "running", "restart_pending"]);
+  return [...new Set(taskCenter.items.value.flatMap((item) => (
+    item.shotId === shotId && active.has(item.status) && item.operationKey
+      ? [item.operationKey]
+      : []
+  )))];
+});
 const productionStage = computed(() => {
   const summaries = productionBoard.value?.scenes.flatMap((scene) => scene.shots) ?? [];
-  if (!summaries.length || productionBoard.value?.scenes.some((scene) => !scene.selectedLookAssetId)) return 0;
+  if (!summaries.length) return 0;
   if (summaries.some((item) => ["needs_opening", "generating_anchor", "blocked"].includes(item.state))) return 1;
   if (summaries.some((item) => ["ready_video", "generating_video"].includes(item.state))) return 2;
   if (summaries.some((item) => ["awaiting_review", "stale"].includes(item.state))) return 3;
@@ -250,17 +278,23 @@ async function loadProjects() {
 }
 
 async function loadGraph(projectId?: string) {
-  const id = projectId ?? String(route.query.project ?? "");
+  const id = projectId ?? routeProjectId.value;
   if (!id) {
     graph.value = null;
     productionBoard.value = null;
     return;
   }
-  rememberProject(id);
-  [graph.value, productionBoard.value] = await Promise.all([
-    api.project(id),
-    api.productionBoard(id),
-  ]);
+  if (workspaceRoute.value && routeShotId.value) {
+    selectedShotId.value = routeShotId.value;
+    selectedSequenceId.value = null;
+    await Promise.all([
+      loadGenerationWorkspace(routeShotId.value),
+      loadShotAssistance(routeShotId.value),
+    ]);
+    return;
+  }
+  productionBoard.value = await api.productionBoard(id);
+  graph.value = productionBoard.value.projectGraph;
   const requestedSequence = String(route.query.sequence ?? "");
   if (graph.value.sequences.some((item) => item.id === requestedSequence)) {
     selectedSequenceId.value = requestedSequence;
@@ -270,17 +304,16 @@ async function loadGraph(projectId?: string) {
     return;
   }
   selectedSequenceId.value = null;
-  const requestedShot = String(route.query.shot ?? "");
+  const requestedShot = routeShotId.value;
   const allShots = graph.value.scenes.flatMap((scene) => scene.shots);
   selectedShotId.value = allShots.some((item) => item.id === requestedShot)
     ? requestedShot
     : selectedShotId.value && allShots.some((item) => item.id === selectedShotId.value)
       ? selectedShotId.value
       : allShots[0]?.id ?? null;
-  const requestedWorkspace = Boolean(requestedShot && selectedShotId.value === requestedShot);
-  if (requestedWorkspace || shotWorkspaceVisible.value) {
+  const requestedWorkspace = Boolean(workspaceRoute.value && requestedShot && selectedShotId.value === requestedShot);
+  if (requestedWorkspace) {
     await Promise.all([loadShotAssistance(selectedShotId.value), loadGenerationWorkspace(selectedShotId.value)]);
-    if (requestedWorkspace) shotWorkspaceVisible.value = true;
     return;
   }
   await Promise.all([loadShotAssistance(null), loadGenerationWorkspace(null)]);
@@ -293,7 +326,6 @@ async function reloadGenerationInputs() {
 }
 
 async function selectProject(id: string) {
-  shotWorkspaceVisible.value = false;
   await router.replace({ path: "/studio", query: { project: id } });
   await loadGraph(id);
 }
@@ -301,17 +333,17 @@ async function selectProject(id: string) {
 async function selectShot(id: string) {
   selectedShotId.value = id;
   selectedSequenceId.value = null;
-  await router.replace({
-    path: "/studio",
-    query: { project: graph.value?.project.id, shot: id },
+  await router.push({
+    name: "shot-generation-workspace",
+    params: { projectId: graph.value?.project.id ?? routeProjectId.value, shotId: id },
   });
   anchorPromptPreview.value = null;
   videoPromptPreview.value = null;
-  shotWorkspaceVisible.value = true;
   await Promise.all([loadShotAssistance(id), loadGenerationWorkspace(id)]);
 }
 
 async function loadGenerationWorkspace(shotId?: string | null) {
+  const request = ++generationWorkspaceRequest;
   if (!shotId) {
     generationWorkspace.value = null;
     anchorPromptPreview.value = null;
@@ -319,21 +351,25 @@ async function loadGenerationWorkspace(shotId?: string | null) {
     return;
   }
   try {
-    generationWorkspace.value = await api.shotGenerationWorkspace(shotId);
-    anchorPromptPreview.value = generationWorkspace.value.anchorPreview;
-    videoPromptPreview.value = generationWorkspace.value.videoPreview;
+    const workspace = await api.shotGenerationWorkspace(shotId);
+    if (request !== generationWorkspaceRequest) return;
+    if (workspaceRoute.value && routeShotId.value !== shotId) return;
+    generationWorkspace.value = workspace;
+    anchorPromptPreview.value = workspace.anchorPreview;
+    videoPromptPreview.value = workspace.videoPreview;
   } catch (error) {
+    if (request !== generationWorkspaceRequest) return;
     generationWorkspace.value = null;
     persistentError.value = error instanceof Error ? error.message : String(error);
   }
 }
 
 async function closeShotWorkspace() {
-  shotWorkspaceVisible.value = false;
-  await router.replace({ path: "/studio", query: { project: graph.value?.project.id } });
+  await router.push({ path: "/studio", query: { project: routeProjectId.value } });
 }
 
 async function loadShotAssistance(shotId?: string | null) {
+  const request = ++shotAssistanceRequest;
   if (!shotId) {
     assistContext.value = null;
     assistAnalyses.value = [];
@@ -343,12 +379,13 @@ async function loadShotAssistance(shotId?: string | null) {
     api.shotAssistContext(shotId),
     api.shotAssistAnalyses(shotId),
   ]);
+  if (request !== shotAssistanceRequest) return;
+  if (workspaceRoute.value && routeShotId.value !== shotId) return;
   assistContext.value = context;
   assistAnalyses.value = analyses;
 }
 
 async function showSequence(id: string) {
-  shotWorkspaceVisible.value = false;
   selectedSequenceId.value = id;
   selectedShotId.value = null;
   anchorPromptPreview.value = null;
@@ -578,12 +615,15 @@ function editShot(sceneId: string, shot?: ShotDto) {
 }
 
 async function saveShot() {
+  const referenceBindings = shotForm.anchorMode === "existing"
+    ? shotForm.referenceBindings
+    : shotForm.referenceBindings.filter((item) => item.usage !== "approved_anchor");
   const payload = {
     title: shotForm.title,
     direction: shotForm.direction,
     durationSeconds: shotForm.durationSeconds,
     anchorMode: shotForm.anchorMode,
-    referenceBindings: shotForm.referenceBindings,
+    referenceBindings,
     inheritProjectReferences: shotForm.inheritProjectReferences,
     sceneLookUsage: shotForm.sceneLookUsage,
   };
@@ -592,10 +632,17 @@ async function saveShot() {
       ? await api.updateShot(shotForm.id, payload)
       : await api.addShot(shotForm.sceneId, payload);
     shotVisible.value = false;
-    await reloadGenerationInputs();
-    await selectShot(saved.id);
-    assistCandidateIds.value = [...(assistContext.value?.defaultCandidateAssetIds ?? [])];
-    assistConfirmVisible.value = true;
+    anchorPromptPreview.value = null;
+    videoPromptPreview.value = null;
+    if (workspaceRoute.value && routeShotId.value === saved.id) {
+      await Promise.all([
+        loadGenerationWorkspace(saved.id),
+        loadShotAssistance(saved.id),
+      ]);
+    } else {
+      await selectShot(saved.id);
+    }
+    ElMessage.success("视频片段已保存；可在开场设计中免费填写静态稿，或按需启动 LLM 分析");
   });
 }
 
@@ -634,7 +681,13 @@ async function submitStudioTask(
 }
 
 async function runShotAssistance() {
-  if (!selectedShot.value || !assistContext.value) return;
+  const projectId = generationWorkspace.value?.projectId ?? routeProjectId.value;
+  if (!selectedShot.value || !assistContext.value || !projectId) return;
+  const runtimeRevision = runtimeStatus.settings.value?.current.revision;
+  if (runtimeRevision === undefined) {
+    ElMessage.warning("运行配置尚未加载");
+    return;
+  }
   const shot = selectedShot.value;
   const context = assistContext.value;
   assistConfirmVisible.value = false;
@@ -643,24 +696,66 @@ async function runShotAssistance() {
       shot.id,
       context.sourceDraftRevision,
       assistCandidateIds.value,
+      runtimeRevision,
     ),
     {
       kind: "shot_assistance",
       label: "片段视觉与 Prompt 审稿",
       operationKey: "director:shot-assistance",
-      projectId: graph.value!.project.id,
+      projectId,
       sceneId: shot.sceneId,
       shotId: shot.id,
     },
   );
 }
 
-async function applyShotAssistance(record: ShotAssistRecord, patch: ShotAssistPatch) {
+async function requestShotAssistance() {
+  if (!selectedShot.value) return;
+  persistentError.value = "";
+  try {
+    await loadShotAssistance(selectedShot.value.id);
+    assistCandidateIds.value = [...(assistContext.value?.defaultCandidateAssetIds ?? [])];
+    assistConfirmVisible.value = true;
+  } catch (error) {
+    persistentError.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function saveAnchorBrief(brief: string) {
+  if (!selectedShot.value) return;
+  persistentError.value = "";
+  anchorBriefSaving.value = true;
+  try {
+    generationWorkspace.value = await api.saveAnchorBrief(
+      selectedShot.value.id,
+      selectedShot.value.draftRevision,
+      brief,
+    );
+    anchorPromptPreview.value = generationWorkspace.value.anchorPreview;
+    videoPromptPreview.value = generationWorkspace.value.videoPreview;
+    ElMessage.success("开场静态画面稿已保存；未调用 Ark");
+  } catch (error) {
+    persistentError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    anchorBriefSaving.value = false;
+  }
+}
+
+async function applyShotAssistance(
+  record: ShotAssistRecord,
+  patch: ShotAssistPatch | null,
+  acceptedAnchorBrief: string | null,
+) {
   if (!selectedShot.value) return;
   await act(async () => {
-    await api.acceptShotAssistance(record.stepId, record.sourceDraftRevision, patch);
+    await api.acceptShotAssistance(
+      record.stepId,
+      record.sourceDraftRevision,
+      patch,
+      acceptedAnchorBrief,
+    );
     await reloadGenerationInputs();
-    ElMessage.success("已应用勾选的 LLM 建议字段");
+    ElMessage.success("已保存勾选的 LLM 修改与开场静态画面稿");
   });
 }
 
@@ -708,9 +803,10 @@ async function moveShot(scene: SceneDto, index: number, delta: number) {
 }
 
 async function generate(kind: "anchor" | "video") {
-  if (!selectedShot.value || !graph.value) return;
+  if (!selectedShot.value || !routeProjectId.value) return;
   const shot = selectedShot.value;
-  const preview = await api.promptPreview(shot.id, kind);
+  let preview = kind === "anchor" ? anchorPromptPreview.value : videoPromptPreview.value;
+  if (!preview) preview = await api.promptPreview(shot.id, kind);
   if (!preview.ready) {
     persistentError.value = preview.blockers.join("；") || "当前生成输入尚未就绪";
     ElMessage.warning(persistentError.value);
@@ -744,22 +840,31 @@ async function generate(kind: "anchor" | "video") {
     }
     if (kind === "anchor") anchorPromptPreview.value = retryPreview;
     else videoPromptPreview.value = retryPreview;
+    preview = retryPreview;
+  }
+  const runtimeRevision = runtimeStatus.settings.value?.current.revision;
+  if (runtimeRevision === undefined) {
+    ElMessage.warning("运行配置尚未加载");
+    return;
   }
   await ElMessageBox.confirm(
-    kind === "anchor"
-      ? `${action}锚点会产生一次 Seedream 费用，是否继续？`
-      : `${action}当前视频片段会产生一次 Seedance 费用，是否继续？`,
+    `${action}${kind === "anchor" ? "开场图" : "视频片段"}将使用 ${
+      kind === "anchor"
+        ? runtimeStatus.settings.value?.current.imageModel ?? "当前图片模型"
+        : runtimeStatus.settings.value?.current.videoModel ?? "当前视频模型"
+    }（配置 revision ${runtimeStatus.settings.value?.current.revision ?? "未加载"}），会产生一次 Ark 费用，是否继续？`,
     "付费确认",
   );
+  const confirmedInputHash = preview.inputHash;
   await submitStudioTask(
     () => kind === "anchor"
-      ? api.generateAnchor(shot.id, regenerate, reason)
-      : api.generateVideo(shot.id, regenerate, reason),
+      ? api.generateAnchor(shot.id, regenerate, reason, confirmedInputHash, runtimeRevision)
+      : api.generateVideo(shot.id, regenerate, reason, confirmedInputHash, runtimeRevision),
     {
       kind: kind === "anchor" ? "generate_anchor" : "generate_video",
       label: kind === "anchor" ? "片段开场锚点" : "视频片段",
       operationKey,
-      projectId: graph.value.project.id,
+      projectId: routeProjectId.value,
       sceneId: shot.sceneId,
       shotId: shot.id,
     },
@@ -767,7 +872,7 @@ async function generate(kind: "anchor" | "video") {
 }
 
 async function resumeAttempt(stepId: string) {
-  if (!graph.value || !selectedShot.value) return;
+  if (!selectedShot.value || !routeProjectId.value) return;
   const shot = selectedShot.value;
   await submitStudioTask(
     () => api.resumeStep(stepId),
@@ -775,7 +880,7 @@ async function resumeAttempt(stepId: string) {
       kind: "resume_step",
       label: "恢复 Provider 任务查询",
       operationKey: "resume",
-      projectId: graph.value.project.id,
+      projectId: routeProjectId.value,
       sceneId: shot.sceneId,
       shotId: shot.id,
     },
@@ -862,6 +967,13 @@ async function toggleProjectDefault(asset: AssetDto) {
 function fixedReferenceRole(asset: AssetDto | undefined): ReferenceRole | null {
   if (!asset) return null;
   if (asset.role === "scene_look") return "scene";
+  if (["generated_reference", "external_reference"].includes(asset.role)
+    && asset.metadata.referencePurpose) {
+    const role = String(asset.metadata.referenceRole ?? "");
+    return ["scene", "prop", "composition"].includes(role)
+      ? role as ReferenceRole
+      : null;
+  }
   if (asset.semanticKey?.startsWith("style:")) return "style";
   if (asset.semanticKey?.startsWith("person:") || asset.semanticKey?.startsWith("cat:")) return "identity";
   return null;
@@ -907,13 +1019,16 @@ async function saveShotWorkspaceSettings(settings: {
   inheritProjectReferences: boolean;
 }) {
   if (!selectedShot.value) return;
+  const referenceBindings = settings.anchorMode === "existing"
+    ? selectedShot.value.referenceBindings
+    : selectedShot.value.referenceBindings.filter((item) => item.usage !== "approved_anchor");
   await act(async () => {
     await api.updateShot(selectedShot.value!.id, {
       title: selectedShot.value!.title,
       direction: selectedShot.value!.direction,
       durationSeconds: selectedShot.value!.durationSeconds,
       anchorMode: settings.anchorMode,
-      referenceBindings: selectedShot.value!.referenceBindings,
+      referenceBindings,
       inheritProjectReferences: settings.inheritProjectReferences,
       sceneLookUsage: settings.sceneLookUsage,
     });
@@ -1039,14 +1154,38 @@ async function act(fn: () => Promise<void>) {
   }
 }
 
-watch(() => route.query.project, () => void loadGraph());
-watch(() => route.query.shot, (shotId) => {
-  if (shotId && String(shotId) !== selectedShotId.value) void loadGraph();
-});
-watch(() => taskCenter.revision.value, () => {
-  const event = taskCenter.lastEvent.value;
-  if (event?.item.projectId === graph.value?.project.id) void loadGraph();
-});
+watch(() => [routeProjectId.value, routeShotId.value], () => void loadGraph());
+watch(
+  () => taskCenter.shotSignals.value[routeShotId.value]?.revision ?? 0,
+  () => {
+    if (!workspaceRoute.value || !routeShotId.value) return;
+    void Promise.all([
+      loadGenerationWorkspace(routeShotId.value),
+      loadShotAssistance(routeShotId.value),
+    ]);
+  },
+);
+watch(
+  () => taskCenter.projectSignals.value[routeProjectId.value]?.revision ?? 0,
+  () => {
+    if (!workspaceRoute.value && routeProjectId.value) void loadGraph();
+  },
+);
+watch(
+  () => taskCenter.workspaceRefreshRequest.value?.revision ?? 0,
+  () => {
+    const request = taskCenter.workspaceRefreshRequest.value;
+    if (!request || request.projectId !== routeProjectId.value) return;
+    if (request.shotId && request.shotId === routeShotId.value) {
+      void Promise.all([
+        loadGenerationWorkspace(request.shotId),
+        loadShotAssistance(request.shotId),
+      ]);
+    } else if (!request.shotId && !workspaceRoute.value) {
+      void loadGraph(request.projectId);
+    }
+  },
+);
 watch(() => shotForm.sceneLookUsage, (value) => {
   if (value === "derive_anchor") shotForm.anchorMode = "generate";
 });
@@ -1058,13 +1197,63 @@ watch(() => shotForm.anchorMode, (value) => {
 onMounted(async () => {
   await act(async () => {
     await loadProjects();
-    if (route.query.project) await loadGraph();
+    if (routeProjectId.value) await loadGraph();
   });
 });
 </script>
 
 <template>
-  <div class="studio" v-loading="busy">
+  <ShotGenerationWorkspace
+    v-if="workspaceRoute && selectedShot && selectedScene"
+    :shot="selectedShot"
+    :scene="selectedScene"
+    :all-assets="generationWorkspace?.assets ?? graph?.assets ?? []"
+    :selectable-assets="selectableAssets"
+    :anchor-preview="anchorPromptPreview"
+    :video-preview="videoPromptPreview"
+    :reference-slots="generationWorkspace?.referenceSlots ?? null"
+    :previous-tail="generationWorkspace?.previousTail ?? assistContext?.previousTail ?? null"
+    :active-tasks="generationWorkspace?.activeTasks ?? []"
+    :active-operations="currentShotActiveOperations"
+    :provider-name="runtimeStatus.health.value?.provider ?? null"
+    :anchor-brief="generationWorkspace?.anchorBrief ?? null"
+    :anchor-brief-versions="generationWorkspace?.anchorBriefVersions ?? []"
+    :next-action="generationWorkspace?.nextAction ?? 'fix_inputs'"
+    :next-action-label="generationWorkspace?.nextActionLabel ?? '检查生成输入'"
+    :workspace-blockers="generationWorkspace?.blockers ?? []"
+    :anchor-brief-saving="anchorBriefSaving"
+    :assist-context="assistContext"
+    :assist-records="assistAnalyses"
+    @close="closeShotWorkspace"
+    @edit="openSelectedShotEditor"
+    @generate="generate"
+    @review="review"
+    @select-version="selectVideoVersion"
+    @resume="resumeAttempt"
+    @reconcile="reconcileAttempt"
+    @adopt-tail="adoptPreviousTail"
+    @bind-reference="bindShotReference"
+    @remove-binding="removeBinding"
+    @save-settings="saveShotWorkspaceSettings"
+    @apply-assistance="applyShotAssistance"
+    @save-anchor-brief="saveAnchorBrief"
+    @request-assistance="requestShotAssistance"
+  />
+  <div v-else-if="workspaceRoute" class="workspace-route-state" v-loading="busy">
+    <el-result
+      v-if="persistentError"
+      icon="error"
+      title="片段生成台加载失败"
+      :sub-title="persistentError"
+    >
+      <template #extra>
+        <el-button @click="closeShotWorkspace">返回制作看板</el-button>
+        <el-button type="primary" @click="loadGraph()">重新加载</el-button>
+      </template>
+    </el-result>
+    <p v-else>正在加载片段生成规格、素材与版本历史…</p>
+  </div>
+  <div v-show="!workspaceRoute" class="studio" v-loading="busy">
     <header class="studio-header">
       <div>
         <h1>视觉制作看板</h1>
@@ -1136,6 +1325,12 @@ onMounted(async () => {
         </details>
 
         <div class="scene-production-grid">
+          <VisualAssetWorkbench
+            :project-id="graph.project.id"
+            :scene="scene"
+            :assets="graph.assets"
+            @refreshed="reloadGenerationInputs()"
+          />
           <SceneLookWorkbench
             :project-id="graph.project.id"
             :scene="scene"
@@ -1193,7 +1388,7 @@ onMounted(async () => {
                   <span>片段专用 {{ boardShot(shot.id)?.referenceCounts.custom ?? 0 }}</span>
                   <span>场景 {{ boardShot(shot.id)?.referenceCounts.scene ?? 0 }}</span>
                   <span>项目 {{ boardShot(shot.id)?.referenceCounts.project ?? 0 }}</span>
-                  <b>实际提交 {{ boardShot(shot.id)?.referenceCounts.total ?? 0 }} 张</b>
+                  <b>{{ ({ first_frame: '批准开场图', reference_media: '多参考图', text_only: '纯文本' } as Record<string, string>)[boardShot(shot.id)?.providerInputMode ?? 'text_only'] }} · 实际提交 {{ boardShot(shot.id)?.actualInputCount ?? 0 }} 张</b>
                 </div>
                 <div class="version-counts">
                   <span>开场图 {{ boardShot(shot.id)?.anchorVersionCount ?? 0 }} 个版本</span>
@@ -1228,41 +1423,6 @@ onMounted(async () => {
         <el-button type="primary" @click="createVisible = true">创建第一个项目</el-button>
       </div>
     </section>
-
-    <el-dialog
-      v-model="shotWorkspaceVisible"
-      fullscreen
-      :show-close="false"
-      destroy-on-close
-      class="shot-workspace-dialog"
-    >
-      <ShotGenerationWorkspace
-        v-if="selectedShot && selectedScene"
-        :shot="selectedShot"
-        :scene="selectedScene"
-        :all-assets="graph?.assets ?? []"
-        :selectable-assets="selectableAssets"
-        :anchor-preview="anchorPromptPreview"
-        :video-preview="videoPromptPreview"
-        :reference-slots="generationWorkspace?.referenceSlots ?? null"
-        :previous-tail="generationWorkspace?.previousTail ?? assistContext?.previousTail ?? null"
-        :active-tasks="generationWorkspace?.activeTasks ?? []"
-        :assist-context="assistContext"
-        :assist-records="assistAnalyses"
-        @close="closeShotWorkspace"
-        @edit="openSelectedShotEditor"
-        @generate="generate"
-        @review="review"
-        @select-version="selectVideoVersion"
-        @resume="resumeAttempt"
-        @reconcile="reconcileAttempt"
-        @adopt-tail="adoptPreviousTail"
-        @bind-reference="bindShotReference"
-        @remove-binding="removeBinding"
-        @save-settings="saveShotWorkspaceSettings"
-        @apply-assistance="applyShotAssistance"
-      />
-    </el-dialog>
 
     <el-drawer v-model="assetDrawerVisible" title="当前项目素材" size="520px">
       <template v-if="graph">
@@ -1363,9 +1523,9 @@ onMounted(async () => {
     </section>
 
     <VideoTimeline
-      v-if="selectedShot && selectedVideo && !selectedSequence"
+      v-if="graph && selectedShot && selectedVideo && !selectedSequence"
       :shot-id="selectedShot.id"
-      :project-id="graph!.project.id"
+      :project-id="graph.project.id"
       :scene-id="selectedShot.sceneId"
       :asset-id="selectedVideo.id"
       :src="assetContentUrl(selectedVideo.id)"
@@ -1498,7 +1658,7 @@ onMounted(async () => {
       <template #footer><el-button @click="sceneVisible = false">取消</el-button><el-button type="primary" @click="saveScene">保存</el-button></template>
     </el-dialog>
 
-    <el-dialog v-model="shotVisible" :title="shotForm.id ? '编辑视频片段' : '手工添加视频片段'" width="760px">
+    <el-dialog v-model="shotVisible" append-to-body :title="shotForm.id ? '编辑视频片段' : '手工添加视频片段'" width="760px">
       <el-form label-position="top">
         <el-form-item label="片段标题"><el-input v-model="shotForm.title" /></el-form-item>
         <el-form-item label="完整分镜描述"><el-input v-model="shotForm.direction" type="textarea" :rows="11" placeholder="1. 景别/机位……主体关系……动作……收尾切点与声音……\n2. ……" /></el-form-item>
@@ -1514,7 +1674,7 @@ onMounted(async () => {
             <el-option label="完整参考：起始状态与视觉基准高度一致" value="full_reference" />
             <el-option label="派生锚点：视觉基准只用于生成本片段开场图" value="derive_anchor" />
           </el-select>
-          <div class="source-hint">视频输入顺序：锚点 → 片段自定义 → 场景视觉基准 → 项目默认，再按资产 ID 和内容 SHA 去重。派生锚点获批后，场景视觉基准不会再次进入视频。</div>
+          <div class="source-hint">视频采用互斥输入模式：已有批准锚点时只提交该首帧；没有锚点时才按“片段专用 → 场景视觉基准 → 项目默认”提交普通参考图，并按资产 ID 和内容 SHA 去重。</div>
         </el-form-item>
         <div class="shot-local-findings">
           <el-alert title="以下为免费本地检查；只提示，不自动改写。保存后可选择付费 LLM 分析当前及相邻片段。" type="info" :closable="false" />
@@ -1524,22 +1684,45 @@ onMounted(async () => {
       <template #footer><el-button @click="shotVisible = false">取消</el-button><el-button type="primary" @click="saveShot">保存视频片段</el-button></template>
     </el-dialog>
 
-    <el-dialog v-model="assistConfirmVisible" title="片段已保存：是否进行 LLM 创作分析？" width="760px">
+    <el-dialog
+      v-model="assistConfirmVisible"
+      append-to-body
+      title="LLM 创作分析确认"
+      width="min(980px, calc(100vw - 32px))"
+    >
       <template v-if="assistContext">
-        <el-alert title="保存已经完成。选择“仅保存”不会调用 Ark；分析失败也不会回滚本次保存。" type="info" :closable="false" />
+        <el-alert
+          :title="`这是可选的付费分析，模型 ${runtimeStatus.settings.value?.current.planningModel ?? '未加载'} · revision ${runtimeStatus.settings.value?.current.revision ?? '未加载'}；分析失败不会回滚已保存内容。`"
+          type="info"
+          :closable="false"
+        />
         <p>模型：{{ assistContext.model || '未配置' }} · 草稿 Revision {{ assistContext.sourceDraftRevision }} · 最多 9 张压缩预览图</p>
-        <div class="assist-candidate-grid">
-          <label v-for="asset in assistContext.candidates" :key="asset.assetId" :class="{ disabled: !asset.available || asset.duplicate }">
-            <el-checkbox v-model="assistCandidateIds" :value="asset.assetId" :disabled="!asset.available || asset.duplicate" />
-            <img v-if="asset.contentReady" :src="assetContentUrl(asset.assetId)" />
-            <span>{{ asset.displayName }}<small>{{ asset.sourceLayer }} · {{ asset.responsibility }}</small></span>
-          </label>
-        </div>
+        <el-checkbox-group v-model="assistCandidateIds" class="assist-candidate-grid">
+          <el-checkbox
+            v-for="asset in assistContext.candidates"
+            :key="asset.assetId"
+            :value="asset.assetId"
+            :disabled="!asset.available || asset.duplicate"
+            class="assist-asset-card"
+            :class="{ disabled: !asset.available || asset.duplicate }"
+          >
+            <img v-if="asset.contentReady" :src="assetContentUrl(asset.assetId)" :alt="asset.displayName" />
+            <span v-else class="assist-asset-missing">图片不可读</span>
+            <span class="assist-asset-copy">
+              <b>{{ asset.displayName }}</b>
+              <small>{{ asset.sourceLayer }} · {{ asset.responsibility }}</small>
+              <small v-if="asset.duplicate">内容重复，已自动去重</small>
+              <small v-else-if="!asset.available">当前素材不可用</small>
+            </span>
+          </el-checkbox>
+        </el-checkbox-group>
         <el-alert v-for="warning in assistContext.warnings" :key="warning" :title="warning" type="warning" :closable="false" />
       </template>
       <template #footer>
-        <el-button @click="assistConfirmVisible = false">仅保存</el-button>
-        <el-button type="primary" :disabled="!assistContext?.model || assistCandidateIds.length > 9" @click="runShotAssistance">保存并分析（产生 Ark 费用）</el-button>
+        <el-button @click="assistConfirmVisible = false">取消</el-button>
+        <el-button type="primary" :disabled="!assistContext?.model || assistCandidateIds.length > 9" @click="runShotAssistance">
+          提交分析（产生 Ark 费用）
+        </el-button>
       </template>
     </el-dialog>
 
@@ -1547,16 +1730,16 @@ onMounted(async () => {
 </template>
 
 <style scoped>
+.workspace-route-state { min-height: 100vh; display: grid; place-items: center; padding: 32px; background: #0d1016; color: #aeb8c8; }
 .studio { min-height: 100%; background: #0d1016; color: #e8eaf0; padding: 22px; }
 .studio-header, .shot-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
 .studio-header h1 { margin: 0; }.studio-header p { color: #9299a8; margin: 6px 0 0; }
 .header-actions,.production-heading-actions,.scene-production-header,.shot-board-heading,.production-shot-card footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .production-shell { display: grid; gap: 14px; margin-top: 18px; }.production-heading { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 18px 20px; }.production-heading h2 { margin: 3px 0; }.production-heading p,.scene-production-header p,.shot-board-heading p { margin: 4px 0 0; color: #8c97a9; }.production-steps { padding: 18px 12px; }.production-scene { padding: 20px; }.scene-production-header h2 { display: inline; margin: 0 0 0 6px; }.scene-production-header { align-items: flex-start; }
 .creative-summary { margin: 16px 0; border: 1px solid #2b3441; border-radius: 10px; background: #10151d; }.creative-summary > summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 15px; cursor: pointer; list-style: none; }.creative-summary > summary span { display: grid; gap: 3px; }.creative-summary > summary small { color: #8793a6; }.creative-summary > .source-text,.creative-summary > :deep(.creative-workflow) { margin-left: 14px; margin-right: 14px; }.creative-summary[open] { padding-bottom: 14px; }
-.scene-production-grid { display: grid; grid-template-columns: minmax(360px, 1fr) minmax(360px, .8fr); gap: 12px; align-items: stretch; }.scene-overview { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; }.overview-stat { display: grid; place-content: center; gap: 5px; min-height: 116px; text-align: center; border: 1px solid #2c3645; border-radius: 10px; background: #111821; }.overview-stat span { color: #8995a8; font-size: 12px; }.overview-stat b { font-size: 24px; }
+.scene-production-grid { display: grid; grid-template-columns: repeat(2, minmax(360px, 1fr)); gap: 12px; align-items: stretch; }.scene-overview { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; }.overview-stat { display: grid; place-content: center; gap: 5px; min-height: 116px; text-align: center; border: 1px solid #2c3645; border-radius: 10px; background: #111821; }.overview-stat span { color: #8995a8; font-size: 12px; }.overview-stat b { font-size: 24px; }
 .shot-board-heading { margin: 20px 0 10px; }.shot-board-heading h3 { margin: 0; }.production-shot-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }.shot-flow-item { min-width: 0; display: grid; gap: 7px; }.continuity-link { min-height: 28px; display: flex; align-items: center; justify-content: center; gap: 7px; color: #8492a7; font-size: 11px; }.continuity-link i { color: #5fa3f5; font-style: normal; }.production-shot-card { min-width: 0; height: 100%; display: grid; grid-template-rows: 190px 1fr; overflow: hidden; border: 1px solid #2c3747; border-radius: 12px; background: #101720; cursor: pointer; transition: border-color .15s ease, transform .15s ease; }.production-shot-card:hover { border-color: #4d96ff; transform: translateY(-1px); }.shot-preview { position: relative; display: grid; place-items: center; overflow: hidden; background: #080b10; }.shot-preview img,.shot-preview video { width: 100%; height: 100%; object-fit: cover; }.shot-preview > div { display: grid; gap: 6px; place-items: center; color: #8792a4; }.shot-preview > div > span { font-size: 36px; color: #41516a; }.shot-state { position: absolute; top: 10px; right: 10px; }.production-shot-content { display: grid; gap: 10px; padding: 13px; }.production-shot-content > p { margin: 0; max-height: 86px; overflow: hidden; color: #b7c0ce; font-size: 13px; line-height: 1.65; white-space: pre-wrap; }.visual-slots,.reference-counts,.version-counts { display: flex; gap: 6px; flex-wrap: wrap; }.visual-slots span { padding: 4px 7px; border: 1px solid #303a49; border-radius: 6px; color: #6f7b8e; font-size: 11px; }.visual-slots span.ready { color: #bfe3cb; border-color: #2f6547; background: #12251d; }.reference-counts span,.version-counts span { color: #8794a7; font-size: 11px; }.reference-counts b { margin-left: auto; color: #dce4ef; font-size: 11px; }
 .asset-upload-panel,.drawer-assets { display: grid; gap: 10px; margin-top: 16px; }.drawer-asset-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }.drawer-asset-grid button,.drawer-asset-grid article { min-width: 0; display: grid; gap: 5px; padding: 7px; text-align: left; color: #dce4ef; background: #101721; border: 1px solid #2d3746; border-radius: 8px; cursor: pointer; }.drawer-asset-grid button.selected { border-color: #409eff; }.drawer-asset-grid button.missing { border-color: #9a6732; }.drawer-asset-grid img,.drawer-asset-grid button > span,.drawer-asset-grid article > span { width: 100%; height: 112px; object-fit: cover; border-radius: 5px; background: #080b10; }.drawer-asset-grid button > span,.drawer-asset-grid article > span { display: grid; place-items: center; color: #d09a61; }.drawer-asset-grid small { color: #7f8da0; font-size: 10px; }.drawer-asset-grid.generated { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-.shot-workspace-dialog :deep(.el-dialog__header) { display: none; }.shot-workspace-dialog :deep(.el-dialog__body) { padding: 0; }
 .persistent-alert { margin: 16px 0; }
 .panel { background: #151922; border: 1px solid #292f3b; border-radius: 12px; }
 .panel-title { color: #8c95a7; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 10px; }.reference-title { margin-top: 22px; }
@@ -1565,9 +1748,19 @@ onMounted(async () => {
 .source-hint { color: #8791a2; font-size: 11px; line-height: 1.5; }.empty-state { text-align: center; color: #8f98a7; padding: 80px 20px; }.project-empty { display: grid; min-height: 520px; margin-top: 18px; place-items: center; }
 .master-timeline summary { color: #8fa7c9; cursor: pointer; font-size: 12px; }.sequence-panel, .master-timeline { margin-top: 16px; padding: 16px; }.sequence-heading h3, .master-timeline h3 { margin: 0; }.sequence-heading p, .master-timeline p { color: #9299a8; }.sequence-grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }.sequence-card { border: 1px solid #2b313d; border-radius: 9px; padding: 10px; display: grid; gap: 8px; }.sequence-card.selected { border-color: #4d96ff; }.sequence-open { border: 0; background: transparent; color: #e8eaf0; text-align: left; cursor: pointer; display: grid; gap: 4px; }.sequence-open span { color: #8490a3; font-size: 12px; }.master-timeline video { width: 100%; max-height: 560px; background: #080a0e; }
 .mode-row { align-items: end; }.look-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }.suggestion-summary, .suggestion-shot-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }.suggestion-shot { padding: 14px; margin: 10px 0; border: 1px solid #2b313d; border-radius: 9px; background: #10141b; }.suggestion-shot-head { margin-bottom: 10px; }
-.assist-candidate-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 12px 0; }.assist-candidate-grid label { display: grid; grid-template-columns: auto 64px 1fr; gap: 7px; align-items: center; padding: 7px; border: 1px solid #303847; border-radius: 8px; }.assist-candidate-grid label.disabled { opacity: .48; }.assist-candidate-grid img { width: 64px; height: 64px; object-fit: cover; }.assist-candidate-grid span { display: grid; font-size: 12px; }.assist-candidate-grid small { color: #8791a2; }
+.assist-candidate-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; margin: 12px 0; }
+.assist-asset-card { box-sizing: border-box; width: 100%; height: auto; min-width: 0; margin: 0 !important; padding: 8px; border: 1px solid #303847; border-radius: 8px; background: #101722; }
+.assist-asset-card.disabled { opacity: .48; }
+.assist-asset-card :deep(.el-checkbox__input) { flex: 0 0 auto; }
+.assist-asset-card :deep(.el-checkbox__label) { min-width: 0; flex: 1; display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 9px; align-items: center; padding-left: 9px; white-space: normal; }
+.assist-asset-card img,.assist-asset-missing { width: 72px; height: 72px; object-fit: cover; border-radius: 6px; background: #080b10; }
+.assist-asset-missing { display: grid; place-items: center; color: #d09a61; font-size: 11px; text-align: center; }
+.assist-asset-copy { min-width: 0; display: grid; gap: 4px; overflow-wrap: anywhere; }
+.assist-asset-copy b { color: #dce4ef; font-size: 13px; }
+.assist-asset-copy small { color: #8791a2; font-size: 11px; line-height: 1.45; }
 .shot-local-findings { display: grid; gap: 6px; width: 100%; }
 .profile-reference-heading { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin: 12px 0 8px; }.profile-reference-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px 16px; }
 .sequence-editor { display: grid; gap: 9px; margin-top: 14px; }.sequence-editor-row { display: grid; grid-template-columns: minmax(0, 1fr) 180px 150px; align-items: center; gap: 10px; padding: 10px; border: 1px solid #2c3645; border-radius: 8px; }.sequence-editor-row div { display: grid; gap: 4px; }.sequence-editor-row small { color: #8791a2; }
 @media (max-width: 1280px) { .scene-production-grid { grid-template-columns: 1fr; }.production-shot-grid { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); } }
+@media (max-width: 700px) { .assist-candidate-grid { grid-template-columns: 1fr; } }
 </style>

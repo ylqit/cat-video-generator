@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ..domain.contracts import (
+    AcceptedVisualAssetPlan,
     ReferenceBinding,
     SceneDraft,
     SceneLookDraft,
@@ -254,6 +255,36 @@ class StoredSequence:
 
 
 @dataclass(frozen=True, slots=True)
+class ProjectReadModel:
+    """Batch-loaded project state for read-heavy production projections."""
+
+    project: StoredProject
+    visual_profile: StoredVisualProfileRevision
+    scenes: tuple[StoredScene, ...]
+    shots: tuple[StoredShot, ...]
+    steps: tuple[StoredStep, ...]
+    prompts: tuple[StoredPrompt, ...]
+    assets: tuple[StoredAsset, ...]
+    reviews: tuple[StoredReview, ...]
+    sequences: tuple[StoredSequence, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ShotGenerationReadModel:
+    """Focused state for one generation workspace and its previous-shot continuity."""
+
+    project: StoredProject
+    visual_profile: StoredVisualProfileRevision
+    scene: StoredScene
+    shot: StoredShot
+    scene_shots: tuple[StoredShot, ...]
+    steps: tuple[StoredStep, ...]
+    prompts: tuple[StoredPrompt, ...]
+    assets: tuple[StoredAsset, ...]
+    reviews: tuple[StoredReview, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class LandedAsset:
     path: Path
     sha256: str
@@ -313,6 +344,12 @@ class MediaGateway(Protocol):
 
 
 class RuntimePreflight(Protocol):
+    @property
+    def video_resolution(self) -> str: ...
+
+    @property
+    def semantic_review_enabled(self) -> bool: ...
+
     def validate_for_video_generation(self, *, allow_paid_generation: bool) -> None: ...
 
     def validate_for_range_edit(self, *, allow_paid_generation: bool) -> None: ...
@@ -382,6 +419,13 @@ class ShotQueueStore(Protocol):
     def list_projects(self) -> tuple[StoredProject, ...]: ...
 
     def get_project(self, project_id: uuid.UUID) -> StoredProject: ...
+
+    def project_read_model(self, project_id: uuid.UUID) -> ProjectReadModel: ...
+
+    def shot_generation_read_model(
+        self,
+        shot_id: uuid.UUID,
+    ) -> ShotGenerationReadModel: ...
 
     def update_project_default_references(
         self,
@@ -472,6 +516,23 @@ class ShotQueueStore(Protocol):
         rewritten_story: str,
     ) -> StoredScene: ...
 
+    def accept_story_expansion(
+        self,
+        *,
+        step_id: uuid.UUID,
+        expected_source_hash: str,
+        accepted_output: dict[str, Any],
+        expanded_story: str,
+    ) -> StoredScene: ...
+
+    def accept_visual_asset_plan(
+        self,
+        *,
+        step_id: uuid.UUID,
+        expected_shot_snapshot_hash: str,
+        accepted_output: AcceptedVisualAssetPlan,
+    ) -> StoredStep: ...
+
     def update_shot(self, shot_id: uuid.UUID, draft: ShotCardDraft) -> StoredShot: ...
 
     def accept_shot_assistance(
@@ -479,8 +540,18 @@ class ShotQueueStore(Protocol):
         *,
         step_id: uuid.UUID,
         source_draft_revision: int,
-        patch: ShotAssistPatch,
+        patch: ShotAssistPatch | None,
+        accepted_anchor_brief: str | None,
     ) -> StoredShot: ...
+
+    def save_manual_anchor_brief(
+        self,
+        *,
+        shot_id: uuid.UUID,
+        source_draft_revision: int,
+        brief: str,
+        input_hash: str,
+    ) -> StoredStep: ...
 
     def delete_shot(self, shot_id: uuid.UUID) -> None: ...
 
@@ -493,6 +564,8 @@ class ShotQueueStore(Protocol):
     def next_attempt(self, *, shot_id: uuid.UUID, operation_key: str) -> int: ...
 
     def next_scene_attempt(self, *, scene_id: uuid.UUID, operation_key: str) -> int: ...
+
+    def next_project_attempt(self, *, project_id: uuid.UUID, operation_key: str) -> int: ...
 
     def create_step_with_prompt(
         self,
@@ -530,6 +603,8 @@ class ShotQueueStore(Protocol):
         scene_id: uuid.UUID | None = None,
         shot_id: uuid.UUID | None = None,
     ) -> tuple[StoredStep, ...]: ...
+
+    def task_center_steps(self, *, limit: int = 300) -> tuple[StoredStep, ...]: ...
 
     def get_prompt(self, step_id: uuid.UUID) -> StoredPrompt | None: ...
 

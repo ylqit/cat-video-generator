@@ -26,7 +26,7 @@
 ## 阶段 3：素材职责与最终 Prompt
 
 - [final-verified] Canon、场景定妆、批准锚点的职责由资产来源确定，不允许任意改写。
-- [final-verified] 合并顺序保持“批准锚点 → 片段自定义 → 场景定妆 → 项目 Canon”。
+- [final-verified] Provider 输入按模式分流：批准锚点作为唯一 `first_frame`；无锚点时普通参考图按“片段自定义 → 场景定妆 → 项目 Canon”合并。
 - [final-verified] 项目默认为空时使用视觉档案 Canon 引用回退，并按场景环境筛选互斥画风图。
 - [final-verified] Prompt 预览拆分 LLM 创作正文、系统技术外壳、实际素材和最终 Provider Prompt。
 - [final-verified] 为当前项目提供人工触发的 Canon 默认引用修复，不删除历史。

@@ -36,7 +36,6 @@ describe("global task center", () => {
     calls.resumeStep.mockResolvedValue({ jobId: "resume-job-1" });
     const center = await import("../taskCenter");
 
-    center.rememberProject("project-1");
     await center.refreshTaskCenter();
 
     const item = center.useTaskCenter().items.value[0];

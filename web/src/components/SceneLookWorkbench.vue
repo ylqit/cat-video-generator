@@ -13,6 +13,7 @@ import type {
   SceneLookVersion,
   VisualProfileRevisionDto,
 } from "../api/types";
+import { useRuntimeStatus } from "../runtimeStatus";
 import { registerTask, useTaskCenter } from "../tasks/taskCenter";
 
 const props = defineProps<{
@@ -34,6 +35,8 @@ const selectedVersion = ref<SceneLookVersion | null>(null);
 const imageErrors = ref<Record<string, string>>({});
 const workbenchTab = ref("look");
 const taskCenter = useTaskCenter();
+const runtimeStatus = useRuntimeStatus();
+const paidReady = computed(() => runtimeStatus.settings.value?.arkReady === true);
 
 const usableAssets = computed(() => props.assets.filter(
   (item) => item.mediaType === "image"
@@ -96,6 +99,9 @@ async function run(action: () => Promise<void>) {
 }
 
 async function open() {
+  envelope.value = null;
+  preview.value = null;
+  errorText.value = "";
   visible.value = true;
   workbenchTab.value = "look";
   await run(async () => {
@@ -116,13 +122,22 @@ async function open() {
   });
 }
 
+async function skipSceneLook() {
+  await open();
+  if (!envelope.value) return;
+  envelope.value.draft.lookPlan.imageRecommended = false;
+  await saveDraft(false);
+  visible.value = false;
+  ElMessage.success("已标记为本场跳过；场景视觉基准不是片段生产的强制前置条件");
+}
+
 async function syncProjectProfile() {
   if (!envelope.value) return;
   await run(async () => {
     const current = await api.visualProfile(props.projectId);
     profile.value = current;
     const extras = envelope.value!.draft.referenceBindings.filter(
-      (item) => ["wardrobe", "prop", "composition"].includes(item.purpose),
+      (item) => ["wardrobe", "environment", "prop", "composition"].includes(item.purpose),
     );
     const environmentKey = `style:${envelope.value!.draft.lookPlan.environmentStyle}`;
     const profileBindings = current.referenceBindings.filter((binding) => {
@@ -251,8 +266,11 @@ async function generate() {
       reason = answer.value.trim();
       if (!reason) throw new Error("重新生成必须填写单项修正目标");
     }
+    const runtimeRevision = runtimeStatus.settings.value?.current.revision;
+    if (runtimeRevision === undefined) throw new Error("运行配置尚未加载");
     await ElMessageBox.confirm(
       `模型：${healthModel.value}\n参考图：${preview.value.referenceCount} 张\n`
+      + `配置 revision：${runtimeStatus.settings.value?.current.revision ?? "未加载"}\n`
       + `${regenerate ? "重新生成并保留旧版本" : "生成新候选"}会产生一次 Seedream 费用。`,
       "生成确认",
     );
@@ -261,6 +279,7 @@ async function generate() {
       saved.revision,
       regenerate,
       reason,
+      runtimeRevision,
     );
     registerTask(submitted.jobId, {
       kind: "generate_scene_look",
@@ -275,20 +294,24 @@ async function generate() {
   }
 }
 
-async function refreshVersions() {
+async function refreshVersions(notifyParent = true) {
   versions.value = await api.sceneLookVersions(props.scene.id);
   selectedVersion.value = versions.value.find((item) => item.selected)
     ?? versions.value[0]
     ?? null;
-  emit("refreshed");
+  if (notifyParent) emit("refreshed");
 }
 
-watch(() => taskCenter.revision.value, () => {
-  const event = taskCenter.lastEvent.value;
-  if (event?.item.sceneId !== props.scene.id) return;
+watch(() => taskCenter.sceneSignals.value[props.scene.id]?.revision ?? 0, () => {
   if (visible.value) void refreshVersions();
   else emit("refreshed");
 });
+watch(
+  () => sceneLookAssets.value.map((asset) => `${asset.id}:${asset.status}`).join("|"),
+  () => {
+    if (visible.value) void refreshVersions(false);
+  },
+);
 
 async function decide(version: SceneLookVersion, decision: "approved" | "rejected") {
   await run(async () => {
@@ -341,15 +364,18 @@ async function recordImageFailure(asset: AssetDto) {
     <div class="scene-look-copy">
       <div>
         <b>场景视觉基准</b>
-        <el-tag size="small" type="info">不是视频首帧</el-tag>
+        <el-tag size="small" type="info">按需可选 · 不是视频首帧</el-tag>
       </div>
       <p v-if="selectedAsset">当前：{{ selectedAsset.displayName }}</p>
       <p v-else>尚未选择已批准版本</p>
       <small>{{ sceneLookAssets.length }} 个历史版本 · 负责服饰、环境、共同道具与画风</small>
     </div>
-    <el-button type="primary" plain @click="open">
-      {{ sceneLookAssets.length ? "查看版本与重试" : "开始设计" }}
-    </el-button>
+    <div class="card-actions">
+      <el-button v-if="!selectedAsset" text @click="skipSceneLook">本场跳过</el-button>
+      <el-button type="primary" plain @click="open">
+        {{ sceneLookAssets.length ? "查看版本与重试" : "开始设计" }}
+      </el-button>
+    </div>
   </article>
 
   <el-dialog
@@ -377,7 +403,7 @@ async function recordImageFailure(asset: AssetDto) {
           <el-button
             type="primary"
             :loading="Boolean(activeTask)"
-            :disabled="!envelope || Boolean(activeTask)"
+            :disabled="!envelope || Boolean(activeTask) || !paidReady"
             @click="generate"
           >
             {{ versions.length ? "生成新候选 / 重试" : "生成首个候选" }}
@@ -515,7 +541,7 @@ async function recordImageFailure(asset: AssetDto) {
                     <div v-else class="image-failure">{{ imageErrors[asset.id] }}<br />请检查 contentReady 或执行 Canon repair</div>
                     <template v-if="bindingFor(asset.id)">
                       <el-select :model-value="bindingFor(asset.id)?.purpose" size="small" @update:model-value="updateBinding(asset.id, 'purpose', String($event))">
-                        <el-option v-for="purpose in ['person_identity','person_body','cat_identity','style','wardrobe','prop','composition']" :key="purpose" :label="purpose" :value="purpose" />
+                        <el-option v-for="purpose in ['person_identity','person_body','cat_identity','style','wardrobe','environment','prop','composition']" :key="purpose" :label="purpose" :value="purpose" />
                       </el-select>
                       <el-input :model-value="bindingFor(asset.id)?.instruction" size="small" placeholder="可选：该图只负责什么" @update:model-value="updateBinding(asset.id, 'instruction', String($event))" />
                     </template>
@@ -570,6 +596,7 @@ async function recordImageFailure(asset: AssetDto) {
 .scene-look-copy > div { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .scene-look-copy p { margin: 7px 0 3px; color: #dbe4f0; }
 .scene-look-copy small, .muted { color: #8f9bad; font-size: 12px; }
+.card-actions { display: flex; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
 .look-empty { display: grid; place-content: center; width: 100%; height: 100%; box-sizing: border-box; padding: 20px; text-align: center; color: #8290a4; background: radial-gradient(circle at 50% 35%, #1a2636, #090d13 68%); }
 .look-empty.error { color: #df9a71; }
 .look-workbench { min-height: 620px; display: grid; gap: 12px; }
@@ -618,7 +645,7 @@ async function recordImageFailure(asset: AssetDto) {
 }
 @media (max-width: 720px) {
   .scene-look-card { grid-template-columns: 86px 1fr; }
-  .scene-look-card > .el-button { grid-column: 1 / -1; }
+  .scene-look-card > .card-actions { grid-column: 1 / -1; }
   .scene-look-preview { height: 86px; }
   .workbench-toolbar, .section-heading, .version-summary { align-items: flex-start; flex-direction: column; }
   .form-grid { grid-template-columns: 1fr; }
