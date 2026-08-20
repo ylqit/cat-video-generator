@@ -75,7 +75,7 @@ async function openTask(projectId?: string, shotId?: string) {
     requestWorkspaceRefresh(projectId, shotId);
     return;
   }
-  await router.push({ path: "/studio", query: { project: projectId } });
+  await router.push({ name: "aigc-canvas", params: { projectId } });
   requestWorkspaceRefresh(projectId);
 }
 
@@ -120,9 +120,10 @@ watch(() => taskCenter.lastNotification.value, (event) => {
 <template>
   <el-container class="shell">
     <el-aside width="190px" class="sidebar">
-      <div class="brand">猫咪视频工作台</div>
+      <div class="brand">AIGC 媒体工作台</div>
       <el-menu :default-active="route.path" router background-color="transparent">
-        <el-menu-item index="/studio">镜头生产</el-menu-item>
+        <el-menu-item index="/canvas">通用媒体画布</el-menu-item>
+        <el-menu-item index="/studio">旧版镜头生产</el-menu-item>
         <el-menu-item index="/projects">项目列表</el-menu-item>
         <el-menu-item index="/canon">Canon 资产</el-menu-item>
         <el-menu-item index="/settings">系统设置</el-menu-item>

@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from ...config import DatabaseOperation, DatabaseSettings
 from .models import SCHEMA_NAME
 
-ALEMBIC_HEAD = "0018_v5_shot_assistance"
+ALEMBIC_HEAD = "0020_universal_media_canvas"
 
 
 def create_database_engine(

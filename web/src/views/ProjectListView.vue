@@ -10,14 +10,14 @@ const projects = ref<ProjectSummary[]>([]);
 onMounted(async () => { projects.value = await api.projects(); });
 
 function openProject(row: ProjectSummary) {
-  void router.push({ path: "/studio", query: { project: row.id } });
+  void router.push({ name: "aigc-canvas", params: { projectId: row.id } });
 }
 </script>
 
 <template>
   <div class="page">
     <h1>项目列表</h1>
-    <p>每个项目可包含任意数量场景，每个视频片段对应一次 8–15 秒生成。</p>
+    <p>项目先在类型化画布完成简报、主体、故事审批与分镜，再进入媒体生成。</p>
     <el-table :data="projects" @row-click="openProject">
       <el-table-column prop="title" label="项目" />
       <el-table-column prop="contentDate" label="日期" width="140" />

@@ -22,12 +22,12 @@ from ..domain.contracts import (
 )
 from ..domain.rendering import SequenceStatus
 from ..domain.workflow import StepStatus
-from ..infrastructure.db.repositories import WorkflowConflictError
-from ..infrastructure.db.session import ALEMBIC_HEAD
 from ..infrastructure.ark.runtime import (
     RuntimeConfigurationConflictError,
     RuntimeConfigurationFileError,
 )
+from ..infrastructure.db.repositories import WorkflowConflictError
+from ..infrastructure.db.session import ALEMBIC_HEAD
 from .api_schemas import (
     AcceptShotAssistanceRequest,
     AcceptStoryDiagnosisRequest,
@@ -61,6 +61,7 @@ from .api_schemas import (
     UpdateRuntimeSettingsRequest,
     VisualProfileRequest,
 )
+from .api_v2 import install_canvas_v2_routes
 from .jobs import JobConflictError, JobRegistry
 
 if TYPE_CHECKING:
@@ -1178,6 +1179,10 @@ def create_app(
     @app.get("/api/v1/jobs/{job_id}")
     def job(job_id: str) -> dict[str, Any]:
         return job_registry.get(job_id).to_dict()
+
+    canvas_v2 = getattr(container, "canvas_v2", None)
+    if canvas_v2 is not None:
+        install_canvas_v2_routes(app, canvas_v2)
 
     if static_dir is not None:
         if not (static_dir / "index.html").is_file():

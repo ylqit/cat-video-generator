@@ -1,4 +1,6 @@
-.env
+/.env
+/.env.*
+!/.env.example
 .venv/
 .idea/
 __pycache__/
@@ -26,6 +28,7 @@ docs/LibTV
 !/docs/checklists/v5-nonblocking-media-workflow.md
 !/docs/checklists/v5-professional-visual-assets.md
 !/docs/checklists/v5-architecture-convergence.md
+!/docs/checklists/aigc-canvas-v2.md
 !/docs/workflows/
 /docs/workflows/*
 !/docs/workflows/tutorial-adaptation.md

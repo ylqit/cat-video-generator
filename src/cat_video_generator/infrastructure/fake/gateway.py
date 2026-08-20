@@ -67,7 +67,9 @@ class FakeArkGateway:
         if output_name != "ShotAssistAnalysis":
             raise ValueError(f"fake provider has no multimodal fixture for {output_name}")
         payload = {
-            "actionDensityAssessment": "当前动作链适合一个 10 至 12 秒片段，建议保留两个连续子镜头。",
+            "actionDensityAssessment": (
+                "当前动作链适合一个 10 至 12 秒片段，建议保留两个连续子镜头。"
+            ),
             "assetCompatibilityAssessment": (
                 "参考图适合锁定角色、画风和起始状态；已批准开场图应单独作为首帧输入。"
             ),
@@ -75,8 +77,16 @@ class FakeArkGateway:
                 "recommendedDurationSeconds": 10,
                 "rationale": "先建立人猫位置，再完整呈现一次互动并稳定收尾。",
                 "beats": [
-                    {"ordinal": 1, "description": "建立人物、猫咪和目标物的位置", "rhythm": "brief"},
-                    {"ordinal": 2, "description": "完成主要动作并停留在可见结果", "rhythm": "expanded"},
+                    {
+                        "ordinal": 1,
+                        "description": "建立人物、猫咪和目标物的位置",
+                        "rhythm": "brief",
+                    },
+                    {
+                        "ordinal": 2,
+                        "description": "完成主要动作并停留在可见结果",
+                        "rhythm": "expanded",
+                    },
                 ],
             },
             "recommendedSceneLookUsage": "appearance_only",
@@ -231,7 +241,9 @@ class FakeArkGateway:
             }
         if output_name == "StoryDiagnosisOutput":
             return {
-                "overallAssessment": "核心生活事件清楚，可以通过统一道具流向和动作起点提高可生成性。",
+                "overallAssessment": (
+                    "核心生活事件清楚，可以通过统一道具流向和动作起点提高可生成性。"
+                ),
                 "issues": [
                     {
                         "category": "generation_clarity",
@@ -291,7 +303,9 @@ class FakeArkGateway:
                         "purpose": "prop",
                         "targetScope": "project",
                         "rationale": "关键道具会在多个片段持续出现，需要保持结构和颜色。",
-                        "prompt": "生成结构完整、无遮挡的关键道具设计图，保持尺寸、颜色和图案清楚。",
+                        "prompt": (
+                            "生成结构完整、无遮挡的关键道具设计图，保持尺寸、颜色和图案清楚。"
+                        ),
                         "referenceAssetIds": [],
                     },
                 ],

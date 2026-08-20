@@ -7,11 +7,16 @@ from pathlib import Path
 
 from sqlalchemy import Engine, text
 
+from .application.aigc_canvas import AigcCanvasService
 from .application.canon import CanonRepairService
 from .application.sequence_service import SequenceService
 from .application.shot_queue import ProjectEditingService, ShotProductionService
+from .application.universal_media_worker import UniversalMediaWorker
+from .application.universal_video_edit import UniversalVideoEditExecutor
 from .config import DatabaseOperation, DatabaseSettings, RuntimeSettings, load_local_env
 from .infrastructure.ark.runtime import RuntimeArkGateway, RuntimeConfigurationManager
+from .infrastructure.db.aigc_canvas_repository import SqlAlchemyAigcCanvasRepository
+from .infrastructure.db.durable_queue import DurableWorkflowQueue
 from .infrastructure.db.repositories import SqlAlchemyWorkflowRepository
 from .infrastructure.db.session import (
     ALEMBIC_HEAD,
@@ -31,6 +36,9 @@ class RuntimeContainer:
     production: ShotProductionService
     sequences: SequenceService
     canon: CanonRepairService
+    canvas_v2: AigcCanvasService
+    workflow_queue: DurableWorkflowQueue
+    media_canvas_worker: UniversalMediaWorker
     runtime_settings: RuntimeSettings
     runtime_configuration: RuntimeConfigurationManager
     alembic_revision: str
@@ -61,8 +69,13 @@ def build_runtime_container() -> RuntimeContainer:
     database = DatabaseSettings.from_env()
     runtime = RuntimeSettings.from_env()
     engine = _ready_engine(database)
+    sessions = create_session_factory(engine)
     repository = SqlAlchemyWorkflowRepository(
-        create_session_factory(engine),
+        sessions,
+        asset_root=runtime.asset_root,
+    )
+    canvas_repository = SqlAlchemyAigcCanvasRepository(
+        sessions,
         asset_root=runtime.asset_root,
     )
     runtime_configuration = RuntimeConfigurationManager(
@@ -81,6 +94,7 @@ def build_runtime_container() -> RuntimeContainer:
         if runtime.ffmpeg_path is None
         else FfmpegFrameExtractor(ffmpeg_path=runtime.ffmpeg_path, work_root=runtime.work_root)
     )
+    workflow_queue = DurableWorkflowQueue(sessions)
     return RuntimeContainer(
         engine=engine,
         repository=repository,
@@ -110,6 +124,27 @@ def build_runtime_container() -> RuntimeContainer:
             runtime_preflight=runtime_configuration,
         ),
         canon=CanonRepairService(repository=repository, asset_store=store),
+        canvas_v2=AigcCanvasService(
+            repository=canvas_repository,
+            director=gateway,
+            provider_name=runtime_configuration.provider_profile,
+        ),
+        workflow_queue=workflow_queue,
+        media_canvas_worker=UniversalMediaWorker(
+            queue=workflow_queue,
+            repository=canvas_repository,
+            gateway=gateway,
+            asset_store=store,
+            worker_id="media-canvas-worker",
+            video_edit_executor=UniversalVideoEditExecutor(
+                repository=canvas_repository,
+                gateway=gateway,
+                asset_store=store,
+                media_probe=probe,
+                frame_extractor=extractor,
+                resolution=runtime_configuration.video_resolution,
+            ),
+        ),
         runtime_settings=runtime,
         runtime_configuration=runtime_configuration,
         alembic_revision=ALEMBIC_HEAD,

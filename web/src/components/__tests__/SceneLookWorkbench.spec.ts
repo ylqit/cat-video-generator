@@ -33,6 +33,20 @@ vi.mock("../../api/client", () => ({
   },
 }));
 
+vi.mock("../../runtimeStatus", () => ({
+  useRuntimeStatus: () => ({
+    settings: { value: { arkReady: true, current: { revision: 7 } } },
+  }),
+}));
+
+vi.mock("../../tasks/taskCenter", () => ({
+  registerTask: vi.fn(),
+  useTaskCenter: () => ({
+    items: { value: [] },
+    sceneSignals: { value: {} },
+  }),
+}));
+
 const asset: AssetDto = {
   id: "10000000-0000-0000-0000-000000000001",
   role: "canon_reference",
@@ -199,7 +213,13 @@ describe("SceneLookWorkbench", () => {
     generateButton!.click();
     await flushPromises();
 
-    expect(calls.generateSceneLook).toHaveBeenCalledWith(scene.id, envelope.revision, false, undefined);
+    expect(calls.generateSceneLook).toHaveBeenCalledWith(
+      scene.id,
+      envelope.revision,
+      false,
+      undefined,
+      7,
+    );
     expect(document.body.textContent).toContain("场景视觉基准工作台");
   });
 });

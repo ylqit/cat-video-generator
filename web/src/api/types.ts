@@ -6,6 +6,193 @@ export type ReferenceTarget = "anchor" | "video" | "both";
 export type StoryMode = "single" | "multi";
 export type StoryRewriteStrategy = "conservative" | "balanced" | "creative";
 export type EnvironmentStyle = "outdoor" | "indoor";
+
+export type CanvasNodeType =
+  | "BriefNode"
+  | "SubjectNode"
+  | "StoryPlannerNode"
+  | "StoryCandidateNode"
+  | "StoryCriticNode"
+  | "ApprovalGateNode"
+  | "StoryboardDirectorNode"
+  | "SceneNode"
+  | "ShotBeatNode"
+  | "ImageGenerationNode"
+  | "VideoGenerationNode"
+  | "ReviewNode"
+  | "TimelineNode"
+  | "ReferenceAssetNode"
+  | "GenerationBatchNode"
+  | "ImageAssetNode"
+  | "VideoAssetNode"
+  | "VideoEditNode"
+  | "VideoSegmentNode";
+
+export type CanvasPortType =
+  | "brief"
+  | "subject[]"
+  | "story_revision"
+  | "scene_plan"
+  | "shot_beat[]"
+  | "image_reference[]"
+  | "image_asset"
+  | "video_asset"
+  | "approved_asset"
+  | "media_reference[]"
+  | "product_subject"
+  | "image_asset[]"
+  | "edit_recipe";
+
+export interface CanvasNodeDto {
+  id: string;
+  type: CanvasNodeType;
+  objectType: string;
+  objectId: string | null;
+  revision?: number;
+  status?: string;
+  position: { x: number; y: number };
+  data: Record<string, any>;
+}
+
+export interface CanvasEdgeDto {
+  id?: string;
+  sourceNodeId: string;
+  sourceNodeType: CanvasNodeType;
+  sourcePort: CanvasPortType;
+  targetNodeId: string;
+  targetNodeType: CanvasNodeType;
+  targetPort: CanvasPortType;
+}
+
+export interface CanvasDto {
+  projectId: string;
+  canvasV2Enabled: boolean;
+  layoutVersion: number;
+  nodes: CanvasNodeDto[];
+  edges: CanvasEdgeDto[];
+  viewport: { x: number; y: number; zoom: number };
+  syncStatus: "local" | "syncing" | "saved" | "conflict" | "offline";
+  templateKey?: CanvasTemplateKey;
+  featureFlags?: {
+    UNIVERSAL_CANVAS: boolean;
+    PRODUCT_AD_TEMPLATE: boolean;
+    VIDEO_EDIT_V2: boolean;
+  };
+}
+
+export type CanvasTemplateKey = "short_drama" | "product_ad" | "blank";
+
+export interface CanvasTemplateDto {
+  key: CanvasTemplateKey;
+  title: string;
+  description: string;
+  defaultCandidateCount: number;
+  nodeTypes: CanvasNodeType[];
+}
+
+export interface StoryBriefInput {
+  theme: string;
+  audience: string;
+  genre: string;
+  tone: string;
+  aspectRatio: "9:16" | "16:9" | "1:1";
+  targetDurationSeconds: number;
+  constraints: string[];
+}
+
+export interface SubjectInput {
+  name: string;
+  kind: "person" | "animal" | "object" | "location" | "style" | "product";
+  role: "protagonist" | "co_protagonist" | "support" | "prop" | "environment" | "hero_product";
+  identityAnchors: string[];
+  immutableTraits: string[];
+  relationshipNotes?: string;
+  dramaticFunction?: string;
+  visualRisks?: string[];
+  references?: Array<{
+    assetId: string;
+    semanticRole: "front" | "side" | "back" | "turnaround" | "expression" | "full_body" | "outfit" | "packshot_front" | "label_detail" | "material" | "size_scale" | "usage_scene" | "other";
+    instruction: string;
+  }>;
+}
+
+export type VideoEditTool = "rectangle" | "brush" | "arrow" | "text" | "marker";
+
+export interface VideoEditAnnotationInput {
+  frameTimestampMs: number;
+  tool: VideoEditTool;
+  points: Array<{ x: number; y: number }>;
+  label: string;
+}
+
+export interface VideoEditRecipeDto {
+  id: string;
+  canvasNodeId: string;
+  projectId: string;
+  sourceAssetId: string;
+  parentRecipeId?: string | null;
+  revision: number;
+  startMs: number;
+  endMs: number;
+  instruction: string;
+  referenceAssetIds: string[];
+  annotations: VideoEditAnnotationInput[];
+  status: string;
+  compilation?: CapabilityCompilationPlan | null;
+  estimatedCostMicros?: number | null;
+  references?: Array<{
+    assetId: string;
+    semanticRole: string;
+    providerIncluded: boolean;
+  }>;
+}
+
+export interface CapabilityCompilationPlan {
+  recipeId: string;
+  mode: "direct" | "two_stage";
+  stages: Array<{ kind: "control_anchor" | "video_edit"; boundary?: "start" | "end" | null }>;
+  imageCallCount: number;
+  videoCallCount: 1;
+  estimatedCostMicros: number;
+  warnings: string[];
+  provider: string;
+  model: string;
+}
+
+export interface PromptRunDto {
+  id: string;
+  stepId: string;
+  purpose: string;
+  nodeId?: string | null;
+  businessObjectType?: string | null;
+  businessObjectId?: string | null;
+  parentRunId?: string | null;
+  templateName: string;
+  templateVersion: string;
+  systemPrompt?: string | null;
+  userPrompt?: string | null;
+  finalPrompt: string;
+  providerInternalTransform: "not_observable";
+  providerRequestSnapshot: Record<string, unknown>;
+  inputSnapshot: Record<string, unknown>;
+  provider?: string | null;
+  model: string;
+  parameters: Record<string, unknown>;
+  rawResponse?: unknown;
+  structuredResponse?: unknown;
+  acceptedResponse?: unknown;
+  responseDiff?: unknown;
+  tokenUsage?: Record<string, unknown>;
+  costMicros?: number | null;
+  durationMs?: number | null;
+  status: string;
+  error?: Record<string, unknown> | null;
+  inputHash?: string | null;
+  outputHash?: string | null;
+  retryChain: Array<Record<string, unknown>>;
+  createdAt?: string;
+  completedAt?: string | null;
+}
 export type LookReferencePurpose =
   | "person_identity"
   | "person_body"

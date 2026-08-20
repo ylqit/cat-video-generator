@@ -1,6 +1,12 @@
 import type {
   AssetDto,
   AcceptedVisualAssetPlan,
+  CanvasDto,
+  CanvasEdgeDto,
+  CanvasNodeType,
+  CanvasTemplateDto,
+  CanvasTemplateKey,
+  CapabilityCompilationPlan,
   CreativeStepRecord,
   CreativeWorkflowDto,
   HealthDto,
@@ -9,6 +15,7 @@ import type {
   TaskCenterDto,
   PreviousTailStatus,
   ProductionBoardDto,
+  PromptRunDto,
   ProjectGraph,
   ProjectSummary,
   ReferenceBinding,
@@ -35,15 +42,20 @@ import type {
   ShotSuggestion,
   ShotSuggestionOutput,
   StoryDiagnosisOutput,
+  StoryBriefInput,
   StoryExpansionOutput,
   StoryRewriteOutput,
   StoryRewriteStrategy,
+  SubjectInput,
+  VideoEditAnnotationInput,
+  VideoEditRecipeDto,
   VisualAssetPurpose,
   VisualProfileDraft,
   VisualProfileRevisionDto,
 } from "./types";
 
 const BASE = "/api/v1";
+const CANVAS_BASE = "/api/v2";
 
 export class ApiError extends Error {
   constructor(public status: number, public detail: unknown) {
@@ -51,8 +63,8 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${BASE}${path}`, init);
+async function request<T>(path: string, init?: RequestInit, base = BASE): Promise<T> {
+  const response = await fetch(`${base}${path}`, init);
   if (!response.ok) {
     let detail: unknown = response.statusText;
     try {
@@ -73,6 +85,14 @@ function json<T>(path: string, method: string, body?: unknown): Promise<T> {
     headers: { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
+}
+
+function canvasJson<T>(path: string, method: string, body?: unknown, headers?: HeadersInit) {
+  return request<T>(path, {
+    method,
+    headers: { "Content-Type": "application/json", ...headers },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  }, CANVAS_BASE);
 }
 
 function paidJson<T>(path: string, body: unknown, confirmedRevision?: number): Promise<T> {
@@ -394,6 +414,131 @@ export const api = {
   projectTasks: (projectId: string) =>
     request<PersistentTaskDto[]>(`/projects/${projectId}/tasks`),
   canon: () => request<AssetDto[]>("/canon"),
+};
+
+export const canvasApi = {
+  templates: () => request<CanvasTemplateDto[]>("/canvas-templates", undefined, CANVAS_BASE),
+  instantiateTemplate: (projectId: string, templateKey: CanvasTemplateKey) =>
+    canvasJson<Record<string, unknown>>(
+      `/projects/${projectId}/template-instances`,
+      "POST",
+      { templateKey },
+    ),
+  canvas: (projectId: string) =>
+    request<CanvasDto>(`/projects/${projectId}/canvas`, undefined, CANVAS_BASE),
+  createNode: (
+    projectId: string,
+    payload: {
+      nodeType: CanvasNodeType;
+      objectType: string;
+      objectId?: string | null;
+      data?: Record<string, unknown>;
+    },
+  ) => canvasJson<Record<string, unknown>>(
+    `/projects/${projectId}/canvas/nodes`, "POST", payload,
+  ),
+  createEdge: (projectId: string, edge: Omit<CanvasEdgeDto, "id">) =>
+    canvasJson<CanvasEdgeDto>(`/projects/${projectId}/canvas/edges`, "POST", edge),
+  deleteEdge: (edgeId: string) =>
+    canvasJson<Record<string, unknown>>(`/canvas/edges/${edgeId}`, "DELETE"),
+  saveBrief: (projectId: string, brief: StoryBriefInput) =>
+    canvasJson<Record<string, unknown>>(`/projects/${projectId}/brief`, "PUT", brief),
+  createSubject: (projectId: string, subject: SubjectInput) =>
+    canvasJson<Record<string, unknown>>(`/projects/${projectId}/subjects`, "POST", subject),
+  runStoryStrategies: (projectId: string, rewriteInstruction?: string) =>
+    canvasJson<{ id: string; status: string; candidates: Array<Record<string, unknown>> }>(
+      `/projects/${projectId}/story-strategy-runs`,
+      "POST",
+      {
+        idempotencyKey: crypto.randomUUID(),
+        rewriteInstruction: rewriteInstruction || undefined,
+      },
+    ),
+  approveStory: (revisionId: string) =>
+    canvasJson<Record<string, unknown>>(`/story-revisions/${revisionId}/approve`, "POST", {}),
+  createStoryboard: (projectId: string) =>
+    canvasJson<Record<string, unknown>>(`/projects/${projectId}/storyboard-runs`, "POST", {}),
+  updateBeat: (beatId: string, revision: number, patch: Record<string, unknown>) =>
+    canvasJson<Record<string, unknown>>(
+      `/shot-beats/${beatId}`,
+      "PATCH",
+      patch,
+      { "If-Match": String(revision) },
+    ),
+  createGenerationBatch: (payload: {
+    projectId: string;
+    canvasNodeId: string;
+    mediaKind: "image" | "video";
+    candidateCount: number;
+    provider?: string;
+    model?: string;
+    idempotencyKey: string;
+    input: Record<string, unknown>;
+  }) => canvasJson<Record<string, unknown>>("/generation-batches", "POST", payload),
+  createVideoEditRecipe: (payload: {
+    projectId: string;
+    sourceAssetId: string;
+    startMs: number;
+    endMs: number;
+    instruction: string;
+    referenceAssetIds: string[];
+    annotations: VideoEditAnnotationInput[];
+  }) => canvasJson<VideoEditRecipeDto>("/video-edit-recipes", "POST", payload),
+  updateVideoEditRecipe: (
+    recipeId: string,
+    revision: number,
+    payload: Partial<Pick<VideoEditRecipeDto,
+      "startMs" | "endMs" | "instruction" | "referenceAssetIds">>,
+  ) => canvasJson<VideoEditRecipeDto>(
+    `/video-edit-recipes/${recipeId}`,
+    "PATCH",
+    payload,
+    { "If-Match": String(revision) },
+  ),
+  replaceVideoEditAnnotations: (
+    recipeId: string,
+    revision: number,
+    annotations: VideoEditAnnotationInput[],
+  ) => canvasJson<VideoEditRecipeDto>(
+    `/video-edit-recipes/${recipeId}/annotations`,
+    "PUT",
+    { annotations },
+    { "If-Match": String(revision) },
+  ),
+  compileVideoEditRecipe: (recipeId: string) =>
+    canvasJson<CapabilityCompilationPlan>(
+      `/video-edit-recipes/${recipeId}/compile`, "POST", {},
+    ),
+  submitVideoEditRecipe: (
+    recipeId: string,
+    idempotencyKey: string,
+    acceptEstimatedCostMicros: number,
+  ) => canvasJson<Record<string, unknown>>(
+    `/video-edit-recipes/${recipeId}/submit`,
+    "POST",
+    { idempotencyKey, acceptEstimatedCostMicros },
+  ),
+  promptRun: (promptId: string) =>
+    request<PromptRunDto>(`/prompt-runs/${promptId}`, undefined, CANVAS_BASE),
+  saveLayout: (
+    projectId: string,
+    version: number,
+    payload: {
+      nodes: Array<{ nodeId: string; x: number; y: number }>;
+      edges: CanvasEdgeDto[];
+      viewport: { x: number; y: number; zoom: number };
+      operations: Array<Record<string, unknown>>;
+    },
+  ) => canvasJson<CanvasDto>(
+    `/projects/${projectId}/canvas/layout`,
+    "PATCH",
+    {
+      ...payload,
+      edges: payload.edges.map(({ id: _id, ...edge }) => edge),
+    },
+    { "If-Match": String(version) },
+  ),
+  eventsUrl: (projectId: string) => `${CANVAS_BASE}/projects/${projectId}/events`,
 };
 
 export type SuggestionJobResult = { stepId: string; output: ShotSuggestionOutput };

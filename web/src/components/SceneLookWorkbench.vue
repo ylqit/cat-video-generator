@@ -391,6 +391,7 @@ async function recordImageFailure(asset: AssetDto) {
 
       <header class="workbench-toolbar">
         <div>
+          <h2>场景视觉基准工作台</h2>
           <b>{{ selectedVersion ? `当前查看 V${selectedVersion.attempt ?? "?"}` : "尚无视觉基准版本" }}</b>
           <small>
             {{ selectedAsset ? `场景已选择 ${selectedAsset.displayName}` : "场景尚未选择批准版本" }}
@@ -399,14 +400,14 @@ async function recordImageFailure(asset: AssetDto) {
           <small v-if="preview">Prompt {{ preview.charCount }} 字 · {{ preview.referenceCount }} 张参考图</small>
         </div>
         <div class="toolbar-actions">
-          <el-button :disabled="!envelope" @click="previewPrompt">预览 Prompt</el-button>
+          <el-button :disabled="!envelope" @click="previewPrompt">编译预览</el-button>
           <el-button
             type="primary"
             :loading="Boolean(activeTask)"
             :disabled="!envelope || Boolean(activeTask) || !paidReady"
             @click="generate"
           >
-            {{ versions.length ? "生成新候选 / 重试" : "生成首个候选" }}
+            {{ versions.length ? "确认并生成新候选" : "确认并生成" }}
           </el-button>
         </div>
       </header>

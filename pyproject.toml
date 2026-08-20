@@ -41,6 +41,7 @@ pythonpath = ["src"]
 
 [project.scripts]
 cvg = "cat_video_generator.interfaces.cli:main"
+cvg-media-worker = "cat_video_generator.media_worker:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cat_video_generator"]

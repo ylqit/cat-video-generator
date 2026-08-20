@@ -118,7 +118,7 @@ watch(
       ?? creativeBodies.value[0]?.body
       ?? "";
     selectedAnchorBrief.value = record.value?.analysis?.anchorBrief ?? "";
-    selectedFields.value = [];
+    selectedFields.value = Object.keys(record.value?.analysis?.patch ?? {});
   },
   { immediate: true },
 );
@@ -249,7 +249,7 @@ function imageFailed(assetId: string) {
             type="primary"
             :disabled="record.stale || patchAlreadyAccepted || selectedFields.length === 0"
             @click="applySelectedFields"
-          >{{ patchAlreadyAccepted ? '字段修改已接受' : '接受所选字段修改' }}</el-button>
+          >{{ patchAlreadyAccepted ? '字段修改已接受' : '应用勾选字段' }}</el-button>
         </div>
       </template>
     </div>

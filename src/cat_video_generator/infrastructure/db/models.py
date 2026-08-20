@@ -7,6 +7,7 @@ from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     Date,
@@ -68,6 +69,27 @@ class ProductionRun(Base):
         server_default=text(str(CURRENT_CONTRACT_VERSION)),
     )
     status: Mapped[str] = mapped_column(String(32), nullable=False, default=RunStatus.ACTIVE.value)
+    canvas_v2_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("false"),
+    )
+    canvas_template_key: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="short_drama",
+        server_default="short_drama",
+    )
+    universal_canvas_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    product_ad_template_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    video_edit_v2_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     default_reference_bindings_json: Mapped[list[dict[str, Any]]] = mapped_column(
         JSONB,
         nullable=False,
@@ -311,6 +333,13 @@ class WorkflowStep(Base):
         ),
         Index("ix_workflow_steps_resume", "status", "kind", "created_at"),
         Index(
+            "ix_workflow_steps_claim",
+            "status",
+            "next_retry_at",
+            "lease_expires_at",
+            "created_at",
+        ),
+        Index(
             "uq_workflow_steps_shot_attempt",
             "shot_card_id",
             "operation_key",
@@ -354,6 +383,17 @@ class WorkflowStep(Base):
     input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     input_snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     error_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    lease_owner: Mapped[str | None] = mapped_column(String(160))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    request_hash: Mapped[str | None] = mapped_column(String(64))
+    retry_chain_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default="[]",
+    )
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -386,16 +426,627 @@ class PromptRecord(Base):
     model: Mapped[str] = mapped_column(String(200), nullable=False)
     prompt_text: Mapped[str] = mapped_column(Text, nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    call_purpose: Mapped[str | None] = mapped_column(String(120))
+    node_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    business_object_type: Mapped[str | None] = mapped_column(String(80))
+    business_object_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    parent_prompt_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.prompt_records.id", ondelete="SET NULL"),
+    )
+    template_name: Mapped[str | None] = mapped_column(String(160))
+    template_version: Mapped[str | None] = mapped_column(String(80))
+    system_prompt: Mapped[str | None] = mapped_column(Text)
+    user_prompt: Mapped[str | None] = mapped_column(Text)
+    final_prompt: Mapped[str | None] = mapped_column(Text)
+    provider_request_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    provider_internal_transform: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="not_observable",
+        server_default="not_observable",
+    )
+    input_snapshot_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    raw_response_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    structured_response_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    accepted_response_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    response_diff_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    parameters_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    token_usage_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    cost_micros: Mapped[int | None] = mapped_column(BigInteger)
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="succeeded", server_default="succeeded"
+    )
+    error_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    input_hash: Mapped[str | None] = mapped_column(String(64))
+    output_hash: Mapped[str | None] = mapped_column(String(64))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class StoryBriefRecord(Base):
+    __tablename__ = "story_briefs"
+    __table_args__ = (
+        UniqueConstraint("production_run_id", "revision", name="uq_story_briefs_run_revision"),
+        Index("ix_story_briefs_current", "production_run_id", "revision"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    theme: Mapped[str] = mapped_column(Text, nullable=False)
+    audience: Mapped[str] = mapped_column(String(300), nullable=False)
+    genre: Mapped[str] = mapped_column(String(200), nullable=False)
+    tone: Mapped[str] = mapped_column(String(300), nullable=False)
+    aspect_ratio: Mapped[str] = mapped_column(String(16), nullable=False)
+    target_duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    constraints_json: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class Subject(Base):
+    __tablename__ = "subjects"
+    __table_args__ = (
+        Index("ix_subjects_run_role", "production_run_id", "role", "created_at"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="draft", server_default="draft"
+    )
+    current_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            f"{SCHEMA_NAME}.subject_revisions.id",
+            name="fk_subjects_current_revision",
+            use_alter=True,
+            ondelete="SET NULL",
+        ),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class SubjectRevision(Base):
+    __tablename__ = "subject_revisions"
+    __table_args__ = (
+        UniqueConstraint("subject_id", "revision", name="uq_subject_revisions_subject_revision"),
+        UniqueConstraint("subject_id", "revision_hash", name="uq_subject_revisions_subject_hash"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    subject_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.subjects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    identity_anchors_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    immutable_traits_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    relationship_notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    dramatic_function: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    visual_risks_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    revision_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    approval_status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="draft", server_default="draft"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class SubjectReference(Base):
+    __tablename__ = "subject_references"
+    __table_args__ = (
+        UniqueConstraint(
+            "subject_revision_id",
+            "asset_id",
+            "semantic_role",
+            name="uq_subject_references_binding",
+        ),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    subject_revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.subject_revisions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    asset_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.assets.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    semantic_role: Mapped[str] = mapped_column(String(40), nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    instruction: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+
+class StoryRevisionRecord(Base):
+    __tablename__ = "story_revisions"
+    __table_args__ = (
+        UniqueConstraint("production_run_id", "revision", name="uq_story_revisions_run_revision"),
+        Index("ix_story_revisions_run_status", "production_run_id", "status", "revision"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    brief_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.story_briefs.id", ondelete="SET NULL")
+    )
+    parent_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.story_revisions.id", ondelete="SET NULL"),
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    strategy: Mapped[str] = mapped_column(String(40), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="candidate", server_default="candidate"
+    )
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    logline: Mapped[str] = mapped_column(Text, nullable=False)
+    synopsis: Mapped[str] = mapped_column(Text, nullable=False)
+    subject_ids_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    scene_plan_json: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    candidate_prompt_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.prompt_records.id", ondelete="SET NULL")
+    )
+    critic_prompt_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.prompt_records.id", ondelete="SET NULL")
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class StoryScore(Base):
+    __tablename__ = "story_scores"
+    __table_args__ = (
+        UniqueConstraint("story_revision_id", name="uq_story_scores_revision"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    story_revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.story_revisions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    opening_hook: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    causal_completeness: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    subject_necessity: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    emotional_arc: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    visualizability: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    duration_fit: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    continuity_risk: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    safety: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    rationale: Mapped[str] = mapped_column(Text, nullable=False)
+    warnings_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class SceneSubjectBinding(Base):
+    __tablename__ = "scene_subject_bindings"
+    __table_args__ = (
+        UniqueConstraint("scene_id", "subject_revision_id", name="uq_scene_subject_binding"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    scene_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.scenes.id", ondelete="CASCADE")
+    )
+    subject_revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.subject_revisions.id", ondelete="RESTRICT"),
+    )
+    state_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    action: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    relationship_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
+
+
+class ShotBeat(Base):
+    __tablename__ = "shot_beats"
+    __table_args__ = (
+        UniqueConstraint("scene_id", "sort_order", "revision", name="uq_shot_beats_order_revision"),
+        Index("ix_shot_beats_story", "story_revision_id", "scene_id", "sort_order"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    scene_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.scenes.id", ondelete="CASCADE")
+    )
+    shot_card_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.shot_cards.id", ondelete="SET NULL")
+    )
+    story_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.story_revisions.id", ondelete="SET NULL")
+    )
+    prompt_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.prompt_records.id", ondelete="SET NULL")
+    )
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    title: Mapped[str] = mapped_column(String(160), nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    camera: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    dialogue: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    duration_seconds: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="draft", server_default="draft"
+    )
+    stale_reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ShotSubjectState(Base):
+    __tablename__ = "shot_subject_states"
+    __table_args__ = (
+        UniqueConstraint("shot_beat_id", "subject_revision_id", name="uq_shot_subject_state"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    shot_beat_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.shot_beats.id", ondelete="CASCADE")
+    )
+    subject_revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.subject_revisions.id", ondelete="RESTRICT"),
+    )
+    start_state_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    end_state_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    interaction: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+
+class CanvasLayout(Base):
+    __tablename__ = "canvas_layouts"
+    __table_args__ = (
+        UniqueConstraint("production_run_id", name="uq_canvas_layouts_run"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    nodes_json: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    edges_json: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    viewport_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    operations_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    sync_status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="saved", server_default="saved"
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ProviderCapability(Base):
+    __tablename__ = "provider_capabilities"
+    __table_args__ = (
+        UniqueConstraint("provider", "model", name="uq_provider_capabilities_model"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    provider: Mapped[str] = mapped_column(String(80), nullable=False)
+    model: Mapped[str] = mapped_column(String(200), nullable=False)
+    media_kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    capabilities_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class GenerationAttempt(Base):
+    __tablename__ = "generation_attempts"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_generation_attempts_idempotency"),
+        Index("ix_generation_attempts_object", "business_object_type", "business_object_id"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    workflow_step_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.workflow_steps.id", ondelete="SET NULL")
+    )
+    retry_of_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.generation_attempts.id", ondelete="SET NULL"),
+    )
+    business_object_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    business_object_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(96), nullable=False)
+    provider: Mapped[str] = mapped_column(String(80), nullable=False)
+    model: Mapped[str] = mapped_column(String(200), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_task_id: Mapped[str | None] = mapped_column(String(200))
+    request_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    response_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    error_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    cost_micros: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class CanvasGraphNode(Base):
+    __tablename__ = "canvas_graph_nodes"
+    __table_args__ = (
+        Index("ix_canvas_graph_nodes_run_type", "production_run_id", "node_type"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    node_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    object_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    object_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ready")
+    data_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class CanvasGraphEdge(Base):
+    __tablename__ = "canvas_graph_edges"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_node_id",
+            "source_port",
+            "target_node_id",
+            "target_port",
+            name="uq_canvas_graph_edges_typed_connection",
+        ),
+        Index("ix_canvas_graph_edges_run", "production_run_id"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_node_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.canvas_graph_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_port: Mapped[str] = mapped_column(String(80), nullable=False)
+    target_node_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.canvas_graph_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    target_port: Mapped[str] = mapped_column(String(80), nullable=False)
+    relation_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class CanvasEvent(Base):
+    __tablename__ = "canvas_events"
+    __table_args__ = (
+        Index("ix_canvas_events_run_created", "production_run_id", "created_at"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    event_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    data_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class MediaGenerationBatch(Base):
+    __tablename__ = "media_generation_batches"
+    __table_args__ = (
+        CheckConstraint("candidate_count BETWEEN 1 AND 8", name="ck_media_batches_candidates"),
+        UniqueConstraint("idempotency_key", name="uq_media_batches_idempotency"),
+        Index("ix_media_batches_run_status", "production_run_id", "status"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    canvas_node_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.canvas_graph_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    workflow_step_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.workflow_steps.id", ondelete="SET NULL")
+    )
+    media_kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    candidate_count: Mapped[int] = mapped_column(Integer, nullable=False, default=4)
+    provider: Mapped[str] = mapped_column(String(80), nullable=False)
+    model: Mapped[str] = mapped_column(String(200), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    idempotency_key: Mapped[str] = mapped_column(String(96), nullable=False)
+    input_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    output_asset_ids_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class VideoEditRecipe(Base):
+    __tablename__ = "video_edit_recipes"
+    __table_args__ = (
+        CheckConstraint("end_ms - start_ms BETWEEN 500 AND 13000", name="ck_video_edit_interval"),
+        UniqueConstraint("canvas_node_id", "revision", name="uq_video_edit_node_revision"),
+        Index("ix_video_edit_recipes_run_status", "production_run_id", "status"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    canvas_node_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.canvas_graph_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_asset_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.assets.id"), nullable=False
+    )
+    parent_recipe_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.video_edit_recipes.id", ondelete="SET NULL")
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    start_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    instruction: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    compilation_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    estimated_cost_micros: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class VideoEditAnnotation(Base):
+    __tablename__ = "video_edit_annotations"
+    __table_args__ = (
+        UniqueConstraint("recipe_id", "ordinal", name="uq_video_edit_annotations_order"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    recipe_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.video_edit_recipes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    frame_timestamp_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    tool: Mapped[str] = mapped_column(String(24), nullable=False)
+    points_json: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    label: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+
+class VideoEditReference(Base):
+    __tablename__ = "video_edit_references"
+    __table_args__ = (
+        UniqueConstraint("recipe_id", "asset_id", name="uq_video_edit_reference_asset"),
+        UniqueConstraint("recipe_id", "ordinal", name="uq_video_edit_reference_order"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    recipe_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.video_edit_recipes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    asset_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.assets.id"), nullable=False
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    semantic_role: Mapped[str] = mapped_column(String(80), nullable=False, default="reference")
+    provider_included: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
 class Asset(Base):
     __tablename__ = "assets"
     __table_args__ = (
         CheckConstraint(
-            "scope IN ('canon', 'project', 'scene', 'shot')",
+            "scope IN ('canon', 'project', 'scene', 'shot', 'canvas_node')",
             name="ck_assets_scope",
         ),
         CheckConstraint(
@@ -420,6 +1071,10 @@ class Asset(Base):
     )
     producing_step_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.workflow_steps.id", ondelete="SET NULL")
+    )
+    canvas_node_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.canvas_graph_nodes.id", ondelete="SET NULL"),
     )
     role: Mapped[str] = mapped_column(String(64), nullable=False)
     semantic_key: Mapped[str | None] = mapped_column(String(160))

@@ -1803,8 +1803,9 @@ class ShotProductionService:
     ) -> dict[str, Any]:
         if target is ReferenceTarget.BOTH:
             raise ValueError("prompt preview target must be anchor or video")
-        read_model = self._repository.shot_generation_read_model(shot_id)
-        shot = read_model.shot
+        read_model_loader = getattr(self._repository, "shot_generation_read_model", None)
+        read_model = read_model_loader(shot_id) if callable(read_model_loader) else None
+        shot = read_model.shot if read_model is not None else self._repository.get_shot(shot_id)
         compilation = self._shot_compilation_context(
             shot,
             shot_read_model=read_model,
@@ -1822,6 +1823,8 @@ class ShotProductionService:
             spec=spec,
             previous_tail=_tail_state_json(
                 _previous_tail_state_from_shot_read_model(read_model)
+                if read_model is not None
+                else _previous_tail_state(self._repository, shot)
             ),
         )
 
@@ -3736,7 +3739,7 @@ class ShotProductionService:
             )
             if anchor_brief is None:
                 blockers.append(
-                    "请先填写并保存开场静态画面稿，或使用可选的 LLM 创作分析生成建议"
+                    "请先填写并接受开场静态画面稿，或使用可选的 LLM 创作分析生成建议"
                 )
                 anchor_brief = "尚未接受开场静态画面稿"
             prompt = compile_anchor_prompt(
@@ -3997,13 +4000,16 @@ class ShotProductionService:
                     raise ValueError("generated anchor must be approved and selected before video")
             else:
                 anchor = resolve(shot.selected_anchor_asset_id)
-        if anchor is not None and (
-            anchor.media_type != "image"
-            or anchor.status not in {"approved", "ready"}
-            or not anchor.content_ready
+        if (
+            strict
+            and anchor is not None
+            and (
+                anchor.media_type != "image"
+                or anchor.status not in {"approved", "ready"}
+                or not anchor.content_ready
+            )
         ):
-            if strict:
-                raise ValueError("the selected anchor is missing, damaged, or not approved")
+            raise ValueError("the selected anchor is missing, damaged, or not approved")
         # Seedance first-frame input and ordinary reference media are distinct,
         # mutually exclusive request modes.  The anchor was already generated
         # from the selected identity, style, scene and prop inputs, so sending
@@ -4064,15 +4070,14 @@ class ShotProductionService:
                 if compilation is not None
                 else self._repository.get_asset(binding.asset_id)
             )
-            if (
+            if strict and (
                 asset.media_type != "image"
                 or asset.status not in {"approved", "ready"}
                 or not asset.content_ready
             ):
-                if strict:
-                    raise ValueError(
-                        "a selected generation reference is unavailable or not an image"
-                    )
+                raise ValueError(
+                    "a selected generation reference is unavailable or not an image"
+                )
             if asset.id in seen_ids or asset.sha256 in seen_hashes:
                 continue
             seen_ids.add(asset.id)
@@ -4339,18 +4344,47 @@ class ShotProductionService:
                 shot_steps=shot_read_model.steps,
             )
         if read_model is None:
+            project = self._repository.get_project(shot.project_id)
+            scene = self._repository.get_scene(shot.scene_id)
+            visual_profile = self._repository.get_visual_profile(shot.project_id)
+            assets_by_id = {
+                item.id: item
+                for item in self._repository.list_assets(
+                    project_id=shot.project_id,
+                    include_canon=True,
+                )
+            }
+            referenced_asset_ids = {
+                *(binding.asset_id for binding in project.default_reference_bindings),
+                *(binding.asset_id for binding in visual_profile.draft.reference_bindings),
+                *(binding.asset_id for binding in shot.draft.reference_bindings),
+            }
+            if scene.look_draft is not None:
+                referenced_asset_ids.update(
+                    binding.asset_id for binding in scene.look_draft.reference_bindings
+                )
+            referenced_asset_ids.update(
+                asset_id
+                for asset_id in (
+                    scene.selected_look_asset_id,
+                    shot.selected_anchor_asset_id,
+                    shot.selected_video_asset_id,
+                )
+                if asset_id is not None
+            )
+            for asset_id in referenced_asset_ids - assets_by_id.keys():
+                try:
+                    assets_by_id[asset_id] = self._repository.get_asset(asset_id)
+                except LookupError:
+                    # Missing references remain visible as validation blockers in the
+                    # compiled generation specification.
+                    continue
             return ShotCompilationContext(
-                project=self._repository.get_project(shot.project_id),
-                scene=self._repository.get_scene(shot.scene_id),
+                project=project,
+                scene=scene,
                 shot=shot,
-                visual_profile=self._repository.get_visual_profile(shot.project_id),
-                assets_by_id={
-                    item.id: item
-                    for item in self._repository.list_assets(
-                        project_id=shot.project_id,
-                        include_canon=True,
-                    )
-                },
+                visual_profile=visual_profile,
+                assets_by_id=assets_by_id,
                 shot_steps=self._repository.list_steps(
                     project_id=shot.project_id,
                     shot_id=shot.id,
@@ -4519,9 +4553,9 @@ def _reference_image_input_description(
 def _merge_generation_references(
     *,
     custom: tuple[ReferenceBinding, ...],
-    scene_references: tuple[ReferenceBinding, ...],
+    scene_references: tuple[ReferenceBinding, ...] = (),
     scene_look_asset_id: uuid.UUID | None,
-    has_approved_anchor: bool,
+    has_approved_anchor: bool = False,
     project_defaults: tuple[ReferenceBinding, ...],
     inherit_project_references: bool,
     scene_look_usage: SceneLookUsage,

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ElMessage, ElMessageBox } from "element-plus";
 import { computed, reactive, ref, watch } from "vue";
+import type { DeepReadonly } from "vue";
 
 import { ApiError, api } from "../api/client";
 import type {
@@ -16,7 +17,7 @@ type EditableRuntimeConfig = Omit<
 >;
 
 const runtimeStatus = useRuntimeStatus();
-const document = ref<RuntimeSettingsDto | null>(runtimeStatus.settings.value);
+const document = ref<DeepReadonly<RuntimeSettingsDto> | null>(runtimeStatus.settings.value);
 const saving = ref(false);
 const form = reactive<EditableRuntimeConfig>({
   planningModel: "",
@@ -42,7 +43,7 @@ function catalog(role: RuntimeModelRole) {
   return document.value?.modelCatalog.filter((item) => item.role === role) ?? [];
 }
 
-function applyCurrent(source: RuntimeSettingsDto) {
+function applyCurrent(source: DeepReadonly<RuntimeSettingsDto>) {
   document.value = source;
   Object.assign(form, {
     planningModel: source.current.planningModel,

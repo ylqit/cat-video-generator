@@ -61,16 +61,22 @@ def compile_story_expansion_prompt(
     scene: SceneDraft,
     visual_profile: VisualProfileDraft,
 ) -> str:
-    return f"""你是治愈系生活短片的剧情编剧。把用户的一句话主题扩写为一份完整、连续、尚未拆分镜头的场景剧情。
-【项目】{project_title}
-【场景】{scene.title}
-【一句话主题】{scene.source_text}
-【补充口述】{scene.context_note or '无'}
-【目标视频片段数】{scene.target_shot_count}
-【长期人物】{visual_profile.person_identity}；{visual_profile.person_hair}；{visual_profile.person_body}
-【长期猫咪】{visual_profile.cat_identity}
-
-扩写必须围绕一个明确的生活目标，形成起因、连续行动、人猫互动、可见结果和温和收尾。猫咪是主要观察和行动对象，人物承担手部和工具操作；保持道具位置和状态连续，不增加与主题无关的第二个事件。这里只写剧情，不写机位、景别、精确秒点、Provider Prompt 或素材编号。输出完整剧情、创作摘要和仍需人工决定的问题。""".strip()
+    return (
+        "你是治愈系生活短片的剧情编剧。把用户的一句话主题扩写为一份完整、连续、"
+        "尚未拆分镜头的场景剧情。\n"
+        f"【项目】{project_title}\n"
+        f"【场景】{scene.title}\n"
+        f"【一句话主题】{scene.source_text}\n"
+        f"【补充口述】{scene.context_note or '无'}\n"
+        f"【目标视频片段数】{scene.target_shot_count}\n"
+        f"【长期人物】{visual_profile.person_identity}；{visual_profile.person_hair}；"
+        f"{visual_profile.person_body}\n"
+        f"【长期猫咪】{visual_profile.cat_identity}\n\n"
+        "扩写必须围绕一个明确的生活目标，形成起因、连续行动、人猫互动、可见结果和"
+        "温和收尾。猫咪是主要观察和行动对象，人物承担手部和工具操作；保持道具位置和"
+        "状态连续，不增加与主题无关的第二个事件。这里只写剧情，不写机位、景别、精确"
+        "秒点、Provider Prompt 或素材编号。输出完整剧情、创作摘要和仍需人工决定的问题。"
+    )
 
 
 def compile_story_diagnosis_prompt(

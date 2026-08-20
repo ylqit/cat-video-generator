@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from "vue-router";
 
 import CanonView from "./views/CanonView.vue";
+import AigcCanvasView from "./views/AigcCanvasView.vue";
 import ProjectListView from "./views/ProjectListView.vue";
 import RuntimeSettingsView from "./views/RuntimeSettingsView.vue";
 import StudioView from "./views/StudioView.vue";
@@ -8,7 +9,12 @@ import StudioView from "./views/StudioView.vue";
 export const router = createRouter({
   history: createWebHistory(),
   routes: [
-    { path: "/", redirect: "/studio" },
+    { path: "/", redirect: "/canvas" },
+    {
+      path: "/canvas/:projectId?",
+      component: AigcCanvasView,
+      name: "aigc-canvas",
+    },
     { path: "/studio", component: StudioView },
     {
       path: "/studio/projects/:projectId/shots/:shotId",
