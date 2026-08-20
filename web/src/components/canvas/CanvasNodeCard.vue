@@ -11,6 +11,8 @@ const emit = defineEmits<{
   "generate-batch": [node: CanvasNodeDto];
   "promote-candidate": [node: CanvasNodeDto, candidate: Record<string, unknown>];
   "edit-video": [node: CanvasNodeDto];
+  "assist-subject": [node: CanvasNodeDto];
+  "open-composer": [node: CanvasNodeDto];
 }>();
 
 const data = computed(() => props.node.data);
@@ -31,6 +33,10 @@ const title = computed(() => String(data.value.title ?? ({
   VideoSegmentNode: "替换片段",
   ReviewNode: "人工审核",
   TimelineNode: "时间线",
+  ImageGenerationNode: "图片生成",
+  VideoGenerationNode: "视频生成",
+  AudioGenerationNode: "音频生成",
+  PromptArtifactNode: "Prompt 产物",
 } as Record<string, string>)[props.node.type] ?? props.node.type));
 const nodeLabel = computed(() => ({
   BriefNode: "BRIEF",
@@ -49,6 +55,10 @@ const nodeLabel = computed(() => ({
   VideoSegmentNode: "SEGMENT",
   ReviewNode: "REVIEW",
   TimelineNode: "TIMELINE",
+  ImageGenerationNode: "IMAGE GEN",
+  VideoGenerationNode: "VIDEO GEN",
+  AudioGenerationNode: "AUDIO GEN",
+  PromptArtifactNode: "PROMPT",
 } as Record<string, string>)[props.node.type] ?? "NODE");
 </script>
 
@@ -79,6 +89,9 @@ const nodeLabel = computed(() => ({
         <span>Revision {{ data.revision }}</span>
       </div>
       <small v-if="data.references?.length">{{ data.references.length }} 张语义参考</small>
+      <div class="card-actions">
+        <button data-action="assist-subject" type="button" @click.stop="emit('assist-subject', node)">AI 分析并补全</button>
+      </div>
     </template>
 
     <template v-else-if="node.type === 'StoryCandidateNode'">
@@ -142,9 +155,28 @@ const nodeLabel = computed(() => ({
         ><img :src="candidate.thumbnailUrl" :alt="candidate.title || '图片候选'" /><small>提升到画布</small></button>
       </div>
       <div class="card-actions">
+        <button data-action="open-composer" type="button" @click.stop="emit('open-composer', node)">节点生成器</button>
         <button type="button" class="primary-action" @click.stop="emit('generate-batch', node)">生成图片候选</button>
         <button v-if="data.promptId" type="button" @click.stop="emit('inspect-prompt', data.promptId)">查看 Prompt</button>
       </div>
+    </template>
+
+    <template v-else-if="['ImageGenerationNode','VideoGenerationNode','AudioGenerationNode'].includes(node.type)">
+      <p>{{ data.prompt || '添加 Prompt、主体或参考素材后，由能力配置决定实际供应商输入。' }}</p>
+      <div class="fact-row">
+        <span>{{ data.generationConfig?.mode ?? '待配置' }}</span>
+        <span>{{ data.generationConfig?.resolution ?? '能力驱动' }}</span>
+        <span>{{ data.status ?? node.status }}</span>
+      </div>
+      <div class="card-actions">
+        <button data-action="open-composer" class="primary-action" type="button" @click.stop="emit('open-composer', node)">打开节点生成器</button>
+        <button v-if="data.promptId" type="button" @click.stop="emit('inspect-prompt', data.promptId)">查看调用详情</button>
+      </div>
+    </template>
+
+    <template v-else-if="node.type === 'PromptArtifactNode'">
+      <p>{{ data.prompt || data.text || '连接到生成节点，作为可版本化、可审计的 Prompt 输入。' }}</p>
+      <div v-if="data.promptId" class="card-actions"><button type="button" @click.stop="emit('inspect-prompt', data.promptId)">查看精确 Prompt</button></div>
     </template>
 
     <template v-else-if="['ReferenceAssetNode','ImageAssetNode'].includes(node.type)">

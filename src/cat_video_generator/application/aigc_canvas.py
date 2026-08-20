@@ -44,6 +44,35 @@ class CanvasRepository(Protocol):
         self, subject_id: uuid.UUID, payload: Any
     ) -> dict[str, Any]: ...
 
+    def create_subject_completion_run(
+        self,
+        project_id: uuid.UUID,
+        payload: Any,
+        *,
+        provider: str,
+        model: str,
+    ) -> dict[str, Any]: ...
+
+    def get_subject_completion_run(self, run_id: uuid.UUID) -> dict[str, Any]: ...
+
+    def apply_subject_completion(self, run_id: uuid.UUID, payload: Any) -> dict[str, Any]: ...
+
+    def list_project_assets(
+        self, project_id: uuid.UUID, *, media_kind: str | None = None
+    ) -> list[dict[str, Any]]: ...
+
+    def save_node_generation_config(
+        self,
+        node_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        payload: Any,
+    ) -> dict[str, Any]: ...
+
+    def list_provider_capabilities(
+        self, *, media_kind: str | None = None
+    ) -> list[dict[str, Any]]: ...
+
     def approve_story_revision(self, revision_id: uuid.UUID) -> dict[str, Any]: ...
 
     def get_storyboard_context(self, project_id: uuid.UUID) -> dict[str, Any]: ...
@@ -167,6 +196,45 @@ class AigcCanvasService:
         self, subject_id: uuid.UUID, payload: Any
     ) -> dict[str, Any]:
         return self._repository.create_subject_revision(subject_id, payload)
+
+    def create_subject_completion_run(
+        self, project_id: uuid.UUID, payload: Any
+    ) -> dict[str, Any]:
+        return self._repository.create_subject_completion_run(
+            project_id,
+            payload,
+            provider=self._provider_name,
+            model=self._director.model,
+        )
+
+    def get_subject_completion_run(self, run_id: uuid.UUID) -> dict[str, Any]:
+        return self._repository.get_subject_completion_run(run_id)
+
+    def apply_subject_completion(self, run_id: uuid.UUID, payload: Any) -> dict[str, Any]:
+        return self._repository.apply_subject_completion(run_id, payload)
+
+    def list_project_assets(
+        self, project_id: uuid.UUID, *, media_kind: str | None = None
+    ) -> list[dict[str, Any]]:
+        return self._repository.list_project_assets(project_id, media_kind=media_kind)
+
+    def save_node_generation_config(
+        self,
+        node_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        payload: Any,
+    ) -> dict[str, Any]:
+        return self._repository.save_node_generation_config(
+            node_id,
+            expected_revision=expected_revision,
+            payload=payload,
+        )
+
+    def list_provider_capabilities(
+        self, *, media_kind: str | None = None
+    ) -> list[dict[str, Any]]:
+        return self._repository.list_provider_capabilities(media_kind=media_kind)
 
     def run_story_strategies(
         self,

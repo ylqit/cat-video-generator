@@ -69,6 +69,8 @@ class CanvasNodeType(StrEnum):
     VIDEO_ASSET = "VideoAssetNode"
     VIDEO_EDIT = "VideoEditNode"
     VIDEO_SEGMENT = "VideoSegmentNode"
+    PROMPT_ARTIFACT = "PromptArtifactNode"
+    AUDIO_GENERATION = "AudioGenerationNode"
 
 
 class CanvasPortType(StrEnum):
@@ -85,6 +87,8 @@ class CanvasPortType(StrEnum):
     PRODUCT_SUBJECT = "product_subject"
     IMAGE_ASSETS = "image_asset[]"
     EDIT_RECIPE = "edit_recipe"
+    PROMPT = "prompt"
+    AUDIO_ASSET = "audio_asset"
 
 
 class StoryBrief(StrictModel):
@@ -139,6 +143,103 @@ class SubjectDraft(StrictModel):
     dramatic_function: str = Field(alias="dramaticFunction", default="", max_length=1_000)
     visual_risks: list[str] = Field(alias="visualRisks", default_factory=list, max_length=30)
     references: list[SubjectReferenceDraft] = Field(default_factory=list, max_length=30)
+
+
+SubjectCompletionField = Literal[
+    "identityAnchors",
+    "immutableTraits",
+    "relationshipNotes",
+    "dramaticFunction",
+    "visualRisks",
+]
+
+
+class SubjectCompletionProposal(StrictModel):
+    """A reviewable suggestion; it never becomes a subject revision by itself."""
+
+    identity_anchors: list[str] = Field(alias="identityAnchors", min_length=1, max_length=30)
+    immutable_traits: list[str] = Field(
+        alias="immutableTraits", default_factory=list, max_length=30
+    )
+    relationship_notes: str = Field(alias="relationshipNotes", default="", max_length=2_000)
+    dramatic_function: str = Field(alias="dramaticFunction", default="", max_length=1_000)
+    visual_risks: list[str] = Field(alias="visualRisks", default_factory=list, max_length=30)
+    rationale: dict[str, str] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list, max_length=30)
+
+
+class ActualReferenceBinding(StrictModel):
+    asset_id: uuid.UUID = Field(alias="assetId")
+    subject_revision_id: uuid.UUID | None = Field(alias="subjectRevisionId", default=None)
+    semantic_role: str = Field(alias="semanticRole", min_length=1, max_length=80)
+    provider_included: bool = Field(alias="providerIncluded")
+    omission_reason: str | None = Field(alias="omissionReason", default=None, max_length=1_000)
+
+    @model_validator(mode="after")
+    def require_omission_reason(self) -> ActualReferenceBinding:
+        if not self.provider_included and not (self.omission_reason or "").strip():
+            raise ValueError("omissionReason is required when a reference is omitted")
+        return self
+
+
+class NodeGenerationConfigDraft(StrictModel):
+    provider: str = Field(min_length=1, max_length=80)
+    model: str = Field(min_length=1, max_length=200)
+    mode: Literal[
+        "text_to_image",
+        "text_to_video",
+        "image_to_video",
+        "first_last_frame",
+        "all_reference",
+        "audio",
+    ]
+    aspect_ratio: Literal["auto", "16:9", "4:3", "1:1", "3:4", "9:16", "21:9"] = (
+        Field(alias="aspectRatio")
+    )
+    resolution: Literal["480p", "720p", "1080p", "4k"]
+    duration_seconds: int = Field(alias="durationSeconds", ge=1, le=300)
+    audio_enabled: bool = Field(alias="audioEnabled", default=False)
+    candidate_count: int = Field(alias="candidateCount", ge=1, le=8)
+    auto_validate: bool = Field(alias="autoValidate", default=True)
+    auto_link: bool = Field(alias="autoLink", default=True)
+    actual_references: list[ActualReferenceBinding] = Field(
+        alias="actualReferences", default_factory=list, max_length=30
+    )
+
+
+_COMPLETION_FIELD_ATTRIBUTES: dict[str, str] = {
+    "identityAnchors": "identity_anchors",
+    "immutableTraits": "immutable_traits",
+    "relationshipNotes": "relationship_notes",
+    "dramaticFunction": "dramatic_function",
+    "visualRisks": "visual_risks",
+}
+
+
+def subject_completion_missing_fields(subject: SubjectDraft) -> tuple[SubjectCompletionField, ...]:
+    missing: list[SubjectCompletionField] = []
+    for alias, attribute in _COMPLETION_FIELD_ATTRIBUTES.items():
+        value = getattr(subject, attribute)
+        if value == "" or value == []:
+            missing.append(alias)  # type: ignore[arg-type]
+    return tuple(missing)
+
+
+def merge_subject_completion(
+    source: SubjectDraft,
+    proposal: SubjectCompletionProposal,
+    *,
+    accepted_fields: tuple[str, ...],
+) -> SubjectDraft:
+    unknown = set(accepted_fields) - set(_COMPLETION_FIELD_ATTRIBUTES)
+    if unknown:
+        raise ValueError(f"不支持的主体补全字段：{', '.join(sorted(unknown))}")
+    updates = {
+        attribute: getattr(proposal, attribute)
+        for alias, attribute in _COMPLETION_FIELD_ATTRIBUTES.items()
+        if alias in accepted_fields
+    }
+    return source.model_copy(update=updates, deep=True)
 
 
 class StoryScorecard(StrictModel):
@@ -391,13 +492,14 @@ _NODE_INPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
         {CanvasPortType.SHOT_BEATS, CanvasPortType.SUBJECTS}
     ),
     CanvasNodeType.IMAGE_GENERATION: frozenset(
-        {CanvasPortType.SHOT_BEATS, CanvasPortType.IMAGE_REFERENCES}
+        {CanvasPortType.SHOT_BEATS, CanvasPortType.IMAGE_REFERENCES, CanvasPortType.PROMPT}
     ),
     CanvasNodeType.VIDEO_GENERATION: frozenset(
         {
             CanvasPortType.SHOT_BEATS,
             CanvasPortType.IMAGE_REFERENCES,
             CanvasPortType.IMAGE_ASSET,
+            CanvasPortType.PROMPT,
         }
     ),
     CanvasNodeType.REVIEW: frozenset(
@@ -414,6 +516,8 @@ _NODE_INPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
         {CanvasPortType.VIDEO_ASSET, CanvasPortType.MEDIA_REFERENCES}
     ),
     CanvasNodeType.VIDEO_SEGMENT: frozenset({CanvasPortType.EDIT_RECIPE}),
+    CanvasNodeType.PROMPT_ARTIFACT: frozenset(),
+    CanvasNodeType.AUDIO_GENERATION: frozenset({CanvasPortType.PROMPT}),
 }
 
 _NODE_OUTPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
@@ -440,6 +544,8 @@ _NODE_OUTPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
     CanvasNodeType.VIDEO_ASSET: frozenset({CanvasPortType.VIDEO_ASSET}),
     CanvasNodeType.VIDEO_EDIT: frozenset({CanvasPortType.EDIT_RECIPE}),
     CanvasNodeType.VIDEO_SEGMENT: frozenset({CanvasPortType.VIDEO_ASSET}),
+    CanvasNodeType.PROMPT_ARTIFACT: frozenset({CanvasPortType.PROMPT}),
+    CanvasNodeType.AUDIO_GENERATION: frozenset({CanvasPortType.AUDIO_ASSET}),
 }
 
 _PORT_COMPATIBILITY: dict[CanvasPortType, frozenset[CanvasPortType]] = {
@@ -458,4 +564,6 @@ _PORT_COMPATIBILITY: dict[CanvasPortType, frozenset[CanvasPortType]] = {
     CanvasPortType.PRODUCT_SUBJECT: frozenset({CanvasPortType.PRODUCT_SUBJECT}),
     CanvasPortType.IMAGE_ASSETS: frozenset({CanvasPortType.IMAGE_ASSETS}),
     CanvasPortType.EDIT_RECIPE: frozenset({CanvasPortType.EDIT_RECIPE}),
+    CanvasPortType.PROMPT: frozenset({CanvasPortType.PROMPT}),
+    CanvasPortType.AUDIO_ASSET: frozenset({CanvasPortType.AUDIO_ASSET}),
 }

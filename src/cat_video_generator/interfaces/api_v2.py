@@ -12,11 +12,18 @@ import uuid
 from collections.abc import Iterable
 from typing import Any, Protocol
 
-from fastapi import APIRouter, FastAPI, Header, Response, status
+from fastapi import APIRouter, FastAPI, Header, Query, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import Field
 
-from ..domain.aigc_canvas import CanvasConnection, CanvasNodeType, StoryBrief, SubjectDraft
+from ..domain.aigc_canvas import (
+    CanvasConnection,
+    CanvasNodeType,
+    NodeGenerationConfigDraft,
+    StoryBrief,
+    SubjectCompletionField,
+    SubjectDraft,
+)
 from ..domain.contract_base import StrictModel
 from ..domain.universal_canvas import (
     CanvasTemplateKey,
@@ -35,6 +42,32 @@ class CanvasV2Service(Protocol):
     def create_subject_revision(
         self, subject_id: uuid.UUID, payload: SubjectDraft
     ) -> dict[str, Any]: ...
+
+    def create_subject_completion_run(
+        self, project_id: uuid.UUID, payload: SubjectAssistantRunRequest
+    ) -> dict[str, Any]: ...
+
+    def get_subject_completion_run(self, run_id: uuid.UUID) -> dict[str, Any]: ...
+
+    def apply_subject_completion(
+        self, run_id: uuid.UUID, payload: SubjectAssistantApplyRequest
+    ) -> dict[str, Any]: ...
+
+    def list_project_assets(
+        self, project_id: uuid.UUID, *, media_kind: str | None = None
+    ) -> list[dict[str, Any]]: ...
+
+    def save_node_generation_config(
+        self,
+        node_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        payload: NodeGenerationConfigDraft,
+    ) -> dict[str, Any]: ...
+
+    def list_provider_capabilities(
+        self, *, media_kind: str | None = None
+    ) -> list[dict[str, Any]]: ...
 
     def run_story_strategies(
         self, project_id: uuid.UUID, payload: StoryStrategyRunRequest
@@ -132,6 +165,19 @@ class StoryStrategyRunRequest(StrictModel):
     )
 
 
+class SubjectAssistantRunRequest(StrictModel):
+    subject_id: uuid.UUID = Field(alias="subjectId")
+    idempotency_key: str = Field(alias="idempotencyKey", min_length=8, max_length=96)
+    instruction: str = Field(default="", max_length=4_000)
+
+
+class SubjectAssistantApplyRequest(StrictModel):
+    accepted_fields: list[SubjectCompletionField] = Field(
+        alias="acceptedFields", min_length=1, max_length=5
+    )
+    final_draft: SubjectDraft = Field(alias="finalDraft")
+
+
 class ShotBeatPatch(StrictModel):
     title: str | None = Field(default=None, min_length=1, max_length=160)
     action: str | None = Field(default=None, min_length=1, max_length=6_000)
@@ -219,6 +265,14 @@ def install_canvas_v2_routes(app: FastAPI, service: CanvasV2Service) -> None:
     def list_canvas_templates() -> list[dict[str, Any]]:
         return service.list_canvas_templates()
 
+    @router.get("/provider-capabilities")
+    def list_provider_capabilities(
+        media_kind: str | None = Query(
+            alias="mediaKind", default=None, pattern="^(image|video|audio|video_edit)$"
+        ),
+    ) -> list[dict[str, Any]]:
+        return service.list_provider_capabilities(media_kind=media_kind)
+
     @router.post(
         "/projects/{project_id}/template-instances",
         status_code=status.HTTP_201_CREATED,
@@ -248,6 +302,21 @@ def install_canvas_v2_routes(app: FastAPI, service: CanvasV2Service) -> None:
     def delete_canvas_edge(edge_id: uuid.UUID) -> dict[str, Any]:
         return service.delete_canvas_edge(edge_id)
 
+    @router.put(
+        "/canvas/nodes/{node_id}/generation-config",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def save_node_generation_config(
+        node_id: uuid.UUID,
+        payload: NodeGenerationConfigDraft,
+        if_match: str = Header(alias="If-Match"),
+    ) -> dict[str, Any]:
+        return service.save_node_generation_config(
+            node_id,
+            expected_revision=_version_header(if_match),
+            payload=payload,
+        )
+
     @router.put("/projects/{project_id}/brief")
     def save_brief(project_id: uuid.UUID, payload: StoryBrief) -> dict[str, Any]:
         return service.save_brief(project_id, payload)
@@ -262,6 +331,37 @@ def install_canvas_v2_routes(app: FastAPI, service: CanvasV2Service) -> None:
         payload: SubjectDraft,
     ) -> dict[str, Any]:
         return service.create_subject_revision(subject_id, payload)
+
+    @router.post(
+        "/projects/{project_id}/subject-assistant-runs",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def create_subject_completion_run(
+        project_id: uuid.UUID,
+        payload: SubjectAssistantRunRequest,
+    ) -> dict[str, Any]:
+        return service.create_subject_completion_run(project_id, payload)
+
+    @router.get("/subject-assistant-runs/{run_id}")
+    def get_subject_completion_run(run_id: uuid.UUID) -> dict[str, Any]:
+        return service.get_subject_completion_run(run_id)
+
+    @router.post(
+        "/subject-assistant-runs/{run_id}/apply",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def apply_subject_completion(
+        run_id: uuid.UUID,
+        payload: SubjectAssistantApplyRequest,
+    ) -> dict[str, Any]:
+        return service.apply_subject_completion(run_id, payload)
+
+    @router.get("/projects/{project_id}/assets")
+    def list_project_assets(
+        project_id: uuid.UUID,
+        kind: str | None = Query(default=None, pattern="^(image|video|audio)$"),
+    ) -> list[dict[str, Any]]:
+        return service.list_project_assets(project_id, media_kind=kind)
 
     @router.post(
         "/projects/{project_id}/story-strategy-runs",

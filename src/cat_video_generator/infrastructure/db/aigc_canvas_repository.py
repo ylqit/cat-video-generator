@@ -29,10 +29,13 @@ from ...domain.aigc_canvas import (
     StoryRevisionStatus,
     StoryScorecard,
     StoryStrategy,
+    SubjectCompletionProposal,
     SubjectDraft,
     SubjectRole,
     approve_story_revision,
+    subject_completion_missing_fields,
 )
+from ...domain.rendering import MediaSource, VideoInputPlan, build_shot_input_plan
 from ...domain.universal_canvas import (
     CanvasTemplateKey,
     ProviderEditCapability,
@@ -49,6 +52,7 @@ from .models import (
     CanvasLayout,
     GenerationAttempt,
     MediaGenerationBatch,
+    NodeGenerationConfig,
     ProductionRun,
     PromptRecord,
     ProviderCapability,
@@ -60,6 +64,7 @@ from .models import (
     StoryRevisionRecord,
     StoryScore,
     Subject,
+    SubjectCompletionRun,
     SubjectReference,
     SubjectRevision,
     VideoEditAnnotation,
@@ -269,6 +274,399 @@ class SqlAlchemyAigcCanvasRepository:
                 }
             self._mark_subject_downstream_stale(session, subject_id)
             return _subject_json(subject, revision, self._subject_references(session, revision.id))
+
+    def create_subject_completion_run(
+        self,
+        project_id: uuid.UUID,
+        payload: Any,
+        *,
+        provider: str,
+        model: str,
+    ) -> dict[str, Any]:
+        with self._sessions.begin() as session:
+            self._require_project(session, project_id)
+            existing = session.scalar(
+                select(SubjectCompletionRun).where(
+                    SubjectCompletionRun.idempotency_key == payload.idempotency_key
+                )
+            )
+            if existing is not None:
+                if existing.production_run_id != project_id:
+                    raise WorkflowConflictError("主体补全幂等键已被其他项目使用")
+                return _subject_completion_json(existing)
+            subject = self._required(session, Subject, payload.subject_id, lock=True)
+            if subject.production_run_id != project_id:
+                raise ValueError("主体不属于当前项目")
+            if subject.current_revision_id is None:
+                raise WorkflowConflictError("主体没有可分析的当前版本")
+            revision = self._required(session, SubjectRevision, subject.current_revision_id)
+            source = _subject_draft(
+                subject,
+                revision,
+                self._subject_references(session, revision.id),
+            )
+            missing_fields = list(subject_completion_missing_fields(source))
+            source_snapshot = source.model_dump(mode="json", by_alias=True)
+            input_snapshot = {
+                "projectId": str(project_id),
+                "subjectId": str(subject.id),
+                "sourceRevisionId": str(revision.id),
+                "subject": source_snapshot,
+                "missingFields": missing_fields,
+                "instruction": payload.instruction,
+            }
+            input_hash = _json_hash(input_snapshot)
+            step = WorkflowStep(
+                id=uuid.uuid4(),
+                production_run_id=project_id,
+                kind=StepKind.DIRECTOR.value,
+                status=StepStatus.PENDING.value,
+                attempt=1,
+                operation_key=f"subject:complete:{subject.id}:{revision.id}",
+                idempotency_key=hashlib.sha256(payload.idempotency_key.encode()).hexdigest(),
+                provider=provider,
+                model=model,
+                input_hash=input_hash,
+                request_hash=input_hash,
+                input_snapshot_json=input_snapshot,
+            )
+            session.add(step)
+            system_prompt = (
+                "你是AIGC媒体主体设定分析师。只补全有助于跨镜头一致性和戏剧功能的字段，"
+                "不得更换主体身份、类型、角色或凭空删除用户锚点。输出必须可由用户逐项审核。"
+            )
+            user_prompt = (
+                f"待补全字段：{json.dumps(missing_fields, ensure_ascii=False)}\n"
+                f"用户要求：{payload.instruction or '无额外要求'}\n"
+                f"主体快照：{json.dumps(source_snapshot, ensure_ascii=False, sort_keys=True)}"
+            )
+            final_prompt = f"{system_prompt}\n\n{user_prompt}"
+            prompt = PromptRecord(
+                id=uuid.uuid4(),
+                step_id=step.id,
+                purpose=PromptPurpose.DIRECTOR.value,
+                model=model,
+                prompt_text=final_prompt,
+                sha256=hashlib.sha256(final_prompt.encode()).hexdigest(),
+                call_purpose="subject_completion",
+                node_id=subject.id,
+                business_object_type="subject_completion_run",
+                business_object_id=subject.id,
+                template_name="subject.completion.v1",
+                template_version="1.0.0",
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                final_prompt=final_prompt,
+                provider_request_json={
+                    "outputName": "SubjectCompletionProposal",
+                    "input": input_snapshot,
+                },
+                input_snapshot_json=input_snapshot,
+                parameters_json={},
+                status="pending",
+                input_hash=input_hash,
+            )
+            session.add(prompt)
+            run = SubjectCompletionRun(
+                id=uuid.uuid4(),
+                production_run_id=project_id,
+                subject_id=subject.id,
+                source_revision_id=revision.id,
+                workflow_step_id=step.id,
+                prompt_id=prompt.id,
+                idempotency_key=payload.idempotency_key,
+                status="pending",
+                model=model,
+                missing_fields_json=missing_fields,
+            )
+            session.add(run)
+            graph_node = session.get(CanvasGraphNode, subject.id)
+            if graph_node is not None:
+                graph_node.data_json = {
+                    **graph_node.data_json,
+                    "subjectCompletionRunId": str(run.id),
+                    "completionStatus": "pending",
+                }
+            self._record_event(
+                session,
+                project_id,
+                "subject_completion_queued",
+                {"runId": str(run.id), "subjectId": str(subject.id), "stepId": str(step.id)},
+            )
+            return _subject_completion_json(run)
+
+    def subject_completion_work(self, step_id: uuid.UUID) -> dict[str, object]:
+        with self._sessions() as session:
+            step = self._required(session, WorkflowStep, step_id)
+            if not step.operation_key.startswith("subject:complete:"):
+                raise ValueError("workflow step is not a subject completion")
+            run = session.scalar(
+                select(SubjectCompletionRun).where(
+                    SubjectCompletionRun.workflow_step_id == step.id
+                )
+            )
+            prompt = session.scalar(select(PromptRecord).where(PromptRecord.step_id == step.id))
+            if run is None or prompt is None or prompt.status != "pending":
+                raise WorkflowConflictError("主体补全缺少待执行的精确 Prompt")
+            return {"runId": str(run.id), "prompt": prompt.final_prompt or prompt.prompt_text}
+
+    def complete_subject_completion(
+        self,
+        step_id: uuid.UUID,
+        *,
+        proposal: dict[str, object],
+        raw_response: dict[str, object],
+    ) -> str:
+        validated = SubjectCompletionProposal.model_validate(proposal)
+        proposal_json = validated.model_dump(mode="json", by_alias=True)
+        now = datetime.now(UTC)
+        with self._sessions.begin() as session:
+            step = self._required(session, WorkflowStep, step_id, lock=True)
+            run = session.scalar(
+                select(SubjectCompletionRun)
+                .where(SubjectCompletionRun.workflow_step_id == step.id)
+                .with_for_update()
+            )
+            prompt = session.scalar(
+                select(PromptRecord).where(PromptRecord.step_id == step.id).with_for_update()
+            )
+            if run is None or prompt is None:
+                raise RecordNotFoundError(f"subject completion for step {step_id} was not found")
+            if run.status == "awaiting_review":
+                return str(run.id)
+            if run.status != "pending":
+                raise WorkflowConflictError("主体补全运行已不再等待供应商结果")
+            run.status = "awaiting_review"
+            run.proposal_json = proposal_json
+            run.completed_at = now
+            prompt.status = "succeeded"
+            prompt.raw_response_json = raw_response
+            prompt.structured_response_json = proposal_json
+            prompt.output_hash = _json_hash(proposal_json)
+            prompt.completed_at = now
+            graph_node = session.get(CanvasGraphNode, run.subject_id)
+            if graph_node is not None:
+                graph_node.data_json = {
+                    **graph_node.data_json,
+                    "subjectCompletionRunId": str(run.id),
+                    "completionStatus": "awaiting_review",
+                    "completionMissingFields": run.missing_fields_json,
+                }
+            self._record_event(
+                session,
+                run.production_run_id,
+                "subject_completion_ready",
+                {"runId": str(run.id), "subjectId": str(run.subject_id)},
+            )
+            return str(run.id)
+
+    def get_subject_completion_run(self, run_id: uuid.UUID) -> dict[str, Any]:
+        with self._sessions() as session:
+            run = self._required(session, SubjectCompletionRun, run_id)
+            return _subject_completion_json(run)
+
+    def apply_subject_completion(self, run_id: uuid.UUID, payload: Any) -> dict[str, Any]:
+        with self._sessions.begin() as session:
+            run = self._required(session, SubjectCompletionRun, run_id, lock=True)
+            subject = self._required(session, Subject, run.subject_id, lock=True)
+            if run.status == "applied":
+                current = self._required(session, SubjectRevision, subject.current_revision_id)
+                return {
+                    "runId": str(run.id),
+                    "status": run.status,
+                    "acceptedFields": run.accepted_fields_json or [],
+                    **_subject_json(
+                        subject,
+                        current,
+                        self._subject_references(session, current.id),
+                    ),
+                }
+            if run.status != "awaiting_review" or run.proposal_json is None:
+                raise WorkflowConflictError("主体补全建议尚未就绪，不能应用")
+            if subject.current_revision_id != run.source_revision_id:
+                raise WorkflowConflictError("主体版本已变化，请基于新版本重新运行补全")
+            source_revision = self._required(session, SubjectRevision, run.source_revision_id)
+            source = _subject_draft(
+                subject,
+                source_revision,
+                self._subject_references(session, source_revision.id),
+            )
+            final_draft = payload.final_draft
+            accepted = set(payload.accepted_fields)
+            fixed_fields = ("name", "kind", "role", "references")
+            if any(getattr(final_draft, field) != getattr(source, field) for field in fixed_fields):
+                raise ValueError("主体补全不能修改名称、类型、角色或参考素材绑定")
+            aliases = {
+                "identityAnchors": "identity_anchors",
+                "immutableTraits": "immutable_traits",
+                "relationshipNotes": "relationship_notes",
+                "dramaticFunction": "dramatic_function",
+                "visualRisks": "visual_risks",
+            }
+            for alias, attribute in aliases.items():
+                unchanged = getattr(final_draft, attribute) == getattr(source, attribute)
+                if alias not in accepted and not unchanged:
+                    raise ValueError(f"字段 {alias} 未被接受，不能修改")
+            revision = self._add_subject_revision(session, subject, final_draft)
+            subject.current_revision_id = revision.id
+            run.status = "applied"
+            run.accepted_fields_json = list(payload.accepted_fields)
+            run.accepted_draft_json = final_draft.model_dump(mode="json", by_alias=True)
+            prompt = (
+                None
+                if run.prompt_id is None
+                else self._required(session, PromptRecord, run.prompt_id, lock=True)
+            )
+            if prompt is not None:
+                prompt.accepted_response_json = run.accepted_draft_json
+                prompt.response_diff_json = {
+                    "acceptedFields": run.accepted_fields_json,
+                    "sourceRevisionId": str(run.source_revision_id),
+                    "createdRevisionId": str(revision.id),
+                }
+            graph_node = session.get(CanvasGraphNode, subject.id)
+            if graph_node is not None:
+                graph_node.revision += 1
+                graph_node.status = "stale"
+                graph_node.data_json = {
+                    **graph_node.data_json,
+                    "title": final_draft.name,
+                    "completionStatus": "applied",
+                    "subjectRevisionId": str(revision.id),
+                }
+            self._mark_subject_downstream_stale(session, subject.id)
+            self._record_event(
+                session,
+                run.production_run_id,
+                "subject_completion_applied",
+                {
+                    "runId": str(run.id),
+                    "subjectId": str(subject.id),
+                    "revisionId": str(revision.id),
+                },
+            )
+            return {
+                "runId": str(run.id),
+                "status": run.status,
+                "acceptedFields": run.accepted_fields_json,
+                **_subject_json(
+                    subject,
+                    revision,
+                    self._subject_references(session, revision.id),
+                ),
+            }
+
+    def list_project_assets(
+        self, project_id: uuid.UUID, *, media_kind: str | None = None
+    ) -> list[dict[str, Any]]:
+        with self._sessions() as session:
+            self._require_project(session, project_id)
+            query = select(Asset).where(Asset.production_run_id == project_id)
+            if media_kind is not None:
+                query = query.where(Asset.media_type == media_kind)
+            rows = session.scalars(query.order_by(Asset.created_at.desc(), Asset.id).limit(200))
+            return [
+                {
+                    "id": str(row.id),
+                    "projectId": str(project_id),
+                    "canvasNodeId": None if row.canvas_node_id is None else str(row.canvas_node_id),
+                    "mediaType": row.media_type,
+                    "role": row.role,
+                    "status": row.status,
+                    "semanticKey": row.semantic_key,
+                    "sha256": row.sha256,
+                    "metadata": row.metadata_json,
+                    "contentUrl": f"/api/v1/assets/{row.id}/content",
+                    "createdAt": None if row.created_at is None else row.created_at.isoformat(),
+                }
+                for row in rows
+            ]
+
+    def save_node_generation_config(
+        self,
+        node_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        payload: Any,
+    ) -> dict[str, Any]:
+        document = payload.model_dump(mode="json", by_alias=True)
+        input_hash = _json_hash(document)
+        with self._sessions.begin() as session:
+            node = self._required(session, CanvasGraphNode, node_id, lock=True)
+            if node.revision != expected_revision:
+                raise WorkflowConflictError(
+                    f"生成节点版本冲突：当前 {node.revision}，提交 {expected_revision}"
+                )
+            revision = node.revision + 1
+            row = NodeGenerationConfig(
+                id=uuid.uuid4(),
+                canvas_node_id=node.id,
+                revision=revision,
+                provider=payload.provider,
+                model=payload.model,
+                mode=payload.mode,
+                config_json=document,
+                actual_reference_bindings_json=[
+                    item.model_dump(mode="json", by_alias=True)
+                    for item in payload.actual_references
+                ],
+                input_hash=input_hash,
+            )
+            session.add(row)
+            node.revision = revision
+            node.data_json = {
+                **node.data_json,
+                "generationConfigId": str(row.id),
+                "generationConfig": document,
+                "actualReferences": row.actual_reference_bindings_json,
+            }
+            event = self._record_event(
+                session,
+                node.production_run_id,
+                "node_generation_config_saved",
+                {
+                    "nodeId": str(node.id),
+                    "configId": str(row.id),
+                    "revision": revision,
+                    "inputHash": input_hash,
+                },
+            )
+            return {
+                "id": str(row.id),
+                "canvasNodeId": str(node.id),
+                "revision": revision,
+                "inputHash": input_hash,
+                "confirmedEventId": str(event.id),
+                **document,
+            }
+
+    def list_provider_capabilities(
+        self, *, media_kind: str | None = None
+    ) -> list[dict[str, Any]]:
+        with self._sessions() as session:
+            query = select(ProviderCapability).where(ProviderCapability.active.is_(True))
+            if media_kind is not None:
+                query = query.where(ProviderCapability.media_kind == media_kind)
+            rows = session.scalars(
+                query.order_by(
+                    ProviderCapability.provider,
+                    ProviderCapability.model,
+                )
+            )
+            return [
+                {
+                    "id": str(row.id),
+                    "provider": row.provider,
+                    "model": row.model,
+                    "mediaKind": row.media_kind,
+                    "capabilities": row.capabilities_json,
+                    "active": row.active,
+                    "updatedAt": (
+                        None if row.updated_at is None else row.updated_at.isoformat()
+                    ),
+                }
+                for row in rows
+            ]
 
     def list_subjects(self, project_id: uuid.UUID) -> tuple[StoredCanvasSubject, ...]:
         with self._sessions() as session:
@@ -1084,6 +1482,193 @@ class SqlAlchemyAigcCanvasRepository:
             )
             return str(asset.id)
 
+    def video_candidate_work(self, step_id: uuid.UUID) -> dict[str, object]:
+        with self._sessions() as session:
+            step = self._required(session, WorkflowStep, step_id)
+            if not step.operation_key.startswith("media:video:batch:"):
+                raise ValueError("workflow step is not a video batch candidate")
+            batch = self._required(
+                session,
+                MediaGenerationBatch,
+                uuid.UUID(str(step.input_snapshot_json["batchId"])),
+            )
+            if batch.media_kind != "video" or batch.production_run_id != step.production_run_id:
+                raise WorkflowConflictError("视频候选任务与生成批次项目不一致")
+            prompt = session.scalar(select(PromptRecord).where(PromptRecord.step_id == step.id))
+            if prompt is None or prompt.status != "pending":
+                raise WorkflowConflictError("视频候选缺少待执行的精确 Prompt")
+
+            input_document = batch.input_json
+            config = input_document.get("generationConfig", input_document)
+            if not isinstance(config, dict):
+                raise ValueError("视频生成配置必须是对象")
+            included_references = [
+                item
+                for item in config.get("actualReferences", [])
+                if isinstance(item, dict) and item.get("providerIncluded") is True
+            ]
+            assets: list[Asset] = []
+            for item in included_references:
+                asset = self._required(session, Asset, uuid.UUID(str(item["assetId"])))
+                if asset.production_run_id != batch.production_run_id:
+                    raise WorkflowConflictError("视频生成引用不属于当前项目")
+                if asset.media_type != "image":
+                    raise ValueError("首期视频生成只接受图片引用")
+                assets.append(asset)
+            sources = tuple(
+                MediaSource(
+                    asset_id=asset.id,
+                    semantic_key=asset.semantic_key or f"asset:{asset.id}",
+                    media_type=asset.media_type,
+                    sha256=asset.sha256,
+                    metadata=asset.metadata_json,
+                )
+                for asset in assets
+            )
+            mode = str(config.get("mode", "text_to_video"))
+            if mode in {"image_to_video", "first_last_frame"} and len(sources) != 1:
+                raise ValueError("当前 Ark 首帧视频模式必须且只能提交一张实际引用图")
+            resolution = str(config.get("resolution", "720p")).lower()
+            duration_seconds = int(config.get("durationSeconds", 8))
+            plan: VideoInputPlan = build_shot_input_plan(
+                resolution=resolution,
+                duration_seconds=duration_seconds,
+                anchor=sources[0] if mode in {"image_to_video", "first_last_frame"} else None,
+                references=(
+                    () if mode in {"image_to_video", "first_last_frame"} else sources
+                ),
+            )
+            return {
+                "batchId": str(batch.id),
+                "candidateIndex": int(step.input_snapshot_json["candidateIndex"]),
+                "prompt": prompt.final_prompt or prompt.prompt_text,
+                "inputPlan": plan,
+                "inputSources": tuple(
+                    _resolve_asset_path(asset.storage_key, self._asset_root)
+                    for asset in assets
+                ),
+                "providerTaskId": step.provider_task_id,
+            }
+
+    def record_video_candidate_submission(
+        self,
+        step_id: uuid.UUID,
+        *,
+        provider_task_id: str,
+        provider_status: str,
+    ) -> None:
+        with self._sessions.begin() as session:
+            step = self._required(session, WorkflowStep, step_id, lock=True)
+            if not step.operation_key.startswith("media:video:batch:"):
+                raise ValueError("workflow step is not a video batch candidate")
+            bound = session.scalar(
+                select(WorkflowStep.id).where(
+                    WorkflowStep.provider_task_id == provider_task_id,
+                    WorkflowStep.id != step.id,
+                )
+            )
+            if bound is not None:
+                raise WorkflowConflictError("供应商任务号已绑定其他付费意图")
+            step.provider_task_id = provider_task_id
+            step.status = (
+                StepStatus.RUNNING.value
+                if provider_status == "running"
+                else StepStatus.QUEUED.value
+            )
+            step.submitted_at = step.submitted_at or datetime.now(UTC)
+
+    def complete_video_candidate(
+        self,
+        step_id: uuid.UUID,
+        *,
+        landed: LandedAsset,
+        provider_url: str,
+        provider_model: str,
+    ) -> str:
+        with self._sessions.begin() as session:
+            step = self._required(session, WorkflowStep, step_id, lock=True)
+            existing = session.scalar(select(Asset).where(Asset.producing_step_id == step.id))
+            if existing is not None:
+                return str(existing.id)
+            batch = self._required(
+                session,
+                MediaGenerationBatch,
+                uuid.UUID(str(step.input_snapshot_json["batchId"])),
+                lock=True,
+            )
+            candidate_index = int(step.input_snapshot_json["candidateIndex"])
+            prompt = session.scalar(
+                select(PromptRecord).where(PromptRecord.step_id == step.id).with_for_update()
+            )
+            if prompt is None:
+                raise WorkflowConflictError("视频候选缺少 Prompt 审计记录")
+            asset = Asset(
+                id=uuid.uuid4(),
+                production_run_id=batch.production_run_id,
+                producing_step_id=step.id,
+                canvas_node_id=batch.canvas_node_id,
+                role="video_candidate",
+                semantic_key=f"batch:{batch.id}:candidate:{candidate_index}",
+                scope="canvas_node",
+                status="candidate",
+                media_type="video",
+                storage_key=_asset_storage_key(landed.path, self._asset_root),
+                sha256=landed.sha256,
+                byte_size=landed.byte_size,
+                metadata_json={
+                    "batchId": str(batch.id),
+                    "candidateIndex": candidate_index,
+                    "providerUrl": provider_url,
+                    "providerModel": provider_model,
+                    "providerTaskId": step.provider_task_id,
+                    "promptId": str(prompt.id),
+                },
+            )
+            session.add(asset)
+            session.flush()
+            output_ids = [*batch.output_asset_ids_json, str(asset.id)]
+            batch.output_asset_ids_json = output_ids
+            if len(output_ids) >= batch.candidate_count:
+                batch.status = "awaiting_review"
+            node = self._required(session, CanvasGraphNode, batch.canvas_node_id, lock=True)
+            node.status = batch.status
+            node.data_json = {
+                **node.data_json,
+                "status": batch.status,
+                "candidates": [
+                    *list(node.data_json.get("candidates", [])),
+                    {
+                        "id": str(asset.id),
+                        "assetId": str(asset.id),
+                        "title": f"候选 {candidate_index}",
+                        "contentUrl": f"/api/v1/assets/{asset.id}/content",
+                        "promptId": str(prompt.id),
+                        "status": "candidate",
+                    },
+                ],
+            }
+            prompt.status = "succeeded"
+            prompt.raw_response_json = {
+                "url": provider_url,
+                "model": provider_model,
+                "providerTaskId": step.provider_task_id,
+            }
+            prompt.structured_response_json = {"assetId": str(asset.id)}
+            prompt.output_hash = landed.sha256
+            prompt.completed_at = datetime.now(UTC)
+            self._record_event(
+                session,
+                batch.production_run_id,
+                "generation_candidate_ready",
+                {
+                    "batchId": str(batch.id),
+                    "assetId": str(asset.id),
+                    "candidateIndex": candidate_index,
+                    "mediaKind": "video",
+                },
+            )
+            return str(asset.id)
+
     def video_edit_anchor_work(self, step_id: uuid.UUID) -> dict[str, object]:
         with self._sessions() as session:
             step = self._required(session, WorkflowStep, step_id)
@@ -1887,11 +2472,18 @@ class SqlAlchemyAigcCanvasRepository:
             if project.canvas_template_key == CanvasTemplateKey.PRODUCT_AD.value:
                 project.product_ad_template_enabled = True
             node = self._required(session, CanvasGraphNode, payload.canvas_node_id, lock=True)
+            allowed_node_types = {
+                "image": {
+                    CanvasNodeType.GENERATION_BATCH.value,
+                    CanvasNodeType.IMAGE_GENERATION.value,
+                },
+                "video": {CanvasNodeType.VIDEO_GENERATION.value},
+            }
             if (
                 node.production_run_id != payload.project_id
-                or node.node_type != CanvasNodeType.GENERATION_BATCH.value
+                or node.node_type not in allowed_node_types[payload.media_kind]
             ):
-                raise ValueError("生成批次必须绑定当前项目的 GenerationBatchNode")
+                raise ValueError(f"{payload.media_kind}生成批次与画布节点类型不匹配")
             existing = session.scalar(
                 select(MediaGenerationBatch).where(
                     MediaGenerationBatch.idempotency_key == payload.idempotency_key
@@ -2102,6 +2694,7 @@ class SqlAlchemyAigcCanvasRepository:
                 select(ProviderCapability).where(
                     ProviderCapability.provider == capability.provider,
                     ProviderCapability.model == capability.model,
+                    ProviderCapability.media_kind == "video_edit",
                 )
             )
             if capability_row is None:
@@ -3135,6 +3728,28 @@ def _subject_json(
         "status": subject.status,
         "approvalStatus": revision.approval_status,
         **_subject_draft(subject, revision, references).model_dump(mode="json", by_alias=True),
+    }
+
+
+def _subject_completion_json(row: SubjectCompletionRun) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "projectId": str(row.production_run_id),
+        "subjectId": str(row.subject_id),
+        "sourceRevisionId": str(row.source_revision_id),
+        "workflowStepId": (
+            None if row.workflow_step_id is None else str(row.workflow_step_id)
+        ),
+        "promptId": None if row.prompt_id is None else str(row.prompt_id),
+        "status": row.status,
+        "model": row.model,
+        "missingFields": row.missing_fields_json,
+        "proposal": row.proposal_json,
+        "acceptedFields": row.accepted_fields_json,
+        "acceptedDraft": row.accepted_draft_json,
+        "error": row.error_json,
+        "createdAt": None if row.created_at is None else row.created_at.isoformat(),
+        "completedAt": None if row.completed_at is None else row.completed_at.isoformat(),
     }
 
 

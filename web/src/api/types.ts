@@ -26,7 +26,9 @@ export type CanvasNodeType =
   | "ImageAssetNode"
   | "VideoAssetNode"
   | "VideoEditNode"
-  | "VideoSegmentNode";
+  | "VideoSegmentNode"
+  | "PromptArtifactNode"
+  | "AudioGenerationNode";
 
 export type CanvasPortType =
   | "brief"
@@ -41,7 +43,9 @@ export type CanvasPortType =
   | "media_reference[]"
   | "product_subject"
   | "image_asset[]"
-  | "edit_recipe";
+  | "edit_recipe"
+  | "prompt"
+  | "audio_asset";
 
 export interface CanvasNodeDto {
   id: string;
@@ -71,7 +75,7 @@ export interface CanvasDto {
   nodes: CanvasNodeDto[];
   edges: CanvasEdgeDto[];
   viewport: { x: number; y: number; zoom: number };
-  syncStatus: "local" | "syncing" | "saved" | "conflict" | "offline";
+  syncStatus: "local" | "syncing" | "saved" | "conflict" | "offline" | "service_error";
   templateKey?: CanvasTemplateKey;
   featureFlags?: {
     UNIVERSAL_CANVAS: boolean;
@@ -114,6 +118,76 @@ export interface SubjectInput {
     semanticRole: "front" | "side" | "back" | "turnaround" | "expression" | "full_body" | "outfit" | "packshot_front" | "label_detail" | "material" | "size_scale" | "usage_scene" | "other";
     instruction: string;
   }>;
+}
+
+export type SubjectCompletionField =
+  | "identityAnchors"
+  | "immutableTraits"
+  | "relationshipNotes"
+  | "dramaticFunction"
+  | "visualRisks";
+
+export interface SubjectCompletionProposalDto {
+  identityAnchors: string[];
+  immutableTraits: string[];
+  relationshipNotes: string;
+  dramaticFunction: string;
+  visualRisks: string[];
+  rationale: Record<string, string>;
+  warnings: string[];
+}
+
+export interface SubjectCompletionRunDto {
+  id: string;
+  status: "pending" | "awaiting_review" | "applied" | "failed";
+  subjectId?: string;
+  sourceRevisionId?: string;
+  missingFields: SubjectCompletionField[];
+  proposal?: SubjectCompletionProposalDto | null;
+  promptId?: string | null;
+  error?: Record<string, unknown> | null;
+}
+
+export interface ActualReferenceBindingDto {
+  assetId: string;
+  subjectRevisionId?: string | null;
+  semanticRole: string;
+  providerIncluded: boolean;
+  omissionReason?: string | null;
+}
+
+export interface GenerationCapabilityDto {
+  provider: string;
+  model: string;
+  modes: string[];
+  aspectRatios: string[];
+  resolutions: string[];
+  durations: number[];
+  candidateCounts: number[];
+  audio: boolean;
+}
+
+export interface ProviderCapabilityDto {
+  id?: string;
+  provider: string;
+  model: string;
+  mediaKind: string;
+  capabilities: GenerationCapabilityDto | Record<string, unknown>;
+  active?: boolean;
+}
+
+export interface CanvasAssetHistoryDto {
+  id: string;
+  projectId: string;
+  canvasNodeId?: string | null;
+  mediaType: "image" | "video" | "audio";
+  role: string;
+  status: string;
+  semanticKey?: string | null;
+  sha256: string;
+  metadata: Record<string, unknown>;
+  contentUrl: string;
+  createdAt?: string | null;
 }
 
 export type VideoEditTool = "rectangle" | "brush" | "arrow" | "text" | "marker";

@@ -573,7 +573,12 @@ def _create_canvas_and_capability_tables(schema: str) -> None:
             nullable=False,
             server_default=sa.func.now(),
         ),
-        sa.UniqueConstraint("provider", "model", name="uq_provider_capabilities_model"),
+        sa.UniqueConstraint(
+            "provider",
+            "model",
+            "media_kind",
+            name="uq_provider_capabilities_model_kind",
+        ),
         schema=schema,
     )
     op.create_table(
@@ -638,7 +643,7 @@ def _migrate_legacy_projects(schema: str) -> None:
             INSERT INTO {schema}.story_briefs
                 (id, production_run_id, revision, theme, audience, genre, tone,
                  aspect_ratio, target_duration_seconds, constraints_json)
-            SELECT md5(p.id::text || ':legacy-brief')::uuid, p.id, 1,
+            SELECT md5(p.id::text || '-legacy-brief')::uuid, p.id, 1,
                    COALESCE((
                        SELECT string_agg(s.source_text, E'\n\n' ORDER BY s.sort_order)
                        FROM {schema}.scenes s WHERE s.production_run_id = p.id
@@ -663,8 +668,8 @@ def _migrate_legacy_projects(schema: str) -> None:
             SELECT md5(p.id::text || suffix)::uuid, p.id, kind, role, 'approved'
             FROM {schema}.production_runs p
             CROSS JOIN (VALUES
-                (':legacy-person', 'person', 'protagonist'),
-                (':legacy-cat', 'animal', 'co_protagonist')
+                ('-legacy-person', 'person', 'protagonist'),
+                ('-legacy-cat', 'animal', 'co_protagonist')
             ) AS legacy(suffix, kind, role)
             """
         )
@@ -687,8 +692,8 @@ def _migrate_legacy_projects(schema: str) -> None:
             JOIN {schema}.visual_profile_revisions vp
               ON vp.id = p.current_visual_profile_revision_id
             CROSS JOIN (VALUES
-                (':legacy-person', ':legacy-person-rev1', '旧人物主体'),
-                (':legacy-cat', ':legacy-cat-rev1', '旧动物主体')
+                ('-legacy-person', '-legacy-person-rev1', '旧人物主体'),
+                ('-legacy-cat', '-legacy-cat-rev1', '旧动物主体')
             ) AS legacy(subject_suffix, revision_suffix, name)
             """
         )
@@ -709,12 +714,12 @@ def _migrate_legacy_projects(schema: str) -> None:
             INSERT INTO {schema}.story_revisions
                 (id, production_run_id, brief_id, revision, strategy, status, title,
                  logline, synopsis, subject_ids_json, scene_plan_json, approved_at)
-            SELECT md5(p.id::text || ':legacy-story')::uuid, p.id,
-                   md5(p.id::text || ':legacy-brief')::uuid, 1, 'legacy_import',
+            SELECT md5(p.id::text || '-legacy-story')::uuid, p.id,
+                   md5(p.id::text || '-legacy-brief')::uuid, 1, 'legacy_import',
                    'approved', p.title, p.title, b.theme,
                    jsonb_build_array(
-                       md5(p.id::text || ':legacy-person')::text,
-                       md5(p.id::text || ':legacy-cat')::text
+                       md5(p.id::text || '-legacy-person')::text,
+                       md5(p.id::text || '-legacy-cat')::text
                    ),
                    COALESCE((
                        SELECT jsonb_agg(jsonb_build_object(
@@ -733,8 +738,8 @@ def _migrate_legacy_projects(schema: str) -> None:
             INSERT INTO {schema}.shot_beats
                 (id, scene_id, shot_card_id, story_revision_id, sort_order, revision,
                  title, action, camera, dialogue, duration_seconds, status)
-            SELECT md5(sc.id::text || ':legacy-beat')::uuid, sc.scene_id, sc.id,
-                   md5(s.production_run_id::text || ':legacy-story')::uuid,
+            SELECT md5(sc.id::text || '-legacy-beat')::uuid, sc.scene_id, sc.id,
+                   md5(s.production_run_id::text || '-legacy-story')::uuid,
                    sc.sort_order, 1, sc.title, sc.direction,
                    'legacy_unavailable', 'legacy_unavailable', sc.duration_seconds,
                    'legacy_import'

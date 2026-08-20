@@ -25,6 +25,9 @@ def test_canvas_v2_schema_contains_domain_truth_tables() -> None:
         "video_edit_recipes",
         "video_edit_annotations",
         "video_edit_references",
+        "subject_completion_runs",
+        "node_generation_configs",
+        "canvas_recovery_points",
     }
 
     assert expected <= {
@@ -92,7 +95,7 @@ def test_prompt_records_have_full_audit_columns() -> None:
 
 
 def test_canvas_v2_migration_is_current_head() -> None:
-    assert ALEMBIC_HEAD == "0020_universal_media_canvas"
+    assert ALEMBIC_HEAD == "0021_libtv_subject_assistant"
 
 
 def test_assets_can_belong_to_a_universal_canvas_node() -> None:

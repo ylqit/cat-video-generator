@@ -75,4 +75,38 @@ describe("CanvasNodeCard", () => {
     await promptButton!.trigger("click");
     expect(wrapper.emitted("inspect-prompt")?.[0]).toEqual(["prompt-storyboard"]);
   });
+
+  it("exposes explicit subject assistance and node-local generation without auto calls", async () => {
+    const subject = {
+      id: "subject-node",
+      type: "SubjectNode" as const,
+      objectType: "subject",
+      objectId: "subject-1",
+      position: { x: 0, y: 0 },
+      data: {
+        title: "包装罐",
+        name: "包装罐",
+        kind: "product",
+        role: "hero_product",
+        revision: 1,
+        identityAnchors: ["蓝色罐身"],
+      },
+    };
+    const subjectWrapper = mount(CanvasNodeCard, { props: { node: subject } });
+    await subjectWrapper.get('[data-action="assist-subject"]').trigger("click");
+    expect(subjectWrapper.emitted("assist-subject")?.[0]).toEqual([subject]);
+
+    const generation = {
+      ...subject,
+      id: "video-generation",
+      type: "VideoGenerationNode" as const,
+      objectType: "video_generation",
+      objectId: null,
+      data: { title: "视频生成", status: "draft" },
+    };
+    const generationWrapper = mount(CanvasNodeCard, { props: { node: generation } });
+    expect(generationWrapper.emitted("open-composer")).toBeUndefined();
+    await generationWrapper.get('[data-action="open-composer"]').trigger("click");
+    expect(generationWrapper.emitted("open-composer")?.[0]).toEqual([generation]);
+  });
 });

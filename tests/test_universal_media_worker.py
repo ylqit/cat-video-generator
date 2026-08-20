@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from cat_video_generator.application.ports import (
+    DirectorResult,
     ImageResult,
     LandedAsset,
     StoredAsset,
@@ -13,6 +14,7 @@ from cat_video_generator.application.ports import (
 )
 from cat_video_generator.application.universal_media_worker import UniversalMediaWorker
 from cat_video_generator.application.universal_video_edit import UniversalVideoEditExecutor
+from cat_video_generator.domain.rendering import RenderOperation, VideoInputPlan
 from cat_video_generator.domain.workflow import StepStatus
 
 
@@ -28,7 +30,9 @@ def test_worker_claims_only_media_canvas_jobs_and_lands_one_audited_candidate(
     class Queue:
         def claim_next(self, **values: object) -> object:
             assert values["operation_prefixes"] == (
+                "subject:complete:",
                 "media:image:batch:",
+                "media:video:batch:",
                 "video:edit-anchor:",
                 "video:edit-recipe:",
             )
@@ -79,6 +83,160 @@ def test_worker_claims_only_media_canvas_jobs_and_lands_one_audited_candidate(
         "provider_called",
         "downloaded",
         "candidate_persisted",
+        f"finished:{StepStatus.AWAITING_REVIEW}",
+    ]
+
+
+def test_worker_submits_and_lands_audited_video_batch_candidate(tmp_path: Path) -> None:
+    events: list[str] = []
+    lease = SimpleNamespace(
+        step_id=uuid.uuid4(),
+        operation_key=f"media:video:batch:{uuid.uuid4()}:candidate:1",
+    )
+    plan = VideoInputPlan(
+        operation=RenderOperation.SHOT,
+        resolution="720p",
+        duration_seconds=8,
+        bindings=[],
+    )
+
+    class Queue:
+        def claim_next(self, **values: object) -> object:
+            assert "media:video:batch:" in values["operation_prefixes"]  # type: ignore[operator]
+            return lease
+
+        def finish(self, _step_id: uuid.UUID, **values: object) -> None:
+            events.append(f"finished:{values['status']}")
+
+    class Repository:
+        def video_candidate_work(self, _step_id: uuid.UUID) -> dict[str, object]:
+            events.append("loaded_persisted_prompt")
+            return {
+                "prompt": "让已确认主体缓慢转身",
+                "inputPlan": plan,
+                "inputSources": (),
+                "providerTaskId": None,
+            }
+
+        def record_video_candidate_submission(
+            self, _step_id: uuid.UUID, **values: object
+        ) -> None:
+            assert values["provider_task_id"] == "video-task-1"
+            events.append("submission_persisted")
+
+        def complete_video_candidate(self, _step_id: uuid.UUID, **values: object) -> str:
+            assert values["provider_url"] == "https://provider.test/candidate.mp4"
+            events.append("candidate_persisted")
+            return "video-asset-1"
+
+    class Gateway:
+        def submit_video(self, **values: object) -> VideoTaskResult:
+            assert values["input_plan"] == plan
+            events.append("provider_called")
+            return VideoTaskResult(
+                task_id="video-task-1",
+                status="succeeded",
+                video_url="https://provider.test/candidate.mp4",
+                model="seedance",
+            )
+
+        def get_video_task(self, _task_id: str) -> VideoTaskResult:
+            raise AssertionError("new task must be submitted, not polled")
+
+    class Store:
+        def download(self, _url: str, *, suffix: str) -> LandedAsset:
+            assert suffix == ".mp4"
+            events.append("downloaded")
+            path = tmp_path / "candidate.mp4"
+            path.write_bytes(b"video")
+            return LandedAsset(path, "e" * 64, 5)
+
+    worker = UniversalMediaWorker(
+        queue=Queue(),  # type: ignore[arg-type]
+        repository=Repository(),  # type: ignore[arg-type]
+        gateway=Gateway(),  # type: ignore[arg-type]
+        asset_store=Store(),  # type: ignore[arg-type]
+        worker_id="video-batch-worker-test",
+    )
+
+    result = worker.run_once()
+
+    assert result == {"stepId": str(lease.step_id), "assetId": "video-asset-1"}
+    assert events == [
+        "loaded_persisted_prompt",
+        "provider_called",
+        "submission_persisted",
+        "downloaded",
+        "candidate_persisted",
+        f"finished:{StepStatus.AWAITING_REVIEW}",
+    ]
+
+
+def test_worker_executes_persisted_subject_completion_and_waits_for_human_review(
+    tmp_path: Path,
+) -> None:
+    del tmp_path
+    events: list[str] = []
+    lease = SimpleNamespace(
+        step_id=uuid.uuid4(),
+        operation_key=f"subject:complete:{uuid.uuid4()}",
+    )
+
+    class Queue:
+        def claim_next(self, **values: object) -> object:
+            assert "subject:complete:" in values["operation_prefixes"]
+            return lease
+
+        def finish(self, _step_id: uuid.UUID, **values: object) -> None:
+            events.append(f"finished:{values['status']}")
+
+    class Repository:
+        def subject_completion_work(self, _step_id: uuid.UUID) -> dict[str, object]:
+            events.append("loaded_persisted_prompt")
+            return {"prompt": "补齐主体但不要覆盖原版本"}
+
+        def complete_subject_completion(
+            self, _step_id: uuid.UUID, **values: object
+        ) -> str:
+            assert values["proposal"]["immutableTraits"] == ["额头 M 纹不变"]  # type: ignore[index]
+            events.append("proposal_persisted")
+            return "completion-run-1"
+
+    class Gateway:
+        def generate_structured(self, **values: object) -> DirectorResult:
+            assert values["prompt"] == "补齐主体但不要覆盖原版本"
+            assert values["output_name"] == "SubjectCompletionProposal"
+            events.append("provider_called")
+            return DirectorResult(
+                payload={
+                    "identityAnchors": ["灰白虎斑猫"],
+                    "immutableTraits": ["额头 M 纹不变"],
+                    "relationshipNotes": "提醒小满收画",
+                    "dramaticFunction": "触发并解决危机",
+                    "visualRisks": ["尾巴纹路容易漂移"],
+                    "rationale": {},
+                    "warnings": [],
+                },
+                response_id="response-1",
+                model="director-model",
+                request_hash="request-hash",
+            )
+
+    worker = UniversalMediaWorker(
+        queue=Queue(),  # type: ignore[arg-type]
+        repository=Repository(),  # type: ignore[arg-type]
+        gateway=Gateway(),  # type: ignore[arg-type]
+        asset_store=SimpleNamespace(),  # type: ignore[arg-type]
+        worker_id="subject-worker-test",
+    )
+
+    result = worker.run_once()
+
+    assert result == {"stepId": str(lease.step_id), "subjectCompletionRunId": "completion-run-1"}
+    assert events == [
+        "loaded_persisted_prompt",
+        "provider_called",
+        "proposal_persisted",
         f"finished:{StepStatus.AWAITING_REVIEW}",
     ]
 

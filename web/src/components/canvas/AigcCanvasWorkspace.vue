@@ -36,16 +36,25 @@ import { assetContentUrl, canvasApi } from "../../api/client";
 import type {
   CanvasDto,
   CanvasEdgeDto,
+  CanvasAssetHistoryDto,
   CanvasNodeDto,
   CanvasNodeType,
   CanvasPortType,
   PromptRunDto,
+  ActualReferenceBindingDto,
+  GenerationCapabilityDto,
+  ProviderCapabilityDto,
   StoryBriefInput,
+  SubjectCompletionRunDto,
   SubjectInput,
 } from "../../api/types";
+import CanvasNodeLibrary from "./CanvasNodeLibrary.vue";
 import CanvasNodeCard from "./CanvasNodeCard.vue";
+import NodeGenerationComposer from "./NodeGenerationComposer.vue";
 import PromptTraceDrawer from "./PromptTraceDrawer.vue";
+import SubjectAssistantPanel from "./SubjectAssistantPanel.vue";
 import VideoEditWorkspace from "./VideoEditWorkspace.vue";
+import { canvasSyncQueue } from "./canvasSync";
 
 const props = defineProps<{ projectId: string }>();
 const canvas = ref<CanvasDto | null>(null);
@@ -62,6 +71,20 @@ const subjectVisible = ref(false);
 const beatVisible = ref(false);
 const batchVisible = ref(false);
 const batchNode = ref<CanvasNodeDto | null>(null);
+const nodeLibraryVisible = ref(false);
+const assetHistoryVisible = ref(false);
+const assetHistoryKind = ref<"image" | "video" | "audio" | undefined>();
+const assetHistory = ref<CanvasAssetHistoryDto[]>([]);
+const assetHistoryLoading = ref(false);
+const assetHistoryError = ref("");
+const subjectAssistantVisible = ref(false);
+const subjectAssistantNode = ref<CanvasNodeDto | null>(null);
+const subjectAssistantRun = ref<SubjectCompletionRunDto | null>(null);
+const subjectAssistantLoading = ref(false);
+const generationComposerNode = ref<CanvasNodeDto | null>(null);
+const generationCapability = ref<GenerationCapabilityDto | null>(null);
+const generationReferences = ref<ActualReferenceBindingDto[]>([]);
+const generationLoading = ref(false);
 const videoEditorNode = ref<CanvasNodeDto | null>(null);
 const editingBeat = ref<CanvasNodeDto | null>(null);
 const eventSource = ref<EventSource | null>(null);
@@ -118,6 +141,7 @@ const syncLabel = computed(() => ({
   saved: "已保存",
   conflict: "保存冲突",
   offline: "离线",
+  service_error: "服务异常",
 })[syncStatus.value]);
 
 const inputPorts: Partial<Record<CanvasNodeType, CanvasPortType[]>> = {
@@ -128,8 +152,6 @@ const inputPorts: Partial<Record<CanvasNodeType, CanvasPortType[]>> = {
   StoryboardDirectorNode: ["story_revision", "subject[]"],
   SceneNode: ["scene_plan"],
   ShotBeatNode: ["shot_beat[]", "subject[]"],
-  ImageGenerationNode: ["shot_beat[]", "image_reference[]"],
-  VideoGenerationNode: ["shot_beat[]", "image_reference[]", "image_asset"],
   ReviewNode: ["image_asset", "video_asset"],
   TimelineNode: ["approved_asset"],
   GenerationBatchNode: ["product_subject", "media_reference[]"],
@@ -137,6 +159,9 @@ const inputPorts: Partial<Record<CanvasNodeType, CanvasPortType[]>> = {
   VideoAssetNode: ["video_asset"],
   VideoEditNode: ["video_asset", "media_reference[]"],
   VideoSegmentNode: ["edit_recipe"],
+  ImageGenerationNode: ["prompt", "shot_beat[]", "subject[]", "image_reference[]"],
+  VideoGenerationNode: ["prompt", "shot_beat[]", "subject[]", "image_reference[]", "image_asset"],
+  AudioGenerationNode: ["prompt"],
 };
 const outputPorts: Partial<Record<CanvasNodeType, CanvasPortType[]>> = {
   BriefNode: ["brief"],
@@ -157,6 +182,8 @@ const outputPorts: Partial<Record<CanvasNodeType, CanvasPortType[]>> = {
   VideoAssetNode: ["video_asset"],
   VideoEditNode: ["edit_recipe"],
   VideoSegmentNode: ["video_asset"],
+  PromptArtifactNode: ["prompt"],
+  AudioGenerationNode: ["audio_asset"],
 };
 
 function inputPortsFor(type: unknown): CanvasPortType[] {
@@ -179,6 +206,19 @@ async function loadCanvas(focus = false) {
       position: node.position,
       data: { node },
     }));
+    const pendingLayout = canvasSyncQueue.pending(props.projectId).at(-1);
+    if (pendingLayout && Array.isArray(pendingLayout.nodes)) {
+      const positions = new Map(
+        (pendingLayout.nodes as Array<{ nodeId: string; x: number; y: number }>).map(
+          (item) => [item.nodeId, { x: item.x, y: item.y }],
+        ),
+      );
+      flowNodes.value = flowNodes.value.map((node) => ({
+        ...node,
+        position: positions.get(node.id) ?? node.position,
+      }));
+      syncStatus.value = navigator.onLine ? "local" : "offline";
+    }
     flowEdges.value = loaded.edges.map((edge) => ({
       id: edge.id ?? `${edge.sourceNodeId}-${edge.targetNodeId}-${edge.sourcePort}`,
       source: edge.sourceNodeId,
@@ -191,7 +231,7 @@ async function loadCanvas(focus = false) {
     if (brief) Object.assign(briefForm, brief.data);
     if (focus) focusCanvas(true);
   } catch (error) {
-    syncStatus.value = navigator.onLine ? "conflict" : "offline";
+    syncStatus.value = navigator.onLine ? "service_error" : "offline";
     ElMessage.error(error instanceof Error ? error.message : String(error));
   } finally {
     loading.value = false;
@@ -407,6 +447,218 @@ const videoEditReferences = computed(() => (
     })) ?? []
 ));
 
+async function createCatalogNode(type: CanvasNodeType) {
+  if (type === "BriefNode") {
+    briefVisible.value = true;
+    nodeLibraryVisible.value = false;
+    return;
+  }
+  if (type === "SubjectNode") {
+    subjectVisible.value = true;
+    nodeLibraryVisible.value = false;
+    return;
+  }
+  const title = ({
+    StoryPlannerNode: "故事策划",
+    StoryCandidateNode: "故事候选",
+    StoryCriticNode: "故事评审",
+    ApprovalGateNode: "人工审批",
+    StoryboardDirectorNode: "分镜导演",
+    SceneNode: "场景",
+    ShotBeatNode: "镜头 Beat",
+    ReviewNode: "人工审核",
+    TimelineNode: "时间线",
+    GenerationBatchNode: "图片候选批次",
+    ImageGenerationNode: "图片生成",
+    ImageAssetNode: "图片资产",
+    VideoGenerationNode: "视频生成",
+    VideoAssetNode: "视频资产",
+    VideoEditNode: "视频重编",
+    AudioGenerationNode: "音频生成",
+    PromptArtifactNode: "Prompt 产物",
+    ReferenceAssetNode: "上传 / 引用素材",
+  } as Partial<Record<CanvasNodeType, string>>)[type] ?? type;
+  await canvasApi.createNode(props.projectId, {
+    nodeType: type,
+    objectType: type.replace(/Node$/, "").replace(/[A-Z]/g, (value) => `_${value.toLowerCase()}`).replace(/^_/, ""),
+    data: {
+      title,
+      status: "draft",
+      ...(type === "GenerationBatchNode" ? { candidateCount: 4, candidates: [] } : {}),
+    },
+  });
+  nodeLibraryVisible.value = false;
+  await loadCanvas(true);
+}
+
+async function openAssetHistory(kind?: "image" | "video" | "audio") {
+  assetHistoryVisible.value = true;
+  assetHistoryKind.value = kind;
+  assetHistoryLoading.value = true;
+  assetHistoryError.value = "";
+  try {
+    assetHistory.value = await canvasApi.assets(props.projectId, kind);
+  } catch (error) {
+    assetHistoryError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    assetHistoryLoading.value = false;
+  }
+}
+
+function subjectDraft(node: CanvasNodeDto): SubjectInput {
+  return {
+    name: String(node.data.name ?? node.data.title ?? "未命名主体"),
+    kind: (node.data.kind ?? "object") as SubjectInput["kind"],
+    role: (node.data.role ?? "support") as SubjectInput["role"],
+    identityAnchors: Array.isArray(node.data.identityAnchors) ? [...node.data.identityAnchors] as string[] : [],
+    immutableTraits: Array.isArray(node.data.immutableTraits) ? [...node.data.immutableTraits] as string[] : [],
+    relationshipNotes: String(node.data.relationshipNotes ?? ""),
+    dramaticFunction: String(node.data.dramaticFunction ?? ""),
+    visualRisks: Array.isArray(node.data.visualRisks) ? [...node.data.visualRisks] as string[] : [],
+    references: Array.isArray(node.data.references)
+      ? (node.data.references as NonNullable<SubjectInput["references"]>).map((item) => ({ ...item }))
+      : [],
+  };
+}
+
+function openSubjectAssistant(node: CanvasNodeDto) {
+  if (!node.objectId) {
+    ElMessage.error("主体节点尚未绑定可版本化的领域主体");
+    return;
+  }
+  subjectAssistantNode.value = node;
+  subjectAssistantRun.value = null;
+  subjectAssistantVisible.value = true;
+}
+
+async function runSubjectAssistant(instruction: string) {
+  const node = subjectAssistantNode.value;
+  if (!node?.objectId) return;
+  subjectAssistantLoading.value = true;
+  try {
+    subjectAssistantRun.value = await canvasApi.createSubjectCompletionRun(
+      props.projectId,
+      node.objectId,
+      instruction,
+    );
+    ElMessage.success("主体分析已进入持久任务队列，建议不会自动覆盖当前版本");
+  } finally {
+    subjectAssistantLoading.value = false;
+  }
+}
+
+async function refreshSubjectAssistantRun() {
+  if (!subjectAssistantRun.value) return;
+  subjectAssistantRun.value = await canvasApi.subjectCompletionRun(subjectAssistantRun.value.id);
+}
+
+async function applySubjectAssistant(payload: { acceptedFields: string[]; finalDraft: SubjectInput }) {
+  if (!subjectAssistantRun.value) return;
+  subjectAssistantLoading.value = true;
+  try {
+    await canvasApi.applySubjectCompletion(
+      subjectAssistantRun.value.id,
+      payload.acceptedFields,
+      payload.finalDraft,
+    );
+    subjectAssistantVisible.value = false;
+    await loadCanvas();
+    ElMessage.success("已按人工选择创建新的不可变 SubjectRevision");
+  } finally {
+    subjectAssistantLoading.value = false;
+  }
+}
+
+async function openGenerationComposer(node: CanvasNodeDto) {
+  generationComposerNode.value = node;
+  generationCapability.value = null;
+  generationReferences.value = [];
+  const mediaKind = node.type === "VideoGenerationNode" ? "video"
+    : node.type === "AudioGenerationNode" ? "audio" : "image";
+  generationLoading.value = true;
+  try {
+    const rows = await canvasApi.providerCapabilities(mediaKind);
+    const row = rows[0];
+    if (!row) {
+      ElMessage.error(`没有启用的 ${mediaKind} ProviderCapability`);
+      return;
+    }
+    const raw = row.capabilities as Partial<GenerationCapabilityDto> & { maxReferenceImages?: number };
+    generationCapability.value = {
+      provider: row.provider,
+      model: row.model,
+      modes: raw.modes?.length ? raw.modes : [mediaKind === "video" ? "text_to_video" : mediaKind === "audio" ? "audio" : "text_to_image"],
+      aspectRatios: raw.aspectRatios?.length ? raw.aspectRatios : ["9:16", "16:9"],
+      resolutions: raw.resolutions?.length ? raw.resolutions : ["720p"],
+      durations: raw.durations?.length ? raw.durations : [mediaKind === "video" ? 8 : 1],
+      candidateCounts: raw.candidateCounts?.length ? raw.candidateCounts : [1],
+      audio: Boolean(raw.audio),
+    };
+    const incomingIds = new Set(
+      canvas.value?.edges.filter((edge) => edge.targetNodeId === node.id).map((edge) => edge.sourceNodeId),
+    );
+    const sources = canvas.value?.nodes.filter((item) => incomingIds.has(item.id)) ?? [];
+    const candidates: Array<{ assetId: string; subjectRevisionId?: string; semanticRole: string }> = [];
+    for (const source of sources) {
+      if (["ReferenceAssetNode", "ImageAssetNode"].includes(source.type)) {
+        const assetId = String(source.data.assetId ?? source.objectId ?? "");
+        if (assetId) candidates.push({ assetId, semanticRole: String(source.data.semanticRole ?? "reference") });
+      }
+      if (source.type === "SubjectNode" && Array.isArray(source.data.references)) {
+        for (const reference of source.data.references as Array<Record<string, unknown>>) {
+          if (reference.assetId) candidates.push({
+            assetId: String(reference.assetId),
+            subjectRevisionId: String(source.data.revisionId ?? source.objectId ?? "") || undefined,
+            semanticRole: String(reference.semanticRole ?? source.data.kind ?? "subject"),
+          });
+        }
+      }
+    }
+    const maxReferences = Math.max(0, Number(raw.maxReferenceImages ?? 9));
+    generationReferences.value = candidates.map((item, index) => ({
+      ...item,
+      providerIncluded: index < maxReferences,
+      omissionReason: index < maxReferences ? null : `当前 ${row.model} 最多接受 ${maxReferences} 张参考图`,
+    }));
+  } finally {
+    generationLoading.value = false;
+  }
+}
+
+async function submitNodeGeneration(payload: Record<string, unknown>) {
+  const node = generationComposerNode.value;
+  const config = payload.config as Record<string, unknown>;
+  if (!node || !config) return;
+  if (node.type === "AudioGenerationNode") {
+    ElMessage.error("首期 Ark 尚未启用音频生成能力，配置可见但不会静默提交");
+    return;
+  }
+  await ElMessageBox.confirm(
+    "将先保存精确 Prompt、实际引用、参数和幂等键，再由 PostgreSQL Worker 提交供应商。",
+    "确认节点生成",
+  );
+  generationLoading.value = true;
+  try {
+    await canvasApi.saveNodeGenerationConfig(node.id, node.revision ?? 1, config);
+    const mediaKind = node.type === "VideoGenerationNode" ? "video" : "image";
+    await canvasApi.createGenerationBatch({
+      projectId: props.projectId,
+      canvasNodeId: node.id,
+      mediaKind,
+      candidateCount: Number(config.candidateCount ?? 1),
+      provider: String(config.provider),
+      model: String(config.model),
+      idempotencyKey: crypto.randomUUID(),
+      input: { prompt: String(payload.prompt), generationConfig: config },
+    });
+    generationComposerNode.value = null;
+    await loadCanvas();
+    ElMessage.success(`${mediaKind === "video" ? "视频" : "图片"}生成已进入持久任务队列`);
+  } finally {
+    generationLoading.value = false;
+  }
+}
+
 function autoLayout() {
   const columns: Partial<Record<CanvasNodeType, number>> = {
     BriefNode: 0,
@@ -482,6 +734,21 @@ function portsCompatible(source: CanvasPortType, target: CanvasPortType): boolea
 
 async function persistLayout(operationType: string) {
   if (!canvas.value) return;
+  const operation = {
+    operationId: crypto.randomUUID(),
+    type: operationType,
+    createdAt: new Date().toISOString(),
+    nodes: flowNodes.value.map((node) => ({
+      nodeId: node.id,
+      x: node.position.x,
+      y: node.position.y,
+    })),
+  };
+  canvasSyncQueue.enqueue(props.projectId, operation);
+  if (!navigator.onLine) {
+    syncStatus.value = "offline";
+    return;
+  }
   syncStatus.value = "syncing";
   try {
     const viewport = { x: 0, y: 0, zoom: 1 };
@@ -496,19 +763,27 @@ async function persistLayout(operationType: string) {
         })),
         edges: canvas.value.edges,
         viewport,
-        operations: [{
-          operationId: crypto.randomUUID(),
-          type: operationType,
-          createdAt: new Date().toISOString(),
-        }],
+        operations: canvasSyncQueue.pending(props.projectId),
       },
     );
     canvas.value.layoutVersion = saved.layoutVersion;
+    canvasSyncQueue.confirm(
+      props.projectId,
+      canvasSyncQueue.pending(props.projectId).map((item) => item.operationId),
+    );
     syncStatus.value = "saved";
   } catch (error) {
     syncStatus.value = navigator.onLine ? "conflict" : "offline";
     ElMessage.error(error instanceof Error ? error.message : String(error));
   }
+}
+
+async function replayPendingLayout() {
+  if (!canvasSyncQueue.pending(props.projectId).length) {
+    await loadCanvas();
+    return;
+  }
+  await persistLayout("replay_offline_operations");
 }
 
 function nodeDragStop() {
@@ -531,8 +806,13 @@ function connectEvents() {
     "video_edit_recipe_revised",
     "video_edit_recipe_compiled",
     "video_edit_recipe_queued",
+    "subject_completion_ready",
+    "subject_completion_applied",
+    "node_generation_config_saved",
+    "generation_candidate_ready",
   ]) source.addEventListener(eventName, () => void loadCanvas());
-  source.onerror = () => { syncStatus.value = navigator.onLine ? "conflict" : "offline"; };
+  source.addEventListener("subject_completion_ready", () => void refreshSubjectAssistantRun());
+  source.onerror = () => { syncStatus.value = navigator.onLine ? "service_error" : "offline"; };
   eventSource.value = source;
 }
 
@@ -543,8 +823,12 @@ watch(() => props.projectId, async () => {
 onMounted(async () => {
   await loadCanvas(true);
   connectEvents();
+  window.addEventListener("online", replayPendingLayout);
 });
-onBeforeUnmount(() => eventSource.value?.close());
+onBeforeUnmount(() => {
+  eventSource.value?.close();
+  window.removeEventListener("online", replayPendingLayout);
+});
 </script>
 
 <template>
@@ -589,7 +873,21 @@ onBeforeUnmount(() => eventSource.value?.close());
             @generate-batch="openGenerationBatch"
             @promote-candidate="promoteCandidate"
             @edit-video="openVideoEditor"
+            @assist-subject="openSubjectAssistant"
+            @open-composer="openGenerationComposer"
           />
+          <div
+            v-if="generationComposerNode?.id === data.node.id && generationCapability"
+            class="node-composer-anchor"
+          >
+            <NodeGenerationComposer
+              :node-revision="data.node.revision ?? 1"
+              :capabilities="generationCapability"
+              :actual-references="generationReferences"
+              @save-config="() => undefined"
+              @generate="submitNodeGeneration"
+            />
+          </div>
           <Handle
             v-for="(port, index) in outputPortsFor(data.node.type)"
             :id="port"
@@ -608,12 +906,20 @@ onBeforeUnmount(() => eventSource.value?.close());
       </aside>
 
       <nav class="canvas-toolbar" aria-label="画布工具">
+        <button type="button" title="添加节点" @click="nodeLibraryVisible = !nodeLibraryVisible"><Plus /></button>
         <button type="button" title="编辑创意简报" @click="briefVisible = true"><EditPen /></button>
         <button type="button" title="添加通用主体" @click="subjectVisible = true"><Plus /></button>
         <button type="button" title="自动布局" @click="autoLayout"><MagicStick /></button>
         <button type="button" title="聚焦全部节点" @click="fitView({ padding: .16, duration: 320 })"><Aim /></button>
         <button type="button" title="刷新画布" @click="loadCanvas()"><Refresh /></button>
       </nav>
+
+      <CanvasNodeLibrary
+        v-if="nodeLibraryVisible"
+        class="node-library-popover"
+        @create-node="createCatalogNode"
+        @open-asset-history="openAssetHistory()"
+      />
 
       <aside v-if="isShortDrama" class="workflow-actions">
         <div>
@@ -644,6 +950,47 @@ onBeforeUnmount(() => eventSource.value?.close());
       :prompt="selectedPrompt"
       :loading="promptLoading"
     />
+
+    <el-drawer v-model="subjectAssistantVisible" title="主体分析与人工补全" size="620px">
+      <SubjectAssistantPanel
+        v-if="subjectAssistantNode"
+        :subject="subjectDraft(subjectAssistantNode)"
+        :run="subjectAssistantRun"
+        :loading="subjectAssistantLoading"
+        @run="runSubjectAssistant"
+        @apply="applySubjectAssistant"
+        @inspect-prompt="inspectPrompt"
+      />
+    </el-drawer>
+
+    <el-drawer v-model="assetHistoryVisible" title="项目素材历史" size="720px">
+      <div class="asset-history-filters">
+        <button type="button" @click="openAssetHistory()">全部</button>
+        <button type="button" @click="openAssetHistory('image')">图片</button>
+        <button type="button" @click="openAssetHistory('video')">视频</button>
+        <button type="button" @click="openAssetHistory('audio')">音频</button>
+      </div>
+      <el-alert
+        v-if="assetHistoryError"
+        :title="`素材加载失败：${assetHistoryError}`"
+        description="可重试；当前已加载缓存不会被清空。"
+        type="error"
+        :closable="false"
+        show-icon
+      >
+        <template #default><el-button @click="openAssetHistory(assetHistoryKind)">重试</el-button></template>
+      </el-alert>
+      <div v-if="assetHistoryLoading" class="asset-history-state">正在读取素材索引…</div>
+      <div v-else-if="!assetHistory.length && !assetHistoryError" class="asset-history-state">当前项目还没有可用素材。</div>
+      <div class="asset-history-grid">
+        <article v-for="asset in assetHistory" :key="asset.id">
+          <img v-if="asset.mediaType === 'image'" :src="asset.contentUrl" :alt="asset.semanticKey || asset.role" />
+          <video v-else-if="asset.mediaType === 'video'" :src="asset.contentUrl" muted preload="metadata" />
+          <div v-else class="audio-placeholder">AUDIO</div>
+          <b>{{ asset.semanticKey || asset.role }}</b><small>{{ asset.status }} · {{ asset.mediaType }}</small>
+        </article>
+      </div>
+    </el-drawer>
 
     <el-drawer v-model="briefVisible" title="创意简报" size="520px">
       <el-form label-position="top">
@@ -715,7 +1062,7 @@ onBeforeUnmount(() => eventSource.value?.close());
 .eyebrow { color: #687487; font-size: 9px; font-weight: 800; letter-spacing: .15em; }
 .topbar-state { display: flex; align-items: center; gap: 7px; color: #929dad; font-size: 12px; }
 .sync-indicator { width: 7px; height: 7px; border-radius: 50%; background: #798393; }
-.sync-saved { background: #5bd09a; }.sync-syncing, .sync-local { background: #e1bd62; }.sync-conflict, .sync-offline { background: #e07373; }
+.sync-saved { background: #5bd09a; }.sync-syncing, .sync-local { background: #e1bd62; }.sync-conflict, .sync-offline, .sync-service_error { background: #e07373; }
 .canvas-stage { position: relative; height: calc(100% - 72px); min-height: 648px; }
 .vue-flow { background: #111317; }
 .vue-flow :deep(.vue-flow__edge-path) { stroke: #5c6675; stroke-width: 1.2; }
@@ -725,15 +1072,21 @@ onBeforeUnmount(() => eventSource.value?.close());
 .canvas-toolbar { position: absolute; left: 50%; bottom: 22px; z-index: 5; display: flex; gap: 5px; padding: 7px; transform: translateX(-50%); background: #24272c; border: 1px solid #3b3f47; border-radius: 14px; box-shadow: 0 14px 35px rgb(0 0 0 / 34%); }
 .canvas-toolbar button { width: 36px; height: 36px; padding: 8px; color: #c3cad5; background: transparent; border: 0; border-radius: 9px; cursor: pointer; }
 .canvas-toolbar button:hover { color: #fff; background: #383d45; }
+.node-library-popover { position: absolute; left: 50%; bottom: 78px; z-index: 12; transform: translateX(-50%); }
+.node-composer-anchor { position: absolute; top: 0; left: 292px; z-index: 20; }
 .workflow-actions { position: absolute; right: 18px; bottom: 22px; z-index: 5; display: flex; align-items: center; gap: 8px; max-width: calc(100% - 180px); padding: 9px; color: #c8d0db; background: rgb(28 31 37 / 95%); border: 1px solid #3a4049; border-radius: 12px; box-shadow: 0 14px 35px rgb(0 0 0 / 32%); }
 .workflow-actions div { display: grid; padding: 0 8px; }.workflow-actions small { color: #808b9c; }
 .workflow-actions button { display: flex; align-items: center; gap: 6px; padding: 9px 11px; color: #dce5f2; background: #303640; border: 1px solid #48515f; border-radius: 8px; cursor: pointer; }
 .workflow-actions button :deep(svg) { width: 14px; }.workflow-actions button:disabled { opacity: .38; cursor: not-allowed; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
 .batch-form { margin-top: 18px; }
+.asset-history-filters { display: flex; gap: 7px; margin-bottom: 12px; }.asset-history-filters button { padding: 7px 10px; color: #cad3df; background: #292e36; border: 1px solid #3c4450; border-radius: 7px; cursor: pointer; }
+.asset-history-state { padding: 30px; color: #8b96a7; text-align: center; }.asset-history-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 14px; }.asset-history-grid article { display: grid; gap: 5px; padding: 8px; color: #dce3ed; background: #1c2026; border: 1px solid #303741; border-radius: 9px; }.asset-history-grid img, .asset-history-grid video, .audio-placeholder { width: 100%; height: 132px; object-fit: cover; background: #101217; border-radius: 6px; }.asset-history-grid small { color: #7f8a9a; }.audio-placeholder { display: grid; place-items: center; color: #758196; font-size: 11px; letter-spacing: .16em; }
 @media (max-width: 980px) {
   .stage-guide { display: none; }
   .workflow-actions { left: 12px; right: 12px; bottom: 70px; max-width: none; flex-wrap: wrap; }
   .canvas-toolbar { bottom: 14px; }
+  .node-composer-anchor { position: fixed; top: auto; right: 12px; bottom: 70px; left: 12px; }
+  .asset-history-grid { grid-template-columns: repeat(2, 1fr); }
 }
 </style>

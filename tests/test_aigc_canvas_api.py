@@ -15,6 +15,7 @@ class _CanvasService:
         self.brief: dict[str, object] | None = None
         self.subject: dict[str, object] | None = None
         self.approved_revision: uuid.UUID | None = None
+        self.subject_completion_run_id = uuid.uuid4()
 
     def save_brief(self, project_id: uuid.UUID, payload: object) -> dict[str, object]:
         self.brief = payload.model_dump(by_alias=True, mode="json")  # type: ignore[attr-defined]
@@ -23,6 +24,82 @@ class _CanvasService:
     def create_subject(self, project_id: uuid.UUID, payload: object) -> dict[str, object]:
         self.subject = payload.model_dump(by_alias=True, mode="json")  # type: ignore[attr-defined]
         return {"id": str(uuid.uuid4()), "projectId": str(project_id), **self.subject}
+
+    def create_subject_completion_run(
+        self, project_id: uuid.UUID, payload: object
+    ) -> dict[str, object]:
+        return {
+            "id": str(self.subject_completion_run_id),
+            "projectId": str(project_id),
+            "subjectId": str(payload.subject_id),  # type: ignore[attr-defined]
+            "status": "pending",
+            "missingFields": ["immutableTraits", "dramaticFunction"],
+        }
+
+    def get_subject_completion_run(self, run_id: uuid.UUID) -> dict[str, object]:
+        assert run_id == self.subject_completion_run_id
+        return {
+            "id": str(run_id),
+            "status": "awaiting_review",
+            "proposal": {"identityAnchors": ["灰白虎斑猫"]},
+            "promptId": str(uuid.uuid4()),
+        }
+
+    def apply_subject_completion(
+        self, run_id: uuid.UUID, payload: object
+    ) -> dict[str, object]:
+        assert run_id == self.subject_completion_run_id
+        return {
+            "runId": str(run_id),
+            "status": "applied",
+            "revision": 2,
+            "acceptedFields": payload.accepted_fields,  # type: ignore[attr-defined]
+        }
+
+    def list_project_assets(
+        self, project_id: uuid.UUID, *, media_kind: str | None = None
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                "id": str(uuid.uuid4()),
+                "projectId": str(project_id),
+                "mediaType": media_kind or "image",
+                "status": "ready",
+            }
+        ]
+
+    def save_node_generation_config(
+        self,
+        node_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        payload: object,
+    ) -> dict[str, object]:
+        assert expected_revision == 2
+        return {
+            "id": str(uuid.uuid4()),
+            "canvasNodeId": str(node_id),
+            "revision": 3,
+            **payload.model_dump(mode="json", by_alias=True),  # type: ignore[attr-defined]
+        }
+
+    def list_provider_capabilities(
+        self, *, media_kind: str | None = None
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                "provider": "ark",
+                "model": "seedance-2",
+                "mediaKind": media_kind or "video",
+                "capabilities": {
+                    "modes": ["text_to_video", "image_to_video"],
+                    "aspectRatios": ["16:9", "9:16"],
+                    "resolutions": ["720p"],
+                    "durations": [5, 10],
+                    "candidateCounts": [1],
+                },
+            }
+        ]
 
     def approve_story_revision(self, revision_id: uuid.UUID) -> dict[str, object]:
         self.approved_revision = revision_id
@@ -262,3 +339,93 @@ def test_v2_video_edit_recipe_compile_and_submit_contract(tmp_path: Path) -> Non
     assert compiled.json()["mode"] == "two_stage"
     assert submitted.status_code == 202
     assert submitted.json()["status"] == "queued"
+
+
+def test_subject_assistant_is_explicit_async_and_requires_human_apply(tmp_path: Path) -> None:
+    service = _CanvasService()
+    client = _client(tmp_path, service)
+    project_id = uuid.uuid4()
+    subject_id = uuid.uuid4()
+
+    queued = client.post(
+        f"/api/v2/projects/{project_id}/subject-assistant-runs",
+        json={
+            "subjectId": str(subject_id),
+            "idempotencyKey": "subject-assistant-0001",
+            "instruction": "补齐跨镜头身份锚点",
+        },
+    )
+    inspected = client.get(
+        f"/api/v2/subject-assistant-runs/{service.subject_completion_run_id}"
+    )
+    applied = client.post(
+        f"/api/v2/subject-assistant-runs/{service.subject_completion_run_id}/apply",
+        json={
+            "acceptedFields": ["immutableTraits"],
+            "finalDraft": {
+                "name": "灰灰",
+                "kind": "animal",
+                "role": "co_protagonist",
+                "identityAnchors": ["灰白虎斑猫"],
+                "immutableTraits": ["额头 M 纹不变"],
+                "relationshipNotes": "",
+                "dramaticFunction": "",
+                "visualRisks": [],
+                "references": [],
+            },
+        },
+    )
+
+    assert queued.status_code == 202
+    assert queued.json()["status"] == "pending"
+    assert inspected.json()["status"] == "awaiting_review"
+    assert applied.status_code == 201
+    assert applied.json()["acceptedFields"] == ["immutableTraits"]
+
+
+def test_v2_canvas_asset_history_filters_by_media_kind(tmp_path: Path) -> None:
+    service = _CanvasService()
+    client = _client(tmp_path, service)
+    project_id = uuid.uuid4()
+
+    response = client.get(f"/api/v2/projects/{project_id}/assets?kind=video")
+
+    assert response.status_code == 200
+    assert response.json()[0]["mediaType"] == "video"
+
+
+def test_generation_config_and_capabilities_are_server_driven(tmp_path: Path) -> None:
+    service = _CanvasService()
+    client = _client(tmp_path, service)
+    node_id = uuid.uuid4()
+    reference_id = uuid.uuid4()
+
+    capabilities = client.get("/api/v2/provider-capabilities?mediaKind=video")
+    saved = client.put(
+        f"/api/v2/canvas/nodes/{node_id}/generation-config",
+        headers={"If-Match": "2"},
+        json={
+            "provider": "ark",
+            "model": "seedance-2",
+            "mode": "image_to_video",
+            "aspectRatio": "9:16",
+            "resolution": "720p",
+            "durationSeconds": 5,
+            "audioEnabled": True,
+            "candidateCount": 1,
+            "autoValidate": True,
+            "autoLink": True,
+            "actualReferences": [
+                {
+                    "assetId": str(reference_id),
+                    "semanticRole": "protagonist",
+                    "providerIncluded": True,
+                }
+            ],
+        },
+    )
+
+    assert capabilities.status_code == 200
+    assert capabilities.json()[0]["capabilities"]["resolutions"] == ["720p"]
+    assert saved.status_code == 201
+    assert saved.json()["revision"] == 3

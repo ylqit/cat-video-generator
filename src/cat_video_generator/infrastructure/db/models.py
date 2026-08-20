@@ -771,6 +771,11 @@ class CanvasLayout(Base):
     sync_status: Mapped[str] = mapped_column(
         String(24), nullable=False, default="saved", server_default="saved"
     )
+    failure_reason: Mapped[str | None] = mapped_column(Text)
+    last_confirmed_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.canvas_events.id", ondelete="SET NULL"),
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
@@ -779,7 +784,12 @@ class CanvasLayout(Base):
 class ProviderCapability(Base):
     __tablename__ = "provider_capabilities"
     __table_args__ = (
-        UniqueConstraint("provider", "model", name="uq_provider_capabilities_model"),
+        UniqueConstraint(
+            "provider",
+            "model",
+            "media_kind",
+            name="uq_provider_capabilities_model_kind",
+        ),
         {"schema": SCHEMA_NAME},
     )
 
@@ -915,6 +925,115 @@ class CanvasEvent(Base):
     )
     event_type: Mapped[str] = mapped_column(String(80), nullable=False)
     data_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class CanvasRecoveryPoint(Base):
+    __tablename__ = "canvas_recovery_points"
+    __table_args__ = (
+        Index(
+            "ix_canvas_recovery_points_run_version",
+            "production_run_id",
+            "layout_version",
+            "created_at",
+        ),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    layout_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.canvas_events.id", ondelete="SET NULL")
+    )
+    reason: Mapped[str] = mapped_column(String(80), nullable=False)
+    snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class SubjectCompletionRun(Base):
+    __tablename__ = "subject_completion_runs"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_subject_completion_idempotency"),
+        Index("ix_subject_completion_runs_subject_status", "subject_id", "status", "created_at"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    subject_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.subjects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.subject_revisions.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    workflow_step_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.workflow_steps.id", ondelete="SET NULL"),
+    )
+    prompt_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.prompt_records.id", ondelete="SET NULL"),
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(96), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending", server_default="pending"
+    )
+    model: Mapped[str] = mapped_column(String(200), nullable=False)
+    missing_fields_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    proposal_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    accepted_fields_json: Mapped[list[str] | None] = mapped_column(JSONB)
+    accepted_draft_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    error_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class NodeGenerationConfig(Base):
+    __tablename__ = "node_generation_configs"
+    __table_args__ = (
+        UniqueConstraint(
+            "canvas_node_id", "revision", name="uq_node_generation_configs_revision"
+        ),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    canvas_node_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.canvas_graph_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    provider: Mapped[str] = mapped_column(String(80), nullable=False)
+    model: Mapped[str] = mapped_column(String(200), nullable=False)
+    mode: Mapped[str] = mapped_column(String(40), nullable=False)
+    config_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    actual_reference_bindings_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

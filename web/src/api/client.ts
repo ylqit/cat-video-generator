@@ -2,6 +2,7 @@ import type {
   AssetDto,
   AcceptedVisualAssetPlan,
   CanvasDto,
+  CanvasAssetHistoryDto,
   CanvasEdgeDto,
   CanvasNodeType,
   CanvasTemplateDto,
@@ -16,6 +17,7 @@ import type {
   PreviousTailStatus,
   ProductionBoardDto,
   PromptRunDto,
+  ProviderCapabilityDto,
   ProjectGraph,
   ProjectSummary,
   ReferenceBinding,
@@ -47,6 +49,7 @@ import type {
   StoryRewriteOutput,
   StoryRewriteStrategy,
   SubjectInput,
+  SubjectCompletionRunDto,
   VideoEditAnnotationInput,
   VideoEditRecipeDto,
   VisualAssetPurpose,
@@ -445,6 +448,52 @@ export const canvasApi = {
     canvasJson<Record<string, unknown>>(`/projects/${projectId}/brief`, "PUT", brief),
   createSubject: (projectId: string, subject: SubjectInput) =>
     canvasJson<Record<string, unknown>>(`/projects/${projectId}/subjects`, "POST", subject),
+  createSubjectCompletionRun: (
+    projectId: string,
+    subjectId: string,
+    instruction: string,
+  ) => canvasJson<SubjectCompletionRunDto>(
+    `/projects/${projectId}/subject-assistant-runs`,
+    "POST",
+    { subjectId, instruction, idempotencyKey: crypto.randomUUID() },
+  ),
+  subjectCompletionRun: (runId: string) =>
+    request<SubjectCompletionRunDto>(
+      `/subject-assistant-runs/${runId}`,
+      undefined,
+      CANVAS_BASE,
+    ),
+  applySubjectCompletion: (
+    runId: string,
+    acceptedFields: string[],
+    finalDraft: SubjectInput,
+  ) => canvasJson<Record<string, unknown>>(
+    `/subject-assistant-runs/${runId}/apply`,
+    "POST",
+    { acceptedFields, finalDraft },
+  ),
+  assets: (projectId: string, kind?: "image" | "video" | "audio") =>
+    request<CanvasAssetHistoryDto[]>(
+      `/projects/${projectId}/assets${kind ? `?kind=${kind}` : ""}`,
+      undefined,
+      CANVAS_BASE,
+    ),
+  providerCapabilities: (mediaKind?: "image" | "video" | "audio" | "video_edit") =>
+    request<ProviderCapabilityDto[]>(
+      `/provider-capabilities${mediaKind ? `?mediaKind=${mediaKind}` : ""}`,
+      undefined,
+      CANVAS_BASE,
+    ),
+  saveNodeGenerationConfig: (
+    nodeId: string,
+    revision: number,
+    payload: Record<string, unknown>,
+  ) => canvasJson<Record<string, unknown>>(
+    `/canvas/nodes/${nodeId}/generation-config`,
+    "PUT",
+    payload,
+    { "If-Match": String(revision) },
+  ),
   runStoryStrategies: (projectId: string, rewriteInstruction?: string) =>
     canvasJson<{ id: string; status: string; candidates: Array<Record<string, unknown>> }>(
       `/projects/${projectId}/story-strategy-runs`,
