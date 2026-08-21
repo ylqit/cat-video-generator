@@ -9,6 +9,7 @@ from cat_video_generator.domain.aigc_canvas import (
     CanvasConnection,
     CanvasNodeType,
     CanvasPortType,
+    NodeGenerationConfigDraft,
     SubjectDraft,
 )
 from cat_video_generator.domain.universal_canvas import (
@@ -74,6 +75,60 @@ def test_universal_canvas_accepts_reference_to_batch_and_video_to_edit_edges() -
     assert edit_edge.target_node_type is CanvasNodeType.VIDEO_EDIT
 
 
+def test_generation_nodes_accept_subjects_and_general_media_references() -> None:
+    subject_edge = CanvasConnection(
+        sourceNodeId=uuid.uuid4(),
+        sourceNodeType=CanvasNodeType.SUBJECT,
+        sourcePort=CanvasPortType.SUBJECTS,
+        targetNodeId=uuid.uuid4(),
+        targetNodeType=CanvasNodeType.IMAGE_GENERATION,
+        targetPort=CanvasPortType.SUBJECTS,
+    )
+    reference_edge = CanvasConnection(
+        sourceNodeId=uuid.uuid4(),
+        sourceNodeType=CanvasNodeType.REFERENCE_ASSET,
+        sourcePort=CanvasPortType.MEDIA_REFERENCES,
+        targetNodeId=uuid.uuid4(),
+        targetNodeType=CanvasNodeType.VIDEO_GENERATION,
+        targetPort=CanvasPortType.MEDIA_REFERENCES,
+    )
+
+    assert subject_edge.target_port is CanvasPortType.SUBJECTS
+    assert reference_edge.target_port is CanvasPortType.MEDIA_REFERENCES
+
+
+def test_node_generation_config_preserves_camera_motion_annotations_and_provider_slot() -> None:
+    config = NodeGenerationConfigDraft(
+        provider="ark",
+        model="seedance-2",
+        mode="image_to_video",
+        aspectRatio="9:16",
+        resolution="480p",
+        durationSeconds=8,
+        candidateCount=1,
+        draftPrompt="保持包装文字并缓慢推近",
+        cameraMotion="push_in",
+        referenceAnnotations=[{
+            "assetId": str(uuid.uuid4()),
+            "tool": "rectangle",
+            "points": [{"x": 0.1, "y": 0.2}, {"x": 0.5, "y": 0.7}],
+            "label": "保持标签文字",
+        }],
+        actualReferences=[{
+            "assetId": str(uuid.uuid4()),
+            "semanticRole": "packshot_front",
+            "providerIncluded": True,
+            "providerSlot": "reference_image_1",
+        }],
+    )
+
+    document = config.model_dump(by_alias=True, mode="json")
+    assert document["draftPrompt"] == "保持包装文字并缓慢推近"
+    assert document["cameraMotion"] == "push_in"
+    assert document["referenceAnnotations"][0]["tool"] == "rectangle"
+    assert document["actualReferences"][0]["providerSlot"] == "reference_image_1"
+
+
 def test_video_edit_recipe_enforces_one_provider_sized_interval_and_normalized_marks() -> None:
     recipe = VideoEditRecipeDraft(
         projectId=uuid.uuid4(),
@@ -93,6 +148,10 @@ def test_video_edit_recipe_enforces_one_provider_sized_interval_and_normalized_m
     )
 
     assert recipe.duration_ms == 6_000
+    assert recipe.annotations[0].coordinate_space == "source_normalized"
+    assert recipe.model_dump(mode="json", by_alias=True)["annotations"][0][
+        "frameTimestampMs"
+    ] == 5_000
 
     with pytest.raises(ValidationError, match="0.5 至 13 秒"):
         VideoEditRecipeDraft(

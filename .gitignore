@@ -29,6 +29,10 @@ docs/LibTV
 !/docs/checklists/v5-professional-visual-assets.md
 !/docs/checklists/v5-architecture-convergence.md
 !/docs/checklists/aigc-canvas-v2.md
+!/docs/checklists/healing-child-cat-benchmark.md
+!/docs/checklists/one-child-one-cat-six-stage-acceptance.md
+!/docs/checklists/canvas-refresh-durable-task-push-acceptance.md
+!/docs/checklists/libtv-fixed-node-console-acceptance.md
 !/docs/workflows/
 /docs/workflows/*
 !/docs/workflows/tutorial-adaptation.md

@@ -114,6 +114,10 @@ def test_project_tasks_exposes_persistent_provider_state_without_new_schema(
             "model": "fake-seedance",
             "inputSnapshot": {"sourceRevisionHash": "current-input"},
             "error": None,
+            "progress": {},
+            "resultSummary": None,
             "createdAt": "2026-08-14T01:02:00+00:00",
+            "updatedAt": None,
+            "completedAt": None,
         }
     ]

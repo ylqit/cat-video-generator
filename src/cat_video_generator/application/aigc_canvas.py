@@ -11,6 +11,7 @@ from typing import Any, Protocol
 from ..domain.aigc_canvas import (
     PromptRunDraft,
     StoryboardPlanOutput,
+    StoryBrief,
     StoryCandidateOutput,
     StoryScorecard,
     StoryStrategy,
@@ -40,9 +41,15 @@ class CanvasRepository(Protocol):
 
     def create_subject(self, project_id: uuid.UUID, payload: Any) -> dict[str, Any]: ...
 
-    def create_subject_revision(
-        self, subject_id: uuid.UUID, payload: Any
+    def bind_canvas_node_assets(
+        self,
+        node_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        payload: Any,
     ) -> dict[str, Any]: ...
+
+    def create_subject_revision(self, subject_id: uuid.UUID, payload: Any) -> dict[str, Any]: ...
 
     def create_subject_completion_run(
         self,
@@ -60,6 +67,20 @@ class CanvasRepository(Protocol):
     def list_project_assets(
         self, project_id: uuid.UUID, *, media_kind: str | None = None
     ) -> list[dict[str, Any]]: ...
+
+    def save_manual_storyboard(
+        self,
+        project_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        payload: Any,
+    ) -> dict[str, Any]: ...
+
+    def create_video_filmstrip_run(
+        self, asset_id: uuid.UUID, *, frame_count: int
+    ) -> dict[str, Any]: ...
+
+    def get_video_filmstrip(self, asset_id: uuid.UUID, *, frame_count: int) -> dict[str, Any]: ...
 
     def save_node_generation_config(
         self,
@@ -89,9 +110,7 @@ class CanvasRepository(Protocol):
 
     def create_generation_attempt(self, payload: Any) -> dict[str, Any]: ...
 
-    def retry_generation_attempt(
-        self, attempt_id: uuid.UUID, payload: Any
-    ) -> dict[str, Any]: ...
+    def retry_generation_attempt(self, attempt_id: uuid.UUID, payload: Any) -> dict[str, Any]: ...
 
     def review_asset(self, asset_id: uuid.UUID, payload: Any) -> dict[str, Any]: ...
 
@@ -109,17 +128,11 @@ class CanvasRepository(Protocol):
 
     def list_canvas_templates(self) -> list[dict[str, Any]]: ...
 
-    def instantiate_template(
-        self, project_id: uuid.UUID, payload: Any
-    ) -> dict[str, Any]: ...
+    def instantiate_template(self, project_id: uuid.UUID, payload: Any) -> dict[str, Any]: ...
 
-    def create_canvas_node(
-        self, project_id: uuid.UUID, payload: Any
-    ) -> dict[str, Any]: ...
+    def create_canvas_node(self, project_id: uuid.UUID, payload: Any) -> dict[str, Any]: ...
 
-    def create_canvas_edge(
-        self, project_id: uuid.UUID, payload: Any
-    ) -> dict[str, Any]: ...
+    def create_canvas_edge(self, project_id: uuid.UUID, payload: Any) -> dict[str, Any]: ...
 
     def delete_canvas_edge(self, edge_id: uuid.UUID) -> dict[str, Any]: ...
 
@@ -157,7 +170,7 @@ class CanvasRepository(Protocol):
     ) -> dict[str, Any]: ...
 
     def events(
-        self, project_id: uuid.UUID, *, last_event_id: str | None = None
+        self, project_id: uuid.UUID, *, after_sequence: int = 0
     ) -> tuple[dict[str, Any], ...]: ...
 
 
@@ -189,17 +202,75 @@ class AigcCanvasService:
     def save_brief(self, project_id: uuid.UUID, payload: Any) -> dict[str, Any]:
         return self._repository.save_brief(project_id, payload)
 
+    def complete_creative_brief(
+        self,
+        project_id: uuid.UUID,
+        *,
+        theme: str,
+        target_duration_seconds: int,
+    ) -> dict[str, Any]:
+        prompt = (
+            "你是治愈系无对白竖屏短片的创意编辑。把用户的一句话主题补全为结构化创意简报。"
+            "保持固定儿童、固定猫咪、原创二维水彩、单一低压力事件、无对白、原生环境声。"
+            "constraints 必须明确季节天气、主要场景、核心事件、核心道具、猫咪行为模式和温暖收尾。\n"
+            f"用户主题：{theme}\n目标时长：{target_duration_seconds} 秒；画幅：9:16。"
+        )
+        result = self._director.generate_structured(
+            prompt=prompt,
+            schema=StoryBrief.model_json_schema(),
+            output_name="HealingCreativeBrief",
+        )
+        proposed = StoryBrief.model_validate(result.payload)
+        fixed_constraints = [
+            *proposed.constraints,
+            "固定儿童与固定猫咪身份",
+            "原创二维水彩画风",
+            "禁止对白",
+            "原生环境声、动作声与轻音乐",
+        ]
+        brief = proposed.model_copy(
+            update={
+                "theme": theme,
+                "aspect_ratio": "9:16",
+                "target_duration_seconds": target_duration_seconds,
+                "constraints": list(dict.fromkeys(fixed_constraints))[:30],
+            }
+        )
+        return self._repository.save_brief(project_id, brief)
+
     def create_subject(self, project_id: uuid.UUID, payload: Any) -> dict[str, Any]:
         return self._repository.create_subject(project_id, payload)
 
-    def create_subject_revision(
-        self, subject_id: uuid.UUID, payload: Any
+    def list_subjects(self, project_id: uuid.UUID) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": str(item.id),
+                "projectId": str(project_id),
+                "revisionId": str(item.revision_id),
+                "revision": item.revision,
+                "status": item.status,
+                **item.draft.model_dump(mode="json", by_alias=True),
+            }
+            for item in self._repository.list_subjects(project_id)
+        ]
+
+    def bind_canvas_node_assets(
+        self,
+        node_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        payload: Any,
     ) -> dict[str, Any]:
+        return self._repository.bind_canvas_node_assets(
+            node_id,
+            expected_revision=expected_revision,
+            payload=payload,
+        )
+
+    def create_subject_revision(self, subject_id: uuid.UUID, payload: Any) -> dict[str, Any]:
         return self._repository.create_subject_revision(subject_id, payload)
 
-    def create_subject_completion_run(
-        self, project_id: uuid.UUID, payload: Any
-    ) -> dict[str, Any]:
+    def create_subject_completion_run(self, project_id: uuid.UUID, payload: Any) -> dict[str, Any]:
         return self._repository.create_subject_completion_run(
             project_id,
             payload,
@@ -218,6 +289,14 @@ class AigcCanvasService:
     ) -> list[dict[str, Any]]:
         return self._repository.list_project_assets(project_id, media_kind=media_kind)
 
+    def create_video_filmstrip_run(
+        self, asset_id: uuid.UUID, *, frame_count: int
+    ) -> dict[str, Any]:
+        return self._repository.create_video_filmstrip_run(asset_id, frame_count=frame_count)
+
+    def get_video_filmstrip(self, asset_id: uuid.UUID, *, frame_count: int) -> dict[str, Any]:
+        return self._repository.get_video_filmstrip(asset_id, frame_count=frame_count)
+
     def save_node_generation_config(
         self,
         node_id: uuid.UUID,
@@ -231,9 +310,7 @@ class AigcCanvasService:
             payload=payload,
         )
 
-    def list_provider_capabilities(
-        self, *, media_kind: str | None = None
-    ) -> list[dict[str, Any]]:
+    def list_provider_capabilities(self, *, media_kind: str | None = None) -> list[dict[str, Any]]:
         return self._repository.list_provider_capabilities(media_kind=media_kind)
 
     def run_story_strategies(
@@ -256,12 +333,12 @@ class AigcCanvasService:
             "briefId": str(brief_id),
             "brief": brief.model_dump(mode="json", by_alias=True),
             "subjects": subject_snapshot,
-            "rewriteInstruction": payload.rewrite_instruction,
         }
         input_hash = _json_hash(input_snapshot)
-        idempotency_key = payload.idempotency_key or hashlib.sha256(
-            f"{project_id}:story-strategies:{input_hash}".encode()
-        ).hexdigest()
+        idempotency_key = (
+            payload.idempotency_key
+            or hashlib.sha256(f"{project_id}:story-strategies:{input_hash}".encode()).hexdigest()
+        )
         attempt, created = self._repository.begin_generation_attempt(
             project_id=project_id,
             business_object_type="project_story_strategy",
@@ -458,7 +535,17 @@ class AigcCanvasService:
     def approve_story_revision(self, revision_id: uuid.UUID) -> dict[str, Any]:
         return self._repository.approve_story_revision(revision_id)
 
-    def create_storyboard(self, project_id: uuid.UUID) -> dict[str, Any]:
+    def create_storyboard(
+        self,
+        project_id: uuid.UUID,
+        *,
+        exact_durations: tuple[int, ...] | None = None,
+        healing_recipe: bool = False,
+        idempotency_key: str | None = None,
+        creation_mode: str = "from_story",
+        reference_asset_ids: tuple[uuid.UUID, ...] = (),
+        instruction: str | None = None,
+    ) -> dict[str, Any]:
         context = self._repository.get_storyboard_context(project_id)
         if context["existing"] is not None:
             return context["existing"]
@@ -466,15 +553,19 @@ class AigcCanvasService:
             "brief": context["brief"],
             "story": context["story"],
             "subjects": context["subjects"],
+            "creationMode": creation_mode,
+            "referenceAssetIds": [str(item) for item in reference_asset_ids],
+            "instruction": instruction,
         }
         input_hash = _json_hash(input_snapshot)
         attempt, created = self._repository.begin_generation_attempt(
             project_id=project_id,
             business_object_type="storyboard",
             business_object_id=uuid.UUID(str(context["storyId"])),
-            idempotency_key=hashlib.sha256(
-                f"{project_id}:storyboard:{input_hash}".encode()
-            ).hexdigest(),
+            idempotency_key=(
+                idempotency_key
+                or hashlib.sha256(f"{project_id}:storyboard:{input_hash}".encode()).hexdigest()
+            ),
             provider=self._provider_name,
             model=self._director.model,
             request=input_snapshot,
@@ -484,15 +575,33 @@ class AigcCanvasService:
 
         total_seconds = int(context["brief"]["targetDurationSeconds"])
         scene_count = len(context["story"]["scenes"])
-        minimum_beats = math.ceil(total_seconds / 15)
-        maximum_beats = total_seconds // 8
+        if exact_durations is not None:
+            if sum(exact_durations) != total_seconds or any(
+                not 8 <= duration <= 15 for duration in exact_durations
+            ):
+                raise ValueError("配方分镜时长必须精确覆盖总时长且每镜为8至15秒")
+            minimum_beats = maximum_beats = len(exact_durations)
+        else:
+            minimum_beats = math.ceil(total_seconds / 15)
+            maximum_beats = total_seconds // 8
         system_prompt = (
             "你是AIGC短剧分镜导演。把已批准故事拆成可独立编辑和生成的 Shot Beat；"
             "每个 Beat 只能包含一个连续动作意图，必须明确动作、机位、对白和所属场景。"
         )
+        if healing_recipe:
+            system_prompt += (
+                "当前为固定儿童与固定猫咪的原创水彩治愈短片；每镜必须包含开始、小变化、"
+                "温暖收尾三个时间节拍，只写动作、微表情、运镜与声音变化，dialogue必须为空。"
+            )
+        if creation_mode == "from_characters":
+            system_prompt += (
+                "用户从画布明确选择了角色素材。必须以已批准故事为叙事边界，"
+                "将所选角色素材只作为身份与关系约束，不得用普通参考替换 Canon 身份。"
+            )
         user_prompt = (
             f"必须输出 {minimum_beats} 至 {maximum_beats} 个 Beat，"
             f"覆盖全部 {scene_count} 个场景。\n"
+            f"用户补充要求：{instruction or '无'}\n"
             f"输入快照：{json.dumps(input_snapshot, ensure_ascii=False, sort_keys=True)}"
         )
         final_prompt = f"{system_prompt}\n\n{user_prompt}"
@@ -530,13 +639,18 @@ class AigcCanvasService:
             scene_orders = {beat.scene_order for beat in plan.beats}
             if scene_orders != set(range(1, scene_count + 1)):
                 raise ValueError("分镜计划必须覆盖批准故事中的全部场景")
-            weights = tuple(beat.duration_weight for beat in plan.beats)
-            durations = allocate_bounded_durations(
-                total_seconds,
-                weights,
-                minimum_seconds=8,
-                maximum_seconds=15,
-            )
+            if healing_recipe and any(beat.dialogue.strip() for beat in plan.beats):
+                raise ValueError("治愈短片配方不允许生成对白")
+            if exact_durations is None:
+                weights = tuple(beat.duration_weight for beat in plan.beats)
+                durations = allocate_bounded_durations(
+                    total_seconds,
+                    weights,
+                    minimum_seconds=8,
+                    maximum_seconds=15,
+                )
+            else:
+                durations = exact_durations
         except GatewayError as exc:
             status = "submission_unknown" if exc.submission_unknown else "failed"
             self._repository.complete_prompt_run(
@@ -597,12 +711,23 @@ class AigcCanvasService:
             payload=payload,
         )
 
+    def save_manual_storyboard(
+        self,
+        project_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        payload: Any,
+    ) -> dict[str, Any]:
+        return self._repository.save_manual_storyboard(
+            project_id,
+            expected_revision=expected_revision,
+            payload=payload,
+        )
+
     def create_generation_attempt(self, payload: Any) -> dict[str, Any]:
         return self._repository.create_generation_attempt(payload)
 
-    def retry_generation_attempt(
-        self, attempt_id: uuid.UUID, payload: Any
-    ) -> dict[str, Any]:
+    def retry_generation_attempt(self, attempt_id: uuid.UUID, payload: Any) -> dict[str, Any]:
         return self._repository.retry_generation_attempt(attempt_id, payload)
 
     def review_asset(self, asset_id: uuid.UUID, payload: Any) -> dict[str, Any]:
@@ -617,19 +742,13 @@ class AigcCanvasService:
     def list_canvas_templates(self) -> list[dict[str, Any]]:
         return self._repository.list_canvas_templates()
 
-    def instantiate_template(
-        self, project_id: uuid.UUID, payload: Any
-    ) -> dict[str, Any]:
+    def instantiate_template(self, project_id: uuid.UUID, payload: Any) -> dict[str, Any]:
         return self._repository.instantiate_template(project_id, payload)
 
-    def create_canvas_node(
-        self, project_id: uuid.UUID, payload: Any
-    ) -> dict[str, Any]:
+    def create_canvas_node(self, project_id: uuid.UUID, payload: Any) -> dict[str, Any]:
         return self._repository.create_canvas_node(project_id, payload)
 
-    def create_canvas_edge(
-        self, project_id: uuid.UUID, payload: Any
-    ) -> dict[str, Any]:
+    def create_canvas_edge(self, project_id: uuid.UUID, payload: Any) -> dict[str, Any]:
         return self._repository.create_canvas_edge(project_id, payload)
 
     def delete_canvas_edge(self, edge_id: uuid.UUID) -> dict[str, Any]:
@@ -674,13 +793,9 @@ class AigcCanvasService:
         )
 
     def compile_video_edit_recipe(self, recipe_id: uuid.UUID) -> dict[str, Any]:
-        return self._repository.compile_video_edit_recipe(
-            recipe_id, self._video_edit_capability
-        )
+        return self._repository.compile_video_edit_recipe(recipe_id, self._video_edit_capability)
 
-    def submit_video_edit_recipe(
-        self, recipe_id: uuid.UUID, payload: Any
-    ) -> dict[str, Any]:
+    def submit_video_edit_recipe(self, recipe_id: uuid.UUID, payload: Any) -> dict[str, Any]:
         return self._repository.submit_video_edit_recipe(
             recipe_id,
             payload,
@@ -689,9 +804,9 @@ class AigcCanvasService:
         )
 
     def events(
-        self, project_id: uuid.UUID, *, last_event_id: str | None = None
+        self, project_id: uuid.UUID, *, after_sequence: int = 0
     ) -> tuple[dict[str, Any], ...]:
-        return self._repository.events(project_id, last_event_id=last_event_id)
+        return self._repository.events(project_id, after_sequence=after_sequence)
 
     def save_canvas_layout(
         self,

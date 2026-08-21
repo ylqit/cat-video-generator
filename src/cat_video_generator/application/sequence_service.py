@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import uuid
 
@@ -52,7 +53,22 @@ class SequenceService:
         project_id: uuid.UUID,
         *,
         transitions: dict[uuid.UUID, SequenceTransition] | None = None,
+        request_idempotency_key: str | None = None,
     ) -> StoredSequence:
+        prior_sequences = self._repository.list_sequences(project_id)
+        request_idempotency_hash = (
+            hashlib.sha256(request_idempotency_key.encode("utf-8")).hexdigest()
+            if request_idempotency_key is not None
+            else None
+        )
+        if request_idempotency_hash is not None:
+            for prior in reversed(prior_sequences):
+                if prior.rendered_asset_id is None:
+                    continue
+                rendered = self._repository.get_asset(prior.rendered_asset_id)
+                if rendered.metadata.get("requestIdempotencyHash") == request_idempotency_hash:
+                    return prior
+
         if self._runtime_preflight is not None:
             self._runtime_preflight.validate_for_local_composition()
         scenes = self._repository.list_scenes(project_id)
@@ -127,6 +143,7 @@ class SequenceService:
             metadata={
                 "qc": qc,
                 "audioPolicy": "transition_plan",
+                "requestIdempotencyHash": request_idempotency_hash,
                 "transitions": [
                     None
                     if item.transition_from_previous is None
@@ -136,7 +153,6 @@ class SequenceService:
             },
         )
         project = self._repository.get_project(project_id)
-        prior_sequences = self._repository.list_sequences(project_id)
         parent_sequence_id = project.selected_sequence_id or (
             prior_sequences[-1].id if prior_sequences else None
         )

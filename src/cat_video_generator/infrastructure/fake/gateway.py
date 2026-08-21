@@ -15,6 +15,7 @@ from typing import Any
 
 from ...application.ports import (
     DirectorResult,
+    ImageDiagnosticResult,
     ImageResult,
     VideoDiagnosticResult,
     VideoTaskResult,
@@ -225,6 +226,30 @@ class FakeArkGateway:
             request_hash=_request_hash(
                 {"prompt": prompt, "frames": [str(path) for path in frame_paths]}
             ),
+        )
+
+    def diagnose_image(
+        self,
+        *,
+        prompt: str,
+        image_path: Path,
+    ) -> ImageDiagnosticResult:
+        return ImageDiagnosticResult(
+            identity_ok=True,
+            style_ok=True,
+            constraints_ok=True,
+            confidence=0.95,
+            violations=(),
+            evidence=(
+                {
+                    "object": "anchor",
+                    "observation": "local fake anchor available",
+                    "relationError": None,
+                },
+            ),
+            response_id=f"fake-image-review-{uuid.uuid4().hex[:10]}",
+            model=self.review_model,
+            request_hash=_request_hash({"prompt": prompt, "image": str(image_path)}),
         )
 
     @staticmethod

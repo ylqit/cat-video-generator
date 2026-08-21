@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import shutil
+import subprocess
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import Body, FastAPI, Header
+from fastapi import Body, FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
 
 app = FastAPI()
@@ -24,6 +27,11 @@ PRODUCT_IMAGES = (
 PROMOTED_NODES: list[dict[str, Any]] = []
 PROMOTED_EDGES: list[dict[str, str]] = []
 RECIPE_REVISIONS: dict[str, dict[str, Any]] = {}
+GENERATION_CONFIGS: dict[str, dict[str, Any]] = {}
+FILMSTRIP_ERRORS: dict[int, str] = {}
+FILMSTRIP_ROOT = ROOT / "var" / "preview-filmstrip" / "demo-video"
+DEMO_VIDEO_PATH = ROOT / "design-qa-assets" / "product-ad-demo.mp4"
+DEMO_VIDEO_DURATION_MS = 12_000
 
 
 def _node(
@@ -271,6 +279,262 @@ def story_canvas(project_id: str) -> dict[str, Any]:
     }
 
 
+def healing_recipe_instance(instance_id: str = "recipe-healing-demo") -> dict[str, Any]:
+    episode_rules = {
+        "personWardrobe": "米白针织衫、苔绿色背带裤与棕色软底鞋",
+        "timeWeather": "初秋雨后傍晚，窗外有柔和余晖",
+        "mainScene": "有木桌与低窗台的水彩厨房",
+        "environment": "indoor",
+        "coreProps": ["小木碗", "三颗栗子", "亚麻餐巾"],
+        "catBehaviorMode": "natural",
+        "soundPlan": {
+            "ambient": ["雨后屋檐滴水", "远处晚鸟"],
+            "foley": ["栗子轻碰木碗", "猫爪踩过餐巾"],
+            "musicMood": "很轻的木吉他与钟琴，温暖但不煽情",
+            "dialoguePolicy": "none",
+        },
+        "stylePositive": ["柔和水彩晕染", "纸张纤维质感", "低饱和暖色"],
+        "styleExcluded": ["准写实线稿", "塑料三维质感", "高反差霓虹"],
+        "canonProfileId": "healing_child_cat_canon_v2",
+    }
+
+    durations = (11, 10, 10)
+    shot_titles = ("把栗子放进木碗", "团团发现滚落的栗子", "一起守着窗边晚霞")
+    actions = (
+        ("小满把木碗放到窗边", "她逐颗放入栗子，团团在脚边闻一闻", "最后一颗栗子安稳落下"),
+        ("一颗栗子沿桌面慢慢滚动", "团团四足追过去，用前爪轻轻拦住", "小满把栗子拾回碗中"),
+        ("小满铺好亚麻餐巾", "团团蜷在窗台边，尾巴缓慢摆动", "一人一猫安静看着雨后晚霞"),
+    )
+    shots: list[dict[str, Any]] = []
+    for index, (duration, title, shot_actions) in enumerate(
+        zip(durations, shot_titles, actions, strict=True),
+        1,
+    ):
+        first_end = round(duration / 3, 2)
+        second_end = round(duration * 2 / 3, 2)
+        anchor_id = f"recipe-anchor-{index}"
+        video_candidates: list[dict[str, Any]] = []
+        selected_video_id: str | None = None
+        if index == 1:
+            selected_video_id = "demo-video"
+            video_candidates.append(
+                {
+                    "id": "demo-video",
+                    "sha256": "preview-video-approved",
+                    "status": "approved",
+                    "mediaType": "video",
+                    "contentUrl": "/api/v1/assets/demo-video/content",
+                    "qc": {"hasAudio": True, "durationMs": 11000},
+                    "diagnosticStatus": "passed",
+                    "diagnostics": [{"status": "passed", "frameCount": 8}],
+                }
+            )
+        elif index == 2:
+            video_candidates.append(
+                {
+                    "id": "recipe-video-review-2",
+                    "sha256": "preview-video-needs-review",
+                    "status": "content_review",
+                    "mediaType": "video",
+                    "contentUrl": "/api/v1/assets/demo-video/content",
+                    "qc": {"hasAudio": True, "durationMs": 10000},
+                    "diagnosticStatus": "failed",
+                    "diagnostics": [
+                        {
+                            "status": "failed",
+                            "frameCount": 8,
+                            "issues": ["6.2 秒处猫咪短暂出现人形前肢"],
+                        }
+                    ],
+                }
+            )
+        shots.append(
+            {
+                "beatId": f"recipe-beat-{index}",
+                "shotId": f"recipe-shot-{index}",
+                "title": title,
+                "durationSeconds": duration,
+                "status": "approved" if selected_video_id else "planned",
+                "temporalBeats": [
+                    {
+                        "phase": "start",
+                        "startSecond": 0,
+                        "endSecond": first_end,
+                        "childAction": shot_actions[0],
+                    },
+                    {
+                        "phase": "change",
+                        "startSecond": first_end,
+                        "endSecond": second_end,
+                        "childAction": shot_actions[1],
+                    },
+                    {
+                        "phase": "warm_close",
+                        "startSecond": second_end,
+                        "endSecond": duration,
+                        "childAction": shot_actions[2],
+                    },
+                ],
+                "selectedAnchorAssetId": anchor_id,
+                "selectedVideoAssetId": selected_video_id,
+                "anchorCandidates": [
+                    {
+                        "id": anchor_id,
+                        "sha256": f"preview-anchor-{index}",
+                        "status": "approved",
+                        "mediaType": "image",
+                        "contentUrl": "/api/v1/preview-assets/person.png",
+                        "qc": {"width": 720, "height": 1280},
+                        "diagnosticStatus": "passed",
+                        "diagnostics": [
+                            {
+                                "status": "passed",
+                                "checks": ["child_identity", "cat_identity", "watercolor_style"],
+                            }
+                        ],
+                    }
+                ],
+                "videoCandidates": video_candidates,
+            }
+        )
+
+    return {
+        "id": instance_id,
+        "projectId": "project-healing-recipe",
+        "recipeKey": "healing_child_cat_v1",
+        "recipeVersion": 1,
+        "revision": 7,
+        "theme": "雨停以后，小满和团团一起收好三颗栗子",
+        "inspirationKey": "weather",
+        "targetDurationSeconds": 31,
+        "qualityTier": "balanced",
+        "canonProfileId": "healing_child_cat_canon_v2",
+        "stage": "video",
+        "shotDurations": list(durations),
+        "currentBlocker": "镜头 2 的视频专项诊断未通过：请退回重做、局部重编，或填写理由人工覆盖。",
+        "primaryAction": "处理镜头 2 的诊断问题",
+        "estimatedCostMicros": 326000,
+        "reviewStages": [
+            {"key": "story", "complete": True},
+            {"key": "anchors", "complete": True},
+            {"key": "video", "complete": False},
+            {"key": "sequence", "complete": False},
+        ],
+        "progress": {
+            "storyApproved": True,
+            "episodeRulesLocked": True,
+            "shotCount": 3,
+            "approvedAnchorCount": 3,
+            "approvedVideoCount": 1,
+            "sequenceReady": False,
+            "finalApproved": False,
+        },
+        "episodeRules": episode_rules,
+        "storyCandidates": [
+            {
+                "id": "recipe-story-approved",
+                "revision": 1,
+                "strategy": "低压力小发现",
+                "status": "approved",
+                "title": "《第三颗栗子》",
+                "logline": "一颗滚落的栗子，让小满和团团在雨后共享了一次安静的小小协作。",
+                "synopsis": (
+                    "小满收拾雨后捡来的栗子，团团拦住滚向桌边的一颗。"
+                    "没有对白，只有细小动作和窗外余晖。"
+                ),
+                "episodeRules": episode_rules,
+                "scoreAverage": 9.1,
+                "scoreRationale": "事件轻、动作清楚，猫咪参与自然，结尾留有安静余味。",
+            }
+        ],
+        "shots": shots,
+        "sequenceCandidate": None,
+    }
+
+
+def healing_recipe_canvas(project_id: str) -> dict[str, Any]:
+    recipe = healing_recipe_instance()
+    nodes = [
+        _node(
+            recipe["id"],
+            "RecipeGroupNode",
+            "production_recipe_instance",
+            90,
+            160,
+            {"title": "一人一猫治愈短片", **recipe},
+        ),
+        _node(
+            "recipe-brief",
+            "BriefNode",
+            "story_brief",
+            520,
+            40,
+            {
+                "title": "创意与故事",
+                "theme": recipe["theme"],
+                "targetDurationSeconds": 31,
+                "aspectRatio": "9:16",
+                "genre": "治愈日常",
+            },
+        ),
+        _node(
+            "recipe-child",
+            "SubjectNode",
+            "subject",
+            520,
+            250,
+            {
+                "title": "小满 · Canon-v2",
+                "kind": "person",
+                "role": "protagonist",
+                "identityAnchors": ["固定儿童身份与比例参考"],
+            },
+        ),
+        _node(
+            "recipe-cat",
+            "SubjectNode",
+            "subject",
+            520,
+            460,
+            {
+                "title": "团团 · Canon-v2",
+                "kind": "animal",
+                "role": "co_protagonist",
+                "identityAnchors": ["固定猫咪身份，自然四足结构"],
+            },
+        ),
+    ]
+    for index, shot in enumerate(recipe["shots"], 1):
+        nodes.append(
+            _node(
+                shot["beatId"],
+                "ShotBeatNode",
+                "shot_beat",
+                900,
+                40 + (index - 1) * 250,
+                {
+                    "title": shot["title"],
+                    "durationSeconds": shot["durationSeconds"],
+                    "action": shot["temporalBeats"][1]["childAction"],
+                    "camera": "克制的缓慢推进，保持水彩纸张质感",
+                    "dialogue": "",
+                    "temporalBeats": shot["temporalBeats"],
+                },
+            )
+        )
+    return {
+        "projectId": project_id,
+        "canvasV2Enabled": True,
+        "templateKey": "short_drama",
+        "featureFlags": {"universalCanvas": True, "productAdTemplate": False, "videoEditV2": True},
+        "layoutVersion": 7,
+        "nodes": nodes,
+        "edges": [],
+        "viewport": {"x": 0, "y": 0, "zoom": 0.72},
+        "syncStatus": "saved",
+    }
+
+
 def product_canvas(project_id: str) -> dict[str, Any]:
     candidates = [
         {
@@ -492,8 +756,8 @@ def health() -> dict[str, Any]:
         "ready": True,
         "databaseReady": True,
         "contractVersion": 5,
-        "alembicRevision": "0020_universal_media_canvas",
-        "expectedAlembicRevision": "0020_universal_media_canvas",
+        "alembicRevision": "0022_healing_child_cat_recipe",
+        "expectedAlembicRevision": "0022_healing_child_cat_recipe",
     }
 
 
@@ -543,6 +807,12 @@ def runtime_settings() -> dict[str, Any]:
 def projects() -> list[dict[str, str]]:
     return [
         {
+            "id": "project-healing-recipe",
+            "title": "第三颗栗子 · 一人一猫治愈短片",
+            "contentDate": "2026-08-20",
+            "status": "active",
+        },
+        {
             "id": "project-demo",
             "title": "冰爽一刻 · 产品广告",
             "contentDate": "2026-08-20",
@@ -560,6 +830,67 @@ def projects() -> list[dict[str, str]]:
 @app.get("/api/v1/task-center")
 def task_center() -> dict[str, list[Any]]:
     return {"runtimeJobs": [], "persistentTasks": []}
+
+
+@app.get("/api/v2/provider-capabilities")
+def provider_capabilities(
+    media_kind: str | None = Query(default=None, alias="mediaKind"),
+) -> list[dict[str, Any]]:
+    kind = media_kind or "video"
+    is_video = kind in {"video", "video_edit"}
+    capabilities = {
+        "provider": "ark",
+        "model": "doubao-seedance-2-0-260128" if is_video else "doubao-seedream-5-0",
+        "modes": ["text_to_video", "image_to_video"] if is_video else ["text_to_image"],
+        "aspectRatios": ["9:16", "16:9", "1:1"],
+        "resolutions": ["480p", "720p", "1080p"] if is_video else ["1k", "2k"],
+        "durations": [5, 8, 12] if is_video else [1],
+        "candidateCounts": [1, 2, 4],
+        "audio": is_video,
+        "maxReferenceImages": 4 if is_video else 8,
+        "estimatedCostMicros": 135000 if is_video else 28000,
+        "cameraMotions": [
+            {"value": "static", "label": "固定镜头", "enabled": True},
+            {"value": "follow", "label": "跟随拍摄", "enabled": True},
+            {"value": "pan_left", "label": "镜头左摇", "enabled": True},
+            {"value": "pan_right", "label": "镜头右摇", "enabled": True},
+            {"value": "tilt_up", "label": "镜头上摇", "enabled": True},
+            {"value": "tilt_down", "label": "镜头下摇", "enabled": True},
+            {"value": "push_in", "label": "推进", "enabled": True},
+            {"value": "pull_out", "label": "拉远", "enabled": True},
+            {"value": "orbit", "label": "环绕", "enabled": True},
+            {"value": "handheld", "label": "手持", "enabled": True},
+        ]
+        if is_video
+        else [],
+    }
+    return [
+        {
+            "id": f"preview-{kind}-capability",
+            "provider": capabilities["provider"],
+            "model": capabilities["model"],
+            "mediaKind": kind,
+            "capabilities": capabilities,
+            "active": True,
+        }
+    ]
+
+
+@app.put("/api/v2/canvas/nodes/{node_id}/generation-config")
+def save_generation_config(
+    node_id: str,
+    payload: dict[str, Any] = Body(...),
+    if_match: str | None = Header(default=None),
+) -> dict[str, Any]:
+    revision = int(if_match or GENERATION_CONFIGS.get(node_id, {}).get("revision", 0)) + 1
+    saved = {
+        "id": f"preview-generation-config-{node_id}",
+        "nodeId": node_id,
+        "revision": revision,
+        **payload,
+    }
+    GENERATION_CONFIGS[node_id] = saved
+    return saved
 
 
 @app.get("/api/v2/canvas-templates")
@@ -596,7 +927,18 @@ def templates() -> list[dict[str, Any]]:
 
 @app.get("/api/v2/projects/{project_id}/canvas")
 def get_canvas(project_id: str) -> dict[str, Any]:
-    return story_canvas(project_id) if project_id == "project-story" else product_canvas(project_id)
+    if project_id == "project-healing-recipe":
+        return healing_recipe_canvas(project_id)
+    if project_id == "project-story":
+        return story_canvas(project_id)
+    return product_canvas(project_id)
+
+
+@app.get("/api/v2/recipe-instances/{instance_id}")
+def get_recipe_instance(instance_id: str) -> dict[str, Any]:
+    if instance_id != "recipe-healing-demo":
+        raise HTTPException(status_code=404, detail="unknown production recipe preview")
+    return healing_recipe_instance(instance_id)
 
 
 @app.patch("/api/v2/projects/{project_id}/canvas/layout")
@@ -697,6 +1039,17 @@ def update_annotations(
 @app.post("/api/v2/video-edit-recipes/{recipe_id}/compile")
 def compile_recipe(recipe_id: str) -> dict[str, Any]:
     recipe = RECIPE_REVISIONS[recipe_id]
+    actual_references = [
+        {
+            "assetId": asset_id,
+            "subjectRevisionId": None,
+            "semanticRole": "video_edit_reference",
+            "providerIncluded": True,
+            "providerSlot": f"control_anchor_reference_{index}",
+            "omissionReason": None,
+        }
+        for index, asset_id in enumerate(recipe.get("referenceAssetIds", []), 1)
+    ]
     plan = {
         "recipeId": recipe_id,
         "mode": "two_stage",
@@ -711,6 +1064,7 @@ def compile_recipe(recipe_id: str) -> dict[str, Any]:
         "warnings": ["当前 Ark 将先生成两个干净控制锚点，再执行区间视频重编"],
         "provider": "ark",
         "model": "seedance-2",
+        "actualReferences": actual_references,
     }
     RECIPE_REVISIONS[recipe_id] = {
         **recipe,
@@ -752,9 +1106,115 @@ def product_preview(filename: str) -> FileResponse:
 @app.get("/api/v1/assets/demo-video/content")
 def demo_video() -> FileResponse:
     return FileResponse(
-        ROOT / "design-qa-assets" / "product-ad-demo.mp4",
+        DEMO_VIDEO_PATH,
         media_type="video/mp4",
     )
+
+
+def _preview_filmstrip(frame_count: int) -> dict[str, Any]:
+    frame_dir = FILMSTRIP_ROOT / str(frame_count)
+    frames = tuple(sorted(frame_dir.glob("frame-*.png")))
+    timestamps_ms = tuple(
+        round(index * (DEMO_VIDEO_DURATION_MS - 100) / (frame_count - 1))
+        for index in range(frame_count)
+    )
+    return {
+        "assetId": "demo-video",
+        "frameCount": frame_count,
+        "status": "failed"
+        if frame_count in FILMSTRIP_ERRORS
+        else "ready"
+        if len(frames) == frame_count
+        else "not_requested",
+        "stepId": f"preview-filmstrip-demo-video-{frame_count}",
+        "error": (
+            {"code": "ffmpeg_failed", "message": FILMSTRIP_ERRORS[frame_count]}
+            if frame_count in FILMSTRIP_ERRORS
+            else None
+        ),
+        "frames": [
+            {
+                "assetId": f"demo-video-frame-{frame_count}-{index}",
+                "timestampMs": timestamps_ms[index - 1],
+                "contentUrl": (
+                    f"/api/v1/preview-assets/filmstrip/demo-video/{frame_count}/{index}.png"
+                ),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+            for index, path in enumerate(frames, 1)
+        ],
+    }
+
+
+@app.post("/api/v2/assets/demo-video/filmstrip-runs", status_code=202)
+def create_demo_filmstrip(
+    frame_count: int = Query(default=12, alias="frameCount", ge=4, le=12),
+) -> dict[str, Any]:
+    existing = _preview_filmstrip(frame_count)
+    if existing["status"] == "ready":
+        return existing
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        FILMSTRIP_ERRORS[frame_count] = "FFmpeg 未安装，无法生成真实视频帧带"
+        return _preview_filmstrip(frame_count)
+    FILMSTRIP_ERRORS.pop(frame_count, None)
+    frame_dir = FILMSTRIP_ROOT / str(frame_count)
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    for path in frame_dir.glob("frame-*.png"):
+        path.unlink()
+    timestamps_ms = tuple(
+        round(index * (DEMO_VIDEO_DURATION_MS - 100) / (frame_count - 1))
+        for index in range(frame_count)
+    )
+    try:
+        for index, timestamp_ms in enumerate(timestamps_ms, 1):
+            output = frame_dir / f"frame-{index:02d}.png"
+            completed = subprocess.run(
+                [
+                    ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-ss",
+                    f"{timestamp_ms / 1000:.3f}",
+                    "-i",
+                    str(DEMO_VIDEO_PATH),
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    "scale=240:-2",
+                    str(output),
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            if completed.returncode != 0 or not output.is_file():
+                detail = completed.stderr.strip() or f"无法抽取 {timestamp_ms}ms 视频帧"
+                raise RuntimeError(detail)
+    except Exception as exc:
+        for path in frame_dir.glob("frame-*.png"):
+            path.unlink()
+        FILMSTRIP_ERRORS[frame_count] = str(exc)
+    return _preview_filmstrip(frame_count)
+
+
+@app.get("/api/v2/assets/demo-video/filmstrip")
+def get_demo_filmstrip(
+    frame_count: int = Query(default=12, alias="frameCount", ge=4, le=12),
+) -> dict[str, Any]:
+    return _preview_filmstrip(frame_count)
+
+
+@app.get("/api/v1/preview-assets/filmstrip/demo-video/{frame_count}/{index}.png")
+def demo_filmstrip_frame(frame_count: int, index: int) -> FileResponse:
+    if not 4 <= frame_count <= 12 or not 1 <= index <= frame_count:
+        raise HTTPException(status_code=404, detail="unknown filmstrip frame")
+    path = FILMSTRIP_ROOT / str(frame_count) / f"frame-{index:02d}.png"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="filmstrip frame is not ready")
+    return FileResponse(path, media_type="image/png")
 
 
 @app.get("/api/v2/prompt-runs/{prompt_id}")
@@ -856,6 +1316,23 @@ async def events(project_id: str) -> StreamingResponse:
             await asyncio.sleep(15)
 
     return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@app.get("/{spa_path:path}", include_in_schema=False)
+def web_app(spa_path: str) -> FileResponse:
+    """Serve the built SPA so browser QA needs only this deterministic preview process."""
+    dist_root = (ROOT / "web" / "dist").resolve()
+    requested = (dist_root / spa_path).resolve()
+    try:
+        requested.relative_to(dist_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="unknown preview path") from exc
+    if requested.is_file():
+        return FileResponse(requested)
+    index = dist_root / "index.html"
+    if not index.is_file():
+        raise HTTPException(status_code=503, detail="run the web build before visual review")
+    return FileResponse(index, media_type="text/html")
 
 
 if __name__ == "__main__":

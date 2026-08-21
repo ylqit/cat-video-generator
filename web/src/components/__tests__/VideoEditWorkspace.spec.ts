@@ -7,6 +7,8 @@ const calls = vi.hoisted(() => ({
   createVideoEditRecipe: vi.fn(),
   compileVideoEditRecipe: vi.fn(),
   submitVideoEditRecipe: vi.fn(),
+  videoFilmstrip: vi.fn(),
+  createVideoFilmstrip: vi.fn(),
 }));
 
 vi.mock("../../api/client", () => ({ canvasApi: calls }));
@@ -14,6 +16,16 @@ vi.mock("../../api/client", () => ({ canvasApi: calls }));
 describe("VideoEditWorkspace", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    calls.videoFilmstrip.mockResolvedValue({
+      assetId: "video-1",
+      frameCount: 12,
+      status: "ready",
+      frames: Array.from({ length: 12 }, (_, index) => ({
+        assetId: `frame-${index}`,
+        timestampMs: index * 2_000,
+        contentUrl: `/api/v1/assets/frame-${index}/content`,
+      })),
+    });
     calls.createVideoEditRecipe.mockResolvedValue({
       id: "recipe-1",
       revision: 1,
@@ -65,6 +77,12 @@ describe("VideoEditWorkspace", () => {
     expect(wrapper.text()).toContain("箭头");
     expect(wrapper.text()).toContain("时间点");
     expect(wrapper.text()).toContain("会进入供应商请求");
+    await flushPromises();
+    const frames = wrapper.findAll('[data-filmstrip-frame]');
+    expect(frames).toHaveLength(12);
+    expect(new Set(frames.map((item) => item.attributes("src"))).size).toBe(12);
+    expect(wrapper.get('[data-range-handle="start"]')).toBeDefined();
+    expect(wrapper.get('[data-range-handle="end"]')).toBeDefined();
 
     await wrapper.get("textarea").setValue("女主转身并轻触发簪");
     await wrapper.get('[data-tool="rectangle"]').trigger("click");

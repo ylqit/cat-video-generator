@@ -74,6 +74,19 @@ class VideoDiagnosticResult:
     request_hash: str
 
 
+@dataclass(frozen=True, slots=True)
+class ImageDiagnosticResult:
+    identity_ok: bool
+    style_ok: bool
+    constraints_ok: bool
+    confidence: float
+    violations: tuple[str, ...]
+    evidence: tuple[dict[str, str | None], ...]
+    response_id: str
+    model: str
+    request_hash: str
+
+
 class GatewayError(RuntimeError):
     def __init__(
         self,
@@ -156,7 +169,10 @@ class StoredStep:
     provider_task_id: str | None = None
     model: str | None = None
     error: dict[str, Any] | None = None
+    progress: dict[str, Any] = field(default_factory=dict)
     created_at: datetime | None = None
+    updated_at: datetime | None = None
+    completed_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,6 +357,8 @@ class MediaGateway(Protocol):
     def diagnose_video_frames(
         self, *, prompt: str, frame_paths: tuple[Path, ...]
     ) -> VideoDiagnosticResult: ...
+
+    def diagnose_image(self, *, prompt: str, image_path: Path) -> ImageDiagnosticResult: ...
 
 
 class RuntimePreflight(Protocol):

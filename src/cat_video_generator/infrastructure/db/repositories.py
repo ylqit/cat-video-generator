@@ -62,6 +62,7 @@ from ...domain.workflow import (
 from ..ark.runtime import current_execution_snapshot
 from .models import (
     Asset,
+    CanvasEvent,
     ProductionRun,
     PromptRecord,
     Review,
@@ -1477,6 +1478,40 @@ class SqlAlchemyWorkflowRepository:
             ).scalars()
             return tuple(_step(row) for row in rows)
 
+    def task_center_events(
+        self,
+        *,
+        after_sequence: int,
+        limit: int = 200,
+    ) -> tuple[dict[str, Any], ...]:
+        if after_sequence < 0:
+            raise ValueError("after_sequence cannot be negative")
+        if limit < 1 or limit > 200:
+            raise ValueError("event limit must be between 1 and 200")
+        with self._sessions() as session:
+            rows = list(
+                session.scalars(
+                    select(CanvasEvent)
+                    .where(CanvasEvent.sequence > after_sequence)
+                    .order_by(CanvasEvent.sequence)
+                    .limit(limit)
+                )
+            )
+            return tuple(
+                {
+                    "id": str(row.id),
+                    "sequence": row.sequence,
+                    "projectId": str(row.production_run_id),
+                    "type": row.event_type,
+                    "data": {
+                        "projectId": str(row.production_run_id),
+                        **dict(row.data_json),
+                    },
+                    "createdAt": row.created_at.isoformat(),
+                }
+                for row in rows
+            )
+
     def get_prompt(self, step_id: uuid.UUID) -> StoredPrompt | None:
         with self._sessions() as session:
             row = session.scalar(
@@ -2269,7 +2304,10 @@ def _step(row: WorkflowStep) -> StoredStep:
         provider_task_id=row.provider_task_id,
         model=row.model,
         error=None if row.error_json is None else dict(row.error_json),
+        progress=dict(row.progress_json or {}),
         created_at=row.created_at,
+        updated_at=row.updated_at,
+        completed_at=row.completed_at,
     )
 
 

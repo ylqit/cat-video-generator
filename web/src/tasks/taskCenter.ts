@@ -26,14 +26,29 @@ export interface TaskCenterItem {
   sceneId?: string;
   shotId?: string;
   operationKey?: string;
+  canvasNodeId?: string;
+  canvasGroupId?: string;
+  recipeInstanceId?: string;
+  creationMode?: string;
+  workflowStage?: string;
+  phase?: string;
   attempt?: number;
   model?: string | null;
   providerTaskId?: string | null;
   result?: unknown;
+  resultSummary?: Record<string, unknown> | null;
+  progress?: {
+    currentStep?: number;
+    totalSteps?: number;
+    percent?: number;
+    message?: string;
+  };
   error?: Record<string, unknown> | null;
   createdAt?: string | null;
+  completedAt?: string | null;
   updatedAt: string;
   source: "runtime" | "workflow";
+  eventSequence?: number;
 }
 
 export interface RegisterTaskOptions {
@@ -43,6 +58,12 @@ export interface RegisterTaskOptions {
   sceneId?: string;
   shotId?: string;
   operationKey?: string;
+  canvasNodeId?: string;
+  canvasGroupId?: string;
+  recipeInstanceId?: string;
+  creationMode?: string;
+  workflowStage?: string;
+  phase?: string;
 }
 
 export interface TaskCenterEvent {
@@ -63,6 +84,7 @@ export interface WorkspaceRefreshRequest {
 
 const STORAGE_KEY = "cvg.v5.task-center";
 const NOTIFICATIONS_KEY = "cvg.v5.task-notifications";
+const EVENT_CURSOR_KEY = "cvg.v5.task-event-cursor";
 const ACTIVE_INTERVAL_MS = 4_000;
 const IDLE_INTERVAL_MS = 25_000;
 const activeStatuses = new Set<TaskCenterStatus>([
@@ -80,8 +102,11 @@ const sceneSignals = ref<Record<string, TaskCenterScopeSignal>>({});
 const shotSignals = ref<Record<string, TaskCenterScopeSignal>>({});
 const workspaceRefreshRequest = ref<WorkspaceRefreshRequest | null>(null);
 const connectionError = ref("");
-const lastResumeAt = new Map<string, number>();
 let timer: number | undefined;
+let reconnectTimer: number | undefined;
+let eventSource: EventSource | undefined;
+let eventCursor = loadEventCursor();
+let sseConnected = false;
 let refreshing = false;
 let hydrated = false;
 let started = false;
@@ -132,6 +157,12 @@ function loadNotifiedTerminalEvents(): string[] {
   }
 }
 
+function loadEventCursor(): number {
+  if (typeof window === "undefined") return 0;
+  const value = Number(window.localStorage.getItem(EVENT_CURSOR_KEY) ?? "0");
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
 function persist() {
   if (typeof window === "undefined") return;
   window.localStorage.setItem(STORAGE_KEY, JSON.stringify(items.value.slice(0, 100)));
@@ -139,6 +170,7 @@ function persist() {
     NOTIFICATIONS_KEY,
     JSON.stringify([...notifiedTerminalEvents].slice(-200)),
   );
+  window.localStorage.setItem(EVENT_CURSOR_KEY, String(eventCursor));
 }
 
 function normalizedStatus(value: string): TaskCenterStatus {
@@ -157,6 +189,8 @@ function materialSignature(item: TaskCenterItem): string {
     model: item.model,
     providerTaskId: item.providerTaskId,
     result: item.result,
+    resultSummary: item.resultSummary,
+    progress: item.progress,
     error: item.error,
   });
 }
@@ -205,13 +239,20 @@ function updateItem(next: TaskCenterItem) {
     || materialSignature(previous) !== materialSignature(merged);
   if (index < 0) items.value.push(merged);
   else items.value.splice(index, 1, merged);
-  if (materialChanged) signalMaterialChange(merged);
+  if (
+    materialChanged
+    && previous
+    && previous.status !== merged.status
+    && ["awaiting_review", "succeeded"].includes(merged.status)
+  ) signalMaterialChange(merged);
   if (previous && previous.status !== merged.status) {
     const event = { item: merged, previousStatus: previous.status };
     const terminal = ["awaiting_review", "succeeded", "failed", "submission_unknown"].includes(
       merged.status,
     );
-    const fingerprint = `${merged.stepId ?? merged.jobId ?? merged.key}:${merged.status}`;
+    const fingerprint = merged.eventSequence
+      ? `event:${merged.eventSequence}`
+      : `${merged.stepId ?? merged.jobId ?? merged.key}:${merged.status}`;
     if (
       hydrated
       && terminal
@@ -225,14 +266,15 @@ function updateItem(next: TaskCenterItem) {
 }
 
 function mergeRuntimeJob(job: JobDto) {
+  const context = job.context ?? {};
   const result = job.result && typeof job.result === "object"
     ? job.result as Record<string, unknown>
     : {};
-  const stepId = typeof result.stepId === "string" ? result.stepId : job.context.stepId;
+  const stepId = typeof result.stepId === "string" ? result.stepId : context.stepId;
   const existing = items.value.find((item) => item.jobId === job.jobId)
     ?? items.value.find((item) => Boolean(stepId)
       && item.stepId === stepId
-      && (!item.operationKey || item.operationKey === job.context.operationKey));
+      && (!item.operationKey || item.operationKey === context.operationKey));
   updateItem({
     key: existing?.key ?? `job:${job.jobId}`,
     jobId: job.jobId,
@@ -240,19 +282,26 @@ function mergeRuntimeJob(job: JobDto) {
     kind: existing?.kind ?? job.kind,
     label: existing?.label ?? taskKindLabel(job.kind),
     status: runtimeResultStatus(job),
-    projectId: existing?.projectId ?? job.context.projectId,
-    sceneId: existing?.sceneId ?? job.context.sceneId,
-    shotId: existing?.shotId ?? job.context.shotId,
-    operationKey: job.context.operationKey ?? existing?.operationKey,
+    projectId: existing?.projectId ?? context.projectId,
+    sceneId: existing?.sceneId ?? context.sceneId,
+    shotId: existing?.shotId ?? context.shotId,
+    operationKey: context.operationKey ?? existing?.operationKey,
+    canvasNodeId: context.canvasNodeId ?? existing?.canvasNodeId,
+    canvasGroupId: context.canvasGroupId ?? existing?.canvasGroupId,
+    recipeInstanceId: context.recipeInstanceId ?? existing?.recipeInstanceId,
+    creationMode: context.creationMode ?? existing?.creationMode,
+    workflowStage: context.workflowStage ?? existing?.workflowStage,
+    phase: context.phase ?? existing?.phase,
     result: job.result,
     error: job.error,
     createdAt: job.createdAt ?? existing?.createdAt,
+    completedAt: job.finishedAt ?? existing?.completedAt,
     updatedAt: new Date().toISOString(),
     source: "runtime",
   });
 }
 
-function mergeWorkflowTask(task: PersistentTaskDto, activeRuntimeIds: ReadonlySet<string>) {
+function mergeWorkflowTask(task: PersistentTaskDto) {
   const existing = items.value.find((item) => item.stepId === task.stepId
     && (!item.operationKey || item.operationKey === task.operationKey))
     ?? items.value.find((item) => !item.stepId
@@ -262,27 +311,179 @@ function mergeWorkflowTask(task: PersistentTaskDto, activeRuntimeIds: ReadonlySe
       && item.operationKey === task.operationKey
       && activeStatuses.has(item.status));
   const durableStatus = normalizedStatus(task.status);
-  const hasRuntime = Boolean(existing?.jobId && activeRuntimeIds.has(existing.jobId));
   updateItem({
     key: existing?.key ?? `step:${task.stepId}`,
     jobId: existing?.jobId,
     stepId: task.stepId,
     kind: task.kind,
     label: operationLabel(task.operationKey),
-    status: activeStatuses.has(durableStatus) && !hasRuntime ? "restart_pending" : durableStatus,
+    status: durableStatus,
     projectId: task.projectId,
     sceneId: task.sceneId ?? undefined,
     shotId: task.shotId ?? undefined,
     operationKey: task.operationKey,
+    canvasNodeId: task.canvasNodeId ?? undefined,
+    canvasGroupId: task.canvasGroupId ?? undefined,
+    recipeInstanceId: task.recipeInstanceId ?? undefined,
+    creationMode: task.creationMode ?? undefined,
+    workflowStage: task.workflowStage ?? undefined,
+    phase: task.phase ?? undefined,
     attempt: task.attempt,
     model: task.model,
     providerTaskId: task.providerTaskId,
     result: existing?.result,
+    resultSummary: task.resultSummary,
+    progress: task.progress,
     error: task.error,
     createdAt: task.createdAt,
-    updatedAt: new Date().toISOString(),
+    completedAt: task.completedAt,
+    updatedAt: task.updatedAt ?? new Date().toISOString(),
     source: "workflow",
   });
+}
+
+const pushedTaskEvents = [
+  "task_queued",
+  "task_running",
+  "task_progress",
+  "task_awaiting_review",
+  "task_succeeded",
+  "task_failed",
+  "task_submission_unknown",
+] as const;
+const projectionEvents = [
+  "canvas_projection_changed",
+  "workflow_changed",
+  "template_instantiated",
+  "canvas_node_created",
+  "canvas_edge_created",
+  "canvas_edge_deleted",
+  "generation_batch_queued",
+  "video_edit_recipe_created",
+  "video_edit_recipe_revised",
+  "video_edit_recipe_compiled",
+  "video_edit_recipe_queued",
+  "video_edit_candidate_ready",
+  "subject_completion_ready",
+  "subject_completion_applied",
+  "node_generation_config_saved",
+  "generation_candidate_ready",
+  "video_filmstrip_queued",
+  "video_filmstrip_ready",
+] as const;
+
+function handlePushedEvent(eventType: string, event: MessageEvent<string>) {
+  const sequence = Number(event.lastEventId);
+  if (!Number.isSafeInteger(sequence) || sequence <= eventCursor) return;
+  let data: Record<string, unknown>;
+  try {
+    data = JSON.parse(event.data) as Record<string, unknown>;
+  } catch {
+    return;
+  }
+  eventCursor = sequence;
+  if ((projectionEvents as readonly string[]).includes(eventType)) {
+    bumpSignal(
+      projectSignals,
+      typeof data.projectId === "string" ? data.projectId : undefined,
+      typeof data.operationKey === "string" ? data.operationKey : undefined,
+    );
+    persist();
+    return;
+  }
+  const stepId = typeof data.stepId === "string" ? data.stepId : undefined;
+  if (!stepId) return;
+  const existing = items.value.find((item) => item.stepId === stepId);
+  const operationKey = typeof data.operationKey === "string"
+    ? data.operationKey
+    : existing?.operationKey;
+  const statusByEvent: Record<string, TaskCenterStatus> = {
+    task_queued: "queued",
+    task_running: "running",
+    task_awaiting_review: "awaiting_review",
+    task_succeeded: "succeeded",
+    task_failed: "failed",
+    task_submission_unknown: "submission_unknown",
+  };
+  const rawStatus = typeof data.status === "string" ? data.status : statusByEvent[eventType];
+  const progress = data.progress && typeof data.progress === "object"
+    ? data.progress as TaskCenterItem["progress"]
+    : existing?.progress;
+  const resultSummary = data.resultSummary && typeof data.resultSummary === "object"
+    ? data.resultSummary as Record<string, unknown>
+    : existing?.resultSummary;
+  const error = data.error && typeof data.error === "object"
+    ? data.error as Record<string, unknown>
+    : null;
+  updateItem({
+    key: existing?.key ?? `step:${stepId}`,
+    jobId: existing?.jobId,
+    stepId,
+    kind: typeof data.kind === "string" ? data.kind : existing?.kind ?? "workflow",
+    label: operationKey ? operationLabel(operationKey) : existing?.label ?? "后台任务",
+    status: normalizedStatus(rawStatus ?? "running"),
+    projectId: typeof data.projectId === "string" ? data.projectId : existing?.projectId,
+    sceneId: existing?.sceneId,
+    shotId: typeof data.shotId === "string" ? data.shotId : existing?.shotId,
+    operationKey,
+    canvasNodeId: typeof data.canvasNodeId === "string"
+      ? data.canvasNodeId
+      : existing?.canvasNodeId,
+    canvasGroupId: typeof data.canvasGroupId === "string"
+      ? data.canvasGroupId
+      : existing?.canvasGroupId,
+    recipeInstanceId: typeof data.recipeInstanceId === "string"
+      ? data.recipeInstanceId
+      : existing?.recipeInstanceId,
+    creationMode: typeof data.creationMode === "string"
+      ? data.creationMode
+      : existing?.creationMode,
+    workflowStage: typeof data.phase === "string" ? data.phase : existing?.workflowStage,
+    phase: typeof data.phase === "string" ? data.phase : existing?.phase,
+    attempt: existing?.attempt,
+    model: existing?.model,
+    providerTaskId: typeof data.providerTaskId === "string"
+      ? data.providerTaskId
+      : existing?.providerTaskId,
+    result: existing?.result,
+    resultSummary,
+    progress,
+    error,
+    createdAt: existing?.createdAt ?? new Date().toISOString(),
+    completedAt: typeof data.completedAt === "string"
+      ? data.completedAt
+      : existing?.completedAt,
+    updatedAt: new Date().toISOString(),
+    source: "workflow",
+    eventSequence: sequence,
+  });
+  persist();
+}
+
+function connectTaskEvents() {
+  if (!started || typeof window === "undefined" || typeof EventSource === "undefined") return;
+  eventSource?.close();
+  const source = new EventSource(api.taskCenterEventsUrl(eventCursor));
+  eventSource = source;
+  source.onopen = () => {
+    sseConnected = true;
+    connectionError.value = "";
+    scheduleNextRefresh();
+  };
+  for (const eventType of [...pushedTaskEvents, ...projectionEvents]) {
+    source.addEventListener(eventType, (event) => {
+      handlePushedEvent(eventType, event as MessageEvent<string>);
+    });
+  }
+  source.onerror = () => {
+    source.close();
+    if (eventSource === source) eventSource = undefined;
+    sseConnected = false;
+    connectionError.value = "实时推送暂不可用，已降级为任务轮询";
+    void refreshTaskCenter();
+    if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
+    reconnectTimer = window.setTimeout(connectTaskEvents, 3_000);
+  };
 }
 
 function scheduleNextRefresh() {
@@ -294,7 +495,8 @@ function scheduleNextRefresh() {
   }
   timer = window.setTimeout(
     () => void refreshTaskCenter(),
-    activeCount.value > 0 ? ACTIVE_INTERVAL_MS : IDLE_INTERVAL_MS,
+    sseConnected ? IDLE_INTERVAL_MS
+      : activeCount.value > 0 ? ACTIVE_INTERVAL_MS : IDLE_INTERVAL_MS,
   );
 }
 
@@ -305,6 +507,7 @@ function handleVisibilityChange() {
     timer = undefined;
   } else {
     void refreshTaskCenter();
+    if (!eventSource) connectTaskEvents();
   }
 }
 
@@ -319,6 +522,12 @@ export function registerTask(jobId: string, options: RegisterTaskOptions) {
     sceneId: options.sceneId,
     shotId: options.shotId,
     operationKey: options.operationKey,
+    canvasNodeId: options.canvasNodeId,
+    canvasGroupId: options.canvasGroupId,
+    recipeInstanceId: options.recipeInstanceId,
+    creationMode: options.creationMode,
+    workflowStage: options.workflowStage,
+    phase: options.phase,
     updatedAt: new Date().toISOString(),
     createdAt: new Date().toISOString(),
     source: "runtime",
@@ -341,16 +550,8 @@ export async function refreshTaskCenter() {
   try {
     const payload = await api.taskCenter();
     const runtimeIds = new Set(payload.runtimeJobs.map((job) => job.jobId));
-    const activeRuntimeIds = new Set(payload.runtimeJobs.flatMap((job) =>
-      ["queued", "running"].includes(job.status) ? [job.jobId] : [],
-    ));
-    const activeRuntimeStepIds = new Set(payload.runtimeJobs.flatMap((job) =>
-      ["queued", "running"].includes(job.status) && job.context.stepId
-        ? [job.context.stepId]
-        : [],
-    ));
     payload.runtimeJobs.forEach(mergeRuntimeJob);
-    payload.persistentTasks.forEach((task) => mergeWorkflowTask(task, activeRuntimeIds));
+    payload.persistentTasks.forEach(mergeWorkflowTask);
 
     const serverStepIds = new Set(payload.persistentTasks.map((task) => task.stepId));
     items.value = items.value.filter((item) => {
@@ -359,25 +560,6 @@ export async function refreshTaskCenter() {
       return Boolean(item.stepId && serverStepIds.has(item.stepId));
     });
 
-    const now = Date.now();
-    const resumable = payload.persistentTasks.filter((task) =>
-      ["queued", "running"].includes(task.status)
-      && Boolean(task.providerTaskId)
-      && !activeRuntimeStepIds.has(task.stepId)
-      && now - (lastResumeAt.get(task.stepId) ?? 0) >= 30_000,
-    );
-    await Promise.all(resumable.map(async (task) => {
-      lastResumeAt.set(task.stepId, now);
-      try {
-        const submitted = await api.resumeStep(task.stepId);
-        const existing = items.value.find((item) => item.stepId === task.stepId);
-        if (existing) {
-          updateItem({ ...existing, jobId: submitted.jobId, status: "running", updatedAt: new Date().toISOString() });
-        }
-      } catch {
-        // Resume queries the existing provider task and never resubmits unknown work.
-      }
-    }));
     connectionError.value = "";
     persist();
     hydrated = true;
@@ -394,6 +576,7 @@ export function startTaskCenter() {
   started = true;
   document.addEventListener("visibilitychange", handleVisibilityChange);
   void refreshTaskCenter();
+  connectTaskEvents();
 }
 
 export function stopTaskCenter() {
@@ -401,7 +584,12 @@ export function stopTaskCenter() {
   started = false;
   document.removeEventListener("visibilitychange", handleVisibilityChange);
   if (timer !== undefined) window.clearTimeout(timer);
+  if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
+  eventSource?.close();
+  eventSource = undefined;
+  sseConnected = false;
   timer = undefined;
+  reconnectTimer = undefined;
 }
 
 export function clearCompletedTasks() {
@@ -424,6 +612,15 @@ export function taskKindLabel(kind: string): string {
     generate_anchor: "片段开场图",
     generate_video: "视频片段",
     range_edit: "区间重拍",
+    recipe_story: "治愈短片故事候选",
+    recipe_creative_brief: "治愈短片创意补全",
+    recipe_character_design: "治愈短片角色设计",
+    recipe_storyboard: "治愈短片分镜脚本",
+    recipe_anchor: "治愈短片视觉锚点",
+    recipe_video: "治愈短片逐镜视频",
+    recipe_sequence: "治愈短片最终音画",
+    story_strategy: "三案故事策划",
+    storyboard: "分镜脚本生成",
     build_sequence: "本地成片合成",
     resume_step: "Provider 任务恢复",
   } as Record<string, string>)[kind] ?? kind;
@@ -441,6 +638,16 @@ function operationLabel(operationKey: string): string {
     "image:anchor": "片段开场图",
     "video:shot": "视频片段",
     "video:range-edit": "区间重拍",
+    "recipe:story": "治愈短片故事候选",
+    "recipe:creative": "治愈短片创意补全",
+    "recipe:character_design": "治愈短片角色设计",
+    "recipe:storyboard": "治愈短片分镜脚本",
+    "recipe:anchor": "治愈短片视觉锚点",
+    "recipe:video": "治愈短片逐镜视频",
+    "recipe:sequence": "治愈短片最终音画",
+    "canvas:story_strategy": "三案故事策划",
+    "canvas:storyboard": "分镜脚本生成",
+    "canvas-group:run": "一人一猫整组执行",
   } as Record<string, string>)[operationKey]
     ?? (operationKey.startsWith("image:reference:") ? "视觉参考图" : operationKey);
 }

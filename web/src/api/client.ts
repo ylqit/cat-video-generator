@@ -2,9 +2,11 @@ import type {
   AssetDto,
   AcceptedVisualAssetPlan,
   CanvasDto,
+  CanvasLayoutSaveResult,
   CanvasAssetHistoryDto,
   CanvasEdgeDto,
   CanvasNodeType,
+  CanvasNodeAssetBindingDto,
   CanvasTemplateDto,
   CanvasTemplateKey,
   CapabilityCompilationPlan,
@@ -16,8 +18,13 @@ import type {
   TaskCenterDto,
   PreviousTailStatus,
   ProductionBoardDto,
+  ProductionRecipeDefinitionDto,
+  ProductionRecipeInstanceDto,
+  EpisodeRulesDto,
+  HumanReviewDecision,
   PromptRunDto,
   ProviderCapabilityDto,
+  VideoFilmstripDto,
   ProjectGraph,
   ProjectSummary,
   ReferenceBinding,
@@ -49,6 +56,7 @@ import type {
   StoryRewriteOutput,
   StoryRewriteStrategy,
   SubjectInput,
+  SubjectDto,
   SubjectCompletionRunDto,
   VideoEditAnnotationInput,
   VideoEditRecipeDto,
@@ -414,12 +422,147 @@ export const api = {
   jobs: () => request<JobDto[]>("/jobs"),
   job: (jobId: string) => request<JobDto>(`/jobs/${jobId}`),
   taskCenter: () => request<TaskCenterDto>("/task-center"),
+  taskCenterEventsUrl: (afterEventId = 0) =>
+    `${BASE}/task-center/events?afterEventId=${Math.max(0, afterEventId)}`,
   projectTasks: (projectId: string) =>
     request<PersistentTaskDto[]>(`/projects/${projectId}/tasks`),
   canon: () => request<AssetDto[]>("/canon"),
 };
 
 export const canvasApi = {
+  productionRecipes: () => request<ProductionRecipeDefinitionDto[]>(
+    "/production-recipes", undefined, CANVAS_BASE,
+  ),
+  createRecipeInstance: (
+    projectId: string,
+    payload: {
+      recipeKey: "healing_child_cat_v1";
+      theme: string;
+      inspirationKey?: string;
+      targetDurationSeconds: number;
+      qualityTier: "quick" | "balanced" | "premium";
+    },
+  ) => canvasJson<ProductionRecipeInstanceDto>(
+    `/projects/${projectId}/recipe-instances`, "POST", payload,
+  ),
+  recipeInstance: (instanceId: string) => request<ProductionRecipeInstanceDto>(
+    `/recipe-instances/${instanceId}`, undefined, CANVAS_BASE,
+  ),
+  updateRecipeInstance: (
+    instanceId: string,
+    revision: number,
+    payload: Record<string, unknown>,
+  ) => canvasJson<ProductionRecipeInstanceDto>(
+    `/recipe-instances/${instanceId}`,
+    "PATCH",
+    payload,
+    { "If-Match": String(revision) },
+  ),
+  runRecipeStory: (instanceId: string, acceptEstimatedCostMicros = 0) =>
+    canvasJson<JobDto>(
+      `/recipe-instances/${instanceId}/story-runs`,
+      "POST",
+      { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros },
+    ),
+  runRecipeCreativeBrief: (instanceId: string) =>
+    canvasJson<JobDto>(
+      `/recipe-instances/${instanceId}/creative-brief-runs`,
+      "POST",
+      { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros: 0 },
+    ),
+  runRecipeCharacterDesign: (instanceId: string, acceptEstimatedCostMicros = 0) =>
+    canvasJson<JobDto>(
+      `/recipe-instances/${instanceId}/character-design-runs`,
+      "POST",
+      { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros },
+    ),
+  runRecipeStoryboard: (
+    instanceId: string,
+    acceptEstimatedCostMicros = 0,
+    options: {
+      creationMode?: "from_story" | "from_characters";
+      referenceAssetIds?: string[];
+      instruction?: string;
+    } = {},
+  ) =>
+    canvasJson<JobDto>(
+      `/recipe-instances/${instanceId}/storyboard-runs`,
+      "POST",
+      { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros, ...options },
+    ),
+  runRecipeAnchor: (
+    instanceId: string,
+    shotId: string,
+    acceptEstimatedCostMicros = 0,
+    reason?: string,
+  ) =>
+    canvasJson<JobDto>(
+      `/recipe-instances/${instanceId}/shots/${shotId}/anchor-runs`,
+      "POST",
+      { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros, reason },
+    ),
+  runRecipeVideo: (
+    instanceId: string,
+    shotId: string,
+    acceptEstimatedCostMicros = 0,
+    reason?: string,
+  ) =>
+    canvasJson<JobDto>(
+      `/recipe-instances/${instanceId}/shots/${shotId}/video-runs`,
+      "POST",
+      { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros, reason },
+    ),
+  runRecipeSequence: (
+    instanceId: string,
+    acceptEstimatedCostMicros = 0,
+    transitions: Array<{ afterShotId: string; transition: SequenceTransitionDto }> = [],
+  ) =>
+    canvasJson<JobDto>(
+      `/recipe-instances/${instanceId}/sequence-runs`,
+      "POST",
+      { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros, transitions },
+    ),
+  reviewRecipeTarget: (payload: {
+    recipeInstanceId: string;
+    targetType: "creative_brief" | "story_revision" | "episode_rules" | "character_design" | "storyboard_revision" | "shot_beat" | "anchor_asset" | "video_asset" | "final_sequence";
+    targetId: string;
+    targetRevision?: number;
+    targetHash?: string;
+    decision: HumanReviewDecision;
+    blockingDiagnosticPresent?: boolean;
+    issues?: string[];
+    reason?: string;
+    episodeRules?: EpisodeRulesDto;
+  }) => canvasJson<Record<string, unknown>>("/review-decisions", "POST", payload),
+  compileCanvasGroup: (groupId: string) =>
+    canvasJson<Record<string, unknown>>(`/canvas-groups/${groupId}/compile-run`, "POST"),
+  runCanvasGroup: (groupId: string, acceptEstimatedCostMicros = 0) =>
+    canvasJson<JobDto>(
+      `/canvas-groups/${groupId}/runs`,
+      "POST",
+      { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros },
+    ),
+  saveCanvasGroupTemplate: (groupId: string) =>
+    canvasJson<Record<string, unknown>>(
+      `/canvas-groups/${groupId}/toolbox-templates`,
+      "POST",
+    ),
+  convertCanvasGroupToShots: (groupId: string) =>
+    canvasJson<Record<string, unknown>>(`/canvas-groups/${groupId}/shot-groups`, "POST"),
+  ungroupCanvasGroup: (groupId: string, revision: number) =>
+    canvasJson<Record<string, unknown>>(
+      `/canvas-groups/${groupId}/ungroup`,
+      "POST",
+      undefined,
+      { "If-Match": String(revision) },
+    ),
+  canvasGroupDownloadManifest: (groupId: string) =>
+    request<Record<string, unknown>>(
+      `/canvas-groups/${groupId}/download-manifest`,
+      undefined,
+      CANVAS_BASE,
+    ),
+  canvasGroupDownloadUrl: (groupId: string) => `${CANVAS_BASE}/canvas-groups/${groupId}/download`,
   templates: () => request<CanvasTemplateDto[]>("/canvas-templates", undefined, CANVAS_BASE),
   instantiateTemplate: (projectId: string, templateKey: CanvasTemplateKey) =>
     canvasJson<Record<string, unknown>>(
@@ -448,6 +591,19 @@ export const canvasApi = {
     canvasJson<Record<string, unknown>>(`/projects/${projectId}/brief`, "PUT", brief),
   createSubject: (projectId: string, subject: SubjectInput) =>
     canvasJson<Record<string, unknown>>(`/projects/${projectId}/subjects`, "POST", subject),
+  subjects: (projectId: string) =>
+    request<SubjectDto[]>(`/projects/${projectId}/subjects`, undefined, CANVAS_BASE),
+  bindNodeAssets: (
+    nodeId: string,
+    revision: number,
+    bindings: CanvasNodeAssetBindingDto[],
+    allowMove: boolean,
+  ) => canvasJson<Record<string, unknown>>(
+    `/canvas/nodes/${nodeId}/asset-bindings`,
+    "PUT",
+    { bindings, allowMove },
+    { "If-Match": String(revision) },
+  ),
   createSubjectCompletionRun: (
     projectId: string,
     subjectId: string,
@@ -478,6 +634,17 @@ export const canvasApi = {
       undefined,
       CANVAS_BASE,
     ),
+  createVideoFilmstrip: (assetId: string, frameCount = 12) =>
+    canvasJson<VideoFilmstripDto>(
+      `/assets/${assetId}/filmstrip-runs?frameCount=${frameCount}`,
+      "POST",
+    ),
+  videoFilmstrip: (assetId: string, frameCount = 12) =>
+    request<VideoFilmstripDto>(
+      `/assets/${assetId}/filmstrip?frameCount=${frameCount}`,
+      undefined,
+      CANVAS_BASE,
+    ),
   providerCapabilities: (mediaKind?: "image" | "video" | "audio" | "video_edit") =>
     request<ProviderCapabilityDto[]>(
       `/provider-capabilities${mediaKind ? `?mediaKind=${mediaKind}` : ""}`,
@@ -495,7 +662,7 @@ export const canvasApi = {
     { "If-Match": String(revision) },
   ),
   runStoryStrategies: (projectId: string, rewriteInstruction?: string) =>
-    canvasJson<{ id: string; status: string; candidates: Array<Record<string, unknown>> }>(
+    canvasJson<JobDto>(
       `/projects/${projectId}/story-strategy-runs`,
       "POST",
       {
@@ -505,8 +672,18 @@ export const canvasApi = {
     ),
   approveStory: (revisionId: string) =>
     canvasJson<Record<string, unknown>>(`/story-revisions/${revisionId}/approve`, "POST", {}),
-  createStoryboard: (projectId: string) =>
-    canvasJson<Record<string, unknown>>(`/projects/${projectId}/storyboard-runs`, "POST", {}),
+  createStoryboard: (
+    projectId: string,
+    options: {
+      creationMode?: "from_story" | "from_characters";
+      referenceAssetIds?: string[];
+      instruction?: string;
+    } = {},
+  ) => canvasJson<JobDto>(
+    `/projects/${projectId}/storyboard-runs`,
+    "POST",
+    { idempotencyKey: crypto.randomUUID(), ...options },
+  ),
   updateBeat: (beatId: string, revision: number, patch: Record<string, unknown>) =>
     canvasJson<Record<string, unknown>>(
       `/shot-beats/${beatId}`,
@@ -514,6 +691,17 @@ export const canvasApi = {
       patch,
       { "If-Match": String(revision) },
     ),
+  saveManualStoryboard: (
+    projectId: string,
+    revision: number,
+    shots: Array<Record<string, unknown>>,
+    healingRecipe: boolean,
+  ) => canvasJson<Record<string, unknown>>(
+    `/projects/${projectId}/storyboard-drafts`,
+    "PUT",
+    { shots, healingRecipe },
+    { "If-Match": String(revision) },
+  ),
   createGenerationBatch: (payload: {
     projectId: string;
     canvasNodeId: string;
@@ -574,17 +762,13 @@ export const canvasApi = {
     version: number,
     payload: {
       nodes: Array<{ nodeId: string; x: number; y: number }>;
-      edges: CanvasEdgeDto[];
       viewport: { x: number; y: number; zoom: number };
       operations: Array<Record<string, unknown>>;
     },
-  ) => canvasJson<CanvasDto>(
+  ) => canvasJson<CanvasLayoutSaveResult>(
     `/projects/${projectId}/canvas/layout`,
     "PATCH",
-    {
-      ...payload,
-      edges: payload.edges.map(({ id: _id, ...edge }) => edge),
-    },
+    payload,
     { "If-Match": String(version) },
   ),
   eventsUrl: (projectId: string) => `${CANVAS_BASE}/projects/${projectId}/events`,

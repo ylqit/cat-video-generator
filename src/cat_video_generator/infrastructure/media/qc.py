@@ -109,8 +109,8 @@ class FfmpegFrameExtractor:
     ) -> tuple[Path, ...]:
         """在精确毫秒位置抽取边界帧，供非破坏性区间编辑使用。"""
 
-        if not timestamps_ms or len(timestamps_ms) > 8:
-            raise ValueError("精确抽帧数量必须在1至8之间")
+        if not timestamps_ms or len(timestamps_ms) > 12:
+            raise ValueError("精确抽帧数量必须在1至12之间")
         qc_metadata = source.metadata.get("qc")
         duration_ms = (
             qc_metadata.get("durationMs")

@@ -8,6 +8,7 @@ export type StoryRewriteStrategy = "conservative" | "balanced" | "creative";
 export type EnvironmentStyle = "outdoor" | "indoor";
 
 export type CanvasNodeType =
+  | "RecipeGroupNode"
   | "BriefNode"
   | "SubjectNode"
   | "StoryPlannerNode"
@@ -17,6 +18,7 @@ export type CanvasNodeType =
   | "StoryboardDirectorNode"
   | "SceneNode"
   | "ShotBeatNode"
+  | "CharacterDesignNode"
   | "ImageGenerationNode"
   | "VideoGenerationNode"
   | "ReviewNode"
@@ -45,7 +47,8 @@ export type CanvasPortType =
   | "image_asset[]"
   | "edit_recipe"
   | "prompt"
-  | "audio_asset";
+  | "audio_asset"
+  | "character_design";
 
 export interface CanvasNodeDto {
   id: string;
@@ -56,6 +59,87 @@ export interface CanvasNodeDto {
   status?: string;
   position: { x: number; y: number };
   data: Record<string, any>;
+  availableActions?: CanvasNodeActionDto[];
+  executionScope?: {
+    kind: "canvas_node";
+    objectType: string;
+  };
+  workflowSteps?: CanvasWorkflowStepDto[];
+  blocker?: string | null;
+  outputs?: Array<Record<string, unknown>>;
+}
+
+export type CanvasNodeActionKey =
+  | "edit" | "segment_reshoot" | "download" | "fullscreen"
+  | "crop" | "upscale" | "frame_interpolation" | "extend"
+  | "subtitles" | "audio_separation" | "image_edit"
+  | "recipe_primary" | "toggle_children" | "edit_brief" | "edit_subject"
+  | "complete_creative" | "review_creative" | "generate_character_design" | "review_character_design"
+  | "assist_subject" | "generate_stories" | "inspect_story" | "approve_story"
+  | "inspect_prompt" | "review_story" | "storyboard_from_story"
+  | "storyboard_from_characters" | "storyboard_manual" | "review_storyboard" | "open_scene"
+  | "edit_shot" | "generate_anchor" | "open_generator" | "select_references"
+  | "review_asset" | "compose_sequence" | "export_sequence"
+  | "upload_reference" | "select_history" | "create_subject" | "inspect_asset" | "unavailable";
+
+export type CanvasGroupActionKey =
+  | "run_group"
+  | "save_group_template"
+  | "convert_shot_groups"
+  | "ungroup"
+  | "download_group";
+
+export type RecipePhaseKey =
+  | "creative"
+  | "story"
+  | "character_design"
+  | "storyboard"
+  | "render"
+  | "export"
+  | "complete";
+
+export interface CanvasGroupDto {
+  id: string;
+  projectId: string;
+  recipeInstanceId: string | null;
+  parentGroupId: string | null;
+  type: "recipe" | "shot";
+  title: string;
+  lifecycleStatus: "active" | "detached";
+  color: string;
+  revision: number;
+  memberNodeIds: string[];
+  phase?: RecipePhaseKey;
+  phaseProgress: Array<{
+    key: Exclude<RecipePhaseKey, "complete">;
+    label: string;
+    status: "complete" | "current" | "blocked";
+  }>;
+  blocker?: string | null;
+  availableActions: Array<{
+    key: CanvasGroupActionKey;
+    label: string;
+    enabled: boolean;
+    disabledReason?: string | null;
+  }>;
+  data: Record<string, unknown>;
+}
+
+export type StoryboardCreationMode = "from_story" | "from_characters" | "manual";
+
+export interface CanvasWorkflowStepDto {
+  key: string;
+  label: string;
+  status: "pending" | "queued" | "running" | "awaiting_review" | "succeeded" | "failed";
+  detail?: string;
+}
+
+export interface CanvasNodeActionDto {
+  key: CanvasNodeActionKey;
+  label: string;
+  enabled: boolean;
+  execution: "client" | "local_worker" | "provider" | "unavailable";
+  disabledReason?: string;
 }
 
 export interface CanvasEdgeDto {
@@ -74,6 +158,7 @@ export interface CanvasDto {
   layoutVersion: number;
   nodes: CanvasNodeDto[];
   edges: CanvasEdgeDto[];
+  groups: CanvasGroupDto[];
   viewport: { x: number; y: number; zoom: number };
   syncStatus: "local" | "syncing" | "saved" | "conflict" | "offline" | "service_error";
   templateKey?: CanvasTemplateKey;
@@ -84,6 +169,14 @@ export interface CanvasDto {
   };
 }
 
+export interface CanvasLayoutSaveResult {
+  projectId: string;
+  layoutVersion: number;
+  syncStatus: "saved";
+  viewport: { x: number; y: number; zoom: number };
+  rebasedFromVersion: number | null;
+}
+
 export type CanvasTemplateKey = "short_drama" | "product_ad" | "blank";
 
 export interface CanvasTemplateDto {
@@ -92,6 +185,161 @@ export interface CanvasTemplateDto {
   description: string;
   defaultCandidateCount: number;
   nodeTypes: CanvasNodeType[];
+}
+
+export type ProductionRecipeKey = "healing_child_cat_v1";
+export type QualityTier = "quick" | "balanced" | "premium";
+export type CatBehaviorMode = "natural" | "light_anthropomorphic";
+export type RecipeStage = "concept" | "storyboard" | "anchors" | "video" | "sequence" | "complete";
+export type HumanReviewDecision = "approve" | "request_changes" | "override";
+
+export interface EpisodeRulesDto {
+  personWardrobe: string;
+  timeWeather: string;
+  mainScene: string;
+  environment: "indoor" | "outdoor";
+  coreProps: string[];
+  catBehaviorMode: CatBehaviorMode;
+  soundPlan: {
+    ambient: string[];
+    foley: string[];
+    musicMood: string;
+    dialoguePolicy: "none";
+  };
+  stylePositive: string[];
+  styleExcluded: string[];
+  canonProfileId: string;
+}
+
+export interface RecipeAssetCandidateDto {
+  id: string;
+  sha256: string;
+  status: string;
+  mediaType: "image" | "video";
+  contentUrl: string;
+  qc?: Record<string, unknown> | null;
+  diagnosticStatus: "not_run" | "passed" | "failed";
+  diagnostics: Array<Record<string, unknown>>;
+}
+
+export interface RecipeShotDto {
+  beatId: string;
+  shotId: string | null;
+  title: string;
+  durationSeconds: number;
+  status: string;
+  temporalBeats: Array<Record<string, unknown>>;
+  selectedAnchorAssetId: string | null;
+  selectedVideoAssetId: string | null;
+  anchorCandidates: RecipeAssetCandidateDto[];
+  videoCandidates: RecipeAssetCandidateDto[];
+}
+
+export interface RecipeSequenceCandidateDto {
+  id: string;
+  revision: number;
+  status: "content_review" | "approved" | "rejected";
+  durationMs: number;
+  audioPolicy: "native_fades";
+  renderedAssetId: string | null;
+  contentUrl: string | null;
+  sha256: string | null;
+  qc?: Record<string, unknown> | null;
+}
+
+export interface RecipeStoryCandidateDto {
+  id: string;
+  revision: number;
+  strategy: string;
+  status: "candidate" | "approved";
+  title: string;
+  logline: string;
+  synopsis: string;
+  episodeRules: EpisodeRulesDto | null;
+  scoreAverage: number | null;
+  scoreRationale: string | null;
+}
+
+export interface ProductionRecipeDefinitionDto {
+  key: ProductionRecipeKey;
+  title: string;
+  description: string;
+  defaultDurationSeconds: number;
+  minimumDurationSeconds: number;
+  maximumDurationSeconds: number;
+  aspectRatio: "9:16";
+  resolution: "720p";
+  storyCandidateCount: number;
+}
+
+export interface ProductionRecipeInstanceDto {
+  id: string;
+  projectId: string;
+  recipeKey: ProductionRecipeKey;
+  recipeVersion: number;
+  revision: number;
+  theme: string;
+  inspirationKey?: string | null;
+  targetDurationSeconds: number;
+  qualityTier: QualityTier;
+  canonProfileId: string;
+  stage: RecipeStage;
+  phase?: RecipePhaseKey;
+  groupId?: string;
+  lifecycleStatus?: "active" | "archived";
+  shotDurations: number[];
+  currentBlocker: string | null;
+  primaryAction: string;
+  estimatedCostMicros?: number;
+  reviewStages: Array<{
+    key: Exclude<RecipePhaseKey, "complete"> | "anchors" | "video" | "sequence";
+    complete: boolean;
+  }>;
+  progress: {
+    creativeCompleted?: boolean;
+    creativeApproved?: boolean;
+    storyApproved: boolean;
+    characterDesignApproved?: boolean;
+    storyboardApproved?: boolean;
+    episodeRulesLocked: boolean;
+    shotCount: number;
+    approvedAnchorCount: number;
+    approvedVideoCount: number;
+    sequenceReady: boolean;
+    finalApproved: boolean;
+  };
+  episodeRules?: EpisodeRulesDto | null;
+  shots: RecipeShotDto[];
+  sequenceCandidate?: RecipeSequenceCandidateDto | null;
+  storyCandidates?: RecipeStoryCandidateDto[];
+  creativeBrief?: {
+    id: string;
+    revision: number;
+    theme: string;
+    audience: string;
+    genre: string;
+    tone: string;
+    aspectRatio: string;
+    targetDurationSeconds: number;
+    constraints: string[];
+  } | null;
+  characterDesign?: {
+    id: string;
+    revision: number;
+    status: "generating" | "awaiting_review" | "approved" | "stale";
+    sourceStoryRevisionId: string;
+    slots: Record<"child" | "cat" | "pair_scale", Array<{
+      bindingId: string;
+      assetId: string;
+      candidateIndex: number;
+      semanticRole: "appearance" | "pose" | "scale" | "composition";
+      selected: boolean;
+      status: string;
+      sha256: string;
+      contentUrl: string;
+    }>>;
+  } | null;
+  storyboardHash?: string | null;
 }
 
 export interface StoryBriefInput {
@@ -118,6 +366,19 @@ export interface SubjectInput {
     semanticRole: "front" | "side" | "back" | "turnaround" | "expression" | "full_body" | "outfit" | "packshot_front" | "label_detail" | "material" | "size_scale" | "usage_scene" | "other";
     instruction: string;
   }>;
+}
+
+export interface SubjectDto extends SubjectInput {
+  id: string;
+  projectId: string;
+  revisionId: string;
+  revision: number;
+  status: string;
+}
+
+export interface CanvasNodeAssetBindingDto {
+  assetId: string;
+  semanticRole: string;
 }
 
 export type SubjectCompletionField =
@@ -154,6 +415,14 @@ export interface ActualReferenceBindingDto {
   semanticRole: string;
   providerIncluded: boolean;
   omissionReason?: string | null;
+  providerSlot?: string | null;
+}
+
+export interface GenerationReferenceAnnotationDto {
+  assetId: string;
+  tool: "rectangle" | "brush" | "arrow" | "text" | "marker" | "eraser";
+  points: Array<{ x: number; y: number }>;
+  label: string;
 }
 
 export interface GenerationCapabilityDto {
@@ -165,6 +434,13 @@ export interface GenerationCapabilityDto {
   durations: number[];
   candidateCounts: number[];
   audio: boolean;
+  cameraMotions?: Array<{
+    value: string;
+    label: string;
+    enabled?: boolean;
+    disabledReason?: string;
+  }>;
+  estimatedCostMicros?: number | null;
 }
 
 export interface ProviderCapabilityDto {
@@ -190,10 +466,27 @@ export interface CanvasAssetHistoryDto {
   createdAt?: string | null;
 }
 
+export interface VideoFilmstripFrameDto {
+  assetId: string;
+  timestampMs: number;
+  contentUrl: string;
+  sha256?: string;
+}
+
+export interface VideoFilmstripDto {
+  assetId: string;
+  frameCount: number;
+  status: "not_requested" | "pending" | "queued" | "running" | "ready" | "succeeded" | "failed";
+  stepId?: string | null;
+  error?: { code?: string; message?: string } | null;
+  frames: VideoFilmstripFrameDto[];
+}
+
 export type VideoEditTool = "rectangle" | "brush" | "arrow" | "text" | "marker";
 
 export interface VideoEditAnnotationInput {
   frameTimestampMs: number;
+  coordinateSpace?: "source_normalized";
   tool: VideoEditTool;
   points: Array<{ x: number; y: number }>;
   label: string;
@@ -218,6 +511,8 @@ export interface VideoEditRecipeDto {
     assetId: string;
     semanticRole: string;
     providerIncluded: boolean;
+    providerSlot?: string | null;
+    omissionReason?: string | null;
   }>;
 }
 
@@ -231,6 +526,7 @@ export interface CapabilityCompilationPlan {
   warnings: string[];
   provider: string;
   model: string;
+  actualReferences?: ActualReferenceBindingDto[];
 }
 
 export interface PromptRunDto {
@@ -641,9 +937,31 @@ export interface ProjectGraph {
 export interface JobDto {
   jobId: string;
   kind: string;
-  status: "queued" | "running" | "succeeded" | "failed";
+  status: "pending" | "queued" | "running" | "awaiting_review" | "succeeded" | "failed";
   dedupKey?: string;
-  context: Record<string, string>;
+  context?: Record<string, string> & {
+    projectId?: string;
+    sceneId?: string;
+    shotId?: string;
+    stepId?: string;
+    operationKey?: string;
+    canvasNodeId?: string;
+    canvasGroupId?: string;
+    recipeInstanceId?: string;
+    creationMode?: StoryboardCreationMode;
+    workflowStage?: string;
+    phase?: RecipePhaseKey;
+  };
+  projectId?: string;
+  sceneId?: string;
+  shotId?: string;
+  operationKey?: string;
+  canvasNodeId?: string;
+  canvasGroupId?: string;
+  recipeInstanceId?: string;
+  creationMode?: StoryboardCreationMode;
+  workflowStage?: string;
+  phase?: RecipePhaseKey;
   result?: unknown;
   error?: Record<string, unknown> | null;
   createdAt?: string | null;
@@ -660,12 +978,28 @@ export interface PersistentTaskDto {
   status: string;
   attempt: number;
   operationKey: string;
+  canvasNodeId?: string | null;
+  canvasGroupId?: string | null;
+  recipeInstanceId?: string | null;
+  creationMode?: StoryboardCreationMode | null;
+  workflowStage?: string | null;
+  phase?: RecipePhaseKey | null;
   provider?: string | null;
   providerTaskId?: string | null;
   model?: string | null;
   inputSnapshot: Record<string, unknown>;
   error?: Record<string, unknown> | null;
+  progress?: {
+    currentStep?: number;
+    totalSteps?: number;
+    percent?: number;
+    message?: string;
+    resultSummary?: Record<string, unknown>;
+  };
+  resultSummary?: Record<string, unknown> | null;
   createdAt?: string | null;
+  updatedAt?: string | null;
+  completedAt?: string | null;
 }
 
 export interface TaskCenterDto {

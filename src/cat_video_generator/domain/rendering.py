@@ -17,6 +17,11 @@ class RenderOperation(StrEnum):
     EDIT = "edit"
 
 
+class AudioPolicy(StrEnum):
+    NATIVE_REQUIRED = "native_required"
+    NONE = "none"
+
+
 class MediaModality(StrEnum):
     IMAGE = "image"
     VIDEO = "video"
@@ -71,6 +76,10 @@ class VideoInputPlan(StrictModel):
     operation: RenderOperation
     resolution: Literal["480p", "720p"]
     duration_seconds: Annotated[int, Field(ge=4, le=15)]
+    audio_policy: AudioPolicy = Field(
+        alias="audioPolicy",
+        default=AudioPolicy.NATIVE_REQUIRED,
+    )
     bindings: list[MediaBinding] = Field(default_factory=list, max_length=9)
 
     @model_validator(mode="after")

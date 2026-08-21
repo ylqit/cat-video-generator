@@ -7,8 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -63,6 +63,8 @@ from .api_schemas import (
 )
 from .api_v2 import install_canvas_v2_routes
 from .jobs import JobConflictError, JobRegistry
+from .production_recipes_api import install_production_recipe_routes
+from .sse import parse_event_cursor, stream_events
 
 if TYPE_CHECKING:
     from ..bootstrap import RuntimeContainer
@@ -1161,6 +1163,21 @@ def create_app(
 
         def persistent_task(item: Any) -> dict[str, Any]:
             projected = _task_json(item)
+            snapshot = item.input_snapshot if isinstance(item.input_snapshot, dict) else {}
+            completed_at = getattr(item, "completed_at", None)
+            projected.update(
+                canvasNodeId=snapshot.get("canvasNodeId"),
+                canvasGroupId=snapshot.get("canvasGroupId"),
+                recipeInstanceId=snapshot.get("recipeInstanceId"),
+                creationMode=snapshot.get("creationMode"),
+                workflowStage=snapshot.get("workflowStage"),
+                phase=snapshot.get("phase"),
+                progress=item.progress,
+                resultSummary=item.progress.get("resultSummary"),
+                completedAt=(
+                    None if completed_at is None else completed_at.isoformat()
+                ),
+            )
             if item.status is StepStatus.SUCCEEDED and any(
                 asset.status == "candidate" for asset in assets_by_step.get(item.id, [])
             ):
@@ -1172,6 +1189,23 @@ def create_app(
             "persistentTasks": [persistent_task(item) for item in persistent[:100]],
         }
 
+    @app.get("/api/v1/task-center/events")
+    async def task_center_events(
+        request: Request,
+        last_event_id: str | None = Header(alias="Last-Event-ID", default=None),
+        after_event_id: int | None = Query(alias="afterEventId", default=None, ge=0),
+    ) -> StreamingResponse:
+        cursor = parse_event_cursor(last_event_id, after_event_id)
+
+        def load(after_sequence: int) -> tuple[dict[str, Any], ...]:
+            return repository.task_center_events(after_sequence=after_sequence, limit=200)
+
+        return StreamingResponse(
+            stream_events(request, loader=load, after_sequence=cursor),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     @app.get("/api/v1/jobs")
     def list_jobs() -> list[dict[str, Any]]:
         return [item.to_dict() for item in job_registry.list()]
@@ -1182,7 +1216,10 @@ def create_app(
 
     canvas_v2 = getattr(container, "canvas_v2", None)
     if canvas_v2 is not None:
-        install_canvas_v2_routes(app, canvas_v2)
+        install_canvas_v2_routes(app, canvas_v2, job_registry)
+    production_recipes = getattr(container, "production_recipes", None)
+    if production_recipes is not None:
+        install_production_recipe_routes(app, production_recipes)
 
     if static_dir is not None:
         if not (static_dir / "index.html").is_file():
@@ -1330,7 +1367,11 @@ def _task_json(item: Any) -> dict[str, Any]:
         "model": item.model,
         "inputSnapshot": item.input_snapshot,
         "error": item.error,
+        "progress": item.progress,
+        "resultSummary": item.progress.get("resultSummary"),
         "createdAt": None if item.created_at is None else item.created_at.isoformat(),
+        "updatedAt": None if item.updated_at is None else item.updated_at.isoformat(),
+        "completedAt": None if item.completed_at is None else item.completed_at.isoformat(),
     }
 
 

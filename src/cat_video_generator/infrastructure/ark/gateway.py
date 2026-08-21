@@ -25,13 +25,14 @@ from volcenginesdkarkruntime._exceptions import (
 from ...application.ports import (
     DirectorResult,
     GatewayError,
+    ImageDiagnosticResult,
     ImageResult,
     VideoDiagnosticResult,
     VideoTaskResult,
 )
 from ...config import RuntimeSettings
-from ...domain.rendering import VideoInputPlan
-from .review_schemas import VIDEO_DIAGNOSTIC_SCHEMA
+from ...domain.rendering import AudioPolicy, VideoInputPlan
+from .review_schemas import IMAGE_DIAGNOSTIC_SCHEMA, VIDEO_DIAGNOSTIC_SCHEMA
 
 
 class ArkGatewayError(GatewayError):
@@ -291,6 +292,47 @@ class ArkGateway:
             model=getattr(response, "model", self.image_model),
         )
 
+    def diagnose_image(
+        self,
+        *,
+        prompt: str,
+        image_path: Path,
+    ) -> ImageDiagnosticResult:
+        result = self.analyze_structured(
+            prompt=prompt,
+            schema=IMAGE_DIAGNOSTIC_SCHEMA,
+            output_name="ImageSemanticDiagnostic",
+            image_paths=(image_path,),
+        )
+        try:
+            payload = result.payload
+            return ImageDiagnosticResult(
+                identity_ok=bool(payload["identityOk"]),
+                style_ok=bool(payload["styleOk"]),
+                constraints_ok=bool(payload["constraintsOk"]),
+                confidence=float(payload["confidence"]),
+                violations=tuple(str(item) for item in payload["violations"]),
+                evidence=tuple(
+                    {
+                        "object": str(item["object"]),
+                        "observation": str(item["observation"]),
+                        "relationError": (
+                            None if item["relationError"] is None else str(item["relationError"])
+                        ),
+                    }
+                    for item in payload["evidence"]
+                ),
+                response_id=result.response_id,
+                model=result.model,
+                request_hash=result.request_hash,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ArkGatewayError(
+                "Ark图片语义诊断没有返回合法结构。",
+                code="invalid_image_diagnostic_output",
+                retryable=False,
+            ) from exc
+
     def diagnose_video_frames(
         self,
         *,
@@ -450,7 +492,7 @@ class ArkGateway:
                 model=self.video_model,
                 content=content,
                 return_last_frame=False,
-                generate_audio=True,
+                generate_audio=input_plan.audio_policy is AudioPolicy.NATIVE_REQUIRED,
                 watermark=False,
                 resolution=input_plan.resolution,
                 ratio="9:16",

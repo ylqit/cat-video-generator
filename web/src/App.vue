@@ -64,9 +64,18 @@ function taskStatusType(status: string): "success" | "warning" | "danger" | "inf
   return "info";
 }
 
-async function openTask(projectId?: string, shotId?: string) {
+async function openTask(projectId?: string, shotId?: string, canvasNodeId?: string) {
   if (!projectId) return;
   taskDrawerVisible.value = false;
+  if (canvasNodeId) {
+    await router.push({
+      name: "aigc-canvas",
+      params: { projectId },
+      query: { node: canvasNodeId, focus: String(Date.now()) },
+    });
+    requestWorkspaceRefresh(projectId);
+    return;
+  }
   if (shotId) {
     await router.push({
       name: "shot-generation-workspace",
@@ -112,7 +121,14 @@ watch(() => taskCenter.lastNotification.value, (event) => {
     title: event.item.label,
     message: taskStatusText(event.item),
     type: notificationType,
-    duration: event.item.status === "failed" ? 0 : 4500,
+    duration: ["awaiting_review", "failed", "submission_unknown"].includes(event.item.status)
+      ? 0
+      : 4500,
+    onClick: () => void openTask(
+      event.item.projectId,
+      event.item.shotId,
+      event.item.canvasNodeId,
+    ),
   });
 });
 </script>
@@ -148,10 +164,16 @@ watch(() => taskCenter.lastNotification.value, (event) => {
           <el-tag :type="taskStatusType(task.status)">{{ taskStatusText(task) }}</el-tag>
         </div>
         <small>{{ task.model || task.kind }} · {{ task.createdAt ? new Date(task.createdAt).toLocaleString() : '刚刚' }}</small>
+        <el-progress
+          v-if="task.progress && typeof task.progress.percent === 'number' && ['queued', 'pending', 'running', 'submitting'].includes(task.status)"
+          :percentage="task.progress.percent"
+        />
+        <p v-if="task.progress?.message" class="task-progress-message">{{ task.progress.message }}</p>
+        <p v-if="task.resultSummary?.message" class="task-result-message">{{ String(task.resultSummary.message) }}</p>
         <p v-if="task.error">{{ String(task.error.message ?? task.error.code ?? '任务失败') }}</p>
         <div class="task-card-actions">
-          <el-button v-if="task.projectId" size="small" @click="openTask(task.projectId, task.shotId)">打开对应工作区</el-button>
-          <el-button v-if="task.stepId && task.providerTaskId && ['running', 'restart_pending'].includes(task.status)" size="small" @click="resumeTask(task.stepId, task.projectId, task.shotId)">恢复查询</el-button>
+          <el-button v-if="task.projectId" size="small" @click="openTask(task.projectId, task.shotId, task.canvasNodeId)">打开对应节点</el-button>
+          <el-button v-if="task.stepId && task.providerTaskId && ['submission_unknown', 'restart_pending'].includes(task.status)" size="small" @click="resumeTask(task.stepId, task.projectId, task.shotId)">按 Provider ID 对账</el-button>
         </div>
       </article>
     </el-drawer>
@@ -162,4 +184,5 @@ watch(() => taskCenter.lastNotification.value, (event) => {
 .shell { height: 100%; }.sidebar { border-right: 1px solid #252a34; background: #101319; display: flex; flex-direction: column; }.brand { padding: 20px 16px; font-weight: 700; }.sidebar .el-menu { flex: 1; border-right: 0; }.health { padding: 12px; font-size: 11px; color: #8c95a6; display: flex; align-items: center; gap: 6px; }.health i { width: 8px; height: 8px; border-radius: 50%; }.content { padding: 0; background: #0d1016; }
 .task-trigger { margin: 10px 12px 0; padding: 9px 10px; display: flex; align-items: center; justify-content: space-between; color: #dce7f5; background: #17202d; border: 1px solid #314055; border-radius: 7px; cursor: pointer; }
 .task-actions, .task-card { display: grid; gap: 8px; }.task-actions { margin-bottom: 12px; color: #8d9ab0; }.task-card { padding: 12px; margin-bottom: 10px; border: 1px solid #303c4f; border-radius: 8px; background: #111824; }.task-head, .task-card-actions { display: flex; gap: 8px; align-items: center; justify-content: space-between; flex-wrap: wrap; }.task-card small { color: #8592a6; }.task-card p { margin: 0; color: #f3a6a6; white-space: pre-wrap; }
+.task-card .task-progress-message { color: #9eb4cc; }.task-card .task-result-message { color: #8ed4ad; }
 </style>

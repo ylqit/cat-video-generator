@@ -14,7 +14,12 @@ class _CanvasService:
     def __init__(self) -> None:
         self.brief: dict[str, object] | None = None
         self.subject: dict[str, object] | None = None
+        self.saved_layout: dict[str, object] | None = None
+        self.asset_bindings: dict[str, object] | None = None
         self.approved_revision: uuid.UUID | None = None
+        self.storyboard_mode: str | None = None
+        self.storyboard_references: tuple[uuid.UUID, ...] = ()
+        self.manual_storyboard: dict[str, object] | None = None
         self.subject_completion_run_id = uuid.uuid4()
 
     def save_brief(self, project_id: uuid.UUID, payload: object) -> dict[str, object]:
@@ -24,6 +29,38 @@ class _CanvasService:
     def create_subject(self, project_id: uuid.UUID, payload: object) -> dict[str, object]:
         self.subject = payload.model_dump(by_alias=True, mode="json")  # type: ignore[attr-defined]
         return {"id": str(uuid.uuid4()), "projectId": str(project_id), **self.subject}
+
+    def list_subjects(self, project_id: uuid.UUID) -> list[dict[str, object]]:
+        return [{
+            "id": str(uuid.uuid4()),
+            "projectId": str(project_id),
+            "revisionId": str(uuid.uuid4()),
+            "revision": 1,
+            "status": "approved",
+            "name": "蓝色汽水罐",
+            "kind": "product",
+            "role": "hero_product",
+            "identityAnchors": ["蓝色罐身"],
+            "immutableTraits": ["标签文字不变"],
+            "references": [],
+        }]
+
+    def bind_canvas_node_assets(
+        self,
+        node_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        payload: object,
+    ) -> dict[str, object]:
+        assert expected_revision == 1
+        self.asset_bindings = payload.model_dump(by_alias=True, mode="json")  # type: ignore[attr-defined]
+        return {
+            "id": str(node_id),
+            "type": "ReferenceAssetNode",
+            "revision": 2,
+            "status": "ready",
+            "data": {"assets": self.asset_bindings["bindings"]},
+        }
 
     def create_subject_completion_run(
         self, project_id: uuid.UUID, payload: object
@@ -68,6 +105,34 @@ class _CanvasService:
             }
         ]
 
+    def create_video_filmstrip_run(
+        self, asset_id: uuid.UUID, *, frame_count: int
+    ) -> dict[str, object]:
+        return {
+            "assetId": str(asset_id),
+            "frameCount": frame_count,
+            "status": "pending",
+            "stepId": str(uuid.uuid4()),
+            "frames": [],
+        }
+
+    def get_video_filmstrip(
+        self, asset_id: uuid.UUID, *, frame_count: int
+    ) -> dict[str, object]:
+        return {
+            "assetId": str(asset_id),
+            "frameCount": frame_count,
+            "status": "ready",
+            "frames": [
+                {
+                    "assetId": str(uuid.uuid4()),
+                    "timestampMs": index * 1_000,
+                    "contentUrl": f"/api/v1/assets/frame-{index}/content",
+                }
+                for index in range(frame_count)
+            ],
+        }
+
     def save_node_generation_config(
         self,
         node_id: uuid.UUID,
@@ -105,10 +170,42 @@ class _CanvasService:
         self.approved_revision = revision_id
         return {"id": str(revision_id), "status": "approved"}
 
-    def create_storyboard(self, project_id: uuid.UUID) -> dict[str, object]:
+    def create_storyboard(
+        self,
+        project_id: uuid.UUID,
+        *,
+        idempotency_key: str | None = None,
+        creation_mode: str = "from_story",
+        reference_asset_ids: tuple[uuid.UUID, ...] = (),
+        instruction: str | None = None,
+    ) -> dict[str, object]:
         if self.approved_revision is None:
             raise ValueError("故事尚未人工批准，不能生成分镜")
-        return {"projectId": str(project_id), "status": "ready", "beats": []}
+        self.storyboard_mode = creation_mode
+        self.storyboard_references = reference_asset_ids
+        return {
+            "projectId": str(project_id),
+            "status": "ready",
+            "beats": [],
+            "creationMode": creation_mode,
+            "instruction": instruction,
+            "idempotencyKey": idempotency_key,
+        }
+
+    def save_manual_storyboard(
+        self,
+        project_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        payload: object,
+    ) -> dict[str, object]:
+        self.manual_storyboard = payload.model_dump(by_alias=True, mode="json")  # type: ignore[attr-defined]
+        return {
+            "projectId": str(project_id),
+            "revision": expected_revision + 1,
+            "status": "awaiting_review",
+            "shotCount": len(self.manual_storyboard["shots"]),  # type: ignore[arg-type]
+        }
 
     def get_prompt_run(self, prompt_id: uuid.UUID) -> dict[str, object]:
         return {
@@ -136,6 +233,7 @@ class _CanvasService:
     ) -> dict[str, object]:
         assert expected_version == 3
         data = payload.model_dump(by_alias=True, mode="json")  # type: ignore[attr-defined]
+        self.saved_layout = data
         return {
             "projectId": str(project_id),
             "layoutVersion": 4,
@@ -246,21 +344,105 @@ def test_v2_brief_and_generic_subject_endpoints(tmp_path: Path) -> None:
     assert subject_response.json()["kind"] == "animal"
 
 
+def test_v2_lists_subject_revisions_and_binds_assets_to_reference_nodes(tmp_path: Path) -> None:
+    service = _CanvasService()
+    client = _client(tmp_path, service)
+    project_id = uuid.uuid4()
+    node_id = uuid.uuid4()
+    asset_id = uuid.uuid4()
+
+    subjects = client.get(f"/api/v2/projects/{project_id}/subjects")
+    bound = client.put(
+        f"/api/v2/canvas/nodes/{node_id}/asset-bindings",
+        headers={"If-Match": "1"},
+        json={
+            "bindings": [{"assetId": str(asset_id), "semanticRole": "packshot_front"}],
+            "allowMove": False,
+        },
+    )
+
+    assert subjects.status_code == 200
+    assert subjects.json()[0]["revision"] == 1
+    assert subjects.json()[0]["kind"] == "product"
+    assert bound.status_code == 200
+    assert bound.json()["revision"] == 2
+    assert service.asset_bindings == {
+        "bindings": [{"assetId": str(asset_id), "semanticRole": "packshot_front"}],
+        "allowMove": False,
+    }
+
+
 def test_v2_storyboard_is_blocked_until_human_story_approval(tmp_path: Path) -> None:
     service = _CanvasService()
     client = _client(tmp_path, service)
     project_id = uuid.uuid4()
     revision_id = uuid.uuid4()
 
-    blocked = client.post(f"/api/v2/projects/{project_id}/storyboard-runs", json={})
+    blocked = client.post(
+        f"/api/v2/projects/{project_id}/storyboard-runs",
+        json={"idempotencyKey": "blocked-0001"},
+    )
     approved = client.post(f"/api/v2/story-revisions/{revision_id}/approve", json={})
-    ready = client.post(f"/api/v2/projects/{project_id}/storyboard-runs", json={})
+    ready = client.post(
+        f"/api/v2/projects/{project_id}/storyboard-runs",
+        json={"idempotencyKey": "ready-0001"},
+    )
 
-    assert blocked.status_code == 422
-    assert "人工批准" in blocked.json()["detail"]
+    assert blocked.status_code == 202
+    assert blocked.json()["status"] == "failed"
+    assert "人工批准" in blocked.json()["error"]["message"]
     assert approved.status_code == 200
     assert approved.json()["status"] == "approved"
     assert ready.status_code == 202
+    assert ready.json()["kind"] == "storyboard"
+    assert ready.json()["context"]["creationMode"] == "from_story"
+
+
+def test_v2_character_storyboard_and_manual_draft_use_distinct_paths(tmp_path: Path) -> None:
+    service = _CanvasService()
+    client = _client(tmp_path, service)
+    project_id = uuid.uuid4()
+    revision_id = uuid.uuid4()
+    child_asset_id = uuid.uuid4()
+    cat_asset_id = uuid.uuid4()
+    client.post(f"/api/v2/story-revisions/{revision_id}/approve", json={})
+
+    generated = client.post(
+        f"/api/v2/projects/{project_id}/storyboard-runs",
+        json={
+            "creationMode": "from_characters",
+            "referenceAssetIds": [str(child_asset_id), str(cat_asset_id)],
+            "instruction": "孩子与猫咪一起整理窗台",
+            "idempotencyKey": "characters-0001",
+        },
+    )
+    manual = client.put(
+        f"/api/v2/projects/{project_id}/storyboard-drafts",
+        headers={"If-Match": "1"},
+        json={
+            "healingRecipe": True,
+            "shots": [{
+                "order": 1,
+                "durationSeconds": 15,
+                "title": "亮叶",
+                "action": "孩子蹲下看叶片，猫咪在旁边嗅闻水珠",
+                "shotSize": "中景",
+                "lighting": "雨后柔光",
+                "dialogue": "",
+                "soundEffect": "雨滴与猫咪脚步",
+                "camera": "固定机位",
+                "prompt": "固定儿童与猫咪，雨后水彩庭院",
+            }],
+        },
+    )
+
+    assert generated.status_code == 202
+    assert generated.json()["context"]["creationMode"] == "from_characters"
+    assert service.storyboard_mode == "from_characters"
+    assert service.storyboard_references == (child_asset_id, cat_asset_id)
+    assert manual.status_code == 200
+    assert manual.json()["status"] == "awaiting_review"
+    assert service.manual_storyboard is not None
 
 
 def test_v2_prompt_and_optimistic_canvas_layout_endpoints(tmp_path: Path) -> None:
@@ -287,6 +469,41 @@ def test_v2_prompt_and_optimistic_canvas_layout_endpoints(tmp_path: Path) -> Non
     assert canvas.json()["layoutVersion"] == 3
     assert saved.status_code == 200
     assert saved.json()["layoutVersion"] == 4
+
+
+def test_v2_layout_ignores_legacy_business_edge_snapshot(tmp_path: Path) -> None:
+    service = _CanvasService()
+    client = _client(tmp_path, service)
+    project_id = uuid.uuid4()
+    source_id = uuid.uuid4()
+    target_id = uuid.uuid4()
+
+    saved = client.patch(
+        f"/api/v2/projects/{project_id}/canvas/layout",
+        headers={"If-Match": "3"},
+        json={
+            "nodes": [],
+            "edges": [
+                {
+                    "id": str(uuid.uuid4()),
+                    "sourceNodeId": str(source_id),
+                    "sourceNodeType": "ReferenceAssetNode",
+                    "sourcePort": "media_reference[]",
+                    "targetNodeId": str(target_id),
+                    "targetNodeType": "GenerationBatchNode",
+                    "targetPort": "media_reference[]",
+                    "relationType": "media_reference[]->media_reference[]",
+                    "revision": 1,
+                }
+            ],
+            "viewport": {"x": 0, "y": 0, "zoom": 1},
+            "operations": [{"operationId": str(uuid.uuid4()), "type": "move_node"}],
+        },
+    )
+
+    assert saved.status_code == 200
+    assert service.saved_layout is not None
+    assert "edges" not in service.saved_layout
 
 
 def test_v2_template_library_and_product_default(tmp_path: Path) -> None:
@@ -394,6 +611,23 @@ def test_v2_canvas_asset_history_filters_by_media_kind(tmp_path: Path) -> None:
     assert response.json()[0]["mediaType"] == "video"
 
 
+def test_video_filmstrip_queues_once_and_returns_distinct_cached_frames(tmp_path: Path) -> None:
+    service = _CanvasService()
+    client = _client(tmp_path, service)
+    asset_id = uuid.uuid4()
+
+    queued = client.post(f"/api/v2/assets/{asset_id}/filmstrip-runs?frameCount=12")
+    ready = client.get(f"/api/v2/assets/{asset_id}/filmstrip?frameCount=12")
+
+    assert queued.status_code == 202
+    assert queued.json()["status"] == "pending"
+    assert ready.status_code == 200
+    frames = ready.json()["frames"]
+    assert len(frames) == 12
+    assert len({frame["timestampMs"] for frame in frames}) == 12
+    assert len({frame["contentUrl"] for frame in frames}) == 12
+
+
 def test_generation_config_and_capabilities_are_server_driven(tmp_path: Path) -> None:
     service = _CanvasService()
     client = _client(tmp_path, service)
@@ -413,6 +647,7 @@ def test_generation_config_and_capabilities_are_server_driven(tmp_path: Path) ->
             "durationSeconds": 5,
             "audioEnabled": True,
             "candidateCount": 1,
+            "draftPrompt": "保持主体身份并缓慢推近",
             "autoValidate": True,
             "autoLink": True,
             "actualReferences": [

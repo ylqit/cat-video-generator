@@ -24,7 +24,7 @@ from cat_video_generator.infrastructure.media.storage import LocalAssetStore
 
 
 def test_v5_database_models_expose_creation_flow_columns() -> None:
-    assert ALEMBIC_HEAD == "0021_libtv_subject_assistant"
+    assert ALEMBIC_HEAD == "0024_durable_task_events"
     assert hasattr(models.ProductionRun, "default_reference_bindings_json")
     assert hasattr(models.ProductionRun, "current_visual_profile_revision_id")
     assert hasattr(models.VisualProfileRevision, "profile_hash")

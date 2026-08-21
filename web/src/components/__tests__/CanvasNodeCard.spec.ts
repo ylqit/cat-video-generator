@@ -4,6 +4,88 @@ import { describe, expect, it } from "vitest";
 import CanvasNodeCard from "../canvas/CanvasNodeCard.vue";
 
 describe("CanvasNodeCard", () => {
+  it("renders the collapsed healing recipe with textual progress and one primary action", async () => {
+    const node = {
+      id: "recipe-node",
+      type: "RecipeGroupNode" as const,
+      objectType: "production_recipe_instance",
+      objectId: "recipe-1",
+      position: { x: 0, y: 0 },
+      data: {
+        title: "一人一猫治愈短片",
+        theme: "雨后收集落叶",
+        targetDurationSeconds: 31,
+        shotDurations: [11, 10, 10],
+        qualityTier: "balanced",
+        currentBlocker: "故事尚未人工批准",
+        primaryAction: "生成故事候选",
+        reviewStages: [
+          { key: "story", complete: false },
+          { key: "anchors", complete: false },
+          { key: "video", complete: false },
+          { key: "sequence", complete: false },
+        ],
+      },
+    };
+    const wrapper = mount(CanvasNodeCard, { props: { node } });
+
+    expect(wrapper.text()).toContain("31 秒");
+    expect(wrapper.text()).toContain("3 镜");
+    expect(wrapper.text()).toContain("故事：待处理");
+    expect(wrapper.text()).toContain("当前阻塞：故事尚未人工批准");
+    const action = wrapper.findAll("button").filter((button) => button.isVisible());
+    expect(action).toHaveLength(1);
+    await action[0].trigger("click");
+    expect(wrapper.emitted("open-recipe")?.[0]).toEqual([node]);
+  });
+
+  it("selects every node with pointer or keyboard and exposes selection state", async () => {
+    const node = {
+      id: "reference-1",
+      type: "ReferenceAssetNode" as const,
+      objectType: "reference_asset",
+      objectId: null,
+      position: { x: 0, y: 0 },
+      data: { title: "产品包装参考" },
+    };
+    const wrapper = mount(CanvasNodeCard, {
+      props: { node, selected: true, selectionState: "compatible" },
+    });
+
+    expect(wrapper.get("article").attributes("aria-selected")).toBe("true");
+    expect(wrapper.get("article").classes()).toContain("is-selected");
+    expect(wrapper.get("article").classes()).toContain("selection-compatible");
+    await wrapper.get("article").trigger("click");
+    await wrapper.get("article").trigger("keydown", { key: "Enter" });
+    await wrapper.get("article").trigger("keydown", { key: " " });
+    await wrapper.get("article").trigger("dblclick");
+
+    expect(wrapper.emitted("select-node")).toHaveLength(2);
+    expect(wrapper.emitted("select-node")?.[0]).toEqual([node]);
+    expect(wrapper.emitted("activate-node")).toHaveLength(1);
+    expect(wrapper.emitted("activate-node")?.[0]).toEqual([node]);
+  });
+
+  it("shows the selection order while picking references", () => {
+    const wrapper = mount(CanvasNodeCard, {
+      props: {
+        node: {
+          id: "reference-2",
+          type: "ImageAssetNode",
+          objectType: "asset",
+          objectId: "asset-2",
+          position: { x: 0, y: 0 },
+          data: { title: "第二张参考" },
+        },
+        selectionState: "chosen",
+        selectionIndex: 2,
+      },
+    });
+
+    expect(wrapper.get(".selection-badge").text()).toBe("2");
+    expect(wrapper.get(".selection-badge").attributes("aria-label")).toContain("第 2 个");
+  });
+
   it("shows story score, approval state and both auditable prompt calls", async () => {
     const wrapper = mount(CanvasNodeCard, {
       props: {
@@ -42,6 +124,32 @@ describe("CanvasNodeCard", () => {
     );
     await approveButton!.trigger("click");
     expect(wrapper.emitted("approve-story")?.[0]).toEqual(["story-1"]);
+  });
+
+  it("renders a character design slot as a real image node", () => {
+    const wrapper = mount(CanvasNodeCard, {
+      props: {
+        node: {
+          id: "character-child",
+          type: "CharacterDesignNode",
+          objectType: "character_design_slot",
+          objectId: null,
+          position: { x: 0, y: 0 },
+          data: {
+            title: "儿童本集造型图",
+            slot: "child",
+            candidates: [
+              { id: "asset-1", assetId: "asset-1", title: "候选 1", thumbnailUrl: "/asset-1.png" },
+              { id: "asset-2", assetId: "asset-2", title: "候选 2", thumbnailUrl: "/asset-2.png" },
+            ],
+          },
+        },
+      },
+    });
+
+    expect(wrapper.text()).toContain("儿童本集造型");
+    expect(wrapper.text()).toContain("Canon identity 固定");
+    expect(wrapper.findAll(".character-node-candidates img")).toHaveLength(2);
   });
 
   it("renders an editable beat as an independent duration and prompt unit", async () => {
@@ -108,5 +216,26 @@ describe("CanvasNodeCard", () => {
     expect(generationWrapper.emitted("open-composer")).toBeUndefined();
     await generationWrapper.get('[data-action="open-composer"]').trigger("click");
     expect(generationWrapper.emitted("open-composer")?.[0]).toEqual([generation]);
+  });
+
+  it("offers actionable binding choices when a reference node is empty", async () => {
+    const node = {
+      id: "reference-node",
+      type: "ReferenceAssetNode" as const,
+      objectType: "reference_asset",
+      objectId: null,
+      position: { x: 0, y: 0 },
+      data: { title: "产品包装参考", assets: [] },
+    };
+    const wrapper = mount(CanvasNodeCard, { props: { node } });
+
+    expect(wrapper.text()).toContain("等待绑定素材");
+    await wrapper.get('[data-action="upload-reference"]').trigger("click");
+    await wrapper.get('[data-action="select-history"]').trigger("click");
+    await wrapper.get('[data-action="create-subject"]').trigger("click");
+
+    expect(wrapper.emitted("upload-reference")?.[0]).toEqual([node]);
+    expect(wrapper.emitted("select-history")?.[0]).toEqual([node]);
+    expect(wrapper.emitted("create-subject")?.[0]).toEqual([node]);
   });
 });

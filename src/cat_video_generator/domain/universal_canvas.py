@@ -88,6 +88,9 @@ class NormalizedPoint(StrictModel):
 
 class VideoEditAnnotation(StrictModel):
     frame_timestamp_ms: int = Field(alias="frameTimestampMs", ge=0)
+    coordinate_space: Literal["source_normalized"] = Field(
+        alias="coordinateSpace", default="source_normalized"
+    )
     tool: AnnotationTool
     points: list[NormalizedPoint] = Field(min_length=1, max_length=2_000)
     label: str = Field(default="", max_length=1_000)

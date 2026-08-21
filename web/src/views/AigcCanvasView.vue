@@ -24,6 +24,8 @@ const creating = ref(false);
 const productFile = ref<File | null>(null);
 const talentFile = ref<File | null>(null);
 const projectId = computed(() => String(route.params.projectId ?? ""));
+const focusNodeId = computed(() => typeof route.query.node === "string" ? route.query.node : "");
+const focusRequestKey = computed(() => typeof route.query.focus === "string" ? route.query.focus : "");
 
 const form = reactive<{
   title: string;
@@ -186,7 +188,12 @@ async function createCanvasProject() {
 </script>
 
 <template>
-  <AigcCanvasWorkspace v-if="projectId" :project-id="projectId" />
+  <AigcCanvasWorkspace
+    v-if="projectId"
+    :project-id="projectId"
+    :focus-node-id="focusNodeId"
+    :focus-request-key="focusRequestKey"
+  />
   <main v-else class="canvas-entry">
     <CanvasTemplateLibrary
       v-if="!selectedTemplate"

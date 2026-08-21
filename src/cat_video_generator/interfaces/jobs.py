@@ -34,11 +34,35 @@ PAID_KINDS = frozenset(
         "generate_scene_look",
         "generate_video",
         "range_edit",
+        "recipe_story",
+        "recipe_creative_brief",
+    "recipe_character_design",
+    "recipe_group",
+        "recipe_storyboard",
+        "recipe_anchor",
+        "recipe_video",
+        "recipe_sequence",
+        "story_strategy",
+        "storyboard",
     }
 )
 
 _ACTIVE_STATUSES = frozenset({"queued", "running"})
-_CONTEXT_KEYS = frozenset({"projectId", "sceneId", "shotId", "stepId", "operationKey"})
+_CONTEXT_KEYS = frozenset(
+    {
+        "projectId",
+        "sceneId",
+        "shotId",
+        "stepId",
+        "operationKey",
+        "canvasNodeId",
+        "canvasGroupId",
+        "recipeInstanceId",
+        "creationMode",
+        "workflowStage",
+        "phase",
+    }
+)
 
 
 class JobConflictError(RuntimeError):
@@ -108,11 +132,14 @@ class JobRegistry:
 
         with self._records_lock:
             for record in self._records.values():
-                if record.dedup_key == dedup_key and record.status in _ACTIVE_STATUSES:
+                if record.dedup_key != dedup_key:
+                    continue
+                if record.status in _ACTIVE_STATUSES:
                     raise JobConflictError(
                         "相同任务正在执行，请等待完成后再提交",
                         job_id=record.job_id,
                     )
+                return record
             record = JobRecord(
                 job_id=uuid.uuid4().hex,
                 kind=kind,

@@ -13,6 +13,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Identity,
     Index,
     Integer,
     SmallInteger,
@@ -122,6 +123,223 @@ class ProductionRun(Base):
         nullable=False,
         server_default=func.now(),
         onupdate=func.now(),
+    )
+
+
+class ProductionRecipeInstance(Base):
+    __tablename__ = "production_recipe_instances"
+    __table_args__ = (
+        CheckConstraint("revision >= 1", name="ck_production_recipe_instances_revision"),
+        CheckConstraint(
+            "target_duration_seconds BETWEEN 8 AND 60",
+            name="ck_production_recipe_instances_duration",
+        ),
+        CheckConstraint(
+            "quality_tier IN ('quick', 'balanced', 'premium')",
+            name="ck_production_recipe_instances_quality_tier",
+        ),
+        CheckConstraint(
+            "lifecycle_status IN ('active', 'archived')",
+            name="ck_production_recipe_instances_lifecycle",
+        ),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    recipe_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    recipe_version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default=text("1"),
+    )
+    revision: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default=text("1"),
+    )
+    theme: Mapped[str] = mapped_column(Text, nullable=False)
+    inspiration_key: Mapped[str | None] = mapped_column(String(80))
+    target_duration_seconds: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    quality_tier: Mapped[str] = mapped_column(String(24), nullable=False)
+    canon_profile_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    lifecycle_status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="active", server_default="active"
+    )
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class CharacterDesignRevision(Base):
+    __tablename__ = "character_design_revisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "production_recipe_instance_id",
+            "revision",
+            name="uq_character_design_revisions_instance_revision",
+        ),
+        UniqueConstraint("idempotency_key", name="uq_character_design_revisions_idempotency"),
+        CheckConstraint(
+            "status IN ('generating', 'awaiting_review', 'approved', 'stale')",
+            name="ck_character_design_revisions_status",
+        ),
+        Index(
+            "ix_character_design_revisions_current",
+            "production_recipe_instance_id",
+            "revision",
+        ),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    production_recipe_instance_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_recipe_instances.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_story_revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.story_revisions.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(96), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="generating", server_default="generating"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class CharacterDesignAsset(Base):
+    __tablename__ = "character_design_assets"
+    __table_args__ = (
+        UniqueConstraint(
+            "character_design_revision_id",
+            "slot",
+            "candidate_index",
+            name="uq_character_design_assets_slot_candidate",
+        ),
+        UniqueConstraint("asset_id", name="uq_character_design_assets_asset"),
+        CheckConstraint(
+            "slot IN ('child', 'cat', 'pair_scale')",
+            name="ck_character_design_assets_slot",
+        ),
+        CheckConstraint("candidate_index >= 1", name="ck_character_design_assets_candidate"),
+        Index(
+            "ix_character_design_assets_revision_slot",
+            "character_design_revision_id",
+            "slot",
+        ),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    character_design_revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.character_design_revisions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    asset_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.assets.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    slot: Mapped[str] = mapped_column(String(24), nullable=False)
+    candidate_index: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    semantic_role: Mapped[str] = mapped_column(String(40), nullable=False)
+    selected: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class HumanReviewDecisionRecord(Base):
+    __tablename__ = "human_review_decisions"
+    __table_args__ = (
+        CheckConstraint(
+            "decision IN ('approve', 'request_changes', 'override')",
+            name="ck_human_review_decisions_decision",
+        ),
+        CheckConstraint(
+            "target_revision IS NOT NULL OR target_hash IS NOT NULL",
+            name="ck_human_review_decisions_pinned_target",
+        ),
+        CheckConstraint(
+            "NOT (decision = 'approve' AND blocking_diagnostic_present)",
+            name="ck_human_review_decisions_blocking_approval",
+        ),
+        CheckConstraint(
+            "decision != 'override' OR NULLIF(BTRIM(reason), '') IS NOT NULL",
+            name="ck_human_review_decisions_override_reason",
+        ),
+        Index(
+            "ix_human_review_decisions_target",
+            "production_recipe_instance_id",
+            "target_type",
+            "target_id",
+            "created_at",
+        ),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    production_recipe_instance_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_recipe_instances.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    target_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    target_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    target_revision: Mapped[int | None] = mapped_column(Integer)
+    target_hash: Mapped[str | None] = mapped_column(String(64))
+    decision: Mapped[str] = mapped_column(String(24), nullable=False)
+    blocking_diagnostic_present: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("false"),
+    )
+    issues_json: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default="[]",
+    )
+    reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
 
@@ -382,6 +600,12 @@ class WorkflowStep(Base):
     model: Mapped[str | None] = mapped_column(String(200))
     input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     input_snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    progress_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
     error_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     lease_owner: Mapped[str | None] = mapped_column(String(160))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -628,6 +852,12 @@ class StoryRevisionRecord(Base):
     synopsis: Mapped[str] = mapped_column(Text, nullable=False)
     subject_ids_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
     scene_plan_json: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    episode_rules_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
     candidate_prompt_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.prompt_records.id", ondelete="SET NULL")
     )
@@ -718,6 +948,12 @@ class ShotBeat(Base):
     camera: Mapped[str] = mapped_column(Text, nullable=False, default="")
     dialogue: Mapped[str] = mapped_column(Text, nullable=False, default="")
     duration_seconds: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    temporal_beats_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default="[]",
+    )
     status: Mapped[str] = mapped_column(
         String(24), nullable=False, default="draft", server_default="draft"
     )
@@ -910,14 +1146,103 @@ class CanvasGraphEdge(Base):
     )
 
 
-class CanvasEvent(Base):
-    __tablename__ = "canvas_events"
+class CanvasGroup(Base):
+    __tablename__ = "canvas_groups"
     __table_args__ = (
-        Index("ix_canvas_events_run_created", "production_run_id", "created_at"),
+        CheckConstraint("group_type IN ('recipe', 'shot')", name="ck_canvas_groups_type"),
+        CheckConstraint(
+            "lifecycle_status IN ('active', 'detached')",
+            name="ck_canvas_groups_lifecycle",
+        ),
+        Index("ix_canvas_groups_run_status", "production_run_id", "lifecycle_status"),
         {"schema": SCHEMA_NAME},
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    production_recipe_instance_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_recipe_instances.id", ondelete="SET NULL"),
+    )
+    parent_group_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.canvas_groups.id", ondelete="CASCADE"),
+    )
+    group_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    title: Mapped[str] = mapped_column(String(160), nullable=False)
+    lifecycle_status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="active", server_default="active"
+    )
+    color: Mapped[str] = mapped_column(String(16), nullable=False, default="#7c9cff")
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    data_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class CanvasGroupMember(Base):
+    __tablename__ = "canvas_group_members"
+    __table_args__ = (
+        UniqueConstraint("group_id", "canvas_node_id", name="uq_canvas_group_members_node"),
+        Index("ix_canvas_group_members_node", "canvas_node_id"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.canvas_groups.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    canvas_node_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.canvas_graph_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class CanvasGroupTemplate(Base):
+    __tablename__ = "canvas_group_templates"
+    __table_args__ = ({"schema": SCHEMA_NAME},)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    template_key: Mapped[str] = mapped_column(String(120), nullable=False, unique=True)
+    title: Mapped[str] = mapped_column(String(160), nullable=False)
+    definition_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class CanvasEvent(Base):
+    __tablename__ = "canvas_events"
+    __table_args__ = (
+        Index("ix_canvas_events_run_created", "production_run_id", "created_at"),
+        Index("ix_canvas_events_run_sequence", "production_run_id", "sequence"),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    sequence: Mapped[int] = mapped_column(
+        BigInteger,
+        Identity(),
+        nullable=False,
+        unique=True,
+    )
     production_run_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
@@ -1169,7 +1494,7 @@ class Asset(Base):
             name="ck_assets_scope",
         ),
         CheckConstraint(
-            "status IN ('candidate', 'approved', 'rejected', 'ready')",
+            "status IN ('candidate', 'approved', 'rejected', 'ready', 'stale')",
             name="ck_assets_status",
         ),
         Index("ix_assets_sha256_role", "sha256", "role"),

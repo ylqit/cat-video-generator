@@ -5,14 +5,21 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from cat_video_generator.application.ports import (
     DirectorResult,
+    GatewayError,
     ImageResult,
     LandedAsset,
     StoredAsset,
     VideoTaskResult,
 )
-from cat_video_generator.application.universal_media_worker import UniversalMediaWorker
+from cat_video_generator.application.universal_media_worker import (
+    MediaExecutionResult,
+    UniversalMediaWorker,
+    VideoFilmstripExecutor,
+)
 from cat_video_generator.application.universal_video_edit import UniversalVideoEditExecutor
 from cat_video_generator.domain.rendering import RenderOperation, VideoInputPlan
 from cat_video_generator.domain.workflow import StepStatus
@@ -33,14 +40,20 @@ def test_worker_claims_only_media_canvas_jobs_and_lands_one_audited_candidate(
                 "subject:complete:",
                 "media:image:batch:",
                 "media:video:batch:",
+                "media:filmstrip:",
                 "video:edit-anchor:",
                 "video:edit-recipe:",
+                "recipe:",
+                "canvas-group:",
             )
             events.append("claimed")
             return lease
 
         def finish(self, _step_id: uuid.UUID, **values: object) -> None:
             events.append(f"finished:{values['status']}")
+
+        def update_progress(self, *_args: object, **_values: object) -> object:
+            return lease
 
     class Repository:
         def image_candidate_work(self, _step_id: uuid.UUID) -> dict[str, object]:
@@ -87,6 +100,155 @@ def test_worker_claims_only_media_canvas_jobs_and_lands_one_audited_candidate(
     ]
 
 
+def test_worker_dispatches_durable_recipe_task_and_stops_at_review_gate() -> None:
+    step_id = uuid.uuid4()
+    lease = SimpleNamespace(
+        step_id=step_id,
+        operation_key="recipe:story",
+        input_snapshot={"recipeInstanceId": str(uuid.uuid4())},
+        attempt=1,
+    )
+    finished: list[dict[str, object]] = []
+
+    class Queue:
+        def claim_next(self, **_values: object) -> object:
+            return lease
+
+        def heartbeat(self, *_args: object, **_values: object) -> object:
+            return lease
+
+        def update_progress(self, *_args: object, **_values: object) -> object:
+            return lease
+
+        def finish(self, _step_id: uuid.UUID, **values: object) -> None:
+            finished.append(values)
+
+    class Executor:
+        def execute_queued_task(self, task_id: uuid.UUID, **values: object) -> MediaExecutionResult:
+            assert task_id == step_id
+            assert values["operation_key"] == "recipe:story"
+            return MediaExecutionResult(
+                payload={"message": "三个故事候选已生成"},
+                status=StepStatus.AWAITING_REVIEW,
+            )
+
+    worker = UniversalMediaWorker(
+        queue=Queue(),  # type: ignore[arg-type]
+        repository=SimpleNamespace(),  # type: ignore[arg-type]
+        gateway=SimpleNamespace(),  # type: ignore[arg-type]
+        asset_store=SimpleNamespace(),  # type: ignore[arg-type]
+        worker_id="recipe-worker-test",
+        recipe_task_executor=Executor(),
+    )
+
+    result = worker.run_once()
+
+    assert result == {"stepId": str(step_id), "message": "三个故事候选已生成"}
+    assert finished[0]["status"] is StepStatus.AWAITING_REVIEW
+    assert finished[0]["result_summary"] == {"message": "三个故事候选已生成"}
+
+
+def test_worker_persists_network_retry_count_without_changing_business_attempt() -> None:
+    step_id = uuid.uuid4()
+    lease = SimpleNamespace(
+        step_id=step_id,
+        operation_key="recipe:story",
+        input_snapshot={},
+        attempt=7,
+        progress={"networkRetryCount": 1},
+    )
+    finished: list[dict[str, object]] = []
+
+    class Queue:
+        def claim_next(self, **_values: object) -> object:
+            return lease
+
+        def heartbeat(self, *_args: object, **_values: object) -> object:
+            return lease
+
+        def update_progress(self, *_args: object, **_values: object) -> object:
+            return lease
+
+        def finish(self, _step_id: uuid.UUID, **values: object) -> None:
+            finished.append(values)
+
+    class Executor:
+        def execute_queued_task(self, *_args: object, **_values: object) -> MediaExecutionResult:
+            raise GatewayError("provider temporarily unavailable", code="network", retryable=True)
+
+    worker = UniversalMediaWorker(
+        queue=Queue(),  # type: ignore[arg-type]
+        repository=SimpleNamespace(),  # type: ignore[arg-type]
+        gateway=SimpleNamespace(),  # type: ignore[arg-type]
+        asset_store=SimpleNamespace(),  # type: ignore[arg-type]
+        worker_id="retry-worker-test",
+        recipe_task_executor=Executor(),
+    )
+
+    with pytest.raises(GatewayError, match="temporarily unavailable"):
+        worker.run_once()
+
+    assert lease.attempt == 7
+    assert finished[0]["status"] is StepStatus.PENDING
+    assert finished[0]["next_retry_at"] is not None
+    assert finished[0]["progress_update"] == {
+        "networkRetryCount": 2,
+        "message": "网络异常，已安排第 2/3 次自动重试",
+    }
+
+
+def test_worker_never_resubmits_submission_unknown() -> None:
+    step_id = uuid.uuid4()
+    lease = SimpleNamespace(
+        step_id=step_id,
+        operation_key="recipe:video",
+        input_snapshot={},
+        attempt=1,
+        progress={"networkRetryCount": 0},
+    )
+    finished: list[dict[str, object]] = []
+
+    class Queue:
+        def claim_next(self, **_values: object) -> object:
+            return lease
+
+        def heartbeat(self, *_args: object, **_values: object) -> object:
+            return lease
+
+        def update_progress(self, *_args: object, **_values: object) -> object:
+            return lease
+
+        def finish(self, _step_id: uuid.UUID, **values: object) -> None:
+            finished.append(values)
+
+    class Executor:
+        def execute_queued_task(self, *_args: object, **_values: object) -> MediaExecutionResult:
+            raise GatewayError(
+                "submission outcome unknown",
+                code="submission_unknown",
+                retryable=True,
+                submission_unknown=True,
+            )
+
+    worker = UniversalMediaWorker(
+        queue=Queue(),  # type: ignore[arg-type]
+        repository=SimpleNamespace(),  # type: ignore[arg-type]
+        gateway=SimpleNamespace(),  # type: ignore[arg-type]
+        asset_store=SimpleNamespace(),  # type: ignore[arg-type]
+        worker_id="unknown-worker-test",
+        recipe_task_executor=Executor(),
+    )
+
+    with pytest.raises(GatewayError, match="outcome unknown"):
+        worker.run_once()
+
+    assert finished[0]["status"] is StepStatus.SUBMISSION_UNKNOWN
+    assert finished[0]["next_retry_at"] is None
+    assert finished[0]["progress_update"] == {
+        "message": "Provider 提交状态未知，等待人工对账恢复",
+    }
+
+
 def test_worker_submits_and_lands_audited_video_batch_candidate(tmp_path: Path) -> None:
     events: list[str] = []
     lease = SimpleNamespace(
@@ -107,6 +269,9 @@ def test_worker_submits_and_lands_audited_video_batch_candidate(tmp_path: Path) 
 
         def finish(self, _step_id: uuid.UUID, **values: object) -> None:
             events.append(f"finished:{values['status']}")
+
+        def update_progress(self, *_args: object, **_values: object) -> object:
+            return lease
 
     class Repository:
         def video_candidate_work(self, _step_id: uuid.UUID) -> dict[str, object]:
@@ -189,6 +354,9 @@ def test_worker_executes_persisted_subject_completion_and_waits_for_human_review
 
         def finish(self, _step_id: uuid.UUID, **values: object) -> None:
             events.append(f"finished:{values['status']}")
+
+        def update_progress(self, *_args: object, **_values: object) -> object:
+            return lease
 
     class Repository:
         def subject_completion_work(self, _step_id: uuid.UUID) -> dict[str, object]:
@@ -347,6 +515,35 @@ def test_direct_video_edit_freezes_inputs_and_preserves_full_version(
         "submission_persisted",
         "versions_persisted",
     ]
+
+
+def test_filmstrip_executor_extracts_distinct_requested_times_and_persists_frames(
+    tmp_path: Path,
+) -> None:
+    source = _video_asset(tmp_path)
+    timestamps = (0, 2_000, 4_000, 6_000, 8_000, 9_999)
+    completed: dict[str, object] = {}
+
+    class Repository:
+        def filmstrip_work(self, _step_id: uuid.UUID) -> dict[str, object]:
+            return {"source": source, "timestampsMs": timestamps, "filmstripKey": "key"}
+
+        def complete_filmstrip(self, _step_id: uuid.UUID, **values: object) -> tuple[str, ...]:
+            completed.update(values)
+            return tuple(f"frame-{index}" for index in range(len(timestamps)))
+
+    executor = VideoFilmstripExecutor(
+        repository=Repository(),  # type: ignore[arg-type]
+        frame_extractor=_Extractor(tmp_path),
+        asset_store=_EditStore(tmp_path),
+    )
+
+    result = executor.execute(uuid.uuid4())
+
+    assert result.status is StepStatus.SUCCEEDED
+    assert result.payload == {"frameCount": "6"}
+    assert completed["timestamps_ms"] == timestamps
+    assert len(completed["frames"]) == 6  # type: ignore[arg-type]
 
 
 def _video_asset(tmp_path: Path) -> StoredAsset:

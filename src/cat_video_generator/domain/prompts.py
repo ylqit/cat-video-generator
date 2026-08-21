@@ -527,6 +527,14 @@ def compile_video_review_prompt(context: ShotPromptContext) -> str:
 请按时间点指出人物或猫咪身份、肢体结构、关键道具、动作顺序、构图和画风问题；轻微表情或普通背景变化只记为提示。""".strip()
 
 
+def compile_anchor_review_prompt(context: ShotPromptContext) -> str:
+    return f"""检查这一张镜头视觉锚点，只给出创作建议，不自动批准或拒绝。
+镜头：{context.shot_title}
+预期：{context.direction}
+请指出儿童身份与年龄、猫咪脸部毛色和体型、猫科身体结构、固定服装、关键道具初始位置、
+构图以及统一水彩画风的问题。不要把普通水彩晕染或轻微背景差异误报为身份漂移。""".strip()
+
+
 def compile_range_edit_prompt(
     context: ShotPromptContext,
     *,

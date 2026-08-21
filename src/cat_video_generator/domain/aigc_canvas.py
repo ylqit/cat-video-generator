@@ -50,8 +50,10 @@ class StoryStrategy(StrEnum):
 
 
 class CanvasNodeType(StrEnum):
+    RECIPE_GROUP = "RecipeGroupNode"
     BRIEF = "BriefNode"
     SUBJECT = "SubjectNode"
+    CHARACTER_DESIGN = "CharacterDesignNode"
     STORY_PLANNER = "StoryPlannerNode"
     STORY_CANDIDATE = "StoryCandidateNode"
     STORY_CRITIC = "StoryCriticNode"
@@ -76,6 +78,7 @@ class CanvasNodeType(StrEnum):
 class CanvasPortType(StrEnum):
     BRIEF = "brief"
     SUBJECTS = "subject[]"
+    CHARACTER_DESIGN = "character_design"
     STORY_REVISION = "story_revision"
     SCENE_PLAN = "scene_plan"
     SHOT_BEATS = "shot_beat[]"
@@ -174,12 +177,25 @@ class ActualReferenceBinding(StrictModel):
     semantic_role: str = Field(alias="semanticRole", min_length=1, max_length=80)
     provider_included: bool = Field(alias="providerIncluded")
     omission_reason: str | None = Field(alias="omissionReason", default=None, max_length=1_000)
+    provider_slot: str | None = Field(alias="providerSlot", default=None, max_length=120)
 
     @model_validator(mode="after")
     def require_omission_reason(self) -> ActualReferenceBinding:
         if not self.provider_included and not (self.omission_reason or "").strip():
             raise ValueError("omissionReason is required when a reference is omitted")
         return self
+
+
+class NormalizedPoint(StrictModel):
+    x: float = Field(ge=0, le=1)
+    y: float = Field(ge=0, le=1)
+
+
+class GenerationReferenceAnnotation(StrictModel):
+    asset_id: uuid.UUID = Field(alias="assetId")
+    tool: Literal["rectangle", "brush", "arrow", "text", "marker", "eraser"]
+    points: list[NormalizedPoint] = Field(min_length=1, max_length=500)
+    label: str = Field(default="", max_length=500)
 
 
 class NodeGenerationConfigDraft(StrictModel):
@@ -202,6 +218,11 @@ class NodeGenerationConfigDraft(StrictModel):
     candidate_count: int = Field(alias="candidateCount", ge=1, le=8)
     auto_validate: bool = Field(alias="autoValidate", default=True)
     auto_link: bool = Field(alias="autoLink", default=True)
+    draft_prompt: str = Field(alias="draftPrompt", default="", max_length=20_000)
+    camera_motion: str = Field(alias="cameraMotion", default="static", max_length=120)
+    reference_annotations: list[GenerationReferenceAnnotation] = Field(
+        alias="referenceAnnotations", default_factory=list, max_length=100
+    )
     actual_references: list[ActualReferenceBinding] = Field(
         alias="actualReferences", default_factory=list, max_length=30
     )
@@ -476,28 +497,50 @@ def approve_story_revision(
 
 
 _NODE_INPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
+    CanvasNodeType.RECIPE_GROUP: frozenset(),
     CanvasNodeType.BRIEF: frozenset(),
     CanvasNodeType.SUBJECT: frozenset(),
+    CanvasNodeType.CHARACTER_DESIGN: frozenset(
+        {CanvasPortType.SUBJECTS, CanvasPortType.STORY_REVISION}
+    ),
     CanvasNodeType.STORY_PLANNER: frozenset(
         {CanvasPortType.BRIEF, CanvasPortType.SUBJECTS}
     ),
     CanvasNodeType.STORY_CANDIDATE: frozenset({CanvasPortType.STORY_REVISION}),
     CanvasNodeType.STORY_CRITIC: frozenset({CanvasPortType.STORY_REVISION}),
-    CanvasNodeType.APPROVAL_GATE: frozenset({CanvasPortType.STORY_REVISION}),
+    CanvasNodeType.APPROVAL_GATE: frozenset(
+        {
+            CanvasPortType.BRIEF,
+            CanvasPortType.STORY_REVISION,
+            CanvasPortType.CHARACTER_DESIGN,
+        }
+    ),
     CanvasNodeType.STORYBOARD_DIRECTOR: frozenset(
-        {CanvasPortType.STORY_REVISION, CanvasPortType.SUBJECTS}
+        {
+            CanvasPortType.STORY_REVISION,
+            CanvasPortType.SUBJECTS,
+            CanvasPortType.CHARACTER_DESIGN,
+        }
     ),
     CanvasNodeType.SCENE: frozenset({CanvasPortType.SCENE_PLAN}),
     CanvasNodeType.SHOT_BEAT: frozenset(
         {CanvasPortType.SHOT_BEATS, CanvasPortType.SUBJECTS}
     ),
     CanvasNodeType.IMAGE_GENERATION: frozenset(
-        {CanvasPortType.SHOT_BEATS, CanvasPortType.IMAGE_REFERENCES, CanvasPortType.PROMPT}
+        {
+            CanvasPortType.SHOT_BEATS,
+            CanvasPortType.SUBJECTS,
+            CanvasPortType.IMAGE_REFERENCES,
+            CanvasPortType.MEDIA_REFERENCES,
+            CanvasPortType.PROMPT,
+        }
     ),
     CanvasNodeType.VIDEO_GENERATION: frozenset(
         {
             CanvasPortType.SHOT_BEATS,
+            CanvasPortType.SUBJECTS,
             CanvasPortType.IMAGE_REFERENCES,
+            CanvasPortType.MEDIA_REFERENCES,
             CanvasPortType.IMAGE_ASSET,
             CanvasPortType.PROMPT,
         }
@@ -521,14 +564,24 @@ _NODE_INPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
 }
 
 _NODE_OUTPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
+    CanvasNodeType.RECIPE_GROUP: frozenset(),
     CanvasNodeType.BRIEF: frozenset({CanvasPortType.BRIEF}),
     CanvasNodeType.SUBJECT: frozenset(
         {CanvasPortType.SUBJECTS, CanvasPortType.PRODUCT_SUBJECT}
     ),
+    CanvasNodeType.CHARACTER_DESIGN: frozenset(
+        {CanvasPortType.CHARACTER_DESIGN, CanvasPortType.IMAGE_ASSET}
+    ),
     CanvasNodeType.STORY_PLANNER: frozenset({CanvasPortType.STORY_REVISION}),
     CanvasNodeType.STORY_CANDIDATE: frozenset({CanvasPortType.STORY_REVISION}),
     CanvasNodeType.STORY_CRITIC: frozenset({CanvasPortType.STORY_REVISION}),
-    CanvasNodeType.APPROVAL_GATE: frozenset({CanvasPortType.STORY_REVISION}),
+    CanvasNodeType.APPROVAL_GATE: frozenset(
+        {
+            CanvasPortType.BRIEF,
+            CanvasPortType.STORY_REVISION,
+            CanvasPortType.CHARACTER_DESIGN,
+        }
+    ),
     CanvasNodeType.STORYBOARD_DIRECTOR: frozenset({CanvasPortType.SCENE_PLAN}),
     CanvasNodeType.SCENE: frozenset({CanvasPortType.SHOT_BEATS}),
     CanvasNodeType.SHOT_BEAT: frozenset({CanvasPortType.SHOT_BEATS}),
@@ -551,6 +604,7 @@ _NODE_OUTPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
 _PORT_COMPATIBILITY: dict[CanvasPortType, frozenset[CanvasPortType]] = {
     CanvasPortType.BRIEF: frozenset({CanvasPortType.BRIEF}),
     CanvasPortType.SUBJECTS: frozenset({CanvasPortType.SUBJECTS}),
+    CanvasPortType.CHARACTER_DESIGN: frozenset({CanvasPortType.CHARACTER_DESIGN}),
     CanvasPortType.STORY_REVISION: frozenset({CanvasPortType.STORY_REVISION}),
     CanvasPortType.SCENE_PLAN: frozenset({CanvasPortType.SCENE_PLAN}),
     CanvasPortType.SHOT_BEATS: frozenset({CanvasPortType.SHOT_BEATS}),

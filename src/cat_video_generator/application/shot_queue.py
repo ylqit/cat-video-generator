@@ -46,6 +46,7 @@ from ..domain.creative_workflow import shot_snapshot_hash, story_source_hash
 from ..domain.prompts import (
     CompiledPrompt,
     compile_anchor_prompt,
+    compile_anchor_review_prompt,
     compile_range_edit_prompt,
     compile_reference_image_prompt,
     compile_scene_look_prompt,
@@ -2579,6 +2580,7 @@ class ShotProductionService:
         regenerate: bool = False,
         reason: str | None = None,
         expected_input_hash: str | None = None,
+        request_idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         shot = self._repository.get_shot(shot_id)
         self._require_paid_gateway(allow_paid_generation)
@@ -2599,6 +2601,7 @@ class ShotProductionService:
             snapshot=spec.snapshot,
             force_new_attempt=regenerate,
             retry_reason=reason,
+            request_idempotency_key=request_idempotency_key,
         )
         if step.status is not StepStatus.PENDING:
             existing_asset = next(
@@ -2646,6 +2649,7 @@ class ShotProductionService:
                 },
             )
             self._repository.update_step(step.id, status=StepStatus.AWAITING_REVIEW)
+            self._record_anchor_review(shot, step, asset)
             return {"stepId": str(step.id), "assetId": str(asset.id), "status": "awaiting_review"}
         except GatewayError as exc:
             status = StepStatus.SUBMISSION_UNKNOWN if exc.submission_unknown else StepStatus.FAILED
@@ -3133,6 +3137,7 @@ class ShotProductionService:
         regenerate: bool = False,
         reason: str | None = None,
         expected_input_hash: str | None = None,
+        request_idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         if self._runtime_preflight is not None:
             self._runtime_preflight.validate_for_video_generation(
@@ -3159,6 +3164,7 @@ class ShotProductionService:
             snapshot=spec.snapshot,
             force_new_attempt=regenerate,
             retry_reason=reason,
+            request_idempotency_key=request_idempotency_key,
         )
         if step.status is not StepStatus.PENDING:
             return {"stepId": str(step.id), "reused": True, "status": step.status.value}
@@ -3632,7 +3638,8 @@ class ShotProductionService:
         frames: tuple[Path, ...] = ()
         try:
             duration_ms = int(asset.metadata["qc"]["durationMs"])
-            count = min(12, max(4, math.ceil(duration_ms / 1000) + 2))
+            duration_seconds = math.ceil(duration_ms / 1000)
+            count = min(8, max(6, math.ceil(duration_seconds / 3) + 3))
             frames = self._frame_extractor.extract_review_frames(asset, count=count)
             for ordinal, frame in enumerate(frames, 1):
                 self._repository.add_asset(
@@ -3688,6 +3695,53 @@ class ShotProductionService:
         finally:
             for frame in frames:
                 frame.unlink(missing_ok=True)
+
+    def _record_anchor_review(
+        self,
+        shot: StoredShot,
+        step: StoredStep,
+        asset: StoredAsset,
+    ) -> None:
+        try:
+            if not self._semantic_review_enabled or self._gateway is None:
+                raise RuntimeError("视觉锚点 AI 诊断未启用")
+            result = self._gateway.diagnose_image(
+                prompt=compile_anchor_review_prompt(self._prompt_context(shot)),
+                image_path=asset.require_path(),
+            )
+            violations = list(result.violations)
+            if not result.identity_ok:
+                violations.append("人物或猫咪身份与 Canon 不一致")
+            if not result.style_ok:
+                violations.append("画风与本集单一水彩参考不一致")
+            if not result.constraints_ok:
+                violations.append("身体结构、服装、道具或构图约束不满足")
+            self._repository.add_review(
+                step_id=step.id,
+                asset_id=asset.id,
+                source="ark_visual",
+                decision="pending",
+                reason="AI suggestions do not automatically approve or reject media",
+                warnings=tuple(
+                    {"severity": "suggestion", "message": item}
+                    for item in dict.fromkeys(violations)
+                ),
+                evidence={
+                    "confidence": result.confidence,
+                    "evidence": list(result.evidence),
+                    "requestHash": result.request_hash,
+                },
+            )
+        except Exception as exc:
+            self._repository.add_review(
+                step_id=step.id,
+                asset_id=asset.id,
+                source="technical",
+                decision="pending",
+                reason="AI advice was unavailable; manual override remains available",
+                warnings=({"severity": "warning", "message": str(exc)},),
+                evidence={},
+            )
 
     def _compile_shot_generation(
         self,
@@ -3897,7 +3951,13 @@ class ShotProductionService:
         snapshot: dict[str, Any],
         force_new_attempt: bool = False,
         retry_reason: str | None = None,
+        request_idempotency_key: str | None = None,
     ) -> tuple[StoredStep, Any]:
+        if request_idempotency_key is not None:
+            snapshot = {
+                **snapshot,
+                "requestIdempotencyKey": request_idempotency_key,
+            }
         input_hash = _hash_json({"prompt": prompt, "snapshot": snapshot})
         # Reuse the current input's first attempt.  A changed input or explicit
         # regenerate request receives a new attempt without touching old media.
@@ -3922,11 +3982,13 @@ class ShotProductionService:
             (item for item in operation_steps if item.status is StepStatus.SUBMISSION_UNKNOWN),
             None,
         )
-        if unresolved is not None and force_new_attempt:
-            raise ValueError(
-                f"step {unresolved.id} is submission_unknown; reconcile it before regeneration"
-            )
-        if force_new_attempt:
+        if request_idempotency_key is not None and existing:
+            attempt = existing[-1].attempt
+        elif force_new_attempt:
+            if unresolved is not None:
+                raise ValueError(
+                    f"step {unresolved.id} is submission_unknown; reconcile it before regeneration"
+                )
             previous = operation_steps[-1] if operation_steps else None
             if previous is not None and previous.status in {
                 StepStatus.PENDING,

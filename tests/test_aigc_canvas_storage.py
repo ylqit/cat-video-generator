@@ -95,7 +95,7 @@ def test_prompt_records_have_full_audit_columns() -> None:
 
 
 def test_canvas_v2_migration_is_current_head() -> None:
-    assert ALEMBIC_HEAD == "0021_libtv_subject_assistant"
+    assert ALEMBIC_HEAD == "0024_durable_task_events"
 
 
 def test_assets_can_belong_to_a_universal_canvas_node() -> None:

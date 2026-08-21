@@ -9,14 +9,18 @@ from sqlalchemy import Engine, text
 
 from .application.aigc_canvas import AigcCanvasService
 from .application.canon import CanonRepairService
+from .application.production_recipes import ProductionRecipeService
 from .application.sequence_service import SequenceService
 from .application.shot_queue import ProjectEditingService, ShotProductionService
-from .application.universal_media_worker import UniversalMediaWorker
+from .application.universal_media_worker import UniversalMediaWorker, VideoFilmstripExecutor
 from .application.universal_video_edit import UniversalVideoEditExecutor
 from .config import DatabaseOperation, DatabaseSettings, RuntimeSettings, load_local_env
 from .infrastructure.ark.runtime import RuntimeArkGateway, RuntimeConfigurationManager
 from .infrastructure.db.aigc_canvas_repository import SqlAlchemyAigcCanvasRepository
 from .infrastructure.db.durable_queue import DurableWorkflowQueue
+from .infrastructure.db.production_recipe_repository import (
+    SqlAlchemyProductionRecipeRepository,
+)
 from .infrastructure.db.repositories import SqlAlchemyWorkflowRepository
 from .infrastructure.db.session import (
     ALEMBIC_HEAD,
@@ -37,6 +41,7 @@ class RuntimeContainer:
     sequences: SequenceService
     canon: CanonRepairService
     canvas_v2: AigcCanvasService
+    production_recipes: ProductionRecipeService
     workflow_queue: DurableWorkflowQueue
     media_canvas_worker: UniversalMediaWorker
     runtime_settings: RuntimeSettings
@@ -95,40 +100,52 @@ def build_runtime_container() -> RuntimeContainer:
         else FfmpegFrameExtractor(ffmpeg_path=runtime.ffmpeg_path, work_root=runtime.work_root)
     )
     workflow_queue = DurableWorkflowQueue(sessions)
+    editing = ProjectEditingService(
+        repository=repository,
+        director=gateway,
+        provider_name=runtime_configuration.provider_profile,
+    )
+    production = ShotProductionService(
+        repository=repository,
+        gateway=gateway,
+        asset_store=store,
+        media_probe=probe,
+        frame_extractor=extractor,
+        provider_name=runtime_configuration.provider_profile,
+        resolution=runtime_configuration.video_resolution,
+        runtime_preflight=runtime_configuration,
+        enable_video_advice=runtime_configuration.semantic_review_enabled,
+        poll_interval_seconds=runtime.ark_poll_interval_seconds,
+        task_timeout_seconds=runtime.ark_task_timeout_seconds,
+    )
+    sequences = SequenceService(
+        repository=repository,
+        asset_store=store,
+        media_probe=probe,
+        resolution=runtime_configuration.video_resolution,
+        runtime_preflight=runtime_configuration,
+    )
+    canvas_v2 = AigcCanvasService(
+        repository=canvas_repository,
+        director=gateway,
+        provider_name=runtime_configuration.provider_profile,
+    )
+    production_recipes = ProductionRecipeService(
+        repository=SqlAlchemyProductionRecipeRepository(sessions),
+        story_workflow=canvas_v2,
+        shot_workflow=production,
+        sequence_workflow=sequences,
+        asset_root=runtime.asset_root,
+    )
     return RuntimeContainer(
         engine=engine,
         repository=repository,
-        editing=ProjectEditingService(
-            repository=repository,
-            director=gateway,
-            provider_name=runtime_configuration.provider_profile,
-        ),
-        production=ShotProductionService(
-            repository=repository,
-            gateway=gateway,
-            asset_store=store,
-            media_probe=probe,
-            frame_extractor=extractor,
-            provider_name=runtime_configuration.provider_profile,
-            resolution=runtime_configuration.video_resolution,
-            runtime_preflight=runtime_configuration,
-            enable_video_advice=runtime_configuration.semantic_review_enabled,
-            poll_interval_seconds=runtime.ark_poll_interval_seconds,
-            task_timeout_seconds=runtime.ark_task_timeout_seconds,
-        ),
-        sequences=SequenceService(
-            repository=repository,
-            asset_store=store,
-            media_probe=probe,
-            resolution=runtime_configuration.video_resolution,
-            runtime_preflight=runtime_configuration,
-        ),
+        editing=editing,
+        production=production,
+        sequences=sequences,
         canon=CanonRepairService(repository=repository, asset_store=store),
-        canvas_v2=AigcCanvasService(
-            repository=canvas_repository,
-            director=gateway,
-            provider_name=runtime_configuration.provider_profile,
-        ),
+        canvas_v2=canvas_v2,
+        production_recipes=production_recipes,
         workflow_queue=workflow_queue,
         media_canvas_worker=UniversalMediaWorker(
             queue=workflow_queue,
@@ -136,6 +153,13 @@ def build_runtime_container() -> RuntimeContainer:
             gateway=gateway,
             asset_store=store,
             worker_id="media-canvas-worker",
+            recipe_task_executor=production_recipes,
+            provider_poll_interval_seconds=runtime.ark_poll_interval_seconds,
+            filmstrip_executor=VideoFilmstripExecutor(
+                repository=canvas_repository,
+                frame_extractor=extractor,
+                asset_store=store,
+            ),
             video_edit_executor=UniversalVideoEditExecutor(
                 repository=canvas_repository,
                 gateway=gateway,

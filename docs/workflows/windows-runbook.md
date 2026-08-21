@@ -4,19 +4,25 @@
 
 ```powershell
 uv sync --extra dev
+uv run alembic upgrade head
 uv run cvg doctor
-uv run cvg api
+uv run cvg api --host 127.0.0.1 --port 8765
 ```
 
-另一个终端启动前端：
+第二个终端启动持久任务 Worker。开发环境默认只启动一个 Worker，确保付费任务顺序执行：
 
 ```powershell
-npm --prefix web install
-npm --prefix web run dev -- --host 0.0.0.0
+uv run cvg-worker --concurrency 1 --poll-seconds 1
 ```
 
-访问 `http://localhost:5173/studio`。生产单服务可先构建前端，再执行
-`uv run cvg api --static-dir web/dist`。
+第三个终端启动前端：
+
+```powershell
+npm --prefix web run dev
+```
+
+访问 `http://localhost:5173/canvas`。首次升级前先关闭旧 API/Worker，避免 Windows 锁定
+`.venv\\Scripts` 中的可执行文件；升级完成后再按上述三个终端顺序启动。
 
 API 默认监听 `0.0.0.0`，开发前端按上面的 `--host 0.0.0.0` 启动后也可从局域网访问；
 系统不增加 IP 白名单、登录或管理员鉴权。请仅在您信任的局域网与防火墙边界内运行。
@@ -42,7 +48,7 @@ uv run cvg canon-repair --source-dir "风格定稿/Canon-v1"
 uv run cvg doctor
 ```
 
-迁移最终应显示 `0018_v5_shot_assistance`；`doctor` 分别报告数据库、Ark、FFmpeg、
+迁移最终应显示当前 Alembic head（本版本为 `0024_durable_task_events`）；`doctor` 分别报告数据库、Ark、FFmpeg、
 FFprobe、视频生成和本地合成状态。
 
 ## Web 操作
@@ -63,9 +69,9 @@ FFprobe、视频生成和本地合成状态。
 ## 恢复边界
 
 - 左侧“全局任务”统一查看排队、Provider 生成、等待审核、失败和服务重启待恢复状态；运行中媒体尚未落盘时，也会出现在片段“锚点与视频版本”页。
-- 带 Provider Task ID 的 queued/running 视频会由任务中心节流续查；手工“恢复查询”仍可用，且不会重新提交生成。
+- 带 Provider Task ID 的 queued/running 视频由独立 Worker 按 `next_retry_at` 续查；任务中心只消费 SSE 和展示状态，不在线程内重新提交。
 - 已有视频 Task ID：点击“继续查询原任务”。
-- `submission_unknown`：点击“查询候选并对账”，不得直接重做。
+- `submission_unknown`：点击“按 Provider ID 对账”，不得直接重做；普通 running 状态无需人工恢复。
 - 图片同步超时：供应商无持久 Task ID；再次生成前需接受潜在重复计费。
 - Canon/视觉基准显示 HTTP 404：查看资产 ID；`contentReady=false` 或 `legacy:` 时执行
   `cvg canon-repair`（Canon）或重新上传项目图片。不要把旧机器绝对路径写回数据库。
