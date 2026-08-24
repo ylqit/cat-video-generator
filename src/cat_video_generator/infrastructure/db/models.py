@@ -854,6 +854,77 @@ class SubjectReference(Base):
     instruction: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
 
+class StoryEventCandidateRecord(Base):
+    __tablename__ = "story_event_candidates"
+    __table_args__ = (
+        UniqueConstraint(
+            "production_recipe_instance_id",
+            "batch_id",
+            "candidate_index",
+            name="uq_story_event_candidates_batch_index",
+        ),
+        Index(
+            "ix_story_event_candidates_instance_status",
+            "production_recipe_instance_id",
+            "status",
+            "created_at",
+        ),
+        CheckConstraint(
+            "status IN ('candidate', 'selected', 'superseded')",
+            name="ck_story_event_candidates_status",
+        ),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    production_recipe_instance_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_recipe_instances.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    story_brief_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.story_briefs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    batch_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    candidate_index: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    strategy: Mapped[str] = mapped_column(String(40), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="candidate", server_default="candidate"
+    )
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    premise: Mapped[str] = mapped_column(Text, nullable=False)
+    child_action: Mapped[str] = mapped_column(Text, nullable=False)
+    cat_participation: Mapped[str] = mapped_column(Text, nullable=False)
+    small_change: Mapped[str] = mapped_column(Text, nullable=False)
+    warm_ending: Mapped[str] = mapped_column(Text, nullable=False)
+    suggested_scenes_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
+    duration_fit_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    requires_scene_change: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    cat_behavior_mode_suggestion: Mapped[str] = mapped_column(String(40), nullable=False)
+    score_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    generation_prompt_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.prompt_records.id", ondelete="SET NULL")
+    )
+    selected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class StoryRevisionRecord(Base):
     __tablename__ = "story_revisions"
     __table_args__ = (
@@ -874,6 +945,10 @@ class StoryRevisionRecord(Base):
     parent_revision_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey(f"{SCHEMA_NAME}.story_revisions.id", ondelete="SET NULL"),
+    )
+    source_event_candidate_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.story_event_candidates.id", ondelete="SET NULL"),
     )
     revision: Mapped[int] = mapped_column(Integer, nullable=False)
     strategy: Mapped[str] = mapped_column(String(40), nullable=False)

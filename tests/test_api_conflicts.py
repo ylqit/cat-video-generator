@@ -111,6 +111,7 @@ def test_project_tasks_exposes_persistent_provider_state_without_new_schema(
             "operationKey": "video:shot",
             "provider": "fake",
             "providerTaskId": "provider-task-2",
+            "businessObjectId": None,
             "model": "fake-seedance",
             "inputSnapshot": {"sourceRevisionHash": "current-input"},
             "error": None,

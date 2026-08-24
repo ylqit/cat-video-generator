@@ -4,6 +4,7 @@ import type {
   CanvasDto,
   CanvasLayoutSaveResult,
   CanvasAssetHistoryDto,
+  CanvasEdgeCreateRequest,
   CanvasEdgeDto,
   CanvasNodeType,
   CanvasNodeAssetBindingDto,
@@ -468,6 +469,18 @@ export const canvasApi = {
       "POST",
       { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros },
     ),
+  runRecipeStoryEvents: (instanceId: string, acceptEstimatedCostMicros = 0) =>
+    canvasJson<JobDto>(
+      `/recipe-instances/${instanceId}/story-event-runs`,
+      "POST",
+      { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros },
+    ),
+  runRecipeStoryScript: (instanceId: string, acceptEstimatedCostMicros = 0) =>
+    canvasJson<JobDto>(
+      `/recipe-instances/${instanceId}/story-script-runs`,
+      "POST",
+      { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros },
+    ),
   runRecipeCreativeBrief: (instanceId: string) =>
     canvasJson<JobDto>(
       `/recipe-instances/${instanceId}/creative-brief-runs`,
@@ -528,7 +541,7 @@ export const canvasApi = {
     ),
   reviewRecipeTarget: (payload: {
     recipeInstanceId: string;
-    targetType: "creative_brief" | "story_revision" | "episode_rules" | "character_design" | "storyboard_revision" | "shot_beat" | "anchor_asset" | "video_asset" | "final_sequence";
+    targetType: "creative_brief" | "story_event" | "story_revision" | "episode_rules" | "character_design" | "storyboard_revision" | "shot_beat" | "anchor_asset" | "video_asset" | "final_sequence";
     targetId: string;
     targetRevision?: number;
     targetHash?: string;
@@ -587,7 +600,7 @@ export const canvasApi = {
   ) => canvasJson<Record<string, unknown>>(
     `/projects/${projectId}/canvas/nodes`, "POST", payload,
   ),
-  createEdge: (projectId: string, edge: Omit<CanvasEdgeDto, "id">) =>
+  createEdge: (projectId: string, edge: CanvasEdgeCreateRequest) =>
     canvasJson<CanvasEdgeDto>(`/projects/${projectId}/canvas/edges`, "POST", edge),
   deleteEdge: (edgeId: string) =>
     canvasJson<Record<string, unknown>>(`/canvas/edges/${edgeId}`, "DELETE"),

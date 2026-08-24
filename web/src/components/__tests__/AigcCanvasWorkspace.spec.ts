@@ -197,7 +197,37 @@ describe("AigcCanvasWorkspace", () => {
 
     const flow = wrapper.findComponent(VueFlowStub);
     expect(flow.props("panOnDrag")).toBe(false);
-    expect(flow.props("panActivationKeyCode")).toBe("Space");
+    expect(flow.props("panActivationKeyCode")).toBeUndefined();
+
+    const surface = wrapper.get(".canvas-surface");
+    const surfaceElement = surface.element as HTMLElement;
+    const setPointerCapture = vi.fn();
+    const releasePointerCapture = vi.fn();
+    Object.assign(surfaceElement, {
+      setPointerCapture,
+      hasPointerCapture: () => true,
+      releasePointerCapture,
+    });
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: " ", code: "Space" }));
+    await flushPromises();
+    expect(surface.classes()).toContain("space-ready");
+
+    const pointerDown = new MouseEvent("pointerdown", {
+      bubbles: true,
+      button: 0,
+      clientX: 120,
+      clientY: 140,
+    });
+    Object.defineProperty(pointerDown, "pointerId", { value: 7 });
+    wrapper.get('[data-canvas-node-id="video-node"]').element.dispatchEvent(pointerDown);
+    await flushPromises();
+    expect(setPointerCapture).toHaveBeenCalledWith(7);
+    expect(surface.classes()).toContain("panning");
+
+    window.dispatchEvent(new KeyboardEvent("keyup", { key: " ", code: "Space" }));
+    await flushPromises();
+    expect(surface.classes()).not.toContain("panning");
+    expect(releasePointerCapture).toHaveBeenCalledWith(7);
 
     wrapper.findComponent(CanvasNodeCard).vm.$emit("select-node", video);
     await flushPromises();
@@ -253,7 +283,7 @@ describe("AigcCanvasWorkspace", () => {
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
     await flushPromises();
     expect(wrapper.findComponent(CanvasLocalConsole).attributes("style"))
-      .toContain("translate3d(150px, 722px, 0)");
+      .toContain("translate3d(190px, 592px, 0)");
     const measurementsAfterSelection = rectSpy.mock.calls.length;
     const scheduledFrames: FrameRequestCallback[] = [];
     const animationFrameSpy = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
@@ -275,7 +305,7 @@ describe("AigcCanvasWorkspace", () => {
     await flushPromises();
 
     expect(wrapper.findComponent(CanvasLocalConsole).attributes("style"))
-      .toContain("translate3d(310px, 682px, 0)");
+      .toContain("translate3d(350px, 552px, 0)");
     expect(rectSpy.mock.calls.length).toBe(measurementsAfterSelection);
     animationFrameSpy.mockRestore();
     rectSpy.mockRestore();

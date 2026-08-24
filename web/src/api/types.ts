@@ -13,6 +13,8 @@ export type CanvasNodeType =
   | "SubjectNode"
   | "StylePresetNode"
   | "StoryPlannerNode"
+  | "StoryEventNode"
+  | "StoryScriptNode"
   | "StoryCandidateNode"
   | "StoryCriticNode"
   | "ApprovalGateNode"
@@ -37,6 +39,7 @@ export type CanvasPortType =
   | "brief"
   | "subject[]"
   | "story_revision"
+  | "story_event"
   | "scene_plan"
   | "shot_beat[]"
   | "image_reference[]"
@@ -51,6 +54,23 @@ export type CanvasPortType =
   | "audio_asset"
   | "character_design";
 
+export type CanvasLayoutLane =
+  | "canon"
+  | "creative"
+  | "story"
+  | "character_scene"
+  | "storyboard"
+  | "render"
+  | "export";
+
+export interface CanvasNodeLayoutHint {
+  lane: CanvasLayoutLane;
+  laneOrder: number;
+  itemOrder: number;
+  stackKey?: string;
+  positioned?: boolean;
+}
+
 export interface CanvasNodeDto {
   id: string;
   type: CanvasNodeType;
@@ -62,12 +82,21 @@ export interface CanvasNodeDto {
   data: Record<string, any>;
   availableActions?: CanvasNodeActionDto[];
   executionScope?: {
-    kind: "canvas_node";
+    kind: "canvas_node" | "canvas_group" | "business_object";
     objectType: string;
+    recipeInstanceId?: string | null;
+    canvasGroupId?: string | null;
+    businessObjectId?: string | null;
+    sceneId?: string | null;
+    shotId?: string | null;
+    operationKeys?: string[];
+    phases?: RecipePhaseKey[];
+    includeChildTasks?: boolean;
   };
   workflowSteps?: CanvasWorkflowStepDto[];
   blocker?: string | null;
   outputs?: Array<Record<string, unknown>>;
+  layoutHint?: CanvasNodeLayoutHint;
 }
 
 export type CanvasNodeActionKey =
@@ -77,6 +106,8 @@ export type CanvasNodeActionKey =
   | "recipe_primary" | "toggle_children" | "edit_brief" | "edit_subject"
   | "complete_creative" | "review_creative" | "generate_character_design" | "review_character_design"
   | "assist_subject" | "generate_stories" | "approve_story"
+  | "generate_event_candidates" | "select_story_event"
+  | "expand_story_script" | "review_story_script"
   | "inspect_prompt" | "review_story" | "storyboard_from_story"
   | "storyboard_from_characters" | "storyboard_manual" | "review_storyboard" | "open_scene"
   | "edit_shot" | "generate_anchor" | "open_generator" | "select_references"
@@ -198,6 +229,28 @@ export interface CanvasEdgeDto {
   targetNodeId: string;
   targetNodeType: CanvasNodeType;
   targetPort: CanvasPortType;
+  relationType?: string;
+  revision?: number;
+  systemManaged?: boolean;
+  availableActions?: CanvasEdgeActionDto[];
+}
+
+export type CanvasEdgeActionKey = "disconnect_edge";
+
+export interface CanvasEdgeActionDto {
+  key: CanvasEdgeActionKey;
+  label: string;
+  enabled: boolean;
+  disabledReason?: string | null;
+}
+
+export interface CanvasEdgeCreateRequest {
+  sourceNodeId: string;
+  sourceNodeType: CanvasNodeType;
+  sourcePort: CanvasPortType;
+  targetNodeId: string;
+  targetNodeType: CanvasNodeType;
+  targetPort: CanvasPortType;
 }
 
 export interface CanvasDto {
@@ -306,6 +359,46 @@ export interface RecipeStoryCandidateDto {
   episodeRules: EpisodeRulesDto | null;
   scoreAverage: number | null;
   scoreRationale: string | null;
+  sourceEventCandidateId?: string | null;
+}
+
+export interface RecipeStoryEventCandidateDto {
+  id: string;
+  revision: number;
+  batchId: string;
+  candidateIndex: number;
+  strategy: string;
+  status: "candidate" | "selected" | "superseded";
+  title: string;
+  premise: string;
+  childAction: string;
+  catParticipation: string;
+  smallChange: string;
+  warmEnding: string;
+  suggestedScenes: Array<{
+    sceneKey: string;
+    title: string;
+    purpose: string;
+    environment: "indoor" | "outdoor";
+    timeWeather: string;
+    transitionReason?: string | null;
+  }>;
+  durationFitSummary: string;
+  requiresSceneChange: boolean;
+  sceneChangePurpose?: string | null;
+  catBehaviorModeSuggestion: CatBehaviorMode;
+  scoreAverage: number | null;
+  scoreRationale: string | null;
+  selectedAt?: string | null;
+  createdAt?: string | null;
+}
+
+export interface RecipeStoryWorkflowDto {
+  currentStep: 1 | 2 | 3 | 4;
+  totalSteps: 4;
+  status: "generate_events" | "select_event" | "expand_script" | "approve_script" | "complete";
+  selectedEventId?: string | null;
+  scriptRevisionId?: string | null;
 }
 
 export interface ProductionRecipeDefinitionDto {
@@ -362,6 +455,9 @@ export interface ProductionRecipeInstanceDto {
   shots: RecipeShotDto[];
   sequenceCandidate?: RecipeSequenceCandidateDto | null;
   storyCandidates?: RecipeStoryCandidateDto[];
+  storyEvents?: RecipeStoryEventCandidateDto[];
+  selectedStoryEventId?: string | null;
+  storyWorkflow?: RecipeStoryWorkflowDto;
   creativeBrief?: {
     id: string;
     revision: number;
@@ -999,6 +1095,7 @@ export interface JobDto {
     canvasGroupId?: string;
     recipeInstanceId?: string;
     parentStepId?: string;
+    businessObjectId?: string;
     creationMode?: StoryboardCreationMode;
     workflowStage?: string;
     phase?: RecipePhaseKey;
@@ -1011,6 +1108,7 @@ export interface JobDto {
   canvasGroupId?: string;
   recipeInstanceId?: string;
   parentStepId?: string;
+  businessObjectId?: string;
   childStepIds?: string[];
   creationMode?: StoryboardCreationMode;
   workflowStage?: string;
@@ -1020,6 +1118,7 @@ export interface JobDto {
     totalSteps?: number;
     percent?: number;
     message?: string;
+    providerStatus?: string;
   };
   currentStep?: number | string | null;
   resultSummary?: Record<string, unknown> | null;
@@ -1043,6 +1142,7 @@ export interface PersistentTaskDto {
   canvasNodeId?: string | null;
   canvasGroupId?: string | null;
   recipeInstanceId?: string | null;
+  businessObjectId?: string | null;
   parentStepId?: string | null;
   childStepIds?: string[];
   creationMode?: StoryboardCreationMode | null;
@@ -1058,6 +1158,7 @@ export interface PersistentTaskDto {
     totalSteps?: number;
     percent?: number;
     message?: string;
+    providerStatus?: string;
     resultSummary?: Record<string, unknown>;
   };
   resultSummary?: Record<string, unknown> | null;

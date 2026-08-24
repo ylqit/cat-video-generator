@@ -29,6 +29,9 @@ export interface TaskCenterItem {
   canvasNodeId?: string;
   canvasGroupId?: string;
   recipeInstanceId?: string;
+  businessObjectId?: string;
+  parentStepId?: string;
+  childStepIds?: string[];
   creationMode?: string;
   workflowStage?: string;
   phase?: string;
@@ -42,6 +45,7 @@ export interface TaskCenterItem {
     totalSteps?: number;
     percent?: number;
     message?: string;
+    providerStatus?: string;
   };
   error?: Record<string, unknown> | null;
   createdAt?: string | null;
@@ -61,6 +65,8 @@ export interface RegisterTaskOptions {
   canvasNodeId?: string;
   canvasGroupId?: string;
   recipeInstanceId?: string;
+  businessObjectId?: string;
+  parentStepId?: string;
   creationMode?: string;
   workflowStage?: string;
   phase?: string;
@@ -289,6 +295,9 @@ function mergeRuntimeJob(job: JobDto) {
     canvasNodeId: context.canvasNodeId ?? existing?.canvasNodeId,
     canvasGroupId: context.canvasGroupId ?? existing?.canvasGroupId,
     recipeInstanceId: context.recipeInstanceId ?? existing?.recipeInstanceId,
+    businessObjectId: context.businessObjectId ?? existing?.businessObjectId,
+    parentStepId: context.parentStepId ?? existing?.parentStepId,
+    childStepIds: job.childStepIds ?? existing?.childStepIds,
     creationMode: context.creationMode ?? existing?.creationMode,
     workflowStage: context.workflowStage ?? existing?.workflowStage,
     phase: context.phase ?? existing?.phase,
@@ -325,6 +334,9 @@ function mergeWorkflowTask(task: PersistentTaskDto) {
     canvasNodeId: task.canvasNodeId ?? undefined,
     canvasGroupId: task.canvasGroupId ?? undefined,
     recipeInstanceId: task.recipeInstanceId ?? undefined,
+    businessObjectId: task.businessObjectId ?? undefined,
+    parentStepId: task.parentStepId ?? undefined,
+    childStepIds: task.childStepIds ?? [],
     creationMode: task.creationMode ?? undefined,
     workflowStage: task.workflowStage ?? undefined,
     phase: task.phase ?? undefined,
@@ -423,7 +435,7 @@ function handlePushedEvent(eventType: string, event: MessageEvent<string>) {
     label: operationKey ? operationLabel(operationKey) : existing?.label ?? "后台任务",
     status: normalizedStatus(rawStatus ?? "running"),
     projectId: typeof data.projectId === "string" ? data.projectId : existing?.projectId,
-    sceneId: existing?.sceneId,
+    sceneId: typeof data.sceneId === "string" ? data.sceneId : existing?.sceneId,
     shotId: typeof data.shotId === "string" ? data.shotId : existing?.shotId,
     operationKey,
     canvasNodeId: typeof data.canvasNodeId === "string"
@@ -435,6 +447,15 @@ function handlePushedEvent(eventType: string, event: MessageEvent<string>) {
     recipeInstanceId: typeof data.recipeInstanceId === "string"
       ? data.recipeInstanceId
       : existing?.recipeInstanceId,
+    businessObjectId: typeof data.businessObjectId === "string"
+      ? data.businessObjectId
+      : existing?.businessObjectId,
+    parentStepId: typeof data.parentStepId === "string"
+      ? data.parentStepId
+      : existing?.parentStepId,
+    childStepIds: Array.isArray(data.childStepIds)
+      ? data.childStepIds.filter((item): item is string => typeof item === "string")
+      : existing?.childStepIds,
     creationMode: typeof data.creationMode === "string"
       ? data.creationMode
       : existing?.creationMode,
@@ -525,6 +546,8 @@ export function registerTask(jobId: string, options: RegisterTaskOptions) {
     canvasNodeId: options.canvasNodeId,
     canvasGroupId: options.canvasGroupId,
     recipeInstanceId: options.recipeInstanceId,
+    businessObjectId: options.businessObjectId,
+    parentStepId: options.parentStepId,
     creationMode: options.creationMode,
     workflowStage: options.workflowStage,
     phase: options.phase,
@@ -613,6 +636,8 @@ export function taskKindLabel(kind: string): string {
     generate_video: "视频片段",
     range_edit: "区间重拍",
     recipe_story: "治愈短片故事候选",
+    recipe_story_events: "治愈短片事件方案",
+    recipe_story_script: "治愈短片剧情脚本扩写",
     recipe_creative_brief: "治愈短片创意补全",
     recipe_character_design: "治愈短片角色设计",
     recipe_storyboard: "治愈短片分镜脚本",
@@ -639,6 +664,8 @@ function operationLabel(operationKey: string): string {
     "video:shot": "视频片段",
     "video:range-edit": "区间重拍",
     "recipe:story": "治愈短片故事候选",
+    "recipe:story_events": "生成三个事件方案",
+    "recipe:story_script": "扩写完整剧情脚本",
     "recipe:creative": "治愈短片创意补全",
     "recipe:character_design": "治愈短片角色设计",
     "recipe:storyboard": "治愈短片分镜脚本",

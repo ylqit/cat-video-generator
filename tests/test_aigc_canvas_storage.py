@@ -5,8 +5,11 @@ from types import SimpleNamespace
 
 from cat_video_generator.domain.aigc_canvas import CanvasNodeType
 from cat_video_generator.infrastructure.db.aigc_canvas_repository import (
+    _apply_canvas_layout_hints,
     _apply_canvas_node_archive_projection,
+    _apply_canvas_workflow_step_projection,
     _compile_storyboard_prompt_text,
+    _edge_disconnect_policy,
     _preset_subject_targets_node,
 )
 from cat_video_generator.infrastructure.db.models import SCHEMA_NAME, Base, CanvasGraphNode
@@ -105,7 +108,7 @@ def test_prompt_records_have_full_audit_columns() -> None:
 
 
 def test_canvas_v2_migration_is_current_head() -> None:
-    assert ALEMBIC_HEAD == "0027_story_scene_prompts"
+    assert ALEMBIC_HEAD == "0028_story_event_candidates"
 
 
 def test_storyboard_prompt_compiler_keeps_reference_layers_and_exclusions_separate() -> None:
@@ -300,3 +303,150 @@ def test_visual_preset_subject_edges_follow_character_design_slots() -> None:
     assert _preset_subject_targets_node("co_protagonist", cat) is True
     assert _preset_subject_targets_node("protagonist", pair) is True
     assert _preset_subject_targets_node("co_protagonist", pair) is True
+
+
+def test_layout_hints_place_canon_inputs_and_six_stages_in_stable_lanes() -> None:
+    canvas = {
+        "nodes": [
+            {
+                "id": "style",
+                "type": "StylePresetNode",
+                "objectType": "visual_preset",
+                "data": {"title": "线条材质"},
+            },
+            {
+                "id": "cat",
+                "type": "SubjectNode",
+                "objectType": "subject",
+                "data": {"role": "co_protagonist"},
+            },
+            {
+                "id": "child",
+                "type": "SubjectNode",
+                "objectType": "subject",
+                "data": {"role": "protagonist"},
+            },
+            {
+                "id": "brief",
+                "type": "BriefNode",
+                "objectType": "story_brief",
+                "data": {},
+            },
+            {
+                "id": "director",
+                "type": "StoryboardDirectorNode",
+                "objectType": "storyboard",
+                "data": {},
+            },
+            {
+                "id": "timeline",
+                "type": "TimelineNode",
+                "objectType": "timeline",
+                "data": {},
+            },
+        ]
+    }
+
+    _apply_canvas_layout_hints(canvas, positioned_node_ids={"cat"})
+
+    by_id = {node["id"]: node for node in canvas["nodes"]}
+    assert by_id["child"]["layoutHint"] == {
+        "lane": "canon",
+        "laneOrder": 0,
+        "itemOrder": 0,
+        "positioned": False,
+        "stackKey": "canon_identity",
+    }
+    assert by_id["cat"]["layoutHint"]["itemOrder"] == 1
+    assert by_id["cat"]["layoutHint"]["positioned"] is True
+    assert "position" not in by_id["cat"]
+    assert by_id["style"]["layoutHint"]["itemOrder"] == 2
+    assert by_id["brief"]["layoutHint"]["lane"] == "creative"
+    assert by_id["director"]["layoutHint"]["lane"] == "storyboard"
+    assert by_id["timeline"]["layoutHint"]["lane"] == "export"
+    assert by_id["child"]["position"] == {"x": 90, "y": 110}
+
+
+def test_edge_disconnect_policy_protects_canon_and_allows_user_references() -> None:
+    assert _edge_disconnect_policy(
+        source_port="image_reference[]",
+        target_port="image_reference[]",
+        relation_type="canon_identity_reference",
+    ) == (
+        False,
+        "该连线由 Canon 身份规则派生，需修改视觉档案，不能直接剪断",
+    )
+
+    assert _edge_disconnect_policy(
+        source_port="media_reference[]",
+        target_port="media_reference[]",
+        relation_type="media_reference[]->media_reference[]",
+    ) == (True, None)
+
+    enabled, reason = _edge_disconnect_policy(
+        source_port="brief",
+        target_port="story_revision",
+        relation_type="brief->story_revision",
+    )
+    assert enabled is False
+    assert "业务血缘" in str(reason)
+
+
+def test_canvas_workflow_projection_matches_exact_business_object_and_not_recipe_only() -> None:
+    target_id = uuid.uuid4()
+    unrelated_id = uuid.uuid4()
+    recipe_id = uuid.uuid4()
+    target_step = SimpleNamespace(
+        id=uuid.uuid4(),
+        input_snapshot_json={
+            "recipeInstanceId": str(recipe_id),
+            "businessObjectId": str(target_id),
+            "phase": "story",
+        },
+        scene_id=None,
+        shot_card_id=None,
+        operation_key="recipe:story_script",
+        status="running",
+        progress_json={"percent": 48, "message": "正在扩写剧情脚本"},
+    )
+    unrelated_step = SimpleNamespace(
+        id=uuid.uuid4(),
+        input_snapshot_json={
+            "recipeInstanceId": str(recipe_id),
+            "businessObjectId": str(unrelated_id),
+            "phase": "story",
+        },
+        scene_id=None,
+        shot_card_id=None,
+        operation_key="recipe:story_script",
+        status="succeeded",
+        progress_json={"percent": 100, "message": "另一个脚本已完成"},
+    )
+    canvas = {
+        "nodes": [
+            {
+                "id": "script-node",
+                "executionScope": {
+                    "kind": "business_object",
+                    "objectType": "story_event",
+                    "recipeInstanceId": str(recipe_id),
+                    "businessObjectId": str(target_id),
+                    "operationKeys": ["recipe:story_script"],
+                    "phases": ["story"],
+                    "includeChildTasks": True,
+                },
+                "data": {},
+            }
+        ]
+    }
+
+    _apply_canvas_workflow_step_projection(canvas, [target_step, unrelated_step])
+
+    assert canvas["nodes"][0]["workflowSteps"] == [
+        {
+            "key": str(target_step.id),
+            "label": "扩写剧情脚本",
+            "status": "running",
+            "detail": "正在扩写剧情脚本 · 48%",
+        }
+    ]

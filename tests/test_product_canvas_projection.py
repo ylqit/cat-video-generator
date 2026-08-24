@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,10 +21,11 @@ def test_fresh_product_canvas_omits_narrative_projection_nodes() -> None:
         layout=None,
         brief=None,
         subjects=[],
+        story_events=[],
         stories=[],
         scenes=[],
         beats=[],
-        session=object(),  # type: ignore[arg-type]
+        session=SimpleNamespace(scalar=lambda _statement: None),  # type: ignore[arg-type]
         enabled=True,
         include_narrative_projection=False,
     )

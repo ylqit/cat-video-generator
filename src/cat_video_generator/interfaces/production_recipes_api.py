@@ -55,6 +55,14 @@ class ProductionRecipeApiService(Protocol):
         self, instance_id: uuid.UUID, payload: PaidRecipeRunRequest
     ) -> dict[str, Any]: ...
 
+    def run_story_events(
+        self, instance_id: uuid.UUID, payload: PaidRecipeRunRequest
+    ) -> dict[str, Any]: ...
+
+    def run_story_script(
+        self, instance_id: uuid.UUID, payload: PaidRecipeRunRequest
+    ) -> dict[str, Any]: ...
+
     def run_creative_brief(
         self, instance_id: uuid.UUID, payload: PaidRecipeRunRequest
     ) -> dict[str, Any]: ...
@@ -205,6 +213,34 @@ def install_production_recipe_routes(
         return service.enqueue_recipe_task(
             instance_id,
             operation_key="recipe:story",
+            payload=payload,
+        )
+
+    @router.post(
+        "/recipe-instances/{instance_id}/story-event-runs",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def run_story_events(
+        instance_id: uuid.UUID,
+        payload: PaidRecipeRunRequest,
+    ) -> dict[str, Any]:
+        return service.enqueue_recipe_task(
+            instance_id,
+            operation_key="recipe:story_events",
+            payload=payload,
+        )
+
+    @router.post(
+        "/recipe-instances/{instance_id}/story-script-runs",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def run_story_script(
+        instance_id: uuid.UUID,
+        payload: PaidRecipeRunRequest,
+    ) -> dict[str, Any]:
+        return service.enqueue_recipe_task(
+            instance_id,
+            operation_key="recipe:story_script",
             payload=payload,
         )
 

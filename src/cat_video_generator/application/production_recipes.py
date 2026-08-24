@@ -148,6 +148,20 @@ class StoryRecipeWorkflow(Protocol):
         payload: Any,
     ) -> dict[str, Any]: ...
 
+    def run_story_event_strategies(
+        self,
+        project_id: uuid.UUID,
+        recipe_instance_id: uuid.UUID,
+        payload: Any,
+    ) -> dict[str, Any]: ...
+
+    def expand_selected_story_event(
+        self,
+        project_id: uuid.UUID,
+        recipe_instance_id: uuid.UUID,
+        payload: Any,
+    ) -> dict[str, Any]: ...
+
     def create_storyboard(
         self,
         project_id: uuid.UUID,
@@ -331,6 +345,10 @@ class ProductionRecipeService:
             shot_value = input_snapshot.get("shotId")
             if operation_key == "recipe:creative":
                 result = self.run_creative_brief(instance_id, payload)
+            elif operation_key == "recipe:story_events":
+                result = self.run_story_events(instance_id, payload)
+            elif operation_key == "recipe:story_script":
+                result = self.run_story_script(instance_id, payload)
             elif operation_key == "recipe:story":
                 result = self.run_story(instance_id, payload)
             elif operation_key == "recipe:character_design":
@@ -439,6 +457,88 @@ class ProductionRecipeService:
                 }
                 for candidate in candidates
             ],
+        }
+
+    def run_story_events(
+        self,
+        instance_id: uuid.UUID,
+        payload: PaidRecipeRunRequest,
+    ) -> dict[str, Any]:
+        workflow = self._require_story_workflow()
+        instance = _recipe_projection(self._repository.get_instance(instance_id))
+        if instance["phase"] != RecipePhaseKey.STORY.value:
+            raise ValueError("创意简报人工批准后才能生成事件方案")
+        if not instance.get("progress", {}).get("creativeApproved", True):
+            raise ValueError("创意简报尚未人工批准")
+        self._accept_cost(
+            payload,
+            _multiply_cost(self._director_call_cost_micros, 6),
+        )
+        command = RecipeStoryCommand(
+            idempotency_key=payload.idempotency_key,
+            rewrite_instruction=(
+                "生成三个原创、低压力、可在目标时长内完成的一人一猫事件方案。"
+                "只输出儿童行动、猫咪参与、小变化、温暖收尾和换场必要性，"
+                "不要提前扩写成长篇剧情脚本；固定儿童、固定猫咪、固定线条材质画风，"
+                "无对白，自然猫不得直立劳动、持工具或产生人形肢体。"
+            ),
+        )
+        result = workflow.run_story_event_strategies(
+            uuid.UUID(str(instance["projectId"])),
+            instance_id,
+            command,
+        )
+        return {
+            **result,
+            "recipeInstanceId": str(instance_id),
+            "status": "awaiting_review",
+        }
+
+    def run_story_script(
+        self,
+        instance_id: uuid.UUID,
+        payload: PaidRecipeRunRequest,
+    ) -> dict[str, Any]:
+        workflow = self._require_story_workflow()
+        instance = _recipe_projection(self._repository.get_instance(instance_id))
+        if instance["phase"] != RecipePhaseKey.STORY.value:
+            raise ValueError("只有剧情阶段可以扩写完整剧情脚本")
+        story_workflow = dict(instance.get("storyWorkflow") or {})
+        if story_workflow.get("status") != "expand_script":
+            raise ValueError("请先从最新一批事件方案中人工选择一个事件")
+        self._accept_cost(
+            payload,
+            _multiply_cost(self._director_call_cost_micros, 2),
+        )
+        command = RecipeStoryCommand(
+            idempotency_key=payload.idempotency_key,
+            rewrite_instruction=(
+                "把已选择事件扩写为完整、可拍摄的剧情脚本，明确因果链、稳定 sceneKey、"
+                "场景目的、换场原因、声音计划、角色造型与场景资产需求；保持无对白和"
+                "固定儿童、猫咪及画风约束。"
+            ),
+        )
+        result = workflow.expand_selected_story_event(
+            uuid.UUID(str(instance["projectId"])),
+            instance_id,
+            command,
+        )
+        story = dict(result.get("story") or {})
+        story_id_value = story.get("id")
+        if story_id_value is None:
+            raise RuntimeError("剧情脚本扩写没有返回版本标识")
+        rules = _suggest_episode_rules(str(instance["theme"]))
+        self._repository.store_suggested_episode_rules(
+            instance_id,
+            (uuid.UUID(str(story_id_value)),),
+            rules,
+        )
+        return {
+            **result,
+            "recipeInstanceId": str(instance_id),
+            "revisionId": str(story_id_value),
+            "suggestedEpisodeRules": rules.model_dump(mode="json", by_alias=True),
+            "status": "awaiting_review",
         }
 
     def run_character_design(
@@ -636,9 +736,14 @@ class ProductionRecipeService:
                 return self._group_stop(group_id, instance, "awaiting_review")
             result = self.run_creative_brief(instance_id, payload)
         elif phase is RecipePhaseKey.STORY:
-            if instance.get("storyCandidates"):
+            story_workflow = dict(instance.get("storyWorkflow") or {})
+            story_status = str(story_workflow.get("status") or "generate_events")
+            if story_status in {"select_event", "approve_script"}:
                 return self._group_stop(group_id, instance, "awaiting_review")
-            result = self.run_story(instance_id, payload)
+            if story_status == "expand_script":
+                result = self.run_story_script(instance_id, payload)
+            else:
+                result = self.run_story_events(instance_id, payload)
         elif phase is RecipePhaseKey.CHARACTER_DESIGN:
             character_design = instance.get("characterDesign") or {}
             if character_design.get("status") in {"generating", "awaiting_review"}:
@@ -817,9 +922,18 @@ class ProductionRecipeService:
     def _project_instance(self, source: dict[str, Any]) -> dict[str, Any]:
         document = _recipe_projection(source)
         tier = HEALING_CHILD_CAT_RECIPE.quality_tiers[document["qualityTier"]]
-        if document["phase"] in {
+        if document["phase"] == RecipePhaseKey.STORY.value:
+            story_status = str(
+                (document.get("storyWorkflow") or {}).get("status") or "generate_events"
+            )
+            estimate = _multiply_cost(
+                self._director_call_cost_micros,
+                2 if story_status == "expand_script" else 6,
+            )
+            if story_status in {"select_event", "approve_script"}:
+                estimate = 0
+        elif document["phase"] in {
             RecipePhaseKey.CREATIVE.value,
-            RecipePhaseKey.STORY.value,
             RecipePhaseKey.STORYBOARD.value,
         }:
             estimate = self._director_call_cost_micros
@@ -865,6 +979,8 @@ class ProductionRecipeService:
         required_phase = {
             "recipe:creative": RecipePhaseKey.CREATIVE.value,
             "recipe:story": RecipePhaseKey.STORY.value,
+            "recipe:story_events": RecipePhaseKey.STORY.value,
+            "recipe:story_script": RecipePhaseKey.STORY.value,
             "recipe:character_design": RecipePhaseKey.CHARACTER_DESIGN.value,
             "recipe:storyboard": RecipePhaseKey.STORYBOARD.value,
             "recipe:sequence": RecipePhaseKey.EXPORT.value,
@@ -885,6 +1001,12 @@ class ProductionRecipeService:
         ):
             raise ValueError("已完成的分组没有可执行阶段")
         estimated_cost = instance["estimatedCostMicros"]
+        if operation_key in {"recipe:creative", "recipe:story"}:
+            estimated_cost = self._director_call_cost_micros
+        elif operation_key == "recipe:story_events":
+            estimated_cost = _multiply_cost(self._director_call_cost_micros, 6)
+        elif operation_key == "recipe:story_script":
+            estimated_cost = _multiply_cost(self._director_call_cost_micros, 2)
         self._accept_cost(payload, estimated_cost)
 
     @staticmethod
@@ -922,6 +1044,12 @@ def _recipe_projection(source: dict[str, Any]) -> dict[str, Any]:
     character_design_approved = bool(progress.get("characterDesignApproved", True))
     storyboard_approved = bool(progress.get("storyboardApproved", shot_count > 0))
     story_candidates_exist = bool(document.get("storyCandidates"))
+    story_workflow = dict(document.get("storyWorkflow") or {})
+    story_workflow_status = str(story_workflow.get("status") or "generate_events")
+    legacy_story_candidates = any(
+        not candidate.get("sourceEventCandidateId")
+        for candidate in document.get("storyCandidates") or []
+    )
     sequence_ready = bool(progress.get("sequenceReady"))
     final_approved = bool(progress.get("finalApproved"))
 
@@ -958,8 +1086,21 @@ def _recipe_projection(source: dict[str, Any]) -> dict[str, Any]:
     elif creative_approved:
         stage = RecipeStage.CONCEPT
         phase = RecipePhaseKey.STORY
-        blocker = "故事候选等待人工选择与规则确认" if story_candidates_exist else "故事尚未生成"
-        primary_action = "选择并批准故事" if story_candidates_exist else "生成故事候选"
+        if legacy_story_candidates and not document.get("storyEvents"):
+            blocker = "旧版剧情候选等待人工选择与规则确认"
+            primary_action = "选择并批准故事"
+        elif story_workflow_status == "select_event":
+            blocker = "三个事件方案等待人工选择"
+            primary_action = "选择一个事件方案"
+        elif story_workflow_status == "expand_script":
+            blocker = "所选事件尚未扩写为完整剧情脚本"
+            primary_action = "扩写剧情脚本"
+        elif story_workflow_status == "approve_script" or story_candidates_exist:
+            blocker = "完整剧情脚本等待编辑、批准并锁定 EpisodeRules"
+            primary_action = "审核剧情脚本"
+        else:
+            blocker = "事件方案尚未生成"
+            primary_action = "生成三个事件方案"
     else:
         stage = RecipeStage.CONCEPT
         phase = RecipePhaseKey.CREATIVE
@@ -1034,6 +1175,8 @@ def _task_canvas_node_id(project_id: uuid.UUID, operation_key: str) -> uuid.UUID
     semantic_key = {
         "recipe:creative": "creative-brief-approval",
         "recipe:story": "story-planner",
+        "recipe:story_events": "story-planner",
+        "recipe:story_script": "story-script-expander",
         "recipe:character_design": "character-design-approval",
         "recipe:storyboard": "storyboard-director",
         "recipe:anchor": "recipe-anchor-stage",
@@ -1051,9 +1194,11 @@ def _task_result_summary(operation_key: str, result: dict[str, Any]) -> dict[str
         "status": str(result.get("status") or "awaiting_review"),
         "message": "任务已完成，等待人工审核",
         "candidateCount": len(candidates) if isinstance(candidates, list) else 0,
+        "outputCount": len(candidates) if isinstance(candidates, list) else 1,
         "recipeInstanceId": result.get("recipeInstanceId"),
         "shotId": result.get("shotId"),
         "assetId": result.get("renderedAssetId") or result.get("id"),
+        "revisionId": result.get("revisionId"),
     }
 
 

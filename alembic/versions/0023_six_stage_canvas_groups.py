@@ -37,7 +37,12 @@ def upgrade() -> None:
     schema = _schema()
     op.add_column(
         "production_recipe_instances",
-        sa.Column("lifecycle_status", sa.String(length=24), nullable=False, server_default="active"),
+        sa.Column(
+            "lifecycle_status",
+            sa.String(length=24),
+            nullable=False,
+            server_default="active",
+        ),
         schema=schema,
     )
     op.add_column(
@@ -76,8 +81,18 @@ def upgrade() -> None:
         sa.Column("revision", sa.Integer(), nullable=False),
         sa.Column("idempotency_key", sa.String(length=96), nullable=False, unique=True),
         sa.Column("status", sa.String(length=24), nullable=False, server_default="generating"),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.func.now(),
+        ),
         sa.UniqueConstraint(
             "production_recipe_instance_id",
             "revision",
@@ -115,7 +130,12 @@ def upgrade() -> None:
         sa.Column("candidate_index", sa.SmallInteger(), nullable=False),
         sa.Column("semantic_role", sa.String(length=40), nullable=False),
         sa.Column("selected", sa.Boolean(), nullable=False, server_default=sa.text("false")),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.func.now(),
+        ),
         sa.UniqueConstraint(
             "character_design_revision_id",
             "slot",
@@ -157,12 +177,27 @@ def upgrade() -> None:
         ),
         sa.Column("group_type", sa.String(length=24), nullable=False),
         sa.Column("title", sa.String(length=160), nullable=False),
-        sa.Column("lifecycle_status", sa.String(length=24), nullable=False, server_default="active"),
+        sa.Column(
+            "lifecycle_status",
+            sa.String(length=24),
+            nullable=False,
+            server_default="active",
+        ),
         sa.Column("color", sa.String(length=16), nullable=False, server_default="#7c9cff"),
         sa.Column("revision", sa.Integer(), nullable=False, server_default="1"),
         sa.Column("data_json", _json(), nullable=False, server_default=sa.text("'{}'::jsonb")),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.func.now(),
+        ),
         sa.CheckConstraint("group_type IN ('recipe', 'shot')", name="ck_canvas_groups_type"),
         sa.CheckConstraint(
             "lifecycle_status IN ('active', 'detached')",
@@ -192,7 +227,12 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("sort_order", sa.Integer(), nullable=False, server_default="0"),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.func.now(),
+        ),
         sa.UniqueConstraint("group_id", "canvas_node_id", name="uq_canvas_group_members_node"),
         schema=schema,
     )
@@ -208,7 +248,12 @@ def upgrade() -> None:
         sa.Column("template_key", sa.String(length=120), nullable=False, unique=True),
         sa.Column("title", sa.String(length=160), nullable=False),
         sa.Column("definition_json", _json(), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.func.now(),
+        ),
         schema=schema,
     )
 

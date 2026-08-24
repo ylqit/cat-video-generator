@@ -35,6 +35,7 @@ import {
 import { ApiError, api, assetContentUrl, canvasApi } from "../../api/client";
 import type {
   CanvasDto,
+  CanvasEdgeCreateRequest,
   CanvasGroupActionKey,
   CanvasGroupDto,
   CanvasEdgeDto,
@@ -67,6 +68,7 @@ import type {
   VisualProfileDraft,
 } from "../../api/types";
 import CanvasNodeLibrary from "./CanvasNodeLibrary.vue";
+import CanvasInteractiveEdge, { type CanvasInteractiveEdgeData } from "./CanvasInteractiveEdge.vue";
 import CanvasNodeCard from "./CanvasNodeCard.vue";
 import BriefNodeConsole from "./BriefNodeConsole.vue";
 import CanvasContextToolbar from "./CanvasContextToolbar.vue";
@@ -83,6 +85,11 @@ import VideoAssetPanel from "./VideoAssetPanel.vue";
 import VideoEditWorkspace from "./VideoEditWorkspace.vue";
 import VisualEvidenceConsole from "./VisualEvidenceConsole.vue";
 import VisualPresetLibrary from "./VisualPresetLibrary.vue";
+import {
+  arrangeCanvasNodes,
+  canvasNodeFootprint,
+  renderedCanvasNodeFootprint,
+} from "./canvasLayout";
 import {
   CANVAS_OVERLAY_ANCHOR_GAP,
   anchorCanvasOverlay,
@@ -105,6 +112,7 @@ import {
 import { planReferenceEdgeChanges, referenceConnection } from "./canvasSelection";
 import { canvasSyncQueue, classifyCanvasSaveError } from "./canvasSync";
 import { registerTask, useTaskCenter } from "../../tasks/taskCenter";
+import { latestTaskForCanvasNode, tasksForCanvasNode } from "./canvasTaskBinding";
 
 const props = defineProps<{
   projectId: string;
@@ -159,12 +167,14 @@ const localConsoleSession = ref<CanvasOverlaySession | null>(null);
 const localConsoleGeometry = shallowRef<CanvasOverlayGeometry | null>(null);
 const nodeContextMenu = ref<{ nodeId: string; left: number; top: number } | null>(null);
 const archiveUndo = ref<{ nodeId: string; title: string; layoutVersion: number } | null>(null);
+const edgeUndo = ref<{ edge: CanvasEdgeCreateRequest; label: string } | null>(null);
 const archivingNodeId = ref<string | null>(null);
 const selectedReferenceNodeIds = ref<Set<string>>(new Set());
 const storyboardCharacterNodeIds = ref<Set<string>>(new Set());
 const videoEditDrafts = reactive<Record<string, VideoEditConsoleDraft>>({});
 const spacePressed = ref(false);
 const panningCanvas = ref(false);
+const suppressCanvasClick = ref(false);
 const editingBeat = ref<CanvasNodeDto | null>(null);
 const recipeCreateVisible = ref(false);
 const recipeStoryReviewVisible = ref(false);
@@ -265,7 +275,8 @@ const productBatchNode = computed(() => canvas.value?.nodes.find(
   (node) => node.type === "GenerationBatchNode",
 ) ?? null);
 const approvedStory = computed(() => canvas.value?.nodes.find(
-  (node) => node.type === "StoryCandidateNode" && node.data.status === "approved",
+  (node) => ["StoryScriptNode", "StoryCandidateNode"].includes(node.type)
+    && node.data.status === "approved",
 ));
 const activeGroup = computed(() => canvas.value?.groups?.find(
   (group) => group.type === "recipe" && group.lifecycleStatus === "active",
@@ -344,15 +355,21 @@ const localConsoleStyle = computed(() => ({
   transform: `translate3d(${localConsoleGeometry.value?.console.left ?? 16}px, ${localConsoleGeometry.value?.console.top ?? 160}px, 0)`,
 }));
 const localConsolePreset = computed(() => localConsoleSession.value?.presetKey ?? "compact");
-const selectedExecutions = computed(() => {
-  const node = selectedNode.value;
-  if (!node) return [];
-  const recipeId = activeRecipe.value?.id;
-  return taskCenterItems.value.filter((item) => (
-    item.canvasNodeId === node.id
-    || (recipeId && item.recipeInstanceId === recipeId)
-  ));
-});
+const nodeExecutionMap = computed(() => new Map(
+  (canvas.value?.nodes ?? []).map((node) => [
+    node.id,
+    tasksForCanvasNode(taskCenterItems.value, node),
+  ]),
+));
+function executionsForNode(node: CanvasNodeDto) {
+  return nodeExecutionMap.value.get(node.id) ?? [];
+}
+function latestExecutionForNode(node: CanvasNodeDto) {
+  return latestTaskForCanvasNode(taskCenterItems.value, node);
+}
+const selectedExecutions = computed(() => (
+  selectedNode.value ? executionsForNode(selectedNode.value) : []
+));
 const storyboardReferenceAssetIds = computed(() => {
   const ids = new Set<string>();
   for (const node of canvas.value?.nodes ?? []) {
@@ -404,9 +421,11 @@ const storyboardShots = computed<StoryboardShotDraft[]>(() => (
 const inputPorts: Partial<Record<CanvasNodeType, CanvasPortType[]>> = {
   CharacterDesignNode: ["subject[]", "story_revision"],
   StoryPlannerNode: ["brief", "subject[]"],
+  StoryEventNode: ["story_event"],
+  StoryScriptNode: ["story_event"],
   StoryCandidateNode: ["story_revision"],
   StoryCriticNode: ["story_revision"],
-  ApprovalGateNode: ["brief", "story_revision", "character_design"],
+  ApprovalGateNode: ["brief", "story_event", "story_revision", "character_design"],
   StoryboardDirectorNode: ["story_revision", "subject[]", "character_design"],
   SceneNode: ["scene_plan"],
   ShotBeatNode: ["shot_beat[]", "subject[]"],
@@ -427,6 +446,8 @@ const outputPorts: Partial<Record<CanvasNodeType, CanvasPortType[]>> = {
   SubjectNode: ["subject[]", "product_subject"],
   CharacterDesignNode: ["character_design", "image_asset"],
   StoryPlannerNode: ["story_revision"],
+  StoryEventNode: ["story_event"],
+  StoryScriptNode: ["story_revision"],
   StoryCandidateNode: ["story_revision"],
   StoryCriticNode: ["story_revision"],
   ApprovalGateNode: ["brief", "story_revision", "character_design"],
@@ -513,6 +534,7 @@ function storyboardCharacterAssetIds(node: CanvasNodeDto): string[] {
 }
 
 function selectCanvasNode(node: CanvasNodeDto) {
+  if (suppressCanvasClick.value) return;
   nodeContextMenu.value = null;
   const target = referenceSelectionTarget.value;
   if (target) {
@@ -567,6 +589,7 @@ function selectCanvasNode(node: CanvasNodeDto) {
 }
 
 function activateCanvasNode(node: CanvasNodeDto) {
+  if (suppressCanvasClick.value) return;
   if (node.type === "RecipeGroupNode") {
     selectedNodeId.value = node.id;
     initializeOverlaySession();
@@ -611,6 +634,7 @@ function activateCanvasNode(node: CanvasNodeDto) {
 let overlayPositionFrame: number | null = null;
 let pendingOverlayViewport: CanvasViewportTransform | null = null;
 let archiveUndoTimer: number | null = null;
+let edgeUndoTimer: number | null = null;
 
 function measureCanvasSurfaceRect() {
   const measured = canvasSurface.value?.getBoundingClientRect();
@@ -727,6 +751,7 @@ function closeContextPanel() {
 }
 
 function selectCanvasGroup(group: CanvasGroupDto) {
+  if (suppressCanvasClick.value) return;
   selectedGroupId.value = group.id;
   interaction.value = { mode: "idle" };
   localConsoleSession.value = null;
@@ -905,6 +930,7 @@ function registerCanvasJob(
     canvasGroupId?: string;
     recipeInstanceId?: string;
     creationMode?: StoryboardCreationMode;
+    businessObjectId?: string;
   },
 ) {
   const context = job.context ?? job;
@@ -919,6 +945,7 @@ function registerCanvasJob(
     workflowStage: context.workflowStage,
     phase: context.phase,
     operationKey: context.operationKey,
+    businessObjectId: context.businessObjectId ?? options.businessObjectId,
     shotId: context.shotId,
   });
 }
@@ -1097,15 +1124,6 @@ async function finishReferenceSelection() {
   }
 }
 
-function canvasNodeFootprint(node: CanvasNodeDto): { width: number; height: number } {
-  if (node.type === "ImageGenerationNode") return { width: 790, height: 430 };
-  if (["VideoAssetNode", "ImageAssetNode", "ReferenceAssetNode"].includes(node.type)) {
-    return { width: 360, height: 460 };
-  }
-  if (node.type === "StoryCandidateNode") return { width: 430, height: 250 };
-  return { width: 330, height: 210 };
-}
-
 function groupFlowNodes(
   groups: CanvasGroupDto[],
   businessNodes: Node[],
@@ -1117,12 +1135,10 @@ function groupFlowNodes(
     const minX = Math.min(...members.map((node) => node.position.x)) - 54;
     const minY = Math.min(...members.map((node) => node.position.y)) - 104;
     const maxX = Math.max(...members.map((node) => {
-      const source = node.data.node as CanvasNodeDto;
-      return node.position.x + canvasNodeFootprint(source).width;
+      return node.position.x + renderedCanvasNodeFootprint(node).width;
     })) + 54;
     const maxY = Math.max(...members.map((node) => {
-      const source = node.data.node as CanvasNodeDto;
-      return node.position.y + canvasNodeFootprint(source).height;
+      return node.position.y + renderedCanvasNodeFootprint(node).height;
     })) + 64;
     return [{
       id: `canvas-group:${group.id}`,
@@ -1181,7 +1197,7 @@ async function refreshCanvasProjection() {
       loadedRecipe.value = recipe;
       syncStatus.value = loaded.syncStatus;
       const visibleNodeIds = new Set(loaded.nodes.map((node) => node.id));
-      let businessNodes = loaded.nodes.map((node) => ({
+      let businessNodes: Node[] = loaded.nodes.map((node) => ({
         id: node.id,
         type: "canvas",
         position: currentPositions.get(node.id) ?? node.position,
@@ -1200,21 +1216,22 @@ async function refreshCanvasProjection() {
         }));
         syncStatus.value = navigator.onLine ? "local" : "offline";
       }
+      const needsSemanticPlacement = businessNodes.some((node) => {
+        const source = node.data.node as CanvasNodeDto;
+        return source.layoutHint?.positioned === false && !currentPositions.has(node.id);
+      });
+      if (needsSemanticPlacement) {
+        businessNodes = arrangeCanvasNodes(businessNodes, { preservePositioned: true });
+      }
       flowNodes.value = withGroupFrames(businessNodes);
       flowEdges.value = loaded.edges.filter((edge) => (
         visibleNodeIds.has(edge.sourceNodeId) && visibleNodeIds.has(edge.targetNodeId)
-      )).map((edge) => ({
-        id: edge.id ?? `${edge.sourceNodeId}-${edge.targetNodeId}-${edge.sourcePort}`,
-        source: edge.sourceNodeId,
-        target: edge.targetNodeId,
-        sourceHandle: edge.sourcePort,
-        targetHandle: edge.targetPort,
-        class: "typed-edge",
-      }));
+      )).map(toInteractiveFlowEdge);
       const brief = loaded.nodes.find((node) => node.type === "BriefNode");
       if (brief) Object.assign(briefForm, brief.data);
       if (focus) await focusCanvas(true);
       await focusRequestedNode();
+      if (needsSemanticPlacement && !pendingLayout) void persistLayout("semantic_autoplace");
     } while (canvasRefreshQueued);
   } catch (error) {
     syncStatus.value = navigator.onLine ? "service_error" : "offline";
@@ -1281,6 +1298,89 @@ async function runStories() {
     ElMessage.success("故事策划已进入后台执行；节点会显示排队、生成与待审核状态");
   } finally {
     busyAction.value = "";
+  }
+}
+
+function nodeDeclaringAction(actionKey: CanvasNodeActionDto["key"]): CanvasNodeDto | undefined {
+  return canvas.value?.nodes.find((node) => (
+    node.availableActions?.some((action) => action.key === actionKey)
+  ));
+}
+
+async function generateStoryEvents() {
+  const recipe = activeRecipe.value;
+  if (!recipe) return;
+  await ElMessageBox.confirm(
+    `将依据已批准创意、固定儿童、固定猫咪和固定画风生成 3 个可拍摄事件方案，不会直接扩写剧情脚本。${recipeCostLabel(recipe)}。`,
+    "生成三个事件方案",
+    { confirmButtonText: "提交后台任务", cancelButtonText: "取消" },
+  );
+  recipeBusy.value = true;
+  try {
+    const owner = nodeDeclaringAction("generate_event_candidates");
+    const job = await canvasApi.runRecipeStoryEvents(recipe.id, acceptedRecipeCost(recipe));
+    registerCanvasJob(job, {
+      label: "一人一猫 · 三个事件方案",
+      nodeId: owner?.id ?? activeGroup.value?.memberNodeIds[0] ?? "story-events",
+      canvasGroupId: activeGroup.value?.id,
+      recipeInstanceId: recipe.id,
+    });
+    ElMessage.success("事件方案任务已入队；节点卡会直接显示队列、进度与结果")
+  } finally {
+    recipeBusy.value = false;
+  }
+}
+
+async function selectStoryEvent(node: CanvasNodeDto) {
+  const recipe = activeRecipe.value;
+  if (!recipe || node.type !== "StoryEventNode" || !node.objectId) return;
+  await ElMessageBox.confirm(
+    `选择“${String(node.data.title ?? "当前事件")}”作为剧情方向？其他方案会保留为历史分支，只有该事件能驱动剧情脚本扩写。`,
+    "选择事件方案",
+    { confirmButtonText: "选择并继续", cancelButtonText: "取消" },
+  );
+  recipeBusy.value = true;
+  try {
+    await canvasApi.reviewRecipeTarget({
+      recipeInstanceId: recipe.id,
+      targetType: "story_event",
+      targetId: node.objectId,
+      targetRevision: Number(node.data.revision ?? node.revision ?? 1),
+      decision: "approve",
+    });
+    await loadCanvas(false);
+    ElMessage.success("事件方向已选择，现在可以扩写完整剧情脚本");
+  } finally {
+    recipeBusy.value = false;
+  }
+}
+
+async function expandStoryScript() {
+  const recipe = activeRecipe.value;
+  if (!recipe) return;
+  if (!recipe.selectedStoryEventId) {
+    ElMessage.warning("请先从三个事件方案中人工选择一个方向");
+    return;
+  }
+  await ElMessageBox.confirm(
+    `将把已选事件扩写为完整剧情脚本、场景大纲和 EpisodeRules 草稿；完成后仍需人工编辑与批准。${recipeCostLabel(recipe)}。`,
+    "扩写完整剧情脚本",
+    { confirmButtonText: "提交后台任务", cancelButtonText: "取消" },
+  );
+  recipeBusy.value = true;
+  try {
+    const owner = nodeDeclaringAction("expand_story_script");
+    const job = await canvasApi.runRecipeStoryScript(recipe.id, acceptedRecipeCost(recipe));
+    registerCanvasJob(job, {
+      label: "一人一猫 · 剧情脚本扩写",
+      nodeId: owner?.id ?? activeGroup.value?.memberNodeIds[0] ?? "story-script",
+      canvasGroupId: activeGroup.value?.id,
+      recipeInstanceId: recipe.id,
+      businessObjectId: recipe.selectedStoryEventId,
+    });
+    ElMessage.success("剧情扩写任务已入队；完成后会显示脚本、场景与规则摘要")
+  } finally {
+    recipeBusy.value = false;
   }
 }
 
@@ -1477,19 +1577,28 @@ async function runRecipePrimary(
       if ((recipe.creativeBrief?.revision ?? 0) >= 2) await reviewCreativeBrief();
       else await completeCreativeBrief();
     } else if (recipe.phase === "story") {
-      if (recipe.storyCandidates?.some((item) => item.status === "candidate")) {
-        ElMessage.info("请在上方三个候选中选择一个，编辑 EpisodeRules 后人工批准");
-      } else {
-        await ElMessageBox.confirm(
-          `将生成 3 个原创低压力故事候选，不会自动批准。${recipeCostLabel(recipe)}。`,
-          "生成故事候选",
-        );
+      const workflow = recipe.storyWorkflow;
+      if (!workflow) {
         const job = await canvasApi.runRecipeStory(recipe.id, acceptedRecipeCost(recipe));
         registerCanvasJob(job, {
-          label: "治愈短片故事候选",
+          label: "旧版剧情直出",
           nodeId: selectedNode.value?.id ?? activeGroup.value?.memberNodeIds[0] ?? "recipe",
           recipeInstanceId: recipe.id,
         });
+      } else if (workflow.status === "generate_events") await generateStoryEvents();
+      else if (workflow.status === "select_event") {
+        ElMessage.info("请先查看四个事件节拍，并人工选择一个事件方向");
+        const eventNode = canvas.value?.nodes.find((node) => (
+          node.type === "StoryEventNode" && node.data.status === "candidate"
+        ));
+        if (eventNode) selectCanvasNode(eventNode);
+      } else if (workflow.status === "expand_script") await expandStoryScript();
+      else if (workflow.status === "approve_script") {
+        const scriptNode = canvas.value?.nodes.find((node) => (
+          node.type === "StoryScriptNode" && node.objectId === workflow.scriptRevisionId
+        ));
+        if (scriptNode) selectCanvasNode(scriptNode);
+        ElMessage.info("请编辑剧情脚本与 EpisodeRules 后完成人工批准");
       }
     } else if (recipe.phase === "character_design") {
       if (recipe.characterDesign?.status === "awaiting_review") {
@@ -2004,8 +2113,32 @@ function runContextToolbarAction(action: CanvasNodeActionDto) {
       break;
     }
     case "assist_subject": openSubjectAssistant(node); break;
+    case "generate_event_candidates": void generateStoryEvents(); break;
+    case "select_story_event": {
+      if (node.type === "StoryEventNode") void selectStoryEvent(node);
+      else {
+        const eventNode = canvas.value?.nodes.find((item) => (
+          item.type === "StoryEventNode" && item.data.status === "candidate"
+        ));
+        if (eventNode) selectCanvasNode(eventNode);
+        else ElMessage.info("当前没有等待选择的事件方案");
+      }
+      break;
+    }
+    case "expand_story_script": void expandStoryScript(); break;
+    case "review_story_script": {
+      const script = node.type === "StoryScriptNode"
+        ? node
+        : canvas.value?.nodes.find((item) => (
+            item.type === "StoryScriptNode" && item.data.status !== "approved"
+          ));
+      if (script?.objectId) void approveStory(script.objectId);
+      else ElMessage.info("当前没有等待人工审核的剧情脚本");
+      break;
+    }
     case "generate_stories": {
-      if (activeGroup.value) void runCanvasGroupAction(activeGroup.value, "run_group");
+      if (activeRecipe.value?.storyWorkflow) void runRecipePrimary([]);
+      else if (activeGroup.value) void runCanvasGroupAction(activeGroup.value, "run_group");
       else void runStories();
       break;
     }
@@ -2017,6 +2150,22 @@ function runContextToolbarAction(action: CanvasNodeActionDto) {
       break;
     }
     case "review_story": {
+      if (activeRecipe.value?.storyWorkflow?.status === "select_event") {
+        const eventNode = (canvas.value?.nodes ?? []).find((item) => (
+          item.type === "StoryEventNode" && item.data.status === "candidate"
+        ));
+        if (eventNode) selectCanvasNode(eventNode);
+        else ElMessage.info("当前没有等待选择的事件方案");
+        break;
+      }
+      if (activeRecipe.value?.storyWorkflow?.status === "approve_script") {
+        const scriptNode = (canvas.value?.nodes ?? []).find((item) => (
+          item.type === "StoryScriptNode" && item.data.status !== "approved"
+        ));
+        if (scriptNode) selectCanvasNode(scriptNode);
+        else ElMessage.info("当前没有等待审核的剧情脚本");
+        break;
+      }
       const candidate = (canvas.value?.nodes ?? [])
         .filter((item) => item.type === "StoryCandidateNode" && item.data.status === "candidate")
         .sort((left, right) => Number((right.data.scorecard as Record<string, unknown> | undefined)?.average ?? 0) - Number((left.data.scorecard as Record<string, unknown> | undefined)?.average ?? 0))[0];
@@ -2081,7 +2230,7 @@ function runContextToolbarAction(action: CanvasNodeActionDto) {
 }
 
 function handlePaneClick() {
-  if (spacePressed.value || panningCanvas.value || interaction.value.mode === "reference_picking") return;
+  if (suppressCanvasClick.value || spacePressed.value || panningCanvas.value || interaction.value.mode === "reference_picking") return;
   selectedGroupId.value = null;
   closeContextPanel();
 }
@@ -2165,12 +2314,59 @@ function groupExecutionFor(groupId: string) {
   ));
 }
 
-function handleMoveStart() {
-  if (spacePressed.value) panningCanvas.value = true;
+interface GlobalCanvasPanSession {
+  pointerId: number;
+  startClientX: number;
+  startClientY: number;
+  startViewport: { x: number; y: number; zoom: number };
+  surface: HTMLElement;
 }
 
-function handleMoveEnd() {
-  window.setTimeout(() => { panningCanvas.value = false; }, 0);
+let globalCanvasPan: GlobalCanvasPanSession | null = null;
+
+function startGlobalCanvasPan(event: PointerEvent) {
+  const surface = canvasSurface.value;
+  if (
+    !surface
+    || event.button !== 0
+    || !spacePressed.value
+    || isEditableTarget(event.target)
+  ) return;
+  globalCanvasPan = {
+    pointerId: event.pointerId,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    startViewport: { ...viewport.value },
+    surface,
+  };
+  panningCanvas.value = true;
+  suppressCanvasClick.value = true;
+  surface.setPointerCapture(event.pointerId);
+  event.preventDefault();
+  event.stopPropagation();
+}
+
+function moveGlobalCanvasPan(event: PointerEvent) {
+  const session = globalCanvasPan;
+  if (!session || event.pointerId !== session.pointerId) return;
+  void setViewport({
+    x: session.startViewport.x + event.clientX - session.startClientX,
+    y: session.startViewport.y + event.clientY - session.startClientY,
+    zoom: session.startViewport.zoom,
+  });
+  event.preventDefault();
+  event.stopPropagation();
+}
+
+function finishGlobalCanvasPan(event?: PointerEvent) {
+  const session = globalCanvasPan;
+  if (!session || (event && event.pointerId !== session.pointerId)) return;
+  if (session.surface.hasPointerCapture(session.pointerId)) {
+    session.surface.releasePointerCapture(session.pointerId);
+  }
+  globalCanvasPan = null;
+  panningCanvas.value = false;
+  window.setTimeout(() => { suppressCanvasClick.value = false; }, 0);
 }
 
 function handleWorkspaceKeyDown(event: KeyboardEvent) {
@@ -2209,12 +2405,14 @@ function handleWorkspaceKeyDown(event: KeyboardEvent) {
 }
 
 function handleWorkspaceKeyUp(event: KeyboardEvent) {
-  if (event.code === "Space") spacePressed.value = false;
+  if (event.code !== "Space") return;
+  spacePressed.value = false;
+  finishGlobalCanvasPan();
 }
 
 function handleWindowBlur() {
   spacePressed.value = false;
-  panningCanvas.value = false;
+  finishGlobalCanvasPan();
 }
 
 function mediaAssetId(node: CanvasNodeDto): string {
@@ -2692,43 +2890,89 @@ async function submitNodeGeneration(payload: Record<string, unknown>) {
 }
 
 function autoLayout() {
-  const columns: Partial<Record<CanvasNodeType, number>> = {
-    RecipeGroupNode: 0,
-    BriefNode: 0,
-    SubjectNode: 0,
-    StoryPlannerNode: 1,
-    StoryCandidateNode: 2,
-    ApprovalGateNode: 3,
-    CharacterDesignNode: 4,
-    StoryboardDirectorNode: 5,
-    SceneNode: 6,
-    ShotBeatNode: 7,
-    ReferenceAssetNode: 0,
-    GenerationBatchNode: 1,
-    ImageAssetNode: 2,
-    VideoGenerationNode: 3,
-    VideoAssetNode: 4,
-    VideoEditNode: 5,
-    VideoSegmentNode: 6,
-    ReviewNode: 7,
-    TimelineNode: 8,
-  };
-  const rows = new Map<number, number>();
-  const businessNodes = flowNodes.value.filter((flowNode) => flowNode.type === "canvas").map((flowNode) => {
-    const node = flowNode.data.node as CanvasNodeDto;
-    const column = columns[node.type] ?? 7;
-    const row = rows.get(column) ?? 0;
-    rows.set(column, row + 1);
-    return { ...flowNode, position: { x: 90 + column * 360, y: 100 + row * 230 } };
-  });
+  const businessNodes = arrangeCanvasNodes(
+    flowNodes.value.filter((flowNode) => flowNode.type === "canvas"),
+  );
   flowNodes.value = withGroupFrames(businessNodes);
   syncStatus.value = "local";
   void persistLayout("auto_layout");
   requestAnimationFrame(() => void fitView({ padding: 0.15, duration: 360 }));
 }
 
+function toInteractiveFlowEdge(edge: CanvasEdgeDto): Edge<CanvasInteractiveEdgeData> {
+  return {
+    id: edge.id ?? `${edge.sourceNodeId}-${edge.targetNodeId}-${edge.sourcePort}`,
+    type: "interactive",
+    source: edge.sourceNodeId,
+    target: edge.targetNodeId,
+    sourceHandle: edge.sourcePort,
+    targetHandle: edge.targetPort,
+    data: {
+      edge,
+      incident: selectedNodeId.value === edge.sourceNodeId || selectedNodeId.value === edge.targetNodeId,
+      onDisconnect: disconnectCanvasEdge,
+      onUnavailable: (reason) => ElMessage.info(reason),
+    },
+  };
+}
+
+function updateIncidentEdges() {
+  flowEdges.value = flowEdges.value.map((edge) => {
+    const data = edge.data as CanvasInteractiveEdgeData | undefined;
+    if (!data) return edge;
+    const incident = selectedNodeId.value === edge.source || selectedNodeId.value === edge.target;
+    return incident === data.incident ? edge : { ...edge, data: { ...data, incident } };
+  });
+}
+
+async function disconnectCanvasEdge(edge: CanvasEdgeDto) {
+  const action = edge.availableActions?.find((item) => item.key === "disconnect_edge");
+  if (!action?.enabled || !edge.id) {
+    ElMessage.info(action?.disabledReason ?? "该连线由系统规则管理，不能直接剪断");
+    return;
+  }
+  const request: CanvasEdgeCreateRequest = {
+    sourceNodeId: edge.sourceNodeId,
+    sourceNodeType: edge.sourceNodeType,
+    sourcePort: edge.sourcePort,
+    targetNodeId: edge.targetNodeId,
+    targetNodeType: edge.targetNodeType,
+    targetPort: edge.targetPort,
+  };
+  try {
+    await canvasApi.deleteEdge(edge.id);
+    if (edgeUndoTimer !== null) window.clearTimeout(edgeUndoTimer);
+    edgeUndo.value = {
+      edge: request,
+      label: `${String(edge.sourcePort)} → ${String(edge.targetPort)}`,
+    };
+    edgeUndoTimer = window.setTimeout(() => {
+      edgeUndo.value = null;
+      edgeUndoTimer = null;
+    }, 8_000);
+    await loadCanvas(false);
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function restoreDisconnectedEdge() {
+  const pending = edgeUndo.value;
+  if (!pending) return;
+  try {
+    await canvasApi.createEdge(props.projectId, pending.edge);
+    if (edgeUndoTimer !== null) window.clearTimeout(edgeUndoTimer);
+    edgeUndoTimer = null;
+    edgeUndo.value = null;
+    await loadCanvas(false);
+    ElMessage.success("连接已恢复；下游过期状态按审计规则保留");
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  }
+}
+
 async function connect(connection: Connection) {
-  if (!canvas.value || !connection.source || !connection.target) return;
+  if (spacePressed.value || panningCanvas.value || !canvas.value || !connection.source || !connection.target) return;
   const source = canvas.value.nodes.find((node) => node.id === connection.source);
   const target = canvas.value.nodes.find((node) => node.id === connection.target);
   const sourcePort = connection.sourceHandle as CanvasPortType | null;
@@ -2737,7 +2981,7 @@ async function connect(connection: Connection) {
     ElMessage.error("端口类型不兼容，连接已拒绝");
     return;
   }
-  const edge: Omit<CanvasEdgeDto, "id"> = {
+  const edge: CanvasEdgeCreateRequest = {
     sourceNodeId: source.id,
     sourceNodeType: source.type,
     sourcePort,
@@ -2748,13 +2992,7 @@ async function connect(connection: Connection) {
   try {
     const stored = await canvasApi.createEdge(props.projectId, edge);
     canvas.value.edges.push(stored);
-    flowEdges.value.push({
-      id: stored.id ?? crypto.randomUUID(),
-      source: source.id,
-      target: target.id,
-      sourceHandle: sourcePort,
-      targetHandle: targetPort,
-    });
+    flowEdges.value.push(toInteractiveFlowEdge(stored));
     syncStatus.value = "saved";
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : String(error));
@@ -2862,6 +3100,7 @@ function nodeDragStop(event?: { node?: Node }) {
 }
 
 watch([selectedNodeId, consoleKind], async ([nodeId, kind], [previousNodeId, previousKind]) => {
+  updateIncidentEdges();
   if (!nodeId) {
     localConsoleSession.value = null;
     localConsoleGeometry.value = null;
@@ -2909,8 +3148,10 @@ onMounted(async () => {
   window.addEventListener("blur", handleWindowBlur);
 });
 onBeforeUnmount(() => {
+  finishGlobalCanvasPan();
   if (overlayPositionFrame !== null) cancelAnimationFrame(overlayPositionFrame);
   if (archiveUndoTimer !== null) window.clearTimeout(archiveUndoTimer);
+  if (edgeUndoTimer !== null) window.clearTimeout(edgeUndoTimer);
   window.removeEventListener("online", replayPendingLayout);
   window.removeEventListener("resize", handleWorkspaceResize);
   window.removeEventListener("keydown", handleWorkspaceKeyDown);
@@ -2954,6 +3195,10 @@ onBeforeUnmount(() => {
         :class="{ 'space-ready': spacePressed, panning: panningCanvas, 'low-detail': viewport.zoom < 0.48 }"
         tabindex="-1"
         aria-label="无限媒体画布"
+        @pointerdown.capture="startGlobalCanvasPan"
+        @pointermove.capture="moveGlobalCanvasPan"
+        @pointerup.capture="finishGlobalCanvasPan"
+        @pointercancel.capture="finishGlobalCanvasPan"
       >
       <aside v-if="referenceSelectionTarget" class="reference-selection-banner" role="status">
         <div><b>从画布选择参考</b><span>兼容素材已高亮；按住 Space 可平移寻找素材，最多选择 6 张图片</span></div>
@@ -2969,17 +3214,20 @@ onBeforeUnmount(() => {
         :only-render-visible-elements="false"
         :default-viewport="canvas?.viewport"
         :pan-on-drag="false"
-        pan-activation-key-code="Space"
+        :nodes-draggable="!spacePressed"
+        :nodes-connectable="!spacePressed"
+        :elements-selectable="!panningCanvas"
         @connect="connect"
         @pane-click="handlePaneClick"
         @move="scheduleOverlayAnchorUpdate"
-        @move-start="handleMoveStart"
-        @move-end="handleMoveEnd"
         @node-drag="scheduleOverlayAnchorUpdate"
         @node-drag-start="nodeDragStart"
         @node-drag-stop="nodeDragStop"
       >
         <Background pattern-color="#29303a" :gap="24" :size="1" />
+        <template #edge-interactive="edgeProps">
+          <CanvasInteractiveEdge v-bind="edgeProps" />
+        </template>
         <template #node-canvasGroup="{ data }">
           <section
             class="canvas-group-frame"
@@ -3027,6 +3275,7 @@ onBeforeUnmount(() => {
           <CanvasNodeCard
             :node="data.node"
             :selected="selectedNodeId === data.node.id"
+            :latest-execution="latestExecutionForNode(data.node)"
             :selection-state="selectionStateFor(data.node)"
             :selection-index="referenceSelectionIndex(data.node.id)"
             @select-node="selectCanvasNode"
@@ -3197,6 +3446,10 @@ onBeforeUnmount(() => {
           <span>“{{ archiveUndo.title }}”已从画布移除</span>
           <button type="button" @click="restoreArchivedNode">撤销</button>
         </aside>
+        <aside v-if="edgeUndo" class="canvas-edge-undo" role="status" aria-live="polite">
+          <span>连接“{{ edgeUndo.label }}”已剪断，下游已标记为过期</span>
+          <button type="button" @click="restoreDisconnectedEdge">撤销连接</button>
+        </aside>
       </Teleport>
 
       <aside class="stage-guide">
@@ -3210,7 +3463,7 @@ onBeforeUnmount(() => {
         <button type="button" title="添加节点" @click="nodeLibraryVisible = !nodeLibraryVisible"><Plus /></button>
         <button type="button" title="编辑创意简报" @click="briefVisible = true"><EditPen /></button>
         <button type="button" title="添加通用主体" @click="subjectVisible = true"><Plus /></button>
-        <button type="button" title="自动布局" @click="autoLayout"><MagicStick /></button>
+        <button type="button" title="整理一人一猫链路" @click="autoLayout"><MagicStick /></button>
         <button type="button" title="聚焦全部节点" @click="fitView({ padding: .16, duration: 320 })"><Aim /></button>
         <button type="button" title="刷新画布" @click="loadCanvas()"><Refresh /></button>
         <button class="asset-library-entry" type="button" title="打开角色库、风格库和最近使用" @click="openVisualPresetLibrary">素材库</button>
@@ -3485,7 +3738,7 @@ onBeforeUnmount(() => {
 .skeleton-link { width: 72px; height: 2px; background: #303744; }
 @keyframes canvas-skeleton { to { background-position-x: -240%; } }
 @media (prefers-reduced-motion: reduce) { .skeleton-node { animation: none; } }
-.canvas-surface { position: relative; width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; }.vue-flow { background: #111317; }.canvas-surface.space-ready :deep(.vue-flow__pane) { cursor: grab; }.canvas-surface.panning :deep(.vue-flow__pane) { cursor: grabbing; }
+.canvas-surface { position: relative; width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; }.vue-flow { background: #111317; }.canvas-surface.space-ready,.canvas-surface.space-ready :deep(*) { cursor: grab !important; }.canvas-surface.panning,.canvas-surface.panning :deep(*) { cursor: grabbing !important; user-select: none; }
 .vue-flow :deep(.vue-flow__edge-path) { stroke: #5c6675; stroke-width: 1.2; }
 .vue-flow :deep(.vue-flow__handle) { width: 9px; height: 9px; background: #9aa8ba; border: 2px solid #1b1e24; }
 .canvas-group-frame { position: relative; box-sizing: border-box; width: 100%; height: 100%; color: #aeb6c2; background: rgb(53 54 57 / 34%); border: 1px solid color-mix(in srgb, var(--group-color) 54%, #5a5e66); border-radius: 12px; cursor: default; transition: border-color 150ms ease, background 150ms ease, box-shadow 150ms ease; }
@@ -3521,7 +3774,7 @@ onBeforeUnmount(() => {
 .asset-history-state { padding: 30px; color: #8b96a7; text-align: center; }.asset-history-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 14px; }.asset-history-grid article { display: grid; gap: 5px; padding: 8px; color: #dce3ed; background: #1c2026; border: 1px solid #303741; border-radius: 9px; }.asset-history-grid img, .asset-history-grid video, .audio-placeholder { width: 100%; height: 132px; object-fit: cover; background: #101217; border-radius: 6px; }.asset-history-grid small { color: #7f8a9a; }.audio-placeholder { display: grid; place-items: center; color: #758196; font-size: 11px; letter-spacing: .16em; }
 .subject-library-grid { display: grid; gap: 10px; }.subject-library-grid article { display: grid; gap: 8px; padding: 13px; color: #dce3ed; background: #1c2026; border: 1px solid #303741; border-radius: 10px; }.subject-library-grid article div { display: grid; }.subject-library-grid small { color: #8792a3; }.subject-library-grid p { margin: 0; color: #b9c2cf; }.subject-library-grid .subject-warning { color: #e3ad6d; }.subject-library-grid button { justify-self: start; padding: 7px 10px; color: #15202b; background: #d7e8f7; border: 0; border-radius: 7px; cursor: pointer; }
 .canvas-node-context-menu { position: fixed; z-index: 1400; width: 224px; padding: 6px; color: #eceff4; background: #252525; border: 1px solid #454545; border-radius: 12px; box-shadow: 0 14px 38px rgb(0 0 0 / 42%); }.canvas-node-context-menu button { width: 100%; min-height: 44px; padding: 0 12px; color: inherit; text-align: left; background: transparent; border: 0; border-radius: 8px; cursor: pointer; }.canvas-node-context-menu button:hover,.canvas-node-context-menu button:focus-visible { background: #383838; outline: 2px solid #78aef0; outline-offset: -2px; }.canvas-node-context-menu button[aria-disabled="true"] { color: #777; cursor: not-allowed; }
-.canvas-archive-undo { position: fixed; right: 24px; bottom: 24px; z-index: 1700; display: flex; align-items: center; gap: 18px; min-height: 52px; padding: 8px 10px 8px 16px; color: #eceff4; background: #292929; border: 1px solid #494949; border-radius: 12px; box-shadow: 0 16px 40px rgb(0 0 0 / 40%); animation: archive-undo-in 140ms ease-out; }.canvas-archive-undo button { min-width: 64px; min-height: 40px; color: #9fc8ff; background: transparent; border: 0; border-radius: 8px; cursor: pointer; }.canvas-archive-undo button:hover,.canvas-archive-undo button:focus-visible { color: #fff; background: #3a4654; outline: 2px solid #78aef0; outline-offset: -2px; }
+.canvas-archive-undo,.canvas-edge-undo { position: fixed; right: 24px; bottom: 24px; z-index: 1700; display: flex; align-items: center; gap: 18px; min-height: 52px; padding: 8px 10px 8px 16px; color: #eceff4; background: #292929; border: 1px solid #494949; border-radius: 12px; box-shadow: 0 16px 40px rgb(0 0 0 / 40%); animation: archive-undo-in 140ms ease-out; }.canvas-archive-undo button,.canvas-edge-undo button { min-width: 64px; min-height: 40px; color: #9fc8ff; background: transparent; border: 0; border-radius: 8px; cursor: pointer; }.canvas-archive-undo button:hover,.canvas-archive-undo button:focus-visible,.canvas-edge-undo button:hover,.canvas-edge-undo button:focus-visible { color: #fff; background: #3a4654; outline: 2px solid #78aef0; outline-offset: -2px; }
 @keyframes archive-undo-in { from { opacity: 0; transform: translateY(6px); } }
 @media (max-width: 1280px) {
   .stage-guide { display: none; }
@@ -3533,6 +3786,6 @@ onBeforeUnmount(() => {
 }
 @media (prefers-reduced-motion: reduce) {
   .canvas-group-frame { transition: none; }
-  .canvas-archive-undo { animation: none; }
+  .canvas-archive-undo,.canvas-edge-undo { animation: none; }
 }
 </style>

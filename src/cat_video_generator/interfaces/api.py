@@ -1143,16 +1143,29 @@ def create_app(
     @app.get("/api/v1/task-center")
     def task_center() -> dict[str, list[dict[str, Any]]]:
         latest_by_operation: dict[
-            tuple[uuid.UUID, uuid.UUID | None, uuid.UUID | None, str], Any
+            tuple[
+                uuid.UUID,
+                uuid.UUID | None,
+                uuid.UUID | None,
+                str,
+                str | None,
+                str | None,
+                str | None,
+            ],
+            Any,
         ] = {}
         for item in repository.task_center_steps():
             if item.operation_key == "editor:anchor-brief":
                 continue
+            snapshot = item.input_snapshot if isinstance(item.input_snapshot, dict) else {}
             key = (
                 item.project_id,
                 item.scene_id,
                 item.shot_card_id,
                 item.operation_key,
+                snapshot.get("canvasNodeId"),
+                snapshot.get("businessObjectId"),
+                snapshot.get("parentStepId"),
             )
             latest_by_operation.setdefault(key, item)
         persistent = sorted(
@@ -1173,6 +1186,7 @@ def create_app(
                 canvasNodeId=snapshot.get("canvasNodeId"),
                 canvasGroupId=snapshot.get("canvasGroupId"),
                 recipeInstanceId=snapshot.get("recipeInstanceId"),
+                businessObjectId=snapshot.get("businessObjectId"),
                 creationMode=snapshot.get("creationMode"),
                 parentStepId=snapshot.get("parentStepId"),
                 childStepIds=item.progress.get("childStepIds", []),
@@ -1370,6 +1384,7 @@ def _task_json(item: Any) -> dict[str, Any]:
         "operationKey": item.operation_key,
         "provider": item.provider,
         "providerTaskId": item.provider_task_id,
+        "businessObjectId": item.input_snapshot.get("businessObjectId"),
         "model": item.model,
         "inputSnapshot": item.input_snapshot,
         "error": item.error,

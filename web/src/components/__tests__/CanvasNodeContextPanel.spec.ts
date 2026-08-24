@@ -73,4 +73,50 @@ describe("CanvasNodeContextPanel", () => {
     expect(wrapper.text()).toContain("请先生成并保存镜头表");
     expect(wrapper.emitted("action")).toBeUndefined();
   });
+
+  it("keeps long planner details in one scroll region while actions remain in the fixed footer", () => {
+    const node: CanvasNodeDto = {
+      id: "planner-1",
+      type: "StoryPlannerNode",
+      objectType: "story_planner",
+      objectId: "planner-1",
+      position: { x: 0, y: 0 },
+      data: {
+        title: "三案故事策划",
+        briefSummary: "孩子和猫咪在雨后发现一片发亮的叶子",
+        canonDependencies: ["固定儿童", "固定猫咪", "线条材质画风"],
+        candidateCount: 3,
+        candidateRules: ["儿童主动行动", "猫咪自然参与", "以温暖变化收尾"],
+      },
+      availableActions: [{
+        key: "generate_stories",
+        label: "生成三个剧情候选",
+        enabled: true,
+        execution: "local_worker",
+      }],
+    };
+    const wrapper = mount(CanvasNodeContextPanel, {
+      props: {
+        node,
+        embedded: true,
+        executions: Array.from({ length: 5 }, (_, index) => ({
+          key: `task-${index}`,
+          jobId: `task-${index}`,
+          kind: "story_strategy",
+          label: `剧情任务 ${index + 1}`,
+          status: "running" as const,
+          projectId: "project-1",
+          updatedAt: "2026-08-24T00:00:00Z",
+          source: "runtime" as const,
+        })),
+      },
+    });
+
+    expect(wrapper.findAll(".content-scroll")).toHaveLength(1);
+    expect(wrapper.get(".content-scroll").find("footer").exists()).toBe(false);
+    expect(wrapper.get("footer").element.parentElement).toBe(wrapper.get(".context-panel").element);
+    expect(wrapper.text()).toContain("固定儿童、固定猫咪、线条材质画风");
+    expect(wrapper.text()).toContain("儿童主动行动");
+    expect(wrapper.get('[data-action="generate_stories"]').text()).toBe("生成三个剧情候选");
+  });
 });

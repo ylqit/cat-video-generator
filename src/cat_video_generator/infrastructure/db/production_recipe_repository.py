@@ -11,7 +11,12 @@ from typing import Any
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from ...domain.aigc_canvas import CanvasNodeType, CanvasPortType, StoryRevisionStatus
+from ...domain.aigc_canvas import (
+    CanvasNodeType,
+    CanvasPortType,
+    StoryEventCandidateStatus,
+    StoryRevisionStatus,
+)
 from ...domain.production_recipes import (
     CANON_V3_PROFILE_ID,
     CANON_V3_STYLE_NEGATIVE,
@@ -47,6 +52,7 @@ from .models import (
     ShotBeat,
     ShotCard,
     StoryBriefRecord,
+    StoryEventCandidateRecord,
     StoryRevisionRecord,
     StoryScore,
     Subject,
@@ -218,6 +224,8 @@ class SqlAlchemyProductionRecipeRepository:
                             "canvasNodeId",
                             "canvasGroupId",
                             "recipeInstanceId",
+                            "businessObjectId",
+                            "parentStepId",
                             "creationMode",
                             "phase",
                         )},
@@ -226,6 +234,7 @@ class SqlAlchemyProductionRecipeRepository:
                         "operationKey": operation_key,
                         "kind": row.kind,
                         "progress": row.progress_json,
+                        "childStepIds": row.progress_json.get("childStepIds", []),
                     },
                 )
             )
@@ -267,6 +276,28 @@ class SqlAlchemyProductionRecipeRepository:
                 **dict(parent.progress_json or {}),
                 "childStepIds": [str(step_id) for step_id in ordered_ids],
             }
+            parent_snapshot = dict(parent.input_snapshot_json or {})
+            session.add(
+                CanvasEvent(
+                    production_run_id=parent.production_run_id,
+                    event_type="task_progress",
+                    data_json={
+                        "stepId": str(parent.id),
+                        "projectId": str(parent.production_run_id),
+                        "status": parent.status,
+                        "operationKey": parent.operation_key,
+                        "kind": parent.kind,
+                        "canvasNodeId": parent_snapshot.get("canvasNodeId"),
+                        "canvasGroupId": parent_snapshot.get("canvasGroupId"),
+                        "recipeInstanceId": parent_snapshot.get("recipeInstanceId"),
+                        "businessObjectId": parent_snapshot.get("businessObjectId"),
+                        "childStepIds": [str(step_id) for step_id in ordered_ids],
+                        "phase": parent_snapshot.get("phase")
+                        or parent_snapshot.get("workflowStage"),
+                        "progress": parent.progress_json,
+                    },
+                )
+            )
             return tuple(
                 {
                     "stepId": str(step_id),
@@ -304,6 +335,8 @@ class SqlAlchemyProductionRecipeRepository:
         ids = {
             "creative_gate": uuid.uuid5(project_id, "creative-brief-approval"),
             "planner": uuid.uuid5(project_id, "story-planner"),
+            "event_gate": uuid.uuid5(project_id, "story-event-selection"),
+            "script": uuid.uuid5(project_id, "story-script-expander"),
             "story_gate": uuid.uuid5(project_id, "story-approval"),
             "style_preset": uuid.uuid5(project_id, "style-preset:line-texture"),
             "child_design": uuid.uuid5(project_id, "character-design:child"),
@@ -345,9 +378,25 @@ class SqlAlchemyProductionRecipeRepository:
             (
                 ids["planner"],
                 CanvasNodeType.STORY_PLANNER,
-                "story_planner",
+                "story_event_planner",
                 project_id,
-                "AI 剧情生成",
+                "生成三个事件方案",
+                "story",
+            ),
+            (
+                ids["event_gate"],
+                CanvasNodeType.APPROVAL_GATE,
+                "story_event_selection",
+                project_id,
+                "选择一个事件方案",
+                "story",
+            ),
+            (
+                ids["script"],
+                CanvasNodeType.STORY_SCRIPT,
+                "story_script_expander",
+                project_id,
+                "扩写剧情脚本",
                 "story",
             ),
             (
@@ -530,6 +579,27 @@ class SqlAlchemyProductionRecipeRepository:
                 ids["planner"],
                 CanvasPortType.SUBJECTS,
                 "story_subject",
+            ),
+            (
+                ids["planner"],
+                CanvasPortType.STORY_EVENT,
+                ids["event_gate"],
+                CanvasPortType.STORY_EVENT,
+                "event_candidates",
+            ),
+            (
+                ids["event_gate"],
+                CanvasPortType.STORY_EVENT,
+                ids["script"],
+                CanvasPortType.STORY_EVENT,
+                "selected_event",
+            ),
+            (
+                ids["script"],
+                CanvasPortType.STORY_REVISION,
+                ids["story_gate"],
+                CanvasPortType.STORY_REVISION,
+                "script_review",
             ),
             (
                 child.id,
@@ -939,6 +1009,11 @@ class SqlAlchemyProductionRecipeRepository:
             if target["project_id"] != instance.production_run_id:
                 raise ValueError("审核目标不属于当前配方项目")
             target_row = target["row"]
+            if (
+                isinstance(target_row, StoryEventCandidateRecord)
+                and target_row.production_recipe_instance_id != instance.id
+            ):
+                raise ValueError("事件方案不属于当前配方实例")
             if isinstance(target_row, StoryBriefRecord):
                 latest_brief = session.scalar(
                     select(StoryBriefRecord)
@@ -1041,6 +1116,41 @@ class SqlAlchemyProductionRecipeRepository:
                 )
                 for previous in previous_approved:
                     previous.status = StoryRevisionStatus.SUPERSEDED.value
+            if (
+                isinstance(target_row, StoryEventCandidateRecord)
+                and effective_payload.decision.value in _APPROVING_DECISIONS
+            ):
+                previous_selected = list(
+                    session.scalars(
+                        select(StoryEventCandidateRecord)
+                        .where(
+                            StoryEventCandidateRecord.production_recipe_instance_id
+                            == instance.id,
+                            StoryEventCandidateRecord.status
+                            == StoryEventCandidateStatus.SELECTED.value,
+                            StoryEventCandidateRecord.id != target_row.id,
+                        )
+                        .with_for_update()
+                    )
+                )
+                if previous_selected:
+                    previous_ids = [candidate.id for candidate in previous_selected]
+                    session.execute(
+                        update(StoryRevisionRecord)
+                        .where(
+                            StoryRevisionRecord.source_event_candidate_id.in_(previous_ids),
+                            StoryRevisionRecord.status
+                            != StoryRevisionStatus.SUPERSEDED.value,
+                        )
+                        .values(status=StoryRevisionStatus.SUPERSEDED.value)
+                    )
+                    self._invalidate_media_after_upstream_change(
+                        session,
+                        instance.production_run_id,
+                        "已重新选择事件方案",
+                    )
+                    for previous in previous_selected:
+                        previous.status = StoryEventCandidateStatus.SUPERSEDED.value
             self._apply_review_to_target(session, effective_payload, target_row)
             if (
                 isinstance(target_row, StoryRevisionRecord)
@@ -1654,6 +1764,41 @@ class SqlAlchemyProductionRecipeRepository:
             )
         )
         story_ids = [story.id for story in story_rows]
+        all_event_rows = list(
+            session.scalars(
+                select(StoryEventCandidateRecord)
+                .where(StoryEventCandidateRecord.production_recipe_instance_id == row.id)
+                .order_by(
+                    StoryEventCandidateRecord.created_at.desc(),
+                    StoryEventCandidateRecord.candidate_index,
+                )
+            )
+        )
+        latest_event_batch_id = all_event_rows[0].batch_id if all_event_rows else None
+        selected_event = next(
+            (
+                candidate
+                for candidate in all_event_rows
+                if candidate.batch_id == latest_event_batch_id
+                if candidate.status == StoryEventCandidateStatus.SELECTED.value
+            ),
+            None,
+        )
+        visible_event_rows = [
+            candidate
+            for candidate in all_event_rows
+            if candidate.batch_id == latest_event_batch_id
+            or (selected_event is not None and candidate.id == selected_event.id)
+        ]
+        event_script = next(
+            (
+                story
+                for story in story_rows
+                if selected_event is not None
+                and story.source_event_candidate_id == selected_event.id
+            ),
+            None,
+        )
         scores_by_story = {
             score.story_revision_id: score
             for score in session.scalars(
@@ -1767,6 +1912,36 @@ class SqlAlchemyProductionRecipeRepository:
                 _recipe_story_candidate_json(story, scores_by_story.get(story.id))
                 for story in story_rows
             ],
+            "storyEvents": [
+                _recipe_story_event_json(candidate) for candidate in visible_event_rows
+            ],
+            "selectedStoryEventId": (
+                None if selected_event is None else str(selected_event.id)
+            ),
+            "storyWorkflow": {
+                "currentStep": (
+                    1
+                    if not visible_event_rows
+                    else 2
+                    if selected_event is None
+                    else 3
+                    if event_script is None
+                    else 4
+                ),
+                "totalSteps": 4,
+                "status": (
+                    "generate_events"
+                    if not visible_event_rows
+                    else "select_event"
+                    if selected_event is None
+                    else "expand_script"
+                    if event_script is None
+                    else "approve_script"
+                    if event_script.status != StoryRevisionStatus.APPROVED.value
+                    else "complete"
+                ),
+                "scriptRevisionId": None if event_script is None else str(event_script.id),
+            },
             "shots": [
                 _recipe_shot_json(
                     session,
@@ -1892,6 +2067,9 @@ class SqlAlchemyProductionRecipeRepository:
         if target_type == "creative_brief":
             row = session.get(StoryBriefRecord, target_id)
             project_id = None if row is None else row.production_run_id
+        elif target_type == "story_event":
+            row = session.get(StoryEventCandidateRecord, target_id)
+            project_id = None if row is None else row.production_run_id
         elif target_type in {"story_revision", "episode_rules"}:
             row = session.get(StoryRevisionRecord, target_id)
             project_id = None if row is None else row.production_run_id
@@ -1982,6 +2160,11 @@ class SqlAlchemyProductionRecipeRepository:
     ) -> None:
         accepted = payload.decision.value in _APPROVING_DECISIONS
         if isinstance(row, StoryBriefRecord):
+            return
+        if isinstance(row, StoryEventCandidateRecord):
+            if accepted:
+                row.status = StoryEventCandidateStatus.SELECTED.value
+                row.selected_at = datetime.now(UTC)
             return
         if isinstance(row, StoryRevisionRecord):
             if payload.target_type == "storyboard_revision":
@@ -2367,6 +2550,11 @@ def _recipe_story_candidate_json(
         "revision": story.revision,
         "strategy": story.strategy,
         "status": story.status,
+        "sourceEventCandidateId": (
+            None
+            if story.source_event_candidate_id is None
+            else str(story.source_event_candidate_id)
+        ),
         "title": story.title,
         "logline": story.logline,
         "synopsis": story.synopsis,
@@ -2375,6 +2563,32 @@ def _recipe_story_candidate_json(
             None if not score_values else round(sum(score_values) / len(score_values), 2)
         ),
         "scoreRationale": None if score is None else score.rationale,
+    }
+
+
+def _recipe_story_event_json(candidate: StoryEventCandidateRecord) -> dict[str, Any]:
+    return {
+        "id": str(candidate.id),
+        "revision": candidate.revision,
+        "batchId": str(candidate.batch_id),
+        "candidateIndex": candidate.candidate_index,
+        "strategy": candidate.strategy,
+        "status": candidate.status,
+        "title": candidate.title,
+        "premise": candidate.premise,
+        "childAction": candidate.child_action,
+        "catParticipation": candidate.cat_participation,
+        "smallChange": candidate.small_change,
+        "warmEnding": candidate.warm_ending,
+        "suggestedScenes": candidate.suggested_scenes_json,
+        "durationFitSummary": candidate.duration_fit_summary,
+        "requiresSceneChange": candidate.requires_scene_change,
+        "catBehaviorModeSuggestion": candidate.cat_behavior_mode_suggestion,
+        "score": candidate.score_json or None,
+        "selectedAt": (
+            None if candidate.selected_at is None else candidate.selected_at.isoformat()
+        ),
+        "createdAt": candidate.created_at.isoformat(),
     }
 
 

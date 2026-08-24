@@ -333,7 +333,7 @@ def test_service_lists_recipe_and_projects_derived_stage_without_duplicate_state
     assert recipes[0]["key"] == "healing_child_cat_v1"
     assert created["shotDurations"] == [11, 10, 10]
     assert created["stage"] == "concept"
-    assert created["primaryAction"] == "生成故事候选"
+    assert created["primaryAction"] == "生成三个事件方案"
     assert "stage" not in repository.row
 
 
@@ -350,7 +350,7 @@ def test_provider_backed_recipe_cost_is_never_presented_as_free_when_unconfigure
     assert unmetered["estimatedCostMicros"] is None
     assert unmetered["costEstimateStatus"] == "unmetered_paid"
     assert unmetered["costEstimateLabel"] == "付费调用·暂未计量"
-    assert metered["estimatedCostMicros"] == 12_500
+    assert metered["estimatedCostMicros"] == 75_000
     assert metered["costEstimateStatus"] == "metered"
 
 
@@ -381,7 +381,7 @@ def test_service_prompts_for_human_story_choice_when_candidates_exist() -> None:
 
     assert instance["stage"] == "concept"
     assert instance["primaryAction"] == "选择并批准故事"
-    assert instance["currentBlocker"] == "故事候选等待人工选择与规则确认"
+    assert instance["currentBlocker"] == "旧版剧情候选等待人工选择与规则确认"
 
 
 def test_service_derives_final_review_action_after_sequence_render() -> None:

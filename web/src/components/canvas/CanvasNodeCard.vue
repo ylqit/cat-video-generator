@@ -3,12 +3,14 @@ import { computed } from "vue";
 import { Document, MagicStick, Picture } from "@element-plus/icons-vue";
 
 import type { CanvasNodeDto, SubjectReferenceDto } from "../../api/types";
+import type { TaskCenterItem } from "../../tasks/taskCenter";
 
 const props = withDefaults(defineProps<{
   node: CanvasNodeDto;
   selected?: boolean;
   selectionState?: "none" | "compatible" | "incompatible" | "chosen";
   selectionIndex?: number;
+  latestExecution?: TaskCenterItem;
 }>(), {
   selected: false,
   selectionState: "none",
@@ -43,6 +45,8 @@ const title = computed(() => String(data.value.title ?? ({
   StylePresetNode: "画风预设",
   CharacterDesignNode: "角色设计",
   StoryPlannerNode: "三案故事策划",
+  StoryEventNode: "事件方案",
+  StoryScriptNode: "剧情脚本",
   StoryCandidateNode: "故事候选",
   ApprovalGateNode: "人工审批",
   StoryboardDirectorNode: "分镜导演",
@@ -67,6 +71,8 @@ const nodeLabel = computed(() => String(data.value.artifactLabel ?? ({
   StylePresetNode: "STYLE",
   CharacterDesignNode: "CHARACTER",
   StoryPlannerNode: "PLANNER",
+  StoryEventNode: "EVENT",
+  StoryScriptNode: "SCRIPT",
   StoryCandidateNode: "STORY",
   ApprovalGateNode: "GATE",
   StoryboardDirectorNode: "STORYBOARD",
@@ -89,6 +95,28 @@ const nodeLabel = computed(() => String(data.value.artifactLabel ?? ({
 const boundAssets = computed(() => (
   Array.isArray(data.value.assets) ? data.value.assets : []
 ));
+const executionPercent = computed(() => Math.max(
+  0,
+  Math.min(100, Number(props.latestExecution?.progress?.percent ?? 0)),
+));
+const executionText = computed(() => {
+  const task = props.latestExecution;
+  if (!task) return "";
+  const message = task.progress?.message || task.resultSummary?.message;
+  if (typeof message === "string" && message.trim()) return message;
+  return ({
+    queued: "等待 Worker 领取",
+    pending: "任务已进入持久队列",
+    submitting: "正在提交供应商",
+    running: "正在执行",
+    awaiting_review: "产物等待人工审核",
+    succeeded: "执行完成",
+    failed: "执行失败，打开节点查看原因",
+    submission_unknown: "供应商提交状态待对账",
+    restart_pending: "等待 Worker 恢复任务",
+    cancelled: "任务已取消",
+  } as Record<string, string>)[task.status] ?? task.label;
+});
 </script>
 
 <template>
@@ -116,6 +144,17 @@ const boundAssets = computed(() => (
       </span>
     </header>
     <h3>{{ title }}</h3>
+
+    <section
+      v-if="latestExecution"
+      class="node-execution-rail"
+      :class="`task-${latestExecution.status}`"
+      :aria-label="`${latestExecution.label}：${executionText}`"
+    >
+      <div><b>{{ latestExecution.label }}</b><span>{{ executionText }}</span></div>
+      <small v-if="latestExecution.parentStepId">子任务 · {{ latestExecution.progress?.currentStep ?? 0 }}/{{ latestExecution.progress?.totalSteps ?? latestExecution.childStepIds?.length ?? '—' }}</small>
+      <div v-if="['queued','pending','submitting','running','restart_pending'].includes(latestExecution.status)" class="execution-progress" role="progressbar" :aria-valuenow="executionPercent" aria-valuemin="0" aria-valuemax="100"><i :style="{ width: `${executionPercent}%` }" /></div>
+    </section>
 
     <template v-if="node.type === 'RecipeGroupNode'">
       <p>{{ data.theme || '输入一句话，生成固定儿童、固定猫咪与统一水彩画风的治愈短片。' }}</p>
@@ -198,6 +237,33 @@ const boundAssets = computed(() => (
         <span>Canon identity 固定</span>
         <span>{{ data.candidates?.length ?? 0 }} 个候选</span>
       </div>
+    </template>
+
+    <template v-else-if="node.type === 'StoryEventNode'">
+      <p class="event-premise">{{ data.premise }}</p>
+      <ol class="event-beats">
+        <li><b>儿童行动</b><span>{{ data.childAction }}</span></li>
+        <li><b>猫咪参与</b><span>{{ data.catParticipation }}</span></li>
+        <li><b>小变化</b><span>{{ data.smallChange }}</span></li>
+        <li><b>温暖收尾</b><span>{{ data.warmEnding }}</span></li>
+      </ol>
+      <div class="fact-row">
+        <span>{{ data.durationFitSummary }}</span>
+        <span>{{ data.requiresSceneChange ? '需要换场' : '单场景可完成' }}</span>
+        <span>{{ data.status === 'selected' ? '已选择' : data.status === 'superseded' ? '历史方案' : '待选择' }}</span>
+      </div>
+      <div class="card-actions"><button class="primary-action" type="button" @click.stop="emit('activate-node', node)">{{ data.status === 'selected' ? '查看事件方案' : '打开并选择' }}</button></div>
+    </template>
+
+    <template v-else-if="node.type === 'StoryScriptNode'">
+      <p>{{ data.logline || data.synopsis }}</p>
+      <div class="fact-row">
+        <span>来源事件已记录</span>
+        <span>{{ data.scenes?.length ?? data.sceneCount ?? 0 }} 个场景</span>
+        <span>{{ data.status === 'approved' ? '剧情已定稿' : '等待人工审核' }}</span>
+      </div>
+      <small v-if="data.stale">上游已产生新版本，本剧情脚本及下游产物已过期</small>
+      <div class="card-actions"><button class="primary-action" type="button" @click.stop="emit('activate-node', node)">查看完整剧情脚本</button></div>
     </template>
 
     <template v-else-if="node.type === 'StoryCandidateNode'">
@@ -355,6 +421,9 @@ const boundAssets = computed(() => (
 .canvas-card:focus-visible { outline: 2px solid #8db9ee; outline-offset: 3px; }
 .canvas-card.selection-incompatible { opacity: .42; }
 .canvas-card.type-StoryCandidateNode { width: 312px; border-color: #3e5267; }
+.canvas-card.type-StoryEventNode { width: 312px; border-color: #496078; }
+.canvas-card.type-StoryEventNode:has(.status-superseded) { opacity: .58; }
+.canvas-card.type-StoryScriptNode { width: 340px; border-color: #55708c; }
 .canvas-card.type-CharacterDesignNode { width: 312px; min-height: 270px; border-color: #596b7d; background: #1d2025; }
 .canvas-card.type-SubjectNode, .canvas-card.type-StylePresetNode { width: 332px; min-height: 246px; }
 .canvas-card.type-StoryboardDirectorNode { width: 460px; min-height: 430px; border-color: #8a8a8a; background: #202020; }
@@ -376,12 +445,28 @@ header { justify-content: space-between; }
 .node-status { padding: 2px 7px; color: #9aa6b8; background: #242932; border-radius: 999px; font-size: 10px; }
 .status-approved, .status-ready { color: #7ee2ae; background: #153228; }
 .status-candidate { color: #e7c775; background: #332c19; }
+.status-selected { color: #b7d9ff; background: #1b3045; }
+.status-superseded { color: #8a93a2; background: #272a30; }
 h3 { margin: 9px 0 7px; font-size: 15px; line-height: 1.4; }
 p { margin: 0 0 10px; color: #aeb6c4; font-size: 12px; line-height: 1.55; }
 small { display: block; margin-top: 8px; color: #737f92; }
 .fact-row span { padding: 3px 7px; color: #9faabb; background: #23272e; border-radius: 6px; font-size: 10px; }
 .score-row { margin: 10px 0; color: #9eabbc; font-size: 11px; }
 .score-row b { color: #f2ce78; font-size: 22px; }
+.node-execution-rail { display: grid; gap: 6px; margin: 0 0 10px; padding: 8px 9px; color: #bdc9d8; background: #1e2630; border: 1px solid #344458; border-radius: 8px; font-size: 10px; }
+.node-execution-rail > div:first-child { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 7px; align-items: center; }
+.node-execution-rail b { color: #dce9fa; white-space: nowrap; }
+.node-execution-rail span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.node-execution-rail small { margin: 0; }
+.node-execution-rail.task-awaiting_review { color: #e8c77a; background: #302b1d; border-color: #5d5130; }
+.node-execution-rail.task-succeeded { color: #83d9ad; background: #173026; border-color: #2c6049; }
+.node-execution-rail.task-failed, .node-execution-rail.task-submission_unknown { color: #f1a1a1; background: #351f24; border-color: #713941; }
+.execution-progress { height: 3px; overflow: hidden; background: #10151c; border-radius: 999px; }
+.execution-progress i { display: block; height: 100%; background: linear-gradient(90deg, #558bc4, #8ec5ff); transition: width 160ms ease; }
+.event-premise { color: #d5deeb; }
+.event-beats { display: grid; gap: 5px; margin: 0 0 10px; padding: 0; list-style: none; }
+.event-beats li { display: grid; grid-template-columns: 60px minmax(0, 1fr); gap: 6px; color: #aeb8c7; font-size: 10px; line-height: 1.45; }
+.event-beats b { color: #7fa7d2; }
 .evidence-strip { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 8px 0 10px; }
 .evidence-strip figure { min-width: 0; margin: 0; overflow: hidden; background: #11151a; border: 1px solid #343b46; border-radius: 8px; }
 .evidence-strip img { display: block; width: 100%; height: 94px; object-fit: cover; }

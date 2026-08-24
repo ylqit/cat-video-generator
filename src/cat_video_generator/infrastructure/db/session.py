@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from ...config import DatabaseOperation, DatabaseSettings
 from .models import SCHEMA_NAME
 
-ALEMBIC_HEAD = "0027_story_scene_prompts"
+ALEMBIC_HEAD = "0028_story_event_candidates"
 
 
 def create_database_engine(

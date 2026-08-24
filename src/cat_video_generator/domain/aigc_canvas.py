@@ -41,6 +41,12 @@ class StoryRevisionStatus(StrEnum):
     SUPERSEDED = "superseded"
 
 
+class StoryEventCandidateStatus(StrEnum):
+    CANDIDATE = "candidate"
+    SELECTED = "selected"
+    SUPERSEDED = "superseded"
+
+
 class StoryStrategy(StrEnum):
     RELATIONSHIP = "relationship"
     PROBLEM_SOLVING = "problem_solving"
@@ -56,6 +62,8 @@ class CanvasNodeType(StrEnum):
     STYLE_PRESET = "StylePresetNode"
     CHARACTER_DESIGN = "CharacterDesignNode"
     STORY_PLANNER = "StoryPlannerNode"
+    STORY_EVENT = "StoryEventNode"
+    STORY_SCRIPT = "StoryScriptNode"
     STORY_CANDIDATE = "StoryCandidateNode"
     STORY_CRITIC = "StoryCriticNode"
     APPROVAL_GATE = "ApprovalGateNode"
@@ -80,6 +88,7 @@ class CanvasPortType(StrEnum):
     BRIEF = "brief"
     SUBJECTS = "subject[]"
     CHARACTER_DESIGN = "character_design"
+    STORY_EVENT = "story_event"
     STORY_REVISION = "story_revision"
     SCENE_PLAN = "scene_plan"
     SHOT_BEATS = "shot_beat[]"
@@ -312,6 +321,72 @@ class StorySceneOutline(StrictModel):
     synopsis: str = Field(min_length=1, max_length=4_000)
     duration_weight: int = Field(alias="durationWeight", ge=1, le=100)
     continuity: SceneContinuityRules
+
+
+class StoryEventSceneSuggestion(StrictModel):
+    scene_key: str = Field(
+        alias="sceneKey",
+        pattern=r"^[a-z0-9][a-z0-9_-]{1,79}$",
+    )
+    title: str = Field(min_length=1, max_length=160)
+    purpose: str = Field(min_length=1, max_length=1_000)
+    location: str = Field(min_length=1, max_length=300)
+    environment: Literal["indoor", "outdoor"]
+    time_weather: str = Field(alias="timeWeather", min_length=1, max_length=300)
+    transition_reason: str = Field(alias="transitionReason", default="", max_length=1_000)
+
+
+class StoryEventCandidateOutput(StrictModel):
+    """A concise, reviewable event direction rather than a complete screenplay."""
+
+    title: str = Field(min_length=1, max_length=200)
+    premise: str = Field(min_length=1, max_length=2_000)
+    child_action: str = Field(alias="childAction", min_length=1, max_length=2_000)
+    cat_participation: str = Field(
+        alias="catParticipation", min_length=1, max_length=2_000
+    )
+    small_change: str = Field(alias="smallChange", min_length=1, max_length=2_000)
+    warm_ending: str = Field(alias="warmEnding", min_length=1, max_length=2_000)
+    suggested_scenes: list[StoryEventSceneSuggestion] = Field(
+        alias="suggestedScenes", min_length=1, max_length=4
+    )
+    duration_fit_summary: str = Field(
+        alias="durationFitSummary", min_length=1, max_length=1_000
+    )
+    requires_scene_change: bool = Field(alias="requiresSceneChange")
+    cat_behavior_mode_suggestion: Literal["natural", "light_anthropomorphic"] = Field(
+        alias="catBehaviorModeSuggestion"
+    )
+
+
+def validate_story_event_candidate(
+    candidate: StoryEventCandidateOutput,
+    *,
+    target_duration_seconds: int,
+) -> None:
+    maximum_scene_count = 1 if target_duration_seconds <= 15 else math.ceil(
+        target_duration_seconds / 15
+    )
+    if len(candidate.suggested_scenes) > maximum_scene_count:
+        raise ValueError(
+            f"{target_duration_seconds}秒事件最多建议{maximum_scene_count}个场景"
+        )
+    scene_keys = [scene.scene_key for scene in candidate.suggested_scenes]
+    if len(set(scene_keys)) != len(scene_keys):
+        raise ValueError("事件方案的 sceneKey 必须稳定且唯一")
+    if target_duration_seconds <= 15 and candidate.requires_scene_change:
+        raise ValueError("8至15秒事件必须在单一场景内完成")
+    if candidate.requires_scene_change and len(candidate.suggested_scenes) < 2:
+        raise ValueError("需要换场的事件方案必须提供至少两个场景建议")
+    if not candidate.requires_scene_change and len(candidate.suggested_scenes) != 1:
+        raise ValueError("无需换场的事件方案必须只提供一个场景建议")
+    missing_transition = [
+        scene.scene_key
+        for scene in candidate.suggested_scenes[1:]
+        if not scene.transition_reason.strip()
+    ]
+    if missing_transition:
+        raise ValueError("事件换场必须说明叙事目的：" + ", ".join(missing_transition))
 
 
 class StoryCandidateOutput(StrictModel):
@@ -557,11 +632,14 @@ _NODE_INPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
     CanvasNodeType.STORY_PLANNER: frozenset(
         {CanvasPortType.BRIEF, CanvasPortType.SUBJECTS}
     ),
+    CanvasNodeType.STORY_EVENT: frozenset({CanvasPortType.STORY_EVENT}),
+    CanvasNodeType.STORY_SCRIPT: frozenset({CanvasPortType.STORY_EVENT}),
     CanvasNodeType.STORY_CANDIDATE: frozenset({CanvasPortType.STORY_REVISION}),
     CanvasNodeType.STORY_CRITIC: frozenset({CanvasPortType.STORY_REVISION}),
     CanvasNodeType.APPROVAL_GATE: frozenset(
         {
             CanvasPortType.BRIEF,
+            CanvasPortType.STORY_EVENT,
             CanvasPortType.STORY_REVISION,
             CanvasPortType.CHARACTER_DESIGN,
         }
@@ -625,12 +703,17 @@ _NODE_OUTPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
     CanvasNodeType.CHARACTER_DESIGN: frozenset(
         {CanvasPortType.CHARACTER_DESIGN, CanvasPortType.IMAGE_ASSET}
     ),
-    CanvasNodeType.STORY_PLANNER: frozenset({CanvasPortType.STORY_REVISION}),
+    CanvasNodeType.STORY_PLANNER: frozenset(
+        {CanvasPortType.STORY_EVENT, CanvasPortType.STORY_REVISION}
+    ),
+    CanvasNodeType.STORY_EVENT: frozenset({CanvasPortType.STORY_EVENT}),
+    CanvasNodeType.STORY_SCRIPT: frozenset({CanvasPortType.STORY_REVISION}),
     CanvasNodeType.STORY_CANDIDATE: frozenset({CanvasPortType.STORY_REVISION}),
     CanvasNodeType.STORY_CRITIC: frozenset({CanvasPortType.STORY_REVISION}),
     CanvasNodeType.APPROVAL_GATE: frozenset(
         {
             CanvasPortType.BRIEF,
+            CanvasPortType.STORY_EVENT,
             CanvasPortType.STORY_REVISION,
             CanvasPortType.CHARACTER_DESIGN,
         }
@@ -658,6 +741,7 @@ _PORT_COMPATIBILITY: dict[CanvasPortType, frozenset[CanvasPortType]] = {
     CanvasPortType.BRIEF: frozenset({CanvasPortType.BRIEF}),
     CanvasPortType.SUBJECTS: frozenset({CanvasPortType.SUBJECTS}),
     CanvasPortType.CHARACTER_DESIGN: frozenset({CanvasPortType.CHARACTER_DESIGN}),
+    CanvasPortType.STORY_EVENT: frozenset({CanvasPortType.STORY_EVENT}),
     CanvasPortType.STORY_REVISION: frozenset({CanvasPortType.STORY_REVISION}),
     CanvasPortType.SCENE_PLAN: frozenset({CanvasPortType.SCENE_PLAN}),
     CanvasPortType.SHOT_BEATS: frozenset({CanvasPortType.SHOT_BEATS}),

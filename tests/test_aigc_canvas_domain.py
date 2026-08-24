@@ -11,12 +11,14 @@ from cat_video_generator.domain.aigc_canvas import (
     CanvasPortType,
     PromptRunDraft,
     StoryBrief,
+    StoryEventCandidateOutput,
     StoryRevisionStatus,
     StoryScorecard,
     SubjectDraft,
     allocate_bounded_durations,
     allocate_durations,
     approve_story_revision,
+    validate_story_event_candidate,
     validate_story_inputs,
 )
 
@@ -72,6 +74,74 @@ def test_story_generation_rejects_fewer_than_two_narrative_subjects() -> None:
                 _subject("院子", "location", "environment"),
             ),
         )
+
+
+def test_story_event_candidate_keeps_event_beats_separate_from_full_script() -> None:
+    candidate = StoryEventCandidateOutput(
+        title="雨后的亮叶",
+        premise="孩子和猫在院角发现一片会反光的湿叶。",
+        childAction="孩子蹲下观察叶面，没有摘下叶子。",
+        catParticipation="猫咪四足靠近，用鼻尖轻轻碰了碰叶边。",
+        smallChange="一颗水珠滚动，把云缝里的光映到他们眼前。",
+        warmEnding="孩子和猫并排蹲着，看着那一点微光慢慢变暖。",
+        suggestedScenes=[
+            {
+                "sceneKey": "rainy_courtyard",
+                "title": "雨后小院",
+                "purpose": "完成发现、变化和温暖收尾",
+                "location": "住宅楼下的小院角落",
+                "environment": "outdoor",
+                "timeWeather": "雨后傍晚，云层开始散开",
+                "transitionReason": "",
+            }
+        ],
+        durationFitSummary="一个连续15秒镜头可以完整呈现四个事件节拍。",
+        requiresSceneChange=False,
+        catBehaviorModeSuggestion="natural",
+    )
+
+    validate_story_event_candidate(candidate, target_duration_seconds=15)
+
+    assert candidate.child_action.startswith("孩子")
+    assert candidate.cat_participation.startswith("猫咪")
+    assert not hasattr(candidate, "synopsis")
+
+
+def test_short_story_event_rejects_scene_change_before_script_expansion() -> None:
+    candidate = StoryEventCandidateOutput(
+        title="跨场景事件",
+        premise="孩子和猫从房间跑到院子找叶子。",
+        childAction="孩子先在屋内寻找。",
+        catParticipation="猫咪跟随孩子移动。",
+        smallChange="他们在院子发现叶子。",
+        warmEnding="一起停在叶子旁。",
+        suggestedScenes=[
+            {
+                "sceneKey": "room",
+                "title": "房间",
+                "purpose": "开始寻找",
+                "location": "儿童房",
+                "environment": "indoor",
+                "timeWeather": "雨后傍晚",
+                "transitionReason": "",
+            },
+            {
+                "sceneKey": "courtyard",
+                "title": "院子",
+                "purpose": "完成发现",
+                "location": "楼下小院",
+                "environment": "outdoor",
+                "timeWeather": "雨后傍晚",
+                "transitionReason": "为了发现目标叶子",
+            },
+        ],
+        durationFitSummary="尝试在15秒内换场。",
+        requiresSceneChange=True,
+        catBehaviorModeSuggestion="natural",
+    )
+
+    with pytest.raises(ValueError, match="最多建议1个场景"):
+        validate_story_event_candidate(candidate, target_duration_seconds=15)
 
 
 def test_story_brief_rejects_duration_below_initial_provider_capability() -> None:

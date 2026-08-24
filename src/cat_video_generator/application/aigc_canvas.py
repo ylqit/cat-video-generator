@@ -13,9 +13,11 @@ from ..domain.aigc_canvas import (
     StoryboardPlanOutput,
     StoryBrief,
     StoryCandidateOutput,
+    StoryEventCandidateOutput,
     StoryScorecard,
     StoryStrategy,
     allocate_bounded_durations,
+    validate_story_event_candidate,
     validate_story_inputs,
     validate_story_scene_plan,
 )
@@ -35,6 +37,10 @@ class CanvasRepository(Protocol):
     def complete_prompt_run(self, prompt_id: uuid.UUID, **values: object) -> None: ...
 
     def save_story_candidate(self, **values: object) -> dict[str, Any]: ...
+
+    def save_story_event_candidate(self, **values: object) -> dict[str, Any]: ...
+
+    def get_selected_story_event(self, recipe_instance_id: uuid.UUID) -> dict[str, Any]: ...
 
     def finish_generation_attempt(self, attempt_id: str, **values: object) -> None: ...
 
@@ -373,6 +379,213 @@ class AigcCanvasService:
     def list_provider_capabilities(self, *, media_kind: str | None = None) -> list[dict[str, Any]]:
         return self._repository.list_provider_capabilities(media_kind=media_kind)
 
+    def run_story_event_strategies(
+        self,
+        project_id: uuid.UUID,
+        recipe_instance_id: uuid.UUID,
+        payload: Any,
+    ) -> dict[str, Any]:
+        brief_id, brief = self._repository.get_current_brief(project_id)
+        subjects = self._repository.list_subjects(project_id)
+        validate_story_inputs(brief, tuple(item.draft for item in subjects))
+        subject_snapshot = [
+            {
+                "subjectId": str(item.id),
+                "revisionId": str(item.revision_id),
+                **item.draft.model_dump(mode="json", by_alias=True),
+            }
+            for item in subjects
+        ]
+        input_snapshot = {
+            "briefId": str(brief_id),
+            "brief": brief.model_dump(mode="json", by_alias=True),
+            "subjects": subject_snapshot,
+            "recipeInstanceId": str(recipe_instance_id),
+            "creativeDirection": str(getattr(payload, "rewrite_instruction", "") or ""),
+            "narrativeContract": {
+                "candidateCount": 3,
+                "requiredBeats": [
+                    "childAction",
+                    "catParticipation",
+                    "smallChange",
+                    "warmEnding",
+                ],
+                "dialogueAllowed": False,
+            },
+        }
+        input_hash = _json_hash(input_snapshot)
+        idempotency_key = (
+            getattr(payload, "idempotency_key", None)
+            or hashlib.sha256(
+                f"{recipe_instance_id}:story-events:{input_hash}".encode()
+            ).hexdigest()
+        )
+        attempt, created = self._repository.begin_generation_attempt(
+            project_id=project_id,
+            business_object_type="recipe_story_event_batch",
+            business_object_id=recipe_instance_id,
+            idempotency_key=idempotency_key,
+            provider=self._provider_name,
+            model=self._director.model,
+            request=input_snapshot,
+        )
+        if not created:
+            return attempt
+
+        attempt_id = str(attempt["id"])
+        batch_id = uuid.UUID(attempt_id)
+        candidates: list[dict[str, Any]] = []
+        try:
+            for candidate_index, strategy in enumerate(
+                (
+                    StoryStrategy.RELATIONSHIP,
+                    StoryStrategy.PROBLEM_SOLVING,
+                    StoryStrategy.TWIST_HOOK,
+                ),
+                1,
+            ):
+                candidate, prompt_id = self._generate_event_candidate(
+                    project_id=project_id,
+                    recipe_instance_id=recipe_instance_id,
+                    strategy=strategy,
+                    input_snapshot=input_snapshot,
+                )
+                score, _critic_prompt_id = self._score_event_candidate(
+                    project_id=project_id,
+                    recipe_instance_id=recipe_instance_id,
+                    strategy=strategy,
+                    candidate=candidate,
+                    input_snapshot=input_snapshot,
+                    parent_prompt_id=prompt_id,
+                )
+                candidates.append(
+                    self._repository.save_story_event_candidate(
+                        project_id=project_id,
+                        recipe_instance_id=recipe_instance_id,
+                        brief_id=brief_id,
+                        batch_id=batch_id,
+                        candidate_index=candidate_index,
+                        strategy=strategy,
+                        candidate=candidate,
+                        scorecard=score,
+                        generation_prompt_id=prompt_id,
+                    )
+                )
+        except GatewayError as exc:
+            status = "submission_unknown" if exc.submission_unknown else "failed"
+            self._repository.finish_generation_attempt(
+                attempt_id,
+                status=status,
+                error={"code": exc.code, "message": str(exc), "retryable": exc.retryable},
+            )
+            raise
+        except Exception as exc:
+            self._repository.finish_generation_attempt(
+                attempt_id,
+                status="failed",
+                error={"code": "internal", "message": str(exc)},
+            )
+            raise
+        self._repository.finish_generation_attempt(
+            attempt_id,
+            status="succeeded",
+            response={
+                "candidateIds": [str(item["id"]) for item in candidates],
+                "candidateCount": len(candidates),
+            },
+        )
+        return {"id": attempt_id, "status": "succeeded", "candidates": candidates}
+
+    def expand_selected_story_event(
+        self,
+        project_id: uuid.UUID,
+        recipe_instance_id: uuid.UUID,
+        payload: Any,
+    ) -> dict[str, Any]:
+        event = self._repository.get_selected_story_event(recipe_instance_id)
+        brief_id, brief = self._repository.get_current_brief(project_id)
+        subjects = self._repository.list_subjects(project_id)
+        validate_story_inputs(brief, tuple(item.draft for item in subjects))
+        input_snapshot = {
+            "briefId": str(brief_id),
+            "brief": brief.model_dump(mode="json", by_alias=True),
+            "selectedEvent": event,
+            "subjects": [
+                {
+                    "subjectId": str(item.id),
+                    "revisionId": str(item.revision_id),
+                    **item.draft.model_dump(mode="json", by_alias=True),
+                }
+                for item in subjects
+            ],
+            "instruction": str(getattr(payload, "rewrite_instruction", "") or ""),
+        }
+        input_hash = _json_hash(input_snapshot)
+        event_id = uuid.UUID(str(event["id"]))
+        idempotency_key = (
+            getattr(payload, "idempotency_key", None)
+            or hashlib.sha256(f"{event_id}:story-script:{input_hash}".encode()).hexdigest()
+        )
+        attempt, created = self._repository.begin_generation_attempt(
+            project_id=project_id,
+            business_object_type="story_event_script",
+            business_object_id=event_id,
+            idempotency_key=idempotency_key,
+            provider=self._provider_name,
+            model=self._director.model,
+            request=input_snapshot,
+        )
+        if not created:
+            return attempt
+
+        attempt_id = str(attempt["id"])
+        try:
+            script, prompt_id = self._generate_script_from_event(
+                project_id=project_id,
+                event_id=event_id,
+                input_snapshot=input_snapshot,
+            )
+            score, critic_prompt_id = self._score_candidate(
+                project_id=project_id,
+                strategy=StoryStrategy.COMBINED,
+                candidate=script,
+                input_snapshot=input_snapshot,
+                parent_prompt_id=prompt_id,
+            )
+            stored = self._repository.save_story_candidate(
+                project_id=project_id,
+                brief_id=brief_id,
+                strategy=StoryStrategy.COMBINED,
+                candidate=script,
+                scorecard=score,
+                subject_ids=tuple(item.id for item in subjects),
+                subject_revision_ids=tuple(item.revision_id for item in subjects),
+                candidate_prompt_id=prompt_id,
+                critic_prompt_id=critic_prompt_id,
+                source_event_candidate_id=event_id,
+            )
+        except GatewayError as exc:
+            status = "submission_unknown" if exc.submission_unknown else "failed"
+            self._repository.finish_generation_attempt(
+                attempt_id,
+                status=status,
+                error={"code": exc.code, "message": str(exc), "retryable": exc.retryable},
+            )
+            raise
+        except Exception as exc:
+            self._repository.finish_generation_attempt(
+                attempt_id,
+                status="failed",
+                error={"code": "internal", "message": str(exc)},
+            )
+            raise
+        self._repository.finish_generation_attempt(
+            attempt_id,
+            status="succeeded",
+            response={"revisionId": str(stored["id"]), "sourceEventCandidateId": str(event_id)},
+        )
+        return {"id": attempt_id, "status": "succeeded", "story": stored}
+
     def run_story_strategies(
         self,
         project_id: uuid.UUID,
@@ -465,6 +678,206 @@ class AigcCanvasService:
             response={"candidateIds": [str(item["id"]) for item in candidates]},
         )
         return {"id": attempt_id, "status": "succeeded", "candidates": candidates}
+
+    def _generate_event_candidate(
+        self,
+        *,
+        project_id: uuid.UUID,
+        recipe_instance_id: uuid.UUID,
+        strategy: StoryStrategy,
+        input_snapshot: dict[str, Any],
+    ) -> tuple[StoryEventCandidateOutput, uuid.UUID]:
+        system_prompt = (
+            "你是一人一猫治愈短片的事件策划。这里只输出一个可供人选择的事件方向，"
+            "不要扩写文学化完整剧情。事件必须分别说明儿童主动行动、猫咪参与、小变化和"
+            "温暖收尾，并判断目标时长内是否可拍。固定儿童、固定猫咪和固定画风只作为"
+            "不可修改的IP约束；禁止对白，禁止把猫咪生成人形肢体。8至15秒只能使用一个场景，"
+            "更长视频只有在叙事必要时才能换场，每次换场必须说明目的。"
+        )
+        user_prompt = (
+            f"事件策略：{strategy.value}\n"
+            f"输入约束：{json.dumps(input_snapshot, ensure_ascii=False, sort_keys=True)}"
+        )
+        final_prompt = f"{system_prompt}\n\n{user_prompt}"
+        prompt_id, _step_id = self._repository.begin_prompt_run(
+            project_id=project_id,
+            draft=PromptRunDraft(
+                purpose="story_event_candidate",
+                nodeId=uuid.uuid5(project_id, f"story-event-planner:{strategy.value}"),
+                businessObjectType="recipe_story_event_batch",
+                businessObjectId=recipe_instance_id,
+                templateName=f"story.event.{strategy.value}.v1",
+                templateVersion="1.0.0",
+                systemPrompt=system_prompt,
+                userPrompt=user_prompt,
+                finalPrompt=final_prompt,
+                provider=self._provider_name,
+                model=self._director.model,
+                providerRequestSnapshot={
+                    "outputName": "StoryEventCandidateOutput",
+                    "schema": StoryEventCandidateOutput.model_json_schema(),
+                },
+                inputSnapshot=input_snapshot,
+            ),
+        )
+        try:
+            result = self._director.generate_structured(
+                prompt=final_prompt,
+                schema=StoryEventCandidateOutput.model_json_schema(),
+                output_name="StoryEventCandidateOutput",
+            )
+            candidate = StoryEventCandidateOutput.model_validate(result.payload)
+            validate_story_event_candidate(
+                candidate,
+                target_duration_seconds=int(input_snapshot["brief"]["targetDurationSeconds"]),
+            )
+        except Exception as exc:
+            self._repository.complete_prompt_run(
+                prompt_id,
+                status="failed",
+                error={"message": str(exc)},
+            )
+            raise
+        self._repository.complete_prompt_run(
+            prompt_id,
+            status="succeeded",
+            raw_response=result.payload,
+            structured_response=candidate.model_dump(mode="json", by_alias=True),
+            provider_response_id=result.response_id,
+            output_hash=_json_hash(result.payload),
+        )
+        return candidate, prompt_id
+
+    def _score_event_candidate(
+        self,
+        *,
+        project_id: uuid.UUID,
+        recipe_instance_id: uuid.UUID,
+        strategy: StoryStrategy,
+        candidate: StoryEventCandidateOutput,
+        input_snapshot: dict[str, Any],
+        parent_prompt_id: uuid.UUID,
+    ) -> tuple[StoryScorecard, uuid.UUID]:
+        candidate_document = candidate.model_dump(mode="json", by_alias=True)
+        system_prompt = (
+            "你是短片事件方案评审。按开头吸引力、因果完整性、儿童与猫咪必要性、"
+            "情绪弧线、可视化、时长适配、连续性和安全性逐项给出0到10分。"
+            "对无法在目标时长完成、无必要换场或猫咪行为违规的方案必须明确警告。"
+        )
+        user_prompt = (
+            f"原始输入：{json.dumps(input_snapshot, ensure_ascii=False, sort_keys=True)}\n"
+            f"事件方案：{json.dumps(candidate_document, ensure_ascii=False, sort_keys=True)}"
+        )
+        final_prompt = f"{system_prompt}\n\n{user_prompt}"
+        prompt_id, _step_id = self._repository.begin_prompt_run(
+            project_id=project_id,
+            draft=PromptRunDraft(
+                purpose="story_event_critic",
+                nodeId=uuid.uuid5(project_id, f"story-event-critic:{strategy.value}"),
+                businessObjectType="recipe_story_event_batch",
+                businessObjectId=recipe_instance_id,
+                parentRunId=parent_prompt_id,
+                templateName="story.event.critic.v1",
+                templateVersion="1.0.0",
+                systemPrompt=system_prompt,
+                userPrompt=user_prompt,
+                finalPrompt=final_prompt,
+                provider=self._provider_name,
+                model=self._director.model,
+                providerRequestSnapshot={
+                    "outputName": "StoryEventScorecard",
+                    "schema": StoryScorecard.model_json_schema(),
+                },
+                inputSnapshot={**input_snapshot, "candidate": candidate_document},
+            ),
+        )
+        try:
+            result = self._director.generate_structured(
+                prompt=final_prompt,
+                schema=StoryScorecard.model_json_schema(),
+                output_name="StoryEventScorecard",
+            )
+            score = StoryScorecard.model_validate(result.payload)
+        except Exception as exc:
+            self._repository.complete_prompt_run(
+                prompt_id,
+                status="failed",
+                error={"message": str(exc)},
+            )
+            raise
+        self._repository.complete_prompt_run(
+            prompt_id,
+            status="succeeded",
+            raw_response=result.payload,
+            structured_response=score.model_dump(mode="json", by_alias=True),
+            provider_response_id=result.response_id,
+            output_hash=_json_hash(result.payload),
+        )
+        return score, prompt_id
+
+    def _generate_script_from_event(
+        self,
+        *,
+        project_id: uuid.UUID,
+        event_id: uuid.UUID,
+        input_snapshot: dict[str, Any],
+    ) -> tuple[StoryCandidateOutput, uuid.UUID]:
+        system_prompt = (
+            "你是一人一猫治愈短片的剧情编剧。把已由人工选择的事件方案扩写为一个完整、"
+            "可编辑、可分镜的剧情脚本，不得改变事件方向。脚本必须形成开始、发展、小变化、"
+            "温暖收尾的因果链，明确儿童动作和猫咪反应；每个场景提供稳定sceneKey、叙事目的、"
+            "地点、室内外、时间天气、关键装饰、道具和必要换场原因。保持固定IP和无对白约束。"
+        )
+        user_prompt = json.dumps(input_snapshot, ensure_ascii=False, sort_keys=True)
+        final_prompt = f"{system_prompt}\n\n{user_prompt}"
+        prompt_id, _step_id = self._repository.begin_prompt_run(
+            project_id=project_id,
+            draft=PromptRunDraft(
+                purpose="story_script_expansion",
+                nodeId=uuid.uuid5(project_id, "story-script-expander"),
+                businessObjectType="story_event",
+                businessObjectId=event_id,
+                templateName="story.script.from_event.v1",
+                templateVersion="1.0.0",
+                systemPrompt=system_prompt,
+                userPrompt=user_prompt,
+                finalPrompt=final_prompt,
+                provider=self._provider_name,
+                model=self._director.model,
+                providerRequestSnapshot={
+                    "outputName": "StoryScriptOutput",
+                    "schema": StoryCandidateOutput.model_json_schema(),
+                },
+                inputSnapshot=input_snapshot,
+            ),
+        )
+        try:
+            result = self._director.generate_structured(
+                prompt=final_prompt,
+                schema=StoryCandidateOutput.model_json_schema(),
+                output_name="StoryScriptOutput",
+            )
+            script = StoryCandidateOutput.model_validate(result.payload)
+            validate_story_scene_plan(
+                script,
+                target_duration_seconds=int(input_snapshot["brief"]["targetDurationSeconds"]),
+            )
+        except Exception as exc:
+            self._repository.complete_prompt_run(
+                prompt_id,
+                status="failed",
+                error={"message": str(exc)},
+            )
+            raise
+        self._repository.complete_prompt_run(
+            prompt_id,
+            status="succeeded",
+            raw_response=result.payload,
+            structured_response=script.model_dump(mode="json", by_alias=True),
+            provider_response_id=result.response_id,
+            output_hash=_json_hash(result.payload),
+        )
+        return script, prompt_id
 
     def _generate_candidate(
         self,

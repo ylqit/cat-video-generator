@@ -27,6 +27,8 @@ from ...domain.aigc_canvas import (
     PromptRunDraft,
     StoryBrief,
     StoryCandidateOutput,
+    StoryEventCandidateOutput,
+    StoryEventCandidateStatus,
     StoryRevisionStatus,
     StoryScorecard,
     StoryStrategy,
@@ -41,6 +43,7 @@ from ...domain.production_recipes import (
     CANON_V3_PROFILE_ID,
     CANON_V3_STYLE_NEGATIVE,
     CANON_V3_STYLE_POSITIVE,
+    ProductionRecipeKey,
     VisualPresetKey,
     build_temporal_beats,
 )
@@ -78,6 +81,7 @@ from .models import (
     ShotCard,
     ShotSubjectState,
     StoryBriefRecord,
+    StoryEventCandidateRecord,
     StoryRevisionRecord,
     StoryScore,
     Subject,
@@ -1436,6 +1440,7 @@ class SqlAlchemyAigcCanvasRepository:
                 id=uuid.uuid4(),
                 production_run_id=project_id,
                 brief_id=values["brief_id"],
+                source_event_candidate_id=values.get("source_event_candidate_id"),
                 revision=revision,
                 strategy=(
                     values["strategy"].value
@@ -1472,6 +1477,103 @@ class SqlAlchemyAigcCanvasRepository:
             session.add(score)
             session.flush()
             return _story_json(row, score)
+
+    def save_story_event_candidate(self, **values: object) -> dict[str, Any]:
+        project_id = uuid.UUID(str(values["project_id"]))
+        recipe_instance_id = uuid.UUID(str(values["recipe_instance_id"]))
+        candidate = values["candidate"]
+        scorecard = values["scorecard"]
+        if not isinstance(candidate, StoryEventCandidateOutput) or not isinstance(
+            scorecard, StoryScorecard
+        ):
+            raise TypeError("event candidate and scorecard must use Canvas V2 contracts")
+        with self._sessions.begin() as session:
+            self._require_project(session, project_id, lock=True)
+            instance = self._required(
+                session, ProductionRecipeInstance, recipe_instance_id, lock=True
+            )
+            if instance.production_run_id != project_id:
+                raise WorkflowConflictError("事件方案与组合包不属于同一个项目")
+            batch_id = uuid.UUID(str(values["batch_id"]))
+            candidate_index = int(values["candidate_index"])
+            existing = session.scalar(
+                select(StoryEventCandidateRecord).where(
+                    StoryEventCandidateRecord.production_recipe_instance_id
+                    == recipe_instance_id,
+                    StoryEventCandidateRecord.batch_id == batch_id,
+                    StoryEventCandidateRecord.candidate_index == candidate_index,
+                )
+            )
+            if existing is not None:
+                return _story_event_json(existing)
+            row = StoryEventCandidateRecord(
+                id=uuid.uuid4(),
+                production_run_id=project_id,
+                production_recipe_instance_id=recipe_instance_id,
+                story_brief_id=uuid.UUID(str(values["brief_id"])),
+                batch_id=batch_id,
+                candidate_index=candidate_index,
+                revision=1,
+                strategy=(
+                    values["strategy"].value
+                    if isinstance(values["strategy"], StoryStrategy)
+                    else str(values["strategy"])
+                ),
+                status=StoryEventCandidateStatus.CANDIDATE.value,
+                title=candidate.title,
+                premise=candidate.premise,
+                child_action=candidate.child_action,
+                cat_participation=candidate.cat_participation,
+                small_change=candidate.small_change,
+                warm_ending=candidate.warm_ending,
+                suggested_scenes_json=[
+                    scene.model_dump(mode="json", by_alias=True)
+                    for scene in candidate.suggested_scenes
+                ],
+                duration_fit_summary=candidate.duration_fit_summary,
+                requires_scene_change=candidate.requires_scene_change,
+                cat_behavior_mode_suggestion=candidate.cat_behavior_mode_suggestion,
+                score_json={
+                    **scorecard.model_dump(mode="json", by_alias=True),
+                    "average": scorecard.average,
+                },
+                generation_prompt_id=uuid.UUID(str(values["generation_prompt_id"])),
+            )
+            session.add(row)
+            session.flush()
+            return _story_event_json(row)
+
+    def get_selected_story_event(self, recipe_instance_id: uuid.UUID) -> dict[str, Any]:
+        with self._sessions() as session:
+            instance = self._required(session, ProductionRecipeInstance, recipe_instance_id)
+            latest_candidate = session.scalar(
+                select(StoryEventCandidateRecord)
+                .where(
+                    StoryEventCandidateRecord.production_recipe_instance_id
+                    == recipe_instance_id
+                )
+                .order_by(StoryEventCandidateRecord.created_at.desc())
+                .limit(1)
+            )
+            if latest_candidate is None:
+                raise WorkflowConflictError("事件方案尚未生成")
+            row = session.scalar(
+                select(StoryEventCandidateRecord)
+                .where(
+                    StoryEventCandidateRecord.production_recipe_instance_id
+                    == recipe_instance_id,
+                    StoryEventCandidateRecord.batch_id == latest_candidate.batch_id,
+                    StoryEventCandidateRecord.status
+                    == StoryEventCandidateStatus.SELECTED.value,
+                )
+                .order_by(StoryEventCandidateRecord.selected_at.desc())
+                .limit(1)
+            )
+            if row is None:
+                raise WorkflowConflictError("请先人工选择一个事件方案，再扩写剧情脚本")
+            if row.production_run_id != instance.production_run_id:
+                raise WorkflowConflictError("所选事件方案不属于当前组合包")
+            return _story_event_json(row)
 
     def approve_story_revision(self, revision_id: uuid.UUID) -> dict[str, Any]:
         with self._sessions.begin() as session:
@@ -3760,6 +3862,15 @@ class SqlAlchemyAigcCanvasRepository:
     def delete_canvas_edge(self, edge_id: uuid.UUID) -> dict[str, Any]:
         with self._sessions.begin() as session:
             edge = self._required(session, CanvasGraphEdge, edge_id, lock=True)
+            disconnect_enabled, disabled_reason = _edge_disconnect_policy(
+                source_port=edge.source_port,
+                target_port=edge.target_port,
+                relation_type=edge.relation_type,
+            )
+            if not disconnect_enabled:
+                raise WorkflowConflictError(
+                    disabled_reason or "该连接由系统工作流管理，不能直接剪断"
+                )
             target = self._required(session, CanvasGraphNode, edge.target_node_id, lock=True)
             project_id = edge.production_run_id
             target.status = "stale"
@@ -4301,6 +4412,16 @@ class SqlAlchemyAigcCanvasRepository:
                     .order_by(StoryRevisionRecord.revision)
                 )
             )
+            story_events = list(
+                session.scalars(
+                    select(StoryEventCandidateRecord)
+                    .where(StoryEventCandidateRecord.production_run_id == project_id)
+                    .order_by(
+                        StoryEventCandidateRecord.created_at,
+                        StoryEventCandidateRecord.candidate_index,
+                    )
+                )
+            )
             scenes = list(
                 session.scalars(
                     select(Scene)
@@ -4323,11 +4444,20 @@ class SqlAlchemyAigcCanvasRepository:
                     .order_by(Scene.sort_order, ShotBeat.sort_order)
                 )
             )
+            workflow_steps = list(
+                session.scalars(
+                    select(WorkflowStep)
+                    .where(WorkflowStep.production_run_id == project_id)
+                    .order_by(WorkflowStep.created_at.desc(), WorkflowStep.id.desc())
+                    .limit(300)
+                )
+            )
             result = _canvas_json(
                 project_id,
                 layout=layout,
                 brief=brief,
                 subjects=subjects,
+                story_events=story_events,
                 stories=stories,
                 scenes=scenes,
                 beats=beats,
@@ -4408,6 +4538,15 @@ class SqlAlchemyAigcCanvasRepository:
                 groups=groups,
                 members=group_members,
                 states=group_states,
+            )
+            _apply_canvas_workflow_step_projection(result, workflow_steps)
+            _apply_canvas_layout_hints(
+                result,
+                positioned_node_ids={
+                    str(item.get("nodeId"))
+                    for item in (layout.nodes_json if layout else [])
+                    if item.get("nodeId")
+                },
             )
             active_archive_ids = {
                 str(node_id)
@@ -5385,7 +5524,66 @@ def _canvas_node_contract(
             ),
         ],
         "StoryPlannerNode": [
-            _canvas_action("generate_stories", "生成三案", execution="provider"),
+            _canvas_action(
+                (
+                    "generate_event_candidates"
+                    if data.get("objectType") == "story_event_planner"
+                    else "generate_stories"
+                ),
+                (
+                    "生成三个事件方案"
+                    if data.get("objectType") == "story_event_planner"
+                    else "生成三案"
+                ),
+                execution="provider",
+            ),
+        ],
+        "StoryEventNode": [
+            _canvas_action(
+                "select_story_event",
+                "已选择" if status == StoryEventCandidateStatus.SELECTED.value else "选择这个事件",
+                enabled=(
+                    status != StoryEventCandidateStatus.SELECTED.value
+                    and not bool(data.get("isHistoryBranch"))
+                ),
+                disabled_reason=(
+                    "该事件已经选中"
+                    if status == StoryEventCandidateStatus.SELECTED.value
+                    else "该事件属于历史生成批次，需重新生成或选择当前批次事件"
+                    if data.get("isHistoryBranch")
+                    else None
+                ),
+            ),
+        ],
+        "StoryScriptNode": [
+            _canvas_action(
+                (
+                    "expand_story_script"
+                    if data.get("objectType") == "story_script_expander"
+                    else "review_story_script"
+                ),
+                (
+                    "扩写完整剧情脚本"
+                    if data.get("objectType") == "story_script_expander"
+                    else ("剧情脚本已批准" if status == "approved" else "编辑并审核剧情脚本")
+                ),
+                enabled=(
+                    bool(data.get("selectedEventId"))
+                    if data.get("objectType") == "story_script_expander"
+                    else status != "approved"
+                ),
+                execution=(
+                    "provider" if data.get("objectType") == "story_script_expander" else "client"
+                ),
+                disabled_reason=(
+                    "请先选择一个事件方案"
+                    if data.get("objectType") == "story_script_expander"
+                    and not data.get("selectedEventId")
+                    else "该剧情脚本已经人工批准"
+                    if status == "approved"
+                    else None
+                ),
+            ),
         ],
         "StoryCandidateNode": [
             _canvas_action(
@@ -5399,22 +5597,36 @@ def _canvas_node_contract(
         "ApprovalGateNode": [
             _canvas_action(
                 (
-                    "review_creative"
-                    if data.get("phase") == "creative"
+                    "select_story_event"
+                    if data.get("objectType") == "story_event_selection"
                     else (
-                        "review_character_design"
-                        if data.get("phase") == "character_design"
-                        else "review_story"
+                        "review_creative"
+                        if data.get("phase") == "creative"
+                        else (
+                            "review_character_design"
+                            if data.get("phase") == "character_design"
+                            else "review_story"
+                        )
                     )
                 ),
                 (
-                    "审核创意简报"
-                    if data.get("phase") == "creative"
+                    "在事件卡中选择一个方案"
+                    if data.get("objectType") == "story_event_selection"
                     else (
-                        "审核角色设计"
-                        if data.get("phase") == "character_design"
-                        else "选择并审核故事"
+                        "审核创意简报"
+                        if data.get("phase") == "creative"
+                        else (
+                            "审核角色设计"
+                            if data.get("phase") == "character_design"
+                            else "审核剧情脚本"
+                        )
                     )
+                ),
+                enabled=data.get("objectType") != "story_event_selection",
+                disabled_reason=(
+                    "请直接打开一个事件方案卡并选择"
+                    if data.get("objectType") == "story_event_selection"
+                    else None
                 ),
             )
         ],
@@ -5489,11 +5701,33 @@ def _canvas_node_contract(
                 disabled_reason="该节点尚未配置可执行处理器",
             )
         ]
+    operation_keys = [
+        str(action["key"])
+        for action in actions
+        if action.get("key") not in {"unavailable", "archive_node", "restore_node"}
+    ]
     return {
         "availableActions": actions,
         "executionScope": {
-            "kind": "canvas_node",
+            "kind": "business_object" if data.get("businessObjectId") else "canvas_node",
             "objectType": str(data.get("objectType") or node_type),
+            "recipeInstanceId": data.get("recipeInstanceId"),
+            "canvasGroupId": data.get("canvasGroupId"),
+            "businessObjectId": data.get("businessObjectId"),
+            "sceneId": data.get("sceneId"),
+            "shotId": data.get("shotId"),
+            "operationKeys": operation_keys,
+            "phases": [str(data["phase"])] if data.get("phase") else [],
+            "includeChildTasks": node_type
+            in {
+                "StoryPlannerNode",
+                "StoryScriptNode",
+                "CharacterDesignNode",
+                "StoryboardDirectorNode",
+                "ImageGenerationNode",
+                "VideoGenerationNode",
+                "TimelineNode",
+            },
         },
         "workflowSteps": list(data.get("workflowSteps") or []),
         "blocker": data.get("blocker"),
@@ -5598,6 +5832,11 @@ def _graph_edge_json(
     source: CanvasGraphNode,
     target: CanvasGraphNode,
 ) -> dict[str, Any]:
+    disconnect_enabled, disabled_reason = _edge_disconnect_policy(
+        source_port=row.source_port,
+        target_port=row.target_port,
+        relation_type=row.relation_type,
+    )
     return {
         "id": str(row.id),
         "sourceNodeId": str(row.source_node_id),
@@ -5608,7 +5847,61 @@ def _graph_edge_json(
         "targetPort": row.target_port,
         "relationType": row.relation_type,
         "revision": row.revision,
+        "systemManaged": not disconnect_enabled,
+        "availableActions": [
+            {
+                "key": "disconnect_edge",
+                "label": "剪断连接",
+                "enabled": disconnect_enabled,
+                "disabledReason": disabled_reason,
+            }
+        ],
     }
+
+
+_SYSTEM_MANAGED_EDGE_RELATIONS = {
+    "anchor_to_video",
+    "approved_design",
+    "approved_input",
+    "approved_story",
+    "canon_identity_reference",
+    "creative_review",
+    "design_review",
+    "identity_source",
+    "story_subject",
+    "storyboard_to_anchor",
+    "style_source",
+    "video_review",
+    "video_to_sequence",
+    "visual_preset_reference",
+}
+
+
+def _edge_disconnect_policy(
+    *,
+    source_port: str,
+    target_port: str,
+    relation_type: str,
+) -> tuple[bool, str | None]:
+    """Return the authoritative disconnect capability for persisted graph edges."""
+
+    if relation_type in _SYSTEM_MANAGED_EDGE_RELATIONS:
+        if relation_type in {"canon_identity_reference", "identity_source"}:
+            return False, "该连线由 Canon 身份规则派生，需修改视觉档案，不能直接剪断"
+        if relation_type in {"style_source", "visual_preset_reference"}:
+            return False, "该连线由固定画风预设派生，需修改本集视觉档案，不能直接剪断"
+        if relation_type in {"creative_review", "design_review", "video_review"}:
+            return False, "该连线属于人工审核门，不能绕过审核流程直接剪断"
+        return False, "该连线属于一人一猫六阶段主流程，不能直接剪断"
+    editable_ports = {
+        CanvasPortType.IMAGE_REFERENCES.value,
+        CanvasPortType.MEDIA_REFERENCES.value,
+        CanvasPortType.IMAGE_ASSET.value,
+        CanvasPortType.IMAGE_ASSETS.value,
+    }
+    if source_port in editable_ports or target_port in editable_ports:
+        return True, None
+    return False, "该连接承担业务血缘，不支持从画布直接剪断"
 
 
 def _generation_batch_json(session: Session, row: MediaGenerationBatch) -> dict[str, Any]:
@@ -5911,6 +6204,166 @@ def _merge_canvas_groups(
             }
         )
     canvas["groups"] = projected_groups
+
+
+_CANVAS_LAYOUT_LANE_ORDER = {
+    "canon": 0,
+    "creative": 1,
+    "story": 2,
+    "character_scene": 3,
+    "storyboard": 4,
+    "render": 5,
+    "export": 6,
+}
+
+
+def _canvas_node_layout_hint(
+    node: dict[str, Any],
+    *,
+    positioned: bool,
+) -> dict[str, Any]:
+    """Assign one semantic lane and stable item order to every projected node."""
+
+    node_type = str(node.get("type") or "")
+    object_type = str(node.get("objectType") or "")
+    data = dict(node.get("data") or {})
+    phase = str(data.get("phase") or "")
+    lane = "render"
+    item_order = int(data.get("order") or data.get("sortOrder") or 0)
+    stack_key: str | None = None
+
+    if node_type == CanvasNodeType.SUBJECT.value:
+        lane = "canon"
+        role = str(data.get("role") or "")
+        item_order = {"protagonist": 0, "co_protagonist": 1}.get(role, 10)
+        stack_key = "canon_identity"
+    elif node_type == CanvasNodeType.STYLE_PRESET.value:
+        lane, item_order, stack_key = "canon", 2, "canon_style"
+    elif node_type == CanvasNodeType.BRIEF.value:
+        lane, item_order = "creative", 0
+    elif node_type == CanvasNodeType.STORY_PLANNER.value:
+        lane, item_order = "story", 0
+    elif node_type == CanvasNodeType.STORY_EVENT.value:
+        lane = "story"
+        item_order = 10 + int(data.get("candidateIndex") or 0)
+        if data.get("isHistoryBranch"):
+            item_order += 20
+        stack_key = "story_events"
+    elif node_type == CanvasNodeType.STORY_SCRIPT.value:
+        lane = "story"
+        if object_type == "story_script_expander":
+            item_order = 60
+        else:
+            item_order = 70 + int(data.get("revision") or 0)
+            stack_key = "story_scripts"
+    elif node_type == CanvasNodeType.STORY_CANDIDATE.value:
+        lane = "story"
+        item_order = 70 + int(data.get("revision") or 0)
+        stack_key = "legacy_story_candidates"
+    elif node_type == CanvasNodeType.STORY_CRITIC.value:
+        lane, item_order = "story", 70
+    elif node_type == CanvasNodeType.APPROVAL_GATE.value:
+        if phase == "creative" or "creative" in object_type:
+            lane, item_order = "creative", 90
+        elif object_type == "story_event_selection":
+            lane, item_order = "story", 50
+        elif phase == "character_design" or "character_design" in object_type:
+            lane, item_order = "character_scene", 90
+        elif phase == "storyboard" or "storyboard" in object_type:
+            lane, item_order = "storyboard", 90
+        elif phase in {"export", "complete"} or "final" in object_type:
+            lane, item_order = "export", 90
+        else:
+            lane, item_order = "story", 90
+    elif node_type == CanvasNodeType.CHARACTER_DESIGN.value:
+        lane = "character_scene"
+        item_order = {"child": 0, "cat": 10, "pair_scale": 20}.get(
+            str(data.get("slot") or ""), 30
+        )
+        stack_key = "character_design"
+    elif node_type == CanvasNodeType.SCENE.value:
+        lane = "character_scene"
+        item_order = 40 + int(data.get("order") or 0)
+        stack_key = "story_scenes"
+    elif node_type == CanvasNodeType.STORYBOARD_DIRECTOR.value:
+        lane, item_order = "storyboard", 0
+    elif node_type == CanvasNodeType.SHOT_BEAT.value:
+        lane = "storyboard"
+        item_order = 10 + int(data.get("order") or 0)
+        stack_key = "shot_beats"
+    elif node_type == CanvasNodeType.PROMPT_ARTIFACT.value:
+        lane, item_order = "storyboard", 80
+    elif node_type in {
+        CanvasNodeType.IMAGE_GENERATION.value,
+        CanvasNodeType.GENERATION_BATCH.value,
+    }:
+        lane, item_order = "render", 0
+    elif node_type in {CanvasNodeType.IMAGE_ASSET.value, CanvasNodeType.REFERENCE_ASSET.value}:
+        lane = "render"
+        item_order = 20 + int(data.get("order") or 0)
+        stack_key = "render_images"
+    elif node_type == CanvasNodeType.VIDEO_GENERATION.value:
+        lane, item_order = "render", 100
+    elif node_type in {
+        CanvasNodeType.VIDEO_ASSET.value,
+        CanvasNodeType.VIDEO_EDIT.value,
+        CanvasNodeType.VIDEO_SEGMENT.value,
+    }:
+        lane = "render"
+        item_order = 120 + int(data.get("order") or 0)
+        stack_key = "render_videos"
+    elif node_type == CanvasNodeType.REVIEW.value:
+        if phase == "character_design":
+            lane, item_order = "character_scene", 90
+        elif phase == "storyboard":
+            lane, item_order = "storyboard", 90
+        elif phase in {"export", "complete"} or "final" in object_type:
+            lane, item_order = "export", 90
+        else:
+            lane, item_order = "render", 190
+    elif node_type in {CanvasNodeType.TIMELINE.value, CanvasNodeType.AUDIO_GENERATION.value}:
+        lane, item_order = "export", 0
+    elif phase in _CANVAS_LAYOUT_LANE_ORDER:
+        lane = "character_scene" if phase == "character_design" else phase
+
+    hint: dict[str, Any] = {
+        "lane": lane,
+        "laneOrder": _CANVAS_LAYOUT_LANE_ORDER[lane],
+        "itemOrder": item_order,
+        "positioned": positioned,
+    }
+    if stack_key:
+        hint["stackKey"] = stack_key
+    return hint
+
+
+def _apply_canvas_layout_hints(
+    canvas: dict[str, Any],
+    *,
+    positioned_node_ids: set[str],
+) -> None:
+    """Publish layout semantics and give only unpositioned nodes deterministic defaults."""
+
+    nodes = list(canvas.get("nodes", []))
+    for node in nodes:
+        node["layoutHint"] = _canvas_node_layout_hint(
+            node,
+            positioned=str(node["id"]) in positioned_node_ids,
+        )
+    lane_rows: dict[int, int] = {}
+    for node in sorted(
+        nodes,
+        key=lambda item: (
+            int(item["layoutHint"]["laneOrder"]),
+            int(item["layoutHint"]["itemOrder"]),
+            str(item["id"]),
+        ),
+    ):
+        lane_order = int(node["layoutHint"]["laneOrder"])
+        row = lane_rows.get(lane_order, 0)
+        lane_rows[lane_order] = row + 1
+        if str(node["id"]) not in positioned_node_ids:
+            node["position"] = {"x": 90 + lane_order * 430, "y": 110 + row * 250}
 
 
 def _recipe_canvas_group_state(
@@ -6473,6 +6926,11 @@ def _story_json(row: StoryRevisionRecord, score: StoryScore | None) -> dict[str,
         "id": str(row.id),
         "projectId": str(row.production_run_id),
         "briefId": None if row.brief_id is None else str(row.brief_id),
+        "sourceEventCandidateId": (
+            None
+            if row.source_event_candidate_id is None
+            else str(row.source_event_candidate_id)
+        ),
         "revision": row.revision,
         "strategy": row.strategy,
         "status": row.status,
@@ -6497,6 +6955,36 @@ def _story_json(row: StoryRevisionRecord, score: StoryScore | None) -> dict[str,
             }
         ),
         "approvedAt": None if row.approved_at is None else row.approved_at.isoformat(),
+    }
+
+
+def _story_event_json(row: StoryEventCandidateRecord) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "projectId": str(row.production_run_id),
+        "recipeInstanceId": str(row.production_recipe_instance_id),
+        "storyBriefId": str(row.story_brief_id),
+        "batchId": str(row.batch_id),
+        "candidateIndex": row.candidate_index,
+        "revision": row.revision,
+        "strategy": row.strategy,
+        "status": row.status,
+        "title": row.title,
+        "premise": row.premise,
+        "childAction": row.child_action,
+        "catParticipation": row.cat_participation,
+        "smallChange": row.small_change,
+        "warmEnding": row.warm_ending,
+        "suggestedScenes": row.suggested_scenes_json,
+        "durationFitSummary": row.duration_fit_summary,
+        "requiresSceneChange": row.requires_scene_change,
+        "catBehaviorModeSuggestion": row.cat_behavior_mode_suggestion,
+        "scorecard": row.score_json,
+        "generationPromptId": (
+            None if row.generation_prompt_id is None else str(row.generation_prompt_id)
+        ),
+        "selectedAt": None if row.selected_at is None else row.selected_at.isoformat(),
+        "createdAt": row.created_at.isoformat(),
     }
 
 
@@ -6608,6 +7096,7 @@ def _canvas_json(
     layout: CanvasLayout | None,
     brief: StoryBriefRecord | None,
     subjects: list[Subject],
+    story_events: list[StoryEventCandidateRecord],
     stories: list[StoryRevisionRecord],
     scenes: list[Scene],
     beats: list[ShotBeat],
@@ -6616,10 +7105,53 @@ def _canvas_json(
     include_narrative_projection: bool = True,
 ) -> dict[str, Any]:
     planner_id = uuid.uuid5(project_id, "story-planner")
+    event_selection_id = uuid.uuid5(project_id, "story-event-selection")
+    script_expander_id = uuid.uuid5(project_id, "story-script-expander")
     approval_id = uuid.uuid5(project_id, "story-approval")
     storyboard_id = uuid.uuid5(project_id, "storyboard-director")
+    recipe_instance = session.scalar(
+        select(ProductionRecipeInstance).where(
+            ProductionRecipeInstance.production_run_id == project_id,
+            ProductionRecipeInstance.lifecycle_status == "active",
+        )
+    )
+    recipe_instance_id = None if recipe_instance is None else str(recipe_instance.id)
+    uses_event_story_flow = bool(
+        recipe_instance is not None
+        and recipe_instance.recipe_key == ProductionRecipeKey.HEALING_CHILD_CAT_V1.value
+    )
+    latest_event_batch_id = story_events[-1].batch_id if story_events else None
+    current_story_events = [
+        event for event in story_events if event.batch_id == latest_event_batch_id
+    ]
+    selected_story_event = next(
+        (
+            event
+            for event in current_story_events
+            if event.status == StoryEventCandidateStatus.SELECTED.value
+        ),
+        None,
+    )
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
+    subject_revisions = {
+        subject.id: (
+            None
+            if subject.current_revision_id is None
+            else session.get(SubjectRevision, subject.current_revision_id)
+        )
+        for subject in subjects
+    }
+    planner_canon_dependencies = [
+        {
+            "subjectId": str(subject.id),
+            "name": revision.name,
+            "role": subject.role,
+            "status": subject.status,
+        }
+        for subject in subjects
+        if (revision := subject_revisions.get(subject.id)) is not None
+    ]
     if brief is not None:
         nodes.append(
             {
@@ -6636,16 +7168,83 @@ def _canvas_json(
                 {
                     "id": str(planner_id),
                     "type": "StoryPlannerNode",
-                    "objectType": "story_planner",
+                    "objectType": (
+                        "story_event_planner" if uses_event_story_flow else "story_planner"
+                    ),
                     "objectId": str(project_id),
-                    "data": {"title": "三案故事策划"},
+                    "data": {
+                        "title": (
+                            "生成三个事件方案" if uses_event_story_flow else "三案故事策划"
+                        ),
+                        "phase": "story",
+                        "recipeInstanceId": recipe_instance_id,
+                        "briefSummary": None if brief is None else brief.theme,
+                        "canonDependencies": planner_canon_dependencies,
+                        "candidateCount": 3,
+                        "storyWorkflowStep": 1 if not current_story_events else 2,
+                        "storyWorkflowTotalSteps": 4,
+                        "candidateRules": [
+                            "儿童主动参与一个低压力日常事件",
+                            "猫咪以锁定的行为模式参与",
+                            "包含小变化并以温暖画面收尾",
+                        ],
+                    },
                 },
+                *(
+                    (
+                        {
+                            "id": str(event_selection_id),
+                            "type": "ApprovalGateNode",
+                            "objectType": "story_event_selection",
+                            "objectId": str(project_id),
+                            "data": {
+                                "title": "选择一个事件方案",
+                                "phase": "story",
+                                "recipeInstanceId": recipe_instance_id,
+                                "candidateCount": len(current_story_events),
+                                "selectedEventId": (
+                                    None
+                                    if selected_story_event is None
+                                    else str(selected_story_event.id)
+                                ),
+                                "storyWorkflowStep": 2,
+                                "storyWorkflowTotalSteps": 4,
+                            },
+                        },
+                        {
+                            "id": str(script_expander_id),
+                            "type": "StoryScriptNode",
+                            "objectType": "story_script_expander",
+                            "objectId": str(project_id),
+                            "data": {
+                                "title": "扩写完整剧情脚本",
+                                "phase": "story",
+                                "recipeInstanceId": recipe_instance_id,
+                                "selectedEventId": (
+                                    None
+                                    if selected_story_event is None
+                                    else str(selected_story_event.id)
+                                ),
+                                "storyWorkflowStep": 3,
+                                "storyWorkflowTotalSteps": 4,
+                            },
+                        },
+                    )
+                    if uses_event_story_flow
+                    else ()
+                ),
                 {
                     "id": str(approval_id),
                     "type": "ApprovalGateNode",
                     "objectType": "story_approval",
                     "objectId": str(project_id),
-                    "data": {"title": "人工故事定稿"},
+                    "data": {
+                        "title": "人工剧情脚本定稿",
+                        "phase": "story",
+                        "recipeInstanceId": recipe_instance_id,
+                        "storyWorkflowStep": 4,
+                        "storyWorkflowTotalSteps": 4,
+                    },
                 },
                 {
                     "id": str(storyboard_id),
@@ -6654,6 +7253,8 @@ def _canvas_json(
                     "objectId": str(project_id),
                     "data": {
                         "title": "分镜编译",
+                        "phase": "storyboard",
+                        "recipeInstanceId": recipe_instance_id,
                         "shotCount": len(beats),
                         "storyboardApproved": bool(beats)
                         and all(
@@ -6667,11 +7268,7 @@ def _canvas_json(
     if brief is not None:
         edges.append(_edge(brief.id, "BriefNode", "brief", planner_id, "StoryPlannerNode", "brief"))
     for subject in subjects:
-        revision = (
-            None
-            if subject.current_revision_id is None
-            else session.get(SubjectRevision, subject.current_revision_id)
-        )
+        revision = subject_revisions.get(subject.id)
         if revision is None:
             continue
         references = tuple(
@@ -6699,37 +7296,136 @@ def _canvas_json(
                     "subject[]",
                 )
             )
+    if uses_event_story_flow:
+        for event in story_events:
+            event_data = {
+                **_story_event_json(event),
+                "phase": "story",
+                "isCurrentBatch": event.batch_id == latest_event_batch_id,
+                "isHistoryBranch": event.batch_id != latest_event_batch_id
+                or event.status == StoryEventCandidateStatus.SUPERSEDED.value,
+            }
+            nodes.append(
+                {
+                    "id": str(event.id),
+                    "type": "StoryEventNode",
+                    "objectType": "story_event",
+                    "objectId": str(event.id),
+                    "status": event.status,
+                    "data": event_data,
+                }
+            )
+            edges.append(
+                _edge(
+                    planner_id,
+                    "StoryPlannerNode",
+                    "story_event",
+                    event.id,
+                    "StoryEventNode",
+                    "story_event",
+                )
+            )
+            if event.batch_id == latest_event_batch_id:
+                edges.append(
+                    _edge(
+                        event.id,
+                        "StoryEventNode",
+                        "story_event",
+                        event_selection_id,
+                        "ApprovalGateNode",
+                        "story_event",
+                    )
+                )
+        if selected_story_event is not None:
+            edges.append(
+                _edge(
+                    event_selection_id,
+                    "ApprovalGateNode",
+                    "story_event",
+                    script_expander_id,
+                    "StoryScriptNode",
+                    "story_event",
+                )
+            )
     for story in stories:
         score = session.scalar(select(StoryScore).where(StoryScore.story_revision_id == story.id))
+        is_event_script = story.source_event_candidate_id is not None
+        story_node_type = "StoryScriptNode" if is_event_script else "StoryCandidateNode"
+        story_data = {
+            **_story_json(story, score),
+            "phase": "story",
+            "recipeInstanceId": recipe_instance_id,
+            "legacyCompatibility": uses_event_story_flow and not is_event_script,
+        }
+        if uses_event_story_flow and not is_event_script:
+            story_data["artifactLabel"] = "旧版剧情直出"
         nodes.append(
             {
                 "id": str(story.id),
-                "type": "StoryCandidateNode",
+                "type": story_node_type,
                 "objectType": "story_revision",
                 "objectId": str(story.id),
-                "data": _story_json(story, score),
+                "status": story.status,
+                "data": story_data,
             }
         )
-        edges.append(
-            _edge(
-                planner_id,
-                "StoryPlannerNode",
-                "story_revision",
-                story.id,
-                "StoryCandidateNode",
-                "story_revision",
+        if is_event_script:
+            if story.source_event_candidate_id is not None:
+                edges.append(
+                    _edge(
+                        story.source_event_candidate_id,
+                        "StoryEventNode",
+                        "story_event",
+                        story.id,
+                        story_node_type,
+                        "story_event",
+                    )
+                )
+            if (
+                selected_story_event is not None
+                and story.source_event_candidate_id == selected_story_event.id
+            ):
+                edges.extend(
+                    (
+                        _edge(
+                            script_expander_id,
+                            "StoryScriptNode",
+                            "story_revision",
+                            story.id,
+                            story_node_type,
+                            "story_revision",
+                        ),
+                        _edge(
+                            story.id,
+                            story_node_type,
+                            "story_revision",
+                            approval_id,
+                            "ApprovalGateNode",
+                            "story_revision",
+                        ),
+                    )
+                )
+        else:
+            edges.extend(
+                (
+                    _edge(
+                        planner_id,
+                        "StoryPlannerNode",
+                        "story_revision",
+                        story.id,
+                        story_node_type,
+                        "story_revision",
+                    ),
+                    _edge(
+                        story.id,
+                        story_node_type,
+                        "story_revision",
+                        approval_id,
+                        "ApprovalGateNode",
+                        "story_revision",
+                    ),
+                )
             )
-        )
-        edges.append(
-            _edge(
-                story.id,
-                "StoryCandidateNode",
-                "story_revision",
-                approval_id,
-                "ApprovalGateNode",
-                "story_revision",
-            )
-        )
         if story.status == StoryRevisionStatus.APPROVED.value:
             edges.append(
                 _edge(
@@ -6784,10 +7480,15 @@ def _canvas_json(
             }
         )
         if approved_story is not None:
+            approved_story_type = (
+                "StoryScriptNode"
+                if approved_story.source_event_candidate_id is not None
+                else "StoryCandidateNode"
+            )
             edges.append(
                 _edge(
                     approved_story.id,
-                    "StoryCandidateNode",
+                    approved_story_type,
                     "scene_plan",
                     scene.id,
                     "SceneNode",
@@ -6823,11 +7524,13 @@ def _canvas_json(
         "BriefNode": 0,
         "SubjectNode": 0,
         "StoryPlannerNode": 1,
-        "StoryCandidateNode": 2,
-        "ApprovalGateNode": 3,
-        "StoryboardDirectorNode": 4,
-        "SceneNode": 5,
-        "ShotBeatNode": 6,
+        "StoryEventNode": 2,
+        "StoryScriptNode": 3,
+        "StoryCandidateNode": 3,
+        "ApprovalGateNode": 4,
+        "StoryboardDirectorNode": 5,
+        "SceneNode": 6,
+        "ShotBeatNode": 7,
     }
     row_by_stage: dict[int, int] = {}
     for node in nodes:
@@ -6840,6 +7543,10 @@ def _canvas_json(
             if stored is not None
             else {"x": 80 + stage * 320, "y": 80 + row * 220}
         )
+        node["data"].setdefault("objectType", node.get("objectType") or node["type"])
+        node["data"].setdefault("businessObjectId", node.get("objectId"))
+        if recipe_instance_id is not None:
+            node["data"].setdefault("recipeInstanceId", recipe_instance_id)
         node.update(
             _canvas_node_contract(
                 str(node["type"]),
@@ -6886,6 +7593,99 @@ def _canvas_json(
     }
 
 
+def _apply_canvas_workflow_step_projection(
+    canvas: dict[str, Any],
+    workflow_steps: list[WorkflowStep],
+) -> None:
+    """Project durable workflow state onto the exact canvas node that owns it."""
+
+    for node in canvas.get("nodes", []):
+        scope = node.get("executionScope") or {}
+        node_id = str(node.get("id") or "")
+        business_object_id = str(scope.get("businessObjectId") or "")
+        scene_id = str(scope.get("sceneId") or "")
+        shot_id = str(scope.get("shotId") or "")
+        recipe_instance_id = str(scope.get("recipeInstanceId") or "")
+        canvas_group_id = str(scope.get("canvasGroupId") or "")
+        operation_keys = set(scope.get("operationKeys") or [])
+        phases = set(scope.get("phases") or [])
+
+        matched: list[WorkflowStep] = []
+        for step in workflow_steps:
+            snapshot = dict(step.input_snapshot_json or {})
+            task_node_id = str(snapshot.get("canvasNodeId") or "")
+            task_business_object_id = str(snapshot.get("businessObjectId") or "")
+            task_scene_id = str(step.scene_id or snapshot.get("sceneId") or "")
+            task_shot_id = str(step.shot_card_id or snapshot.get("shotId") or "")
+
+            if task_node_id and node_id:
+                step_matches = task_node_id == node_id
+            elif task_business_object_id and business_object_id:
+                step_matches = task_business_object_id == business_object_id
+            elif task_scene_id and scene_id:
+                step_matches = task_scene_id == scene_id
+            elif task_shot_id and shot_id:
+                step_matches = task_shot_id == shot_id
+            else:
+                task_phase = snapshot.get("phase") or snapshot.get("workflowStage")
+                operation_matches = step.operation_key in operation_keys
+                phase_matches = not phases or task_phase in phases
+                recipe_matches = bool(
+                    recipe_instance_id
+                    and snapshot.get("recipeInstanceId") == recipe_instance_id
+                )
+                group_matches = bool(
+                    canvas_group_id
+                    and snapshot.get("canvasGroupId") == canvas_group_id
+                )
+                step_matches = bool(
+                    operation_matches
+                    and phase_matches
+                    and (recipe_matches or group_matches)
+                )
+
+            if step_matches:
+                matched.append(step)
+
+        if not matched:
+            continue
+
+        projected_steps: list[dict[str, Any]] = []
+        for step in matched[:20]:
+            progress = dict(step.progress_json or {})
+            message = str(progress.get("message") or step.operation_key)
+            percent = progress.get("percent")
+            detail = message if percent is None else f"{message} · {percent}%"
+            projected_steps.append(
+                {
+                    "key": str(step.id),
+                    "label": _canvas_workflow_operation_label(step.operation_key),
+                    "status": step.status,
+                    "detail": detail,
+                }
+            )
+        node["workflowSteps"] = projected_steps
+
+        latest = matched[0]
+        latest_progress = dict(latest.progress_json or {})
+        result_summary = latest_progress.get("resultSummary")
+        if isinstance(result_summary, dict):
+            node["outputs"] = [result_summary]
+
+
+def _canvas_workflow_operation_label(operation_key: str) -> str:
+    return {
+        "recipe:story_events": "生成三个事件方案",
+        "recipe:story_script": "扩写剧情脚本",
+        "recipe:creative_brief": "补全创意简报",
+        "recipe:character_design": "生成本集角色造型",
+        "recipe:storyboard": "生成文本分镜",
+        "recipe:anchor": "生成视觉锚点",
+        "recipe:video": "生成逐镜视频",
+        "recipe:sequence": "合成最终音画",
+    }.get(operation_key, operation_key)
+
+
 def _edge(
     source_id: uuid.UUID,
     source_type: str,
@@ -6893,7 +7693,7 @@ def _edge(
     target_id: uuid.UUID,
     target_type: str,
     target_port: str,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     return {
         "id": str(uuid.uuid5(source_id, f"{source_port}:{target_id}:{target_port}")),
         "sourceNodeId": str(source_id),
@@ -6902,4 +7702,15 @@ def _edge(
         "targetNodeId": str(target_id),
         "targetNodeType": target_type,
         "targetPort": target_port,
+        "relationType": "derived_flow",
+        "revision": 1,
+        "systemManaged": True,
+        "availableActions": [
+            {
+                "key": "disconnect_edge",
+                "label": "剪断连接",
+                "enabled": False,
+                "disabledReason": "该连线由故事、审核或六阶段流程派生，不能直接剪断",
+            }
+        ],
     }
