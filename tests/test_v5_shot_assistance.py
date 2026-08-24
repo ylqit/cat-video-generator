@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import uuid
 from dataclasses import replace
 from datetime import date
@@ -28,11 +29,14 @@ from cat_video_generator.application.shot_queue import (
 )
 from cat_video_generator.domain.contracts import (
     AnchorMode,
+    LookReferenceBinding,
     ReferenceBinding,
     ReferenceRole,
     ReferenceTarget,
     ReferenceUsage,
     SceneDraft,
+    SceneLookDraft,
+    SceneLookPlan,
     SceneLookUsage,
     ShotAssistAnalysis,
     ShotAssistPatch,
@@ -40,6 +44,7 @@ from cat_video_generator.domain.contracts import (
     ShotPromptContext,
     VisualProfileDraft,
 )
+from cat_video_generator.domain.creative_workflow import shot_snapshot_hash
 from cat_video_generator.domain.prompts import compile_shot_video_prompt
 from cat_video_generator.domain.rendering import build_shot_input_plan
 from cat_video_generator.domain.shot_assistance import (
@@ -631,6 +636,166 @@ def test_prompt_preview_returns_free_rules_pacing_and_source_layers(tmp_path: Pa
     )
     assert retry_preview["prompt"] == compiled.prompt.text
     assert retry_preview["inputHash"] == compiled.input_hash
+
+
+def test_recipe_scene_cannot_compile_before_visual_assets_and_scene_look_are_ready(
+    tmp_path: Path,
+) -> None:
+    repository = _AssistRepository(tmp_path)
+    repository.scene = replace(
+        repository.scene,
+        draft=repository.scene.draft.model_copy(
+            update={
+                "context_note": json.dumps(
+                    {
+                        "sceneKey": "rainy-yard",
+                        "purpose": "发现雨后亮叶",
+                        "continuity": {
+                            "location": "雨后小院",
+                            "environment": "outdoor",
+                            "timeWeather": "雨后午后",
+                            "decorations": ["苔藓矮墙"],
+                            "props": ["发亮的叶子"],
+                            "transitionReason": "",
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+            }
+        ),
+    )
+    service = ShotProductionService(
+        repository=repository,  # type: ignore[arg-type]
+        gateway=None,
+        asset_store=object(),  # type: ignore[arg-type]
+        media_probe=object(),  # type: ignore[arg-type]
+        frame_extractor=None,
+        provider_name="fake",
+        resolution="720p",
+    )
+
+    with pytest.raises(ValueError, match="场景资产未就绪") as error:
+        service.preview_shot_prompt(repository.shots[1].id)
+
+    message = str(error.value)
+    assert "视觉资产规划" in message
+    assert "本集服饰与配件" in message
+    assert "当前场景环境" in message
+    assert "场景视觉基准" in message
+
+
+def test_recipe_scene_reuses_bound_approved_assets_and_current_scene_look(
+    tmp_path: Path,
+) -> None:
+    repository = _AssistRepository(tmp_path)
+    continuity = {
+        "location": "雨后小院",
+        "environment": "outdoor",
+        "timeWeather": "雨后午后",
+        "decorations": ["苔藓矮墙"],
+        "props": ["发亮的叶子"],
+        "transitionReason": "",
+    }
+
+    def scene_asset(name: str, purpose: str) -> StoredAsset:
+        path = tmp_path / f"{purpose}-{name}.png"
+        path.write_bytes(name.encode("utf-8"))
+        asset = StoredAsset(
+            id=uuid.uuid4(),
+            project_id=repository.project.id,
+            scene_id=repository.scene.id,
+            shot_card_id=None,
+            step_id=None,
+            role="reference",
+            media_type="image",
+            scope="scene",
+            status="approved",
+            path=path,
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            metadata={"displayName": name, "referencePurpose": purpose},
+            semantic_key=f"scene:{purpose}:{name}",
+        )
+        repository.assets[asset.id] = asset
+        return asset
+
+    wardrobe = scene_asset("浅色雨衣", "wardrobe")
+    environment = scene_asset("雨后小院", "environment")
+    decoration = scene_asset("苔藓矮墙", "prop")
+    prop = scene_asset("发亮的叶子", "prop")
+    look = replace(
+        repository.asset,
+        metadata={"displayName": "雨后小院视觉基准", "lookDraftRevision": 1},
+    )
+    repository.assets[look.id] = look
+    repository.scene = replace(
+        repository.scene,
+        draft=repository.scene.draft.model_copy(
+            update={
+                "context_note": json.dumps(
+                    {
+                        "sceneKey": "rainy-yard",
+                        "purpose": "发现雨后亮叶",
+                        "continuity": continuity,
+                    },
+                    ensure_ascii=False,
+                )
+            }
+        ),
+        selected_look_asset_id=look.id,
+        look_draft_revision=1,
+        look_draft=SceneLookDraft(
+            visualProfileRevisionId=repository.profile.id,
+            lookPlan=SceneLookPlan(environmentStyle="outdoor"),
+            referenceBindings=[
+                LookReferenceBinding(
+                    assetId=asset.id,
+                    purpose=purpose,
+                )
+                for asset, purpose in (
+                    (wardrobe, "wardrobe"),
+                    (environment, "environment"),
+                    (decoration, "prop"),
+                    (prop, "prop"),
+                )
+            ],
+        ),
+    )
+    current_hash = shot_snapshot_hash(
+        (shot.id, shot.draft_revision, shot.draft) for shot in repository.shots
+    )
+    repository.step = StoredStep(
+        id=uuid.uuid4(),
+        project_id=repository.project.id,
+        scene_id=repository.scene.id,
+        shot_card_id=None,
+        kind=StepKind.DIRECTOR,
+        status=StepStatus.SUCCEEDED,
+        attempt=1,
+        operation_key="director:visual-asset-plan",
+        input_snapshot={
+            "shotSnapshotHash": current_hash,
+            "acceptedOutput": {"selections": []},
+        },
+    )
+    repository.list_assets = lambda **_kwargs: tuple(repository.assets.values())  # type: ignore[method-assign]
+    service = ProjectEditingService(
+        repository=repository,  # type: ignore[arg-type]
+        director=_AssistGateway(),  # type: ignore[arg-type]
+        provider_name="fake",
+    )
+
+    readiness = service.scene_asset_readiness(repository.scene.id)
+
+    assert readiness.can_compile_shot_prompt is True
+    assert readiness.blockers == []
+    assert readiness.scene_look_status == "approved"
+    assert all(slot.status == "ready" for slot in readiness.required_slots)
+    assert {slot.display_name for slot in readiness.required_slots} >= {
+        "本集服饰与配件",
+        "当前场景环境",
+        "苔藓矮墙",
+        "发亮的叶子",
+    }
 
 
 def test_derive_anchor_uses_scene_look_only_for_anchor_target(tmp_path: Path) -> None:

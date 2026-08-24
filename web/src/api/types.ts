@@ -11,6 +11,7 @@ export type CanvasNodeType =
   | "RecipeGroupNode"
   | "BriefNode"
   | "SubjectNode"
+  | "StylePresetNode"
   | "StoryPlannerNode"
   | "StoryCandidateNode"
   | "StoryCriticNode"
@@ -75,12 +76,59 @@ export type CanvasNodeActionKey =
   | "subtitles" | "audio_separation" | "image_edit"
   | "recipe_primary" | "toggle_children" | "edit_brief" | "edit_subject"
   | "complete_creative" | "review_creative" | "generate_character_design" | "review_character_design"
-  | "assist_subject" | "generate_stories" | "inspect_story" | "approve_story"
+  | "assist_subject" | "generate_stories" | "approve_story"
   | "inspect_prompt" | "review_story" | "storyboard_from_story"
   | "storyboard_from_characters" | "storyboard_manual" | "review_storyboard" | "open_scene"
   | "edit_shot" | "generate_anchor" | "open_generator" | "select_references"
   | "review_asset" | "compose_sequence" | "export_sequence"
-  | "upload_reference" | "select_history" | "create_subject" | "inspect_asset" | "unavailable";
+  | "upload_reference" | "select_history" | "create_subject" | "inspect_asset"
+  | "open_asset_library" | "apply_visual_preset" | "edit_episode_visual_profile"
+  | "archive_node" | "restore_node" | "unavailable";
+
+export interface CanvasNodeArchiveResult {
+  projectId: string;
+  nodeId: string;
+  archived: boolean;
+  layoutVersion: number;
+}
+
+export type StoryboardPromptReferenceRole =
+  | "identity"
+  | "style"
+  | "appearance"
+  | "environment"
+  | "prop"
+  | "composition";
+
+export interface StoryboardPromptReferenceBindingDto {
+  assetId: string;
+  role: StoryboardPromptReferenceRole;
+  purpose: string;
+  source: "canon" | "character_design" | "scene" | "shot";
+  semanticKey?: string | null;
+  title?: string | null;
+  sha256: string;
+}
+
+export interface StoryboardPromptCompilationShotDto {
+  beatId?: string | null;
+  order: number;
+  finalPrompt: string;
+  promptId?: string | null;
+  referenceBindings: StoryboardPromptReferenceBindingDto[];
+  warnings: string[];
+  blockers: string[];
+  estimatedCost: { currency: string; amountMicros: number };
+  inputHash: string;
+}
+
+export interface StoryboardPromptCompilationDto {
+  projectId: string;
+  storyRevisionId: string;
+  visualProfileRevisionId: string;
+  status: "compiled" | "blocked";
+  shots: StoryboardPromptCompilationShotDto[];
+}
 
 export type CanvasGroupActionKey =
   | "run_group"
@@ -130,7 +178,7 @@ export type StoryboardCreationMode = "from_story" | "from_characters" | "manual"
 export interface CanvasWorkflowStepDto {
   key: string;
   label: string;
-  status: "pending" | "queued" | "running" | "awaiting_review" | "succeeded" | "failed";
+  status: "pending" | "queued" | "running" | "awaiting_review" | "succeeded" | "failed" | "submission_unknown";
   detail?: string;
 }
 
@@ -213,7 +261,7 @@ export interface EpisodeRulesDto {
 
 export interface RecipeAssetCandidateDto {
   id: string;
-  sha256: string;
+  sha256: string | null;
   status: string;
   mediaType: "image" | "video";
   contentUrl: string;
@@ -290,7 +338,9 @@ export interface ProductionRecipeInstanceDto {
   shotDurations: number[];
   currentBlocker: string | null;
   primaryAction: string;
-  estimatedCostMicros?: number;
+  estimatedCostMicros?: number | null;
+  costEstimateStatus?: "metered" | "unmetered_paid";
+  costEstimateLabel?: string;
   reviewStages: Array<{
     key: Exclude<RecipePhaseKey, "complete"> | "anchors" | "video" | "sequence";
     complete: boolean;
@@ -948,6 +998,7 @@ export interface JobDto {
     canvasNodeId?: string;
     canvasGroupId?: string;
     recipeInstanceId?: string;
+    parentStepId?: string;
     creationMode?: StoryboardCreationMode;
     workflowStage?: string;
     phase?: RecipePhaseKey;
@@ -959,9 +1010,20 @@ export interface JobDto {
   canvasNodeId?: string;
   canvasGroupId?: string;
   recipeInstanceId?: string;
+  parentStepId?: string;
+  childStepIds?: string[];
   creationMode?: StoryboardCreationMode;
   workflowStage?: string;
   phase?: RecipePhaseKey;
+  progress?: {
+    currentStep?: number;
+    totalSteps?: number;
+    percent?: number;
+    message?: string;
+  };
+  currentStep?: number | string | null;
+  resultSummary?: Record<string, unknown> | null;
+  completedAt?: string | null;
   result?: unknown;
   error?: Record<string, unknown> | null;
   createdAt?: string | null;
@@ -981,6 +1043,8 @@ export interface PersistentTaskDto {
   canvasNodeId?: string | null;
   canvasGroupId?: string | null;
   recipeInstanceId?: string | null;
+  parentStepId?: string | null;
+  childStepIds?: string[];
   creationMode?: StoryboardCreationMode | null;
   workflowStage?: string | null;
   phase?: RecipePhaseKey | null;
@@ -1000,6 +1064,47 @@ export interface PersistentTaskDto {
   createdAt?: string | null;
   updatedAt?: string | null;
   completedAt?: string | null;
+}
+
+export type VisualPresetKey = "healing_child_cat_line_texture_v3";
+
+export interface SubjectReferenceDto {
+  assetId: string;
+  semanticRole?: string;
+  semanticKey: string;
+  title: string;
+  contentUrl: string;
+  thumbnailUrl: string;
+  approvalStatus: string;
+  sha256: string;
+  required: boolean;
+  instruction?: string;
+}
+
+export interface VisualPresetSlotDto extends SubjectReferenceDto {
+  role: "person" | "cat" | "style";
+  purpose: "identity" | "style";
+  instruction: string;
+}
+
+export interface VisualPresetProfileDto {
+  key: VisualPresetKey;
+  canonProfileId: string;
+  title: string;
+  description: string;
+  version: number;
+  ready: boolean;
+  slots: VisualPresetSlotDto[];
+}
+
+export interface EpisodeVisualProfileDto extends VisualProfileDraft {
+  id: string;
+  projectId: string;
+  revision: number;
+  sourceProfileId: string;
+  references: SubjectReferenceDto[];
+  lockedSemanticKeys: string[];
+  createdAt: string;
 }
 
 export interface TaskCenterDto {
@@ -1340,6 +1445,25 @@ export interface VisualAssetVersion extends AssetDto {
   inputSnapshot: Record<string, unknown>;
 }
 
+export interface SceneAssetSlotReadinessDto {
+  key: string;
+  displayName: string;
+  purpose: VisualAssetPurpose;
+  required: boolean;
+  assetIds: string[];
+  status: "ready" | "missing" | "stale";
+}
+
+export interface SceneAssetReadinessDto {
+  requiredSlots: SceneAssetSlotReadinessDto[];
+  boundAssetIds: string[];
+  missingAssetKeys: string[];
+  staleAssetKeys: string[];
+  sceneLookStatus: "approved" | "missing" | "stale";
+  canCompileShotPrompt: boolean;
+  blockers: string[];
+}
+
 export interface SceneVisualAssetsDto {
   sceneId: string;
   lookDraftRevision: number;
@@ -1348,6 +1472,7 @@ export interface SceneVisualAssetsDto {
   project: VisualAssetVersion[];
   scene: VisualAssetVersion[];
   plans: CreativeStepRecord[];
+  readiness: SceneAssetReadinessDto;
 }
 
 export interface ShotAssistContext {

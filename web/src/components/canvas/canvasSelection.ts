@@ -2,6 +2,7 @@ import type { CanvasEdgeDto, CanvasNodeDto } from "../../api/types";
 
 const referenceSourceTypes = new Set<CanvasNodeDto["type"]>([
   "SubjectNode",
+  "CharacterDesignNode",
   "ReferenceAssetNode",
   "ImageAssetNode",
 ]);
@@ -22,6 +23,11 @@ export function referenceConnection(
       return edge(source, "subject[]", target, "subject[]");
     }
     return null;
+  }
+  if (source.type === "CharacterDesignNode") {
+    return target.type === "StoryboardDirectorNode"
+      ? edge(source, "character_design", target, "character_design")
+      : null;
   }
   if (source.type === "ReferenceAssetNode") {
     if (["GenerationBatchNode", "ImageGenerationNode", "VideoGenerationNode", "VideoEditNode"].includes(target.type)) {

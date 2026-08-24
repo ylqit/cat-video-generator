@@ -273,7 +273,10 @@ class SqlAlchemyWorkflowRepository:
             shot_rows = session.execute(
                 select(ShotCard)
                 .join(Scene, Scene.id == ShotCard.scene_id)
-                .where(Scene.production_run_id == project_id)
+                .where(
+                    Scene.production_run_id == project_id,
+                    Scene.active.is_(True),
+                )
             ).scalars()
             for shot_row in shot_rows:
                 scene = _required(session, Scene, shot_row.scene_id)
@@ -321,7 +324,10 @@ class SqlAlchemyWorkflowRepository:
             scene_rows = tuple(
                 session.execute(
                     select(Scene)
-                    .where(Scene.production_run_id == project_id)
+                    .where(
+                        Scene.production_run_id == project_id,
+                        Scene.active.is_(True),
+                    )
                     .order_by(Scene.sort_order)
                 ).scalars()
             )
@@ -484,7 +490,8 @@ class SqlAlchemyWorkflowRepository:
             order = (
                 session.scalar(
                     select(func.coalesce(func.max(Scene.sort_order), 0)).where(
-                        Scene.production_run_id == project_id
+                        Scene.production_run_id == project_id,
+                        Scene.active.is_(True),
                     )
                 )
                 + 1
@@ -577,7 +584,10 @@ class SqlAlchemyWorkflowRepository:
                     raise ValueError("scene look must be an available image")
                 if not _asset(asset, self._asset_root).content_ready:
                     raise ValueError("scene look content is missing; repair or upload it first")
+            if scene.selected_look_asset_id == asset_id:
+                return _scene(scene)
             scene.selected_look_asset_id = asset_id
+            self._invalidate_scene_outputs(session, scene)
             return _scene(scene)
 
     def get_scene_look_draft(self, scene_id: uuid.UUID) -> StoredScene:
@@ -614,6 +624,8 @@ class SqlAlchemyWorkflowRepository:
             scene.look_plan_json = draft.look_plan.model_dump(mode="json", by_alias=True)
             scene.look_draft_json = draft.model_dump(mode="json", by_alias=True)
             scene.look_draft_revision += 1
+            scene.selected_look_asset_id = None
+            self._invalidate_scene_outputs(session, scene)
             return _scene(scene)
 
     def delete_scene(self, scene_id: uuid.UUID) -> None:
@@ -640,7 +652,10 @@ class SqlAlchemyWorkflowRepository:
             rows = list(
                 session.execute(
                     select(Scene)
-                    .where(Scene.production_run_id == project_id)
+                    .where(
+                        Scene.production_run_id == project_id,
+                        Scene.active.is_(True),
+                    )
                     .order_by(Scene.sort_order)
                     .with_for_update()
                 ).scalars()
@@ -660,7 +675,10 @@ class SqlAlchemyWorkflowRepository:
             self._require_project(session, project_id)
             rows = session.execute(
                 select(Scene)
-                .where(Scene.production_run_id == project_id)
+                .where(
+                    Scene.production_run_id == project_id,
+                    Scene.active.is_(True),
+                )
                 .order_by(Scene.sort_order)
             ).scalars()
             return tuple(_scene(row) for row in rows)
@@ -1893,7 +1911,10 @@ class SqlAlchemyWorkflowRepository:
         rows = list(
             session.execute(
                 select(Scene)
-                .where(Scene.production_run_id == project_id)
+                .where(
+                    Scene.production_run_id == project_id,
+                    Scene.active.is_(True),
+                )
                 .order_by(Scene.sort_order)
             ).scalars()
         )
@@ -1940,6 +1961,18 @@ class SqlAlchemyWorkflowRepository:
     @staticmethod
     def _invalidate_project_sequence(session: Session, project_id: uuid.UUID) -> None:
         project = _required(session, ProductionRun, project_id)
+        project.selected_sequence_id = None
+
+    @staticmethod
+    def _invalidate_scene_outputs(session: Session, scene: Scene) -> None:
+        shots = session.execute(
+            select(ShotCard).where(ShotCard.scene_id == scene.id)
+        ).scalars()
+        for shot in shots:
+            shot.selected_anchor_asset_id = None
+            shot.selected_video_asset_id = None
+            shot.status = ShotStatus.READY.value
+        project = _required(session, ProductionRun, scene.production_run_id)
         project.selected_sequence_id = None
 
     def _validate_reference_bindings(

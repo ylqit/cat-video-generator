@@ -20,6 +20,7 @@ const props = defineProps<{
   projectId: string;
   scene: SceneDto;
   assets: AssetDto[];
+  required?: boolean;
 }>();
 const emit = defineEmits<{ refreshed: [] }>();
 
@@ -364,14 +365,14 @@ async function recordImageFailure(asset: AssetDto) {
     <div class="scene-look-copy">
       <div>
         <b>场景视觉基准</b>
-        <el-tag size="small" type="info">按需可选 · 不是视频首帧</el-tag>
+        <el-tag size="small" :type="required ? 'warning' : 'info'">{{ required ? "当前配方必需 · 不是视频首帧" : "按需可选 · 不是视频首帧" }}</el-tag>
       </div>
       <p v-if="selectedAsset">当前：{{ selectedAsset.displayName }}</p>
       <p v-else>尚未选择已批准版本</p>
       <small>{{ sceneLookAssets.length }} 个历史版本 · 负责服饰、环境、共同道具与画风</small>
     </div>
     <div class="card-actions">
-      <el-button v-if="!selectedAsset" text @click="skipSceneLook">本场跳过</el-button>
+      <el-button v-if="!selectedAsset && !required" text @click="skipSceneLook">本场跳过</el-button>
       <el-button type="primary" plain @click="open">
         {{ sceneLookAssets.length ? "查看版本与重试" : "开始设计" }}
       </el-button>

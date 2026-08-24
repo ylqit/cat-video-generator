@@ -17,6 +17,7 @@ from ..domain.aigc_canvas import (
     StoryStrategy,
     allocate_bounded_durations,
     validate_story_inputs,
+    validate_story_scene_plan,
 )
 from ..domain.universal_canvas import ProviderEditCapability
 from .ports import DirectorGateway, GatewayError
@@ -68,11 +69,31 @@ class CanvasRepository(Protocol):
         self, project_id: uuid.UUID, *, media_kind: str | None = None
     ) -> list[dict[str, Any]]: ...
 
+    def list_visual_presets(self) -> list[dict[str, Any]]: ...
+
+    def apply_visual_preset(self, project_id: uuid.UUID, preset_key: str) -> dict[str, Any]: ...
+
+    def get_episode_visual_profile(self, project_id: uuid.UUID) -> dict[str, Any]: ...
+
+    def update_episode_visual_profile(
+        self,
+        project_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        payload: Any,
+    ) -> dict[str, Any]: ...
+
     def save_manual_storyboard(
         self,
         project_id: uuid.UUID,
         *,
         expected_revision: int,
+        payload: Any,
+    ) -> dict[str, Any]: ...
+
+    def compile_storyboard_prompts(
+        self,
+        project_id: uuid.UUID,
         payload: Any,
     ) -> dict[str, Any]: ...
 
@@ -124,6 +145,23 @@ class CanvasRepository(Protocol):
         *,
         expected_version: int,
         payload: Any,
+    ) -> dict[str, Any]: ...
+
+    def archive_canvas_node(
+        self,
+        project_id: uuid.UUID,
+        node_id: uuid.UUID,
+        *,
+        expected_version: int,
+        reason: str | None,
+    ) -> dict[str, Any]: ...
+
+    def restore_canvas_node(
+        self,
+        project_id: uuid.UUID,
+        node_id: uuid.UUID,
+        *,
+        expected_version: int,
     ) -> dict[str, Any]: ...
 
     def list_canvas_templates(self) -> list[dict[str, Any]]: ...
@@ -289,6 +327,28 @@ class AigcCanvasService:
     ) -> list[dict[str, Any]]:
         return self._repository.list_project_assets(project_id, media_kind=media_kind)
 
+    def list_visual_presets(self) -> list[dict[str, Any]]:
+        return self._repository.list_visual_presets()
+
+    def apply_visual_preset(self, project_id: uuid.UUID, preset_key: str) -> dict[str, Any]:
+        return self._repository.apply_visual_preset(project_id, preset_key)
+
+    def get_episode_visual_profile(self, project_id: uuid.UUID) -> dict[str, Any]:
+        return self._repository.get_episode_visual_profile(project_id)
+
+    def update_episode_visual_profile(
+        self,
+        project_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        payload: Any,
+    ) -> dict[str, Any]:
+        return self._repository.update_episode_visual_profile(
+            project_id,
+            expected_revision=expected_revision,
+            payload=payload,
+        )
+
     def create_video_filmstrip_run(
         self, asset_id: uuid.UUID, *, frame_count: int
     ) -> dict[str, Any]:
@@ -333,6 +393,7 @@ class AigcCanvasService:
             "briefId": str(brief_id),
             "brief": brief.model_dump(mode="json", by_alias=True),
             "subjects": subject_snapshot,
+            "creativeDirection": str(getattr(payload, "rewrite_instruction", "") or ""),
         }
         input_hash = _json_hash(input_snapshot)
         idempotency_key = (
@@ -415,7 +476,9 @@ class AigcCanvasService:
         template_name = f"story.{strategy.value}.v1"
         system_prompt = (
             "你是AIGC短剧故事策划。只规划可视化、因果连续且可按目标时长制作的故事，"
-            "所有已给定叙事主体都必须承担不可替代的戏剧功能。"
+            "所有已给定叙事主体都必须承担不可替代的戏剧功能。每个场景必须给出稳定且唯一的"
+            "sceneKey，并完整填写地点、室内外、时间天气、关键装饰、道具和换场原因。"
+            "首场景的换场原因可以为空；之后每次换场必须有明确叙事目的。"
         )
         user_prompt = (
             f"策略：{strategy.value}\n"
@@ -450,6 +513,10 @@ class AigcCanvasService:
                 output_name="CanvasStoryCandidateOutput",
             )
             candidate = StoryCandidateOutput.model_validate(result.payload)
+            validate_story_scene_plan(
+                candidate,
+                target_duration_seconds=int(input_snapshot["brief"]["targetDurationSeconds"]),
+            )
         except Exception as exc:
             self._repository.complete_prompt_run(
                 prompt_id,
@@ -724,6 +791,13 @@ class AigcCanvasService:
             payload=payload,
         )
 
+    def compile_storyboard_prompts(
+        self,
+        project_id: uuid.UUID,
+        payload: Any,
+    ) -> dict[str, Any]:
+        return self._repository.compile_storyboard_prompts(project_id, payload)
+
     def create_generation_attempt(self, payload: Any) -> dict[str, Any]:
         return self._repository.create_generation_attempt(payload)
 
@@ -819,6 +893,34 @@ class AigcCanvasService:
             project_id,
             expected_version=expected_version,
             payload=payload,
+        )
+
+    def archive_canvas_node(
+        self,
+        project_id: uuid.UUID,
+        node_id: uuid.UUID,
+        *,
+        expected_version: int,
+        reason: str | None,
+    ) -> dict[str, Any]:
+        return self._repository.archive_canvas_node(
+            project_id,
+            node_id,
+            expected_version=expected_version,
+            reason=reason,
+        )
+
+    def restore_canvas_node(
+        self,
+        project_id: uuid.UUID,
+        node_id: uuid.UUID,
+        *,
+        expected_version: int,
+    ) -> dict[str, Any]:
+        return self._repository.restore_canvas_node(
+            project_id,
+            node_id,
+            expected_version=expected_version,
         )
 
 

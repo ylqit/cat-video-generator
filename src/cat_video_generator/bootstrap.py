@@ -154,6 +154,7 @@ def build_runtime_container() -> RuntimeContainer:
             asset_store=store,
             worker_id="media-canvas-worker",
             recipe_task_executor=production_recipes,
+            shot_video_executor=production,
             provider_poll_interval_seconds=runtime.ark_poll_interval_seconds,
             filmstrip_executor=VideoFilmstripExecutor(
                 repository=canvas_repository,

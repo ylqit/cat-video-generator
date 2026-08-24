@@ -31,6 +31,9 @@ const emit = defineEmits<{
 
 const activeMode = ref<StoryboardCreationMode | null>(null);
 const instruction = ref("");
+const characterInstructionMissing = computed(() => (
+  activeMode.value === "from_characters" && !instruction.value.trim()
+));
 const stepStatus = computed(() => {
   const latest = props.executions?.[0];
   if (!latest) return ["pending", "pending", "pending"];
@@ -42,6 +45,7 @@ const stepStatus = computed(() => {
 
 function submit() {
   if (activeMode.value !== "from_story" && activeMode.value !== "from_characters") return;
+  if (characterInstructionMissing.value) return;
   emit("run", { mode: activeMode.value, instruction: instruction.value.trim() });
 }
 </script>
@@ -58,11 +62,11 @@ function submit() {
       <button type="button" :disabled="!approvedStoryAvailable || busy" @click="activeMode = 'from_story'">
         <Document /><span><b>剧本生成分镜脚本</b><small>{{ approvedStoryAvailable ? '读取已批准故事，生成可编辑镜头表' : '请先批准一个故事版本' }}</small></span>
       </button>
-      <button type="button" :disabled="busy" @click="activeMode = 'from_characters'">
-        <User /><span><b>角色生成分镜脚本</b><small>选择角色素材并补充一个低压力事件</small></span>
+      <button type="button" :disabled="!approvedStoryAvailable || busy" @click="activeMode = 'from_characters'">
+        <User /><span><b>基于固定角色补充分镜</b><small>{{ approvedStoryAvailable ? '在已批准剧情边界内，用儿童、猫咪和同框图优化动作与构图' : '请先批准剧情脚本，角色素材不能另行创造剧情' }}</small></span>
       </button>
-      <button type="button" :disabled="busy" @click="emit('manual')">
-        <EditPen /><span><b>自己编写分镜脚本</b><small>克隆当前版本或从空白镜头表开始</small></span>
+      <button type="button" :disabled="!approvedStoryAvailable || busy" @click="emit('manual')">
+        <EditPen /><span><b>自己编写分镜脚本</b><small>{{ approvedStoryAvailable ? '克隆已批准规则与场景，人工编辑且不调用付费模型' : '请先批准剧情脚本与本集规则' }}</small></span>
       </button>
     </div>
 
@@ -78,7 +82,8 @@ function submit() {
       </label>
       <footer>
         <span v-if="activeMode === 'from_characters' && selectedReferenceCount < (healingRecipe ? 2 : 1)">{{ healingRecipe ? '必须同时选择固定儿童与固定猫咪素材' : '至少选择 1 个角色素材' }}</span>
-        <button class="primary" type="button" :disabled="busy || (activeMode === 'from_characters' && selectedReferenceCount < (healingRecipe ? 2 : 1))" @click="submit">{{ busy ? '正在生成…' : '生成镜头草稿' }}</button>
+        <span v-else-if="characterInstructionMissing">请填写本集要发生的低压力事件</span>
+        <button class="primary" type="button" :disabled="busy || characterInstructionMissing || (activeMode === 'from_characters' && selectedReferenceCount < (healingRecipe ? 2 : 1))" @click="submit">{{ busy ? '正在生成…' : '生成镜头草稿' }}</button>
       </footer>
     </div>
 

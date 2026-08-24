@@ -218,6 +218,53 @@ describe("CanvasNodeCard", () => {
     expect(generationWrapper.emitted("open-composer")?.[0]).toEqual([generation]);
   });
 
+  it("renders approved Canon evidence instead of a hidden reference count", () => {
+    const wrapper = mount(CanvasNodeCard, {
+      props: {
+        node: {
+          id: "child-canon",
+          type: "SubjectNode",
+          objectType: "subject_revision",
+          objectId: "subject-child",
+          position: { x: 0, y: 0 },
+          data: {
+            title: "固定儿童",
+            kind: "person",
+            role: "protagonist",
+            revision: 3,
+            identityAnchors: ["固定脸型、年龄感与身体比例"],
+            references: [
+              {
+                assetId: "child-headshot",
+                semanticKey: "person:headshot",
+                title: "儿童面部",
+                contentUrl: "/api/v1/assets/child-headshot/content",
+                thumbnailUrl: "/api/v1/assets/child-headshot/content",
+                approvalStatus: "approved",
+                sha256: "a".repeat(64),
+                required: true,
+              },
+              {
+                assetId: "child-fullbody",
+                semanticKey: "person:fullbody",
+                title: "儿童全身比例",
+                contentUrl: "/api/v1/assets/child-fullbody/content",
+                thumbnailUrl: "/api/v1/assets/child-fullbody/content",
+                approvalStatus: "approved",
+                sha256: "b".repeat(64),
+                required: true,
+              },
+            ],
+          },
+        },
+      },
+    });
+
+    expect(wrapper.findAll(".evidence-strip img")).toHaveLength(2);
+    expect(wrapper.text()).toContain("2 张已批准身份证据");
+    expect(wrapper.text()).toContain("表情、多角度或背面证据可补充");
+  });
+
   it("offers actionable binding choices when a reference node is empty", async () => {
     const node = {
       id: "reference-node",
@@ -237,5 +284,23 @@ describe("CanvasNodeCard", () => {
     expect(wrapper.emitted("upload-reference")?.[0]).toEqual([node]);
     expect(wrapper.emitted("select-history")?.[0]).toEqual([node]);
     expect(wrapper.emitted("create-subject")?.[0]).toEqual([node]);
+  });
+
+  it("opens the recoverable removal menu from a node right click", async () => {
+    const node = {
+      id: "prompt-node",
+      type: "PromptArtifactNode" as const,
+      objectType: "prompt_run",
+      objectId: "prompt-1",
+      position: { x: 0, y: 0 },
+      data: { title: "镜头提示词" },
+    };
+    const wrapper = mount(CanvasNodeCard, { props: { node } });
+
+    await wrapper.trigger("contextmenu", { clientX: 240, clientY: 180 });
+
+    const emitted = wrapper.emitted("open-context-menu")?.[0];
+    expect(emitted?.[0]).toEqual(node);
+    expect(emitted?.[1]).toBeInstanceOf(MouseEvent);
   });
 });

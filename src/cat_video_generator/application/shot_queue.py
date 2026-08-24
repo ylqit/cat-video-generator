@@ -24,6 +24,8 @@ from ..domain.contracts import (
     ReferenceRole,
     ReferenceTarget,
     ReferenceUsage,
+    SceneAssetReadiness,
+    SceneAssetSlotReadiness,
     SceneLookDraft,
     SceneLookPlan,
     SceneLookUsage,
@@ -675,6 +677,9 @@ class ProjectEditingService:
             expected_shot_snapshot_hash=expected_hash,
             accepted_output=plan,
         )
+
+    def scene_asset_readiness(self, scene_id: uuid.UUID) -> SceneAssetReadiness:
+        return _scene_asset_readiness(self._repository, scene_id)
 
     def creative_workflow(self, scene_id: uuid.UUID) -> dict[str, Any]:
         scene = self._repository.get_scene(scene_id)
@@ -1670,6 +1675,15 @@ class ShotProductionService:
             return self._runtime_preflight.semantic_review_enabled
         return self._enable_video_advice
 
+    def _assert_scene_assets_ready(self, scene_id: uuid.UUID) -> None:
+        scene = self._repository.get_scene(scene_id)
+        if not _scene_continuity_context(scene):
+            return
+        readiness = _scene_asset_readiness(self._repository, scene.id)
+        if readiness.can_compile_shot_prompt:
+            return
+        raise ValueError("场景资产未就绪：" + "；".join(readiness.blockers))
+
     def import_reference(
         self,
         *,
@@ -1807,6 +1821,7 @@ class ShotProductionService:
         read_model_loader = getattr(self._repository, "shot_generation_read_model", None)
         read_model = read_model_loader(shot_id) if callable(read_model_loader) else None
         shot = read_model.shot if read_model is not None else self._repository.get_shot(shot_id)
+        self._assert_scene_assets_ready(shot.scene_id)
         compilation = self._shot_compilation_context(
             shot,
             shot_read_model=read_model,
@@ -2542,6 +2557,7 @@ class ShotProductionService:
     ) -> None:
         self._require_paid_gateway(allow_paid_generation)
         shot = self._repository.get_shot(shot_id)
+        self._assert_scene_assets_ready(shot.scene_id)
         spec = self._compile_shot_generation(
             shot,
             target=ReferenceTarget.ANCHOR,
@@ -2564,6 +2580,7 @@ class ShotProductionService:
             )
         self._require_paid_gateway(allow_paid_generation)
         shot = self._repository.get_shot(shot_id)
+        self._assert_scene_assets_ready(shot.scene_id)
         spec = self._compile_shot_generation(
             shot,
             target=ReferenceTarget.VIDEO,
@@ -2584,6 +2601,7 @@ class ShotProductionService:
     ) -> dict[str, Any]:
         shot = self._repository.get_shot(shot_id)
         self._require_paid_gateway(allow_paid_generation)
+        self._assert_scene_assets_ready(shot.scene_id)
         spec = self._compile_shot_generation(
             shot,
             target=ReferenceTarget.ANCHOR,
@@ -3145,6 +3163,7 @@ class ShotProductionService:
             )
         self._require_paid_gateway(allow_paid_generation)
         shot = self._repository.get_shot(shot_id)
+        self._assert_scene_assets_ready(shot.scene_id)
         spec = self._compile_shot_generation(
             shot,
             target=ReferenceTarget.VIDEO,
@@ -4671,6 +4690,172 @@ def _merge_generation_references(
     return tuple(merged)
 
 
+def _scene_asset_readiness(repository: ShotQueueStore, scene_id: uuid.UUID) -> SceneAssetReadiness:
+    scene = repository.get_scene(scene_id)
+    shots = tuple(sorted(repository.list_shots(scene.id), key=lambda item: item.order))
+    current_shot_hash = shot_snapshot_hash(
+        (item.id, item.draft_revision, item.draft) for item in shots
+    )
+    accepted_plan_step = next(
+        (
+            step
+            for step in reversed(
+                repository.list_steps(
+                    project_id=scene.project_id,
+                    scene_id=scene.id,
+                )
+            )
+            if step.operation_key == "director:visual-asset-plan"
+            and isinstance(step.input_snapshot.get("acceptedOutput"), dict)
+        ),
+        None,
+    )
+    plan_is_current = bool(
+        accepted_plan_step is not None
+        and accepted_plan_step.input_snapshot.get("shotSnapshotHash")
+        == current_shot_hash
+    )
+    accepted_plan = (
+        None
+        if accepted_plan_step is None
+        else AcceptedVisualAssetPlan.model_validate(
+            accepted_plan_step.input_snapshot["acceptedOutput"]
+        )
+    )
+    all_assets = repository.list_assets(
+        project_id=scene.project_id,
+        include_canon=True,
+    )
+    assets_by_id = {item.id: item for item in all_assets}
+    bound_ids = tuple(
+        binding.asset_id
+        for binding in (() if scene.look_draft is None else scene.look_draft.reference_bindings)
+    )
+    bound_assets = tuple(
+        asset
+        for asset_id in bound_ids
+        if (asset := assets_by_id.get(asset_id)) is not None
+    )
+    continuity = _scene_continuity_context(scene)
+
+    slot_specs: list[tuple[str, str, VisualAssetPurpose, uuid.UUID | None]] = [
+        ("wardrobe", "本集服饰与配件", VisualAssetPurpose.WARDROBE, None),
+        ("environment", "当前场景环境", VisualAssetPurpose.ENVIRONMENT, None),
+    ]
+    for index, label in enumerate(
+        _required_scene_objects(continuity),
+        start=1,
+    ):
+        slot_specs.append(
+            (f"prop-{index}", label, VisualAssetPurpose.PROP, None)
+        )
+    if accepted_plan is not None:
+        for selection in accepted_plan.selections:
+            if selection.action.value == "skip":
+                continue
+            matching_index = next(
+                (
+                    index
+                    for index, (_key, _name, purpose, _asset_id) in enumerate(slot_specs)
+                    if purpose is selection.purpose
+                    and purpose in {
+                        VisualAssetPurpose.WARDROBE,
+                        VisualAssetPurpose.ENVIRONMENT,
+                    }
+                ),
+                None,
+            )
+            expected_asset_id = selection.existing_asset_id
+            replacement = (
+                selection.suggestion_key,
+                selection.display_name,
+                selection.purpose,
+                expected_asset_id,
+            )
+            if matching_index is None:
+                slot_specs.append(replacement)
+            else:
+                slot_specs[matching_index] = replacement
+
+    slots: list[SceneAssetSlotReadiness] = []
+    for key, display_name, purpose, expected_asset_id in slot_specs:
+        candidates = [
+            asset
+            for asset in bound_assets
+            if asset.reference_purpose == purpose.value
+            and (
+                expected_asset_id is None
+                or asset.id == expected_asset_id
+            )
+            and (
+                purpose is not VisualAssetPurpose.PROP
+                or _asset_matches_required_object(asset, display_name)
+            )
+        ]
+        ready_ids = [
+            asset.id
+            for asset in candidates
+            if asset.status in {"approved", "ready"} and asset.content_ready
+        ]
+        stale_ids = [asset.id for asset in candidates if asset.status == "stale"]
+        status = "ready" if ready_ids else "stale" if stale_ids else "missing"
+        slots.append(
+            SceneAssetSlotReadiness(
+                key=key,
+                displayName=display_name,
+                purpose=purpose,
+                assetIds=ready_ids or stale_ids,
+                status=status,
+            )
+        )
+
+    scene_look_status: str = "missing"
+    selected_look = (
+        None
+        if scene.selected_look_asset_id is None
+        else assets_by_id.get(scene.selected_look_asset_id)
+    )
+    if selected_look is not None:
+        look_revision = selected_look.metadata.get("lookDraftRevision")
+        look_is_current = look_revision in {None, scene.look_draft_revision}
+        if selected_look.status == "stale" or not look_is_current:
+            scene_look_status = "stale"
+        elif selected_look.status in {"approved", "ready"} and selected_look.content_ready:
+            scene_look_status = "approved"
+
+    missing_keys = [item.key for item in slots if item.status == "missing"]
+    stale_keys = [item.key for item in slots if item.status == "stale"]
+    blockers: list[str] = []
+    if accepted_plan is None:
+        blockers.append("尚未人工接受当前场景的视觉资产规划")
+    elif not plan_is_current:
+        blockers.append("分镜已更新，视觉资产规划需要重新生成并接受")
+    if missing_keys:
+        labels = "、".join(item.display_name for item in slots if item.status == "missing")
+        blockers.append(f"缺少已批准并绑定的场景资产：{labels}")
+    if stale_keys:
+        labels = "、".join(item.display_name for item in slots if item.status == "stale")
+        blockers.append(f"场景资产已过期：{labels}")
+    if scene_look_status == "missing":
+        blockers.append("尚未选择已批准的场景视觉基准（Scene Look）")
+    elif scene_look_status == "stale":
+        blockers.append("已选择的场景视觉基准已过期")
+    bound_asset_ids = list(dict.fromkeys(
+        [*bound_ids]
+        + ([] if selected_look is None else [selected_look.id])
+    ))
+    return SceneAssetReadiness(
+        requiredSlots=slots,
+        boundAssetIds=bound_asset_ids,
+        missingAssetKeys=missing_keys,
+        staleAssetKeys=stale_keys,
+        sceneLookStatus=scene_look_status,
+        canCompileShotPrompt=not blockers,
+        blockers=blockers,
+    )
+
+
+
 def _scene_story_snapshot(scene: StoredScene | None) -> dict[str, Any] | None:
     if scene is None:
         return None
@@ -4679,6 +4864,45 @@ def _scene_story_snapshot(scene: StoredScene | None) -> dict[str, Any] | None:
         "title": scene.draft.title,
         "sourceText": scene.draft.source_text,
     }
+
+
+def _scene_continuity_context(scene: StoredScene) -> dict[str, Any]:
+    note = scene.draft.context_note
+    if not note:
+        return {}
+    try:
+        document = json.loads(note)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(document, dict):
+        return {}
+    continuity = document.get("continuity")
+    if not isinstance(continuity, dict):
+        return {}
+    return continuity
+
+
+def _required_scene_objects(continuity: dict[str, Any]) -> tuple[str, ...]:
+    values: list[str] = []
+    for field in ("decorations", "props"):
+        items = continuity.get(field)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            label = str(item).strip()
+            if label and label not in values:
+                values.append(label)
+    return tuple(values)
+
+
+def _asset_matches_required_object(asset: StoredAsset, required_name: str) -> bool:
+    asset_name = "".join(asset.display_name.lower().split())
+    target_name = "".join(required_name.lower().split())
+    return bool(
+        asset_name
+        and target_name
+        and (asset_name in target_name or target_name in asset_name)
+    )
 
 
 def _creative_step_json(step: StoredStep) -> dict[str, Any]:

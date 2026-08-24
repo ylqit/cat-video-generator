@@ -2,27 +2,44 @@ import { describe, expect, it } from "vitest";
 
 import {
   CANVAS_CONSOLE_PRESETS,
-  clampCanvasPanelPosition,
+  anchorCanvasOverlay,
   consolePresetForNode,
-  positionCanvasPanel,
+  projectCanvasNodeRect,
   resolveCanvasConsoleSize,
 } from "../canvas/canvasPanels";
 
 describe("canvas panel placement", () => {
-  it("places the panel below the node without inheriting canvas zoom", () => {
-    expect(positionCanvasPanel(
-      { left: 100, top: 80, width: 280, height: 180 },
-      { width: 1200, height: 900 },
-      { width: 720, height: 420 },
-    )).toEqual({ left: 100, top: 272, placement: "below" });
+  it("projects graph coordinates through the current viewport and cached surface rect", () => {
+    expect(projectCanvasNodeRect(
+      {
+        computedPosition: { x: 100, y: 80 },
+        dimensions: { width: 280, height: 180 },
+      },
+      { x: 30, y: -10, zoom: 0.5 },
+      { left: 20, top: 70, width: 1200, height: 900 },
+    )).toEqual({ left: 100, top: 100, width: 140, height: 90 });
   });
 
-  it("flips above and clamps horizontally when the lower viewport is full", () => {
-    expect(positionCanvasPanel(
-      { left: 900, top: 700, width: 280, height: 160 },
-      { width: 1200, height: 900 },
+  it("centers the toolbar above and the console strictly below the node", () => {
+    expect(anchorCanvasOverlay(
+      { left: 100, top: 80, width: 280, height: 180 },
       { width: 720, height: 420 },
-    )).toEqual({ left: 464, top: 268, placement: "above" });
+      { width: 720, height: 56 },
+    )).toEqual({
+      toolbar: { left: -120, top: 12, placement: "above" },
+      console: { left: -120, top: 272, placement: "below" },
+    });
+  });
+
+  it("does not flip or clamp the console when its anchored position leaves the viewport", () => {
+    expect(anchorCanvasOverlay(
+      { left: 900, top: 700, width: 280, height: 160 },
+      { width: 720, height: 420 },
+      { width: 720, height: 56 },
+    )).toEqual({
+      toolbar: { left: 680, top: 632, placement: "above" },
+      console: { left: 680, top: 872, placement: "below" },
+    });
   });
 
   it("maps domain node types to fixed LibTV-style console presets", () => {
@@ -36,16 +53,9 @@ describe("canvas panel placement", () => {
 
   it("keeps desktop presets fixed and safely shrinks them inside a small viewport", () => {
     expect(resolveCanvasConsoleSize(CANVAS_CONSOLE_PRESETS.image, { width: 1440, height: 1024 }))
-      .toEqual({ width: 920, height: 560 });
+      .toEqual({ width: 760, height: 440 });
     expect(resolveCanvasConsoleSize(CANVAS_CONSOLE_PRESETS.storyboard, { width: 900, height: 600 }))
-      .toEqual({ width: 876, height: 504 });
+      .toEqual({ width: 760, height: 420 });
   });
 
-  it("clamps a fixed screen position on resize without re-anchoring it to the node", () => {
-    expect(clampCanvasPanelPosition(
-      { left: 900, top: 700, placement: "below" },
-      { width: 1200, height: 800 },
-      { width: 720, height: 320 },
-    )).toEqual({ left: 464, top: 464, placement: "below" });
-  });
 });

@@ -29,10 +29,17 @@ def run_migrations_offline() -> None:
 
 def _run_migrations(connection: Connection, schema: str) -> None:
     config.attributes["schema"] = schema
+
+    def include_name(name: str | None, type_: str, _parent_names: dict[str, str | None]) -> bool:
+        if type_ == "schema":
+            return name == schema
+        return True
+
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
         include_schemas=True,
+        include_name=include_name,
         compare_type=True,
         version_table_schema=schema,
         version_table="alembic_version",

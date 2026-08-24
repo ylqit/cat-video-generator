@@ -155,16 +155,34 @@ class _Director:
                 "synopsis": "风起后两者分工合作，最后保住画作。",
                 "scenes": [
                     {
+                        "sceneKey": "courtyard-wind",
                         "title": "风起",
                         "purpose": "建立钩子",
                         "synopsis": "猫发现雨滴，小孩注意到画作。",
                         "durationWeight": 1,
+                        "continuity": {
+                            "location": "住宅小院",
+                            "environment": "outdoor",
+                            "timeWeather": "午后，阵雨将至",
+                            "decorations": ["晾画绳"],
+                            "props": ["画作"],
+                            "transitionReason": "",
+                        },
                     },
                     {
+                        "sceneKey": "covered-porch",
                         "title": "收画",
                         "purpose": "完成行动",
                         "synopsis": "两者配合收回画作。",
                         "durationWeight": 2,
+                        "continuity": {
+                            "location": "小院连廊",
+                            "environment": "outdoor",
+                            "timeWeather": "午后，雨滴落下",
+                            "decorations": ["木质廊柱"],
+                            "props": ["画作", "收纳篮"],
+                            "transitionReason": "为了躲雨并完成收画行动",
+                        },
                     },
                 ],
             }

@@ -24,4 +24,13 @@ describe("CanvasLocalConsole", () => {
     await wrapper.get('button[aria-label="全屏打开"]').trigger("click");
     expect(wrapper.emitted("fullscreen")).toHaveLength(1);
   });
+
+  it("offers a dedicated close action", async () => {
+    const wrapper = mount(CanvasLocalConsole, {
+      props: { title: "故事候选", preset: "text" },
+    });
+
+    await wrapper.get('button[aria-label="关闭局部控制台"]').trigger("click");
+    expect(wrapper.emitted("close")).toHaveLength(1);
+  });
 });

@@ -85,6 +85,9 @@ const selectedReferenceCount = computed(() => new Set(
 const currentSceneLook = computed(() => props.assets.find(
   (item) => item.id === props.scene.selectedLookAssetId,
 ) ?? null);
+const readySlotCount = computed(() => (
+  data.value?.readiness.requiredSlots.filter((item) => item.status === "ready").length ?? 0
+));
 const approvedByPurpose = computed(() => {
   const grouped: Record<VisualAssetPurpose, VisualAssetVersion[]> = {
     wardrobe: [],
@@ -350,7 +353,10 @@ watch(() => taskCenter.projectSignals.value[props.projectId]?.revision ?? 0, () 
     <div>
       <b>视觉资产准备</b>
       <p>按需规划服装、环境和关键道具；人物、猫咪与画风继续继承全局 Canon。</p>
-      <small>{{ data?.plans.length ?? 0 }} 个规划版本 · {{ versions.length }} 个图片候选</small>
+      <small>
+        {{ readySlotCount }}/{{ data?.readiness.requiredSlots.length ?? 0 }} 个必需槽位就绪
+        · Scene Look {{ data?.readiness.sceneLookStatus === 'approved' ? '已批准' : '未就绪' }}
+      </small>
     </div>
     <el-button type="primary" plain @click="open">打开资产工作台</el-button>
   </article>
@@ -379,6 +385,30 @@ watch(() => taskCenter.projectSignals.value[props.projectId]?.revision ?? 0, () 
           <el-tag v-if="busy" type="info">正在同步</el-tag>
         </div>
       </header>
+
+      <section
+        v-if="data?.readiness"
+        class="readiness-board"
+        :class="{ ready: data.readiness.canCompileShotPrompt }"
+      >
+        <header>
+          <div>
+            <b>{{ data.readiness.canCompileShotPrompt ? "本场景可合成镜头 Prompt" : "本场景尚不能生成视觉锚点" }}</b>
+            <small>只有已批准并绑定到当前场景的素材才计入就绪状态。</small>
+          </div>
+          <el-tag :type="data.readiness.canCompileShotPrompt ? 'success' : 'warning'">
+            {{ readySlotCount }}/{{ data.readiness.requiredSlots.length }} 槽位
+          </el-tag>
+        </header>
+        <div class="readiness-slots">
+          <span v-for="slot in data.readiness.requiredSlots" :key="slot.key" :class="slot.status">
+            {{ slot.displayName }} · {{ slot.status === 'ready' ? '已就绪' : slot.status === 'stale' ? '已过期' : '缺失' }}
+          </span>
+        </div>
+        <ul v-if="data.readiness.blockers.length">
+          <li v-for="blocker in data.readiness.blockers" :key="blocker">{{ blocker }}</li>
+        </ul>
+      </section>
 
       <section class="canon-strip">
         <div><b>全局身份与画风</b><small>只读继承，不在项目内重复生成身份包</small></div>
@@ -517,6 +547,7 @@ watch(() => taskCenter.projectSignals.value[props.projectId]?.revision ?? 0, () 
 .visual-asset-card { min-height: 142px; display: grid; grid-template-columns: 84px 1fr auto; gap: 16px; align-items: center; padding: 18px; border: 1px solid #2b3545; border-radius: 12px; background: #111722; }
 .visual-asset-card p { margin: 6px 0; color: #aeb8c8; }.visual-asset-card small { color: #7f8ba0; }.asset-card-icon { display: grid; place-items: center; width: 74px; height: 96px; border-radius: 10px; background: linear-gradient(150deg, #22486e, #15253b); color: #91c9ff; font-weight: 700; }
 .visual-workbench { display: grid; gap: 14px; min-height: 70vh; }.asset-toolbar, .plan-version-row, .suggestion-card header, .plan-footer { display: flex; justify-content: space-between; gap: 12px; align-items: center; }.asset-toolbar small, .canon-strip small, .suggestion-card small { display: block; color: #8491a5; margin-top: 4px; }
+.readiness-board { display: grid; gap: 10px; padding: 14px; border: 1px solid #725523; border-radius: 10px; background: #211a10; }.readiness-board.ready { border-color: #2d684e; background: #102119; }.readiness-board header { display: flex; justify-content: space-between; gap: 12px; align-items: center; }.readiness-board small { display: block; margin-top: 4px; color: #9aa7b8; }.readiness-board ul { margin: 0; padding-left: 20px; color: #efbd72; }.readiness-slots { display: flex; flex-wrap: wrap; gap: 7px; }.readiness-slots span { padding: 5px 8px; border: 1px solid #604c2c; border-radius: 999px; color: #d9b979; }.readiness-slots span.ready { border-color: #356b55; color: #86d2ae; }.readiness-slots span.stale { border-color: #7c4c32; color: #df9a72; }
 .canon-strip, .plan-section { padding: 14px; border: 1px solid #293445; border-radius: 10px; background: #0f141d; }.canon-strip { display: grid; grid-template-columns: 190px 1fr; gap: 12px; }.canon-assets { display: flex; gap: 8px; overflow-x: auto; }.canon-assets span { display: grid; gap: 3px; min-width: 70px; text-align: center; }.canon-assets img { width: 70px; height: 76px; object-fit: cover; border-radius: 6px; background: #080b10; }
 .layer-board { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }.layer-board article { min-height: 156px; padding: 12px; border: 1px solid #293445; border-radius: 10px; background: #0f141d; }.layer-board header { display: flex; justify-content: space-between; align-items: center; }.layer-board p { min-height: 42px; margin: 8px 0; color: #8794a7; font-size: 12px; }.layer-thumbs { display: flex; gap: 5px; overflow-x: auto; }.layer-thumbs :deep(.el-image) { flex: 0 0 58px; width: 58px; height: 72px; border-radius: 5px; background: #080b10; }
 .plan-section { display: grid; gap: 12px; }.text-only-items { display: flex; gap: 7px; flex-wrap: wrap; align-items: center; }.text-only-items span { padding: 5px 8px; border: 1px solid #38445a; border-radius: 999px; color: #aab5c7; }

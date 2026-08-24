@@ -2,7 +2,7 @@
 import { computed } from "vue";
 import { Document, MagicStick, Picture } from "@element-plus/icons-vue";
 
-import type { CanvasNodeDto } from "../../api/types";
+import type { CanvasNodeDto, SubjectReferenceDto } from "../../api/types";
 
 const props = withDefaults(defineProps<{
   node: CanvasNodeDto;
@@ -28,13 +28,19 @@ const emit = defineEmits<{
   "select-history": [node: CanvasNodeDto];
   "create-subject": [node: CanvasNodeDto];
   "open-recipe": [node: CanvasNodeDto];
+  "open-context-menu": [node: CanvasNodeDto, event: MouseEvent];
 }>();
 
 const data = computed(() => props.node.data);
+const subjectReferences = computed<SubjectReferenceDto[]>(() => {
+  if (props.node.type !== "SubjectNode" || !Array.isArray(data.value.references)) return [];
+  return data.value.references as SubjectReferenceDto[];
+});
 const title = computed(() => String(data.value.title ?? ({
   RecipeGroupNode: "一人一猫治愈短片",
   BriefNode: "创意简报",
   SubjectNode: "主体",
+  StylePresetNode: "画风预设",
   CharacterDesignNode: "角色设计",
   StoryPlannerNode: "三案故事策划",
   StoryCandidateNode: "故事候选",
@@ -55,9 +61,10 @@ const title = computed(() => String(data.value.title ?? ({
   AudioGenerationNode: "音频生成",
   PromptArtifactNode: "Prompt 产物",
 } as Record<string, string>)[props.node.type] ?? props.node.type));
-const nodeLabel = computed(() => ({
+const nodeLabel = computed(() => String(data.value.artifactLabel ?? ({
   BriefNode: "BRIEF",
   SubjectNode: "SUBJECT",
+  StylePresetNode: "STYLE",
   CharacterDesignNode: "CHARACTER",
   StoryPlannerNode: "PLANNER",
   StoryCandidateNode: "STORY",
@@ -78,7 +85,7 @@ const nodeLabel = computed(() => ({
   AudioGenerationNode: "AUDIO GEN",
   PromptArtifactNode: "PROMPT",
   RecipeGroupNode: "RECIPE",
-} as Record<string, string>)[props.node.type] ?? "NODE");
+} as Record<string, string>)[props.node.type] ?? "NODE"));
 const boundAssets = computed(() => (
   Array.isArray(data.value.assets) ? data.value.assets : []
 ));
@@ -93,6 +100,7 @@ const boundAssets = computed(() => (
     :data-canvas-node-id="node.id"
     :aria-selected="selected"
     @click="emit('select-node', node)"
+    @contextmenu.prevent.stop="emit('open-context-menu', node, $event)"
     @dblclick="emit('activate-node', node)"
     @keydown.enter.prevent="emit('select-node', node)"
   >
@@ -139,15 +147,39 @@ const boundAssets = computed(() => (
     </template>
 
     <template v-else-if="node.type === 'SubjectNode'">
+      <div v-if="subjectReferences.length" class="evidence-strip" aria-label="Canon 身份证据图">
+        <figure v-for="reference in subjectReferences" :key="reference.assetId">
+          <img :src="reference.thumbnailUrl || reference.contentUrl" :alt="reference.title || reference.semanticKey" />
+          <figcaption>{{ reference.title || reference.semanticKey }}</figcaption>
+        </figure>
+      </div>
       <p>{{ data.identityAnchors?.join('；') }}</p>
       <div class="fact-row">
         <span>{{ data.kind }}</span>
         <span>{{ data.role }}</span>
         <span>Revision {{ data.revision }}</span>
       </div>
-      <small v-if="data.references?.length">{{ data.references.length }} 张语义参考</small>
+      <small v-if="subjectReferences.length">{{ subjectReferences.length }} 张已批准身份证据</small>
+      <small
+        v-if="subjectReferences.length && !subjectReferences.some((reference) => !reference.required)"
+        class="evidence-missing"
+      >表情、多角度或背面证据可补充（不会伪造占位素材）</small>
       <div class="card-actions">
         <button data-action="assist-subject" type="button" @click.stop="emit('assist-subject', node)">AI 分析并补全</button>
+      </div>
+    </template>
+
+    <template v-else-if="node.type === 'StylePresetNode'">
+      <div class="style-preset-body">
+        <img
+          v-if="data.references?.[0]?.thumbnailUrl || data.references?.[0]?.contentUrl"
+          :src="data.references[0].thumbnailUrl || data.references[0].contentUrl"
+          :alt="data.references[0].title || '线条材质画风'"
+        />
+        <div>
+          <p>只提取线条、材质与光线，不复制叶片、露珠、绿色配色或微距构图。</p>
+          <div class="fact-row"><span>Canon-v3</span><span>style 锁定</span><span>已批准</span></div>
+        </div>
       </div>
     </template>
 
@@ -324,6 +356,7 @@ const boundAssets = computed(() => (
 .canvas-card.selection-incompatible { opacity: .42; }
 .canvas-card.type-StoryCandidateNode { width: 312px; border-color: #3e5267; }
 .canvas-card.type-CharacterDesignNode { width: 312px; min-height: 270px; border-color: #596b7d; background: #1d2025; }
+.canvas-card.type-SubjectNode, .canvas-card.type-StylePresetNode { width: 332px; min-height: 246px; }
 .canvas-card.type-StoryboardDirectorNode { width: 460px; min-height: 430px; border-color: #8a8a8a; background: #202020; }
 .canvas-card.type-RecipeGroupNode { width: 360px; border-color: #6f8f7b; background: linear-gradient(145deg, #1b2421, #181b21 58%); }
 .canvas-card.type-ApprovalGateNode { border-color: #78663e; }
@@ -349,6 +382,13 @@ small { display: block; margin-top: 8px; color: #737f92; }
 .fact-row span { padding: 3px 7px; color: #9faabb; background: #23272e; border-radius: 6px; font-size: 10px; }
 .score-row { margin: 10px 0; color: #9eabbc; font-size: 11px; }
 .score-row b { color: #f2ce78; font-size: 22px; }
+.evidence-strip { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 8px 0 10px; }
+.evidence-strip figure { min-width: 0; margin: 0; overflow: hidden; background: #11151a; border: 1px solid #343b46; border-radius: 8px; }
+.evidence-strip img { display: block; width: 100%; height: 94px; object-fit: cover; }
+.evidence-strip figcaption { padding: 5px 7px; overflow: hidden; color: #aeb8c7; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.evidence-missing { color: #d1a85c; }
+.style-preset-body { display: grid; grid-template-columns: 116px 1fr; gap: 12px; align-items: stretch; margin-top: 8px; }
+.style-preset-body > img { width: 116px; height: 148px; object-fit: cover; border: 1px solid #414a56; border-radius: 8px; }
 .card-actions { margin-top: 10px; }
 button {
   padding: 6px 9px;

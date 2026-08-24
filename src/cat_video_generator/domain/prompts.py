@@ -14,7 +14,7 @@ from .contracts import (
     VisualAssetPurpose,
     VisualProfileDraft,
 )
-from .rendering import VideoInputPlan
+from .rendering import ProviderMediaRole, VideoInputPlan
 from .shot_assistance import ShotLocalAnalysis
 from .visual_profiles import (
     DEFAULT_SERIES_VISUAL_PROFILE,
@@ -242,6 +242,7 @@ def compile_visual_asset_plan_prompt(
 
 【项目】{project_title}
 【已批准场景剧情】{scene.title}：{scene.source_text}
+【场景连续性规则】{scene.context_note or '沿用已批准剧情中的地点、时间天气、装饰和道具约束'}
 【已确认视频片段】
 {shots}
 【长期人物】{visual_profile.person_identity}；{visual_profile.person_hair}；{visual_profile.person_body}
@@ -251,8 +252,10 @@ def compile_visual_asset_plan_prompt(
 {assets}
 
 全局人物、猫咪和画风 Canon 已存在，不得建议复制新的身份包。
-请分析换装、空间结构、跨片段复用、道具状态变化和动作接触关系，
-只在必要时建议 wardrobe、environment、prop、composition 四类图片。
+请分析换装、空间结构、跨片段复用、道具状态变化和动作接触关系。
+必须为本场提供一个 wardrobe 和一个 environment 建议；场景连续性规则中的关键装饰、
+核心道具必须逐项提供 prop 建议。只有一次性且不影响动作、连续性或主体接触的小物件
+才可放入 textOnlyItems。composition 仅在普通镜头文字不足以明确空间关系时建议。
 每项指定 project 或 scene 归属、说明理由，并给出可编辑的 Seedream 图片 Prompt。
 环境图默认为空场景或仅保留固定家具；服装图采用中性稳定姿态且不得改变身份；
 道具图清晰完整、无遮挡；小型一次性物件列入 textOnlyItems，不要拆成独立资产。
@@ -403,16 +406,30 @@ def compile_shot_video_prompt_parts(
         if not regeneration_instruction
         else f"\n【本次重做目标】{regeneration_instruction.strip()}"
     )
-    prefix = (
-        f"【主体、画风和素材职责】输出{input_plan.resolution}、9:16竖屏、"
-        f"{context.duration_seconds}秒的一个完整视频片段，使用原生环境声和动作声。"
-        f"{profile.person_identity}；{profile.person_hair}；{profile.person_body}；"
-        f"{profile.cat_identity}。采用{'、'.join(profile.style_positive)}，"
-        f"排除{'、'.join(profile.style_negative)}。"
-        "项目视觉档案负责长期人物和猫咪身份及系列画风；"
-        "场景视觉基准和片段素材只承担各自声明的视觉职责，不得反向改写长期身份。"
-        f"素材：{binding_text}"
+    first_frame_mode = any(
+        binding.provider_role is ProviderMediaRole.FIRST_FRAME
+        for binding in input_plan.bindings
     )
+    if first_frame_mode:
+        prefix = (
+            f"【首帧职责】输出{input_plan.resolution}、9:16竖屏、"
+            f"{context.duration_seconds}秒的一个完整视频片段，使用原生环境声和动作声。"
+            "已批准首帧是本镜头唯一的人物身份、猫咪身份、外观、比例、构图和画风来源；"
+            "只延续首帧并执行下方动作、微表情、运镜与声音变化，"
+            "不得重写、重构或补充人物、猫咪与画风特征。"
+            f"素材：{binding_text}"
+        )
+    else:
+        prefix = (
+            f"【主体、画风和素材职责】输出{input_plan.resolution}、9:16竖屏、"
+            f"{context.duration_seconds}秒的一个完整视频片段，使用原生环境声和动作声。"
+            f"{profile.person_identity}；{profile.person_hair}；{profile.person_body}；"
+            f"{profile.cat_identity}。采用{'、'.join(profile.style_positive)}，"
+            f"排除{'、'.join(profile.style_negative)}。"
+            "项目视觉档案负责长期人物和猫咪身份及系列画风；"
+            "场景视觉基准和片段素材只承担各自声明的视觉职责，不得反向改写长期身份。"
+            f"素材：{binding_text}"
+        )
     suffix = (
         "【系统技术限制】严格执行已确认创作正文，"
         "不由系统补写剧情、动作、空间关系、节奏或声音。"

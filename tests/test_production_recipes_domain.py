@@ -17,6 +17,7 @@ from cat_video_generator.domain.production_recipes import (
     RecipeSequenceRunRequest,
     SoundPlan,
     build_temporal_beats,
+    canon_reference_keys,
     canon_v2_reference_keys,
     recipe_task_source_hash,
     split_shot_durations,
@@ -244,6 +245,40 @@ def test_canon_v2_uses_one_watercolor_environment_style(
         style_key,
     )
     assert "style:line_texture" not in keys
+
+
+@pytest.mark.parametrize("environment", ("indoor", "outdoor"))
+def test_canon_v3_uses_fixed_identity_and_one_line_texture_style(environment: str) -> None:
+    keys = canon_reference_keys("canon-v3-healing-child-cat-line-texture", environment)
+
+    assert keys == (
+        "person:headshot",
+        "person:fullbody",
+        "cat:front",
+        "cat:side",
+        "style:line_texture",
+    )
+    assert "style:indoor" not in keys
+    assert "style:outdoor" not in keys
+
+
+def test_canon_v3_manifest_keeps_style_reference_responsibility_narrow() -> None:
+    manifest = json.loads(
+        (PROJECT_ROOT / "风格定稿" / "Canon-v3" / "manifest.json").read_text(encoding="utf-8")
+    )
+
+    assert manifest["profileId"] == "canon-v3-healing-child-cat-line-texture"
+    assert manifest["requiredKeys"] == [
+        "person:headshot",
+        "person:fullbody",
+        "cat:front",
+        "cat:side",
+        "style:line_texture",
+    ]
+    assert "style:indoor" not in manifest["requiredKeys"]
+    assert "style:outdoor" not in manifest["requiredKeys"]
+    assert "叶片" in manifest["styleReferenceInstruction"]
+    assert "绿色" in manifest["styleReferenceInstruction"]
 
 
 def test_golden_sample_manifest_covers_ten_original_indoor_outdoor_modes() -> None:

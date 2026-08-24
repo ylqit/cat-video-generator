@@ -26,6 +26,12 @@ describe("canvas reference selection", () => {
       sourcePort: "image_asset",
       targetPort: "image_reference[]",
     });
+    expect(
+      referenceConnection(node("character", "CharacterDesignNode"), node("storyboard", "StoryboardDirectorNode")),
+    ).toMatchObject({
+      sourcePort: "character_design",
+      targetPort: "character_design",
+    });
     expect(referenceConnection(node("timeline", "TimelineNode"), node("video", "VideoGenerationNode"))).toBeNull();
   });
 

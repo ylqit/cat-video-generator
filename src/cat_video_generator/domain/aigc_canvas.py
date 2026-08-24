@@ -53,6 +53,7 @@ class CanvasNodeType(StrEnum):
     RECIPE_GROUP = "RecipeGroupNode"
     BRIEF = "BriefNode"
     SUBJECT = "SubjectNode"
+    STYLE_PRESET = "StylePresetNode"
     CHARACTER_DESIGN = "CharacterDesignNode"
     STORY_PLANNER = "StoryPlannerNode"
     STORY_CANDIDATE = "StoryCandidateNode"
@@ -290,11 +291,27 @@ class StoryScorecard(StrictModel):
         return round(sum(values) / len(values), 2)
 
 
+class SceneContinuityRules(StrictModel):
+    """Scene-local facts that must not leak into another story scene."""
+
+    location: str = Field(min_length=1, max_length=300)
+    environment: Literal["indoor", "outdoor"]
+    time_weather: str = Field(alias="timeWeather", min_length=1, max_length=300)
+    decorations: list[str] = Field(default_factory=list, max_length=20)
+    props: list[str] = Field(default_factory=list, max_length=20)
+    transition_reason: str = Field(alias="transitionReason", default="", max_length=1_000)
+
+
 class StorySceneOutline(StrictModel):
+    scene_key: str = Field(
+        alias="sceneKey",
+        pattern=r"^[a-z0-9][a-z0-9_-]{1,79}$",
+    )
     title: str = Field(min_length=1, max_length=160)
     purpose: str = Field(min_length=1, max_length=1_000)
     synopsis: str = Field(min_length=1, max_length=4_000)
     duration_weight: int = Field(alias="durationWeight", ge=1, le=100)
+    continuity: SceneContinuityRules
 
 
 class StoryCandidateOutput(StrictModel):
@@ -302,6 +319,35 @@ class StoryCandidateOutput(StrictModel):
     logline: str = Field(min_length=1, max_length=2_000)
     synopsis: str = Field(min_length=1, max_length=12_000)
     scenes: list[StorySceneOutline] = Field(min_length=1, max_length=30)
+
+
+def validate_story_scene_plan(
+    candidate: StoryCandidateOutput,
+    *,
+    target_duration_seconds: int,
+) -> None:
+    """Validate story-driven scene changes against the supplier shot envelope."""
+
+    maximum_scene_count = 1 if target_duration_seconds <= 15 else math.ceil(
+        target_duration_seconds / 15
+    )
+    if len(candidate.scenes) > maximum_scene_count:
+        raise ValueError(
+            f"{target_duration_seconds}秒故事最多允许{maximum_scene_count}个场景，"
+            "请合并没有独立叙事目的的换场"
+        )
+    scene_keys = [scene.scene_key for scene in candidate.scenes]
+    if len(set(scene_keys)) != len(scene_keys):
+        raise ValueError("故事场景 sceneKey 必须稳定且唯一")
+    missing_transition = [
+        scene.scene_key
+        for scene in candidate.scenes[1:]
+        if not scene.continuity.transition_reason.strip()
+    ]
+    if missing_transition:
+        raise ValueError(
+            "换场必须填写叙事目的：" + ", ".join(missing_transition)
+        )
 
 
 class StoryboardBeatOutput(StrictModel):
@@ -500,8 +546,13 @@ _NODE_INPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
     CanvasNodeType.RECIPE_GROUP: frozenset(),
     CanvasNodeType.BRIEF: frozenset(),
     CanvasNodeType.SUBJECT: frozenset(),
+    CanvasNodeType.STYLE_PRESET: frozenset(),
     CanvasNodeType.CHARACTER_DESIGN: frozenset(
-        {CanvasPortType.SUBJECTS, CanvasPortType.STORY_REVISION}
+        {
+            CanvasPortType.SUBJECTS,
+            CanvasPortType.STORY_REVISION,
+            CanvasPortType.IMAGE_REFERENCES,
+        }
     ),
     CanvasNodeType.STORY_PLANNER: frozenset(
         {CanvasPortType.BRIEF, CanvasPortType.SUBJECTS}
@@ -520,6 +571,7 @@ _NODE_INPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
             CanvasPortType.STORY_REVISION,
             CanvasPortType.SUBJECTS,
             CanvasPortType.CHARACTER_DESIGN,
+            CanvasPortType.IMAGE_REFERENCES,
         }
     ),
     CanvasNodeType.SCENE: frozenset({CanvasPortType.SCENE_PLAN}),
@@ -569,6 +621,7 @@ _NODE_OUTPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
     CanvasNodeType.SUBJECT: frozenset(
         {CanvasPortType.SUBJECTS, CanvasPortType.PRODUCT_SUBJECT}
     ),
+    CanvasNodeType.STYLE_PRESET: frozenset({CanvasPortType.IMAGE_REFERENCES}),
     CanvasNodeType.CHARACTER_DESIGN: frozenset(
         {CanvasPortType.CHARACTER_DESIGN, CanvasPortType.IMAGE_ASSET}
     ),

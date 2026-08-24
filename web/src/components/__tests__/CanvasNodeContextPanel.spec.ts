@@ -23,6 +23,9 @@ describe("CanvasNodeContextPanel", () => {
 
     expect(wrapper.text()).toContain("孩子和猫在雨前一起收回风筝");
     expect(wrapper.text()).toContain("综合评分 8.7");
+    expect(wrapper.text()).toContain("原创故事候选");
+    expect(wrapper.text()).not.toContain("StoryCandidateNode");
+    expect(wrapper.text()).not.toContain("story_revision");
     expect(wrapper.text()).not.toContain("privateDebugPayload");
     expect(wrapper.text()).not.toContain("shouldNotLeak");
 
@@ -46,5 +49,28 @@ describe("CanvasNodeContextPanel", () => {
     expect(wrapper.emitted("action")?.[0]).toEqual([
       { key: "edit_brief", label: "编辑创意简报", enabled: true, execution: "client" },
     ]);
+  });
+
+  it("explains a disabled action instead of silently ignoring the click", async () => {
+    const node: CanvasNodeDto = {
+      id: "storyboard-1",
+      type: "StoryboardDirectorNode",
+      objectType: "storyboard_director",
+      objectId: "director-1",
+      position: { x: 0, y: 0 },
+      data: { title: "分镜导演", shotCount: 0 },
+      availableActions: [{
+        key: "review_storyboard",
+        label: "批准当前分镜",
+        enabled: false,
+        execution: "unavailable",
+        disabledReason: "请先生成并保存镜头表",
+      }],
+    };
+    const wrapper = mount(CanvasNodeContextPanel, { props: { node } });
+
+    await wrapper.get('[data-action="review_storyboard"]').trigger("click");
+    expect(wrapper.text()).toContain("请先生成并保存镜头表");
+    expect(wrapper.emitted("action")).toBeUndefined();
   });
 });

@@ -13,6 +13,9 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ...domain.aigc_canvas import CanvasNodeType, CanvasPortType, StoryRevisionStatus
 from ...domain.production_recipes import (
+    CANON_V3_PROFILE_ID,
+    CANON_V3_STYLE_NEGATIVE,
+    CANON_V3_STYLE_POSITIVE,
     CatBehaviorMode,
     CharacterDesignSlot,
     EpisodeRules,
@@ -21,7 +24,7 @@ from ...domain.production_recipes import (
     ProductionRecipeInstanceDraft,
     ProductionRecipeInstancePatch,
     build_temporal_beats,
-    canon_v2_reference_keys,
+    canon_reference_keys,
     recipe_task_source_hash,
 )
 from ...domain.workflow import StepKind, StepStatus
@@ -38,6 +41,7 @@ from .models import (
     HumanReviewDecisionRecord,
     ProductionRecipeInstance,
     ProductionRun,
+    PromptRecord,
     Review,
     Scene,
     ShotBeat,
@@ -46,15 +50,22 @@ from .models import (
     StoryRevisionRecord,
     StoryScore,
     Subject,
-    SubjectReference,
-    SubjectRevision,
     VideoSequence,
     VisualProfileRevision,
     WorkflowStep,
 )
 from .repositories import RecordNotFoundError, WorkflowConflictError
+from .story_scenes import materialize_approved_story_scenes
+from .visual_preset_profiles import (
+    CANON_V3_REQUIRED_KEYS,
+    ensure_canon_v3_subjects,
+    ensure_canon_v3_visual_profile,
+    generation_reference_bindings,
+    visual_profile_bindings,
+    visual_reference_json,
+)
 
-_CANON_PROFILE_ID = "canon-v2-healing-child-cat"
+_CANON_PROFILE_ID = CANON_V3_PROFILE_ID
 _APPROVING_DECISIONS = {
     HumanReviewDecision.APPROVE.value,
     HumanReviewDecision.OVERRIDE.value,
@@ -220,6 +231,52 @@ class SqlAlchemyProductionRecipeRepository:
             )
             return _workflow_task_json(row)
 
+    def record_task_children(
+        self,
+        parent_step_id: uuid.UUID,
+        child_step_ids: tuple[uuid.UUID, ...],
+    ) -> tuple[dict[str, Any], ...]:
+        ordered_ids = tuple(dict.fromkeys(child_step_ids))
+        if not ordered_ids:
+            return ()
+        if parent_step_id in ordered_ids:
+            raise WorkflowConflictError("任务不能将自身登记为子任务")
+        with self._sessions.begin() as session:
+            parent = self._required(session, WorkflowStep, parent_step_id, lock=True)
+            children = list(
+                session.scalars(
+                    select(WorkflowStep)
+                    .where(WorkflowStep.id.in_(ordered_ids))
+                    .with_for_update()
+                )
+            )
+            by_id = {child.id: child for child in children}
+            missing = [step_id for step_id in ordered_ids if step_id not in by_id]
+            if missing:
+                raise RecordNotFoundError(
+                    f"父任务引用了不存在的子任务：{', '.join(str(item) for item in missing)}"
+                )
+            if any(child.production_run_id != parent.production_run_id for child in children):
+                raise WorkflowConflictError("父子任务必须属于同一个项目")
+            for child in children:
+                child.input_snapshot_json = {
+                    **dict(child.input_snapshot_json or {}),
+                    "parentStepId": str(parent.id),
+                }
+            parent.progress_json = {
+                **dict(parent.progress_json or {}),
+                "childStepIds": [str(step_id) for step_id in ordered_ids],
+            }
+            return tuple(
+                {
+                    "stepId": str(step_id),
+                    "status": by_id[step_id].status,
+                    "providerTaskId": by_id[step_id].provider_task_id,
+                    "error": by_id[step_id].error_json,
+                }
+                for step_id in ordered_ids
+            )
+
     @staticmethod
     def _initialize_recipe_canvas_group(
         session: Session,
@@ -248,6 +305,7 @@ class SqlAlchemyProductionRecipeRepository:
             "creative_gate": uuid.uuid5(project_id, "creative-brief-approval"),
             "planner": uuid.uuid5(project_id, "story-planner"),
             "story_gate": uuid.uuid5(project_id, "story-approval"),
+            "style_preset": uuid.uuid5(project_id, "style-preset:line-texture"),
             "child_design": uuid.uuid5(project_id, "character-design:child"),
             "cat_design": uuid.uuid5(project_id, "character-design:cat"),
             "pair_design": uuid.uuid5(project_id, "character-design:pair-scale"),
@@ -276,6 +334,14 @@ class SqlAlchemyProductionRecipeRepository:
             ),
             (child.id, CanvasNodeType.SUBJECT, "subject", child.id, "固定儿童", "character_design"),
             (cat.id, CanvasNodeType.SUBJECT, "subject", cat.id, "固定猫咪", "character_design"),
+            (
+                ids["style_preset"],
+                CanvasNodeType.STYLE_PRESET,
+                "visual_preset",
+                None,
+                "线条材质",
+                "character_design",
+            ),
             (
                 ids["planner"],
                 CanvasNodeType.STORY_PLANNER,
@@ -380,6 +446,26 @@ class SqlAlchemyProductionRecipeRepository:
             }
             if node_id in slot_by_node:
                 data["slot"] = slot_by_node[node_id]
+            if node_id == ids["style_preset"]:
+                style_asset = session.scalar(
+                    select(Asset).where(
+                        Asset.scope == "canon",
+                        Asset.status.in_(("ready", "approved")),
+                        Asset.semantic_key == "style:line_texture",
+                    )
+                )
+                if style_asset is None:
+                    raise WorkflowConflictError("Canon-v3 缺少线条材质参考")
+                data.update(
+                    {
+                        "presetKey": "healing_child_cat_line_texture_v3",
+                        "canonProfileId": CANON_V3_PROFILE_ID,
+                        "references": [visual_reference_json(style_asset, required=True)],
+                        "stylePositive": list(CANON_V3_STYLE_POSITIVE),
+                        "styleExcluded": list(CANON_V3_STYLE_NEGATIVE),
+                        "locked": True,
+                    }
+                )
             if node is None:
                 node = CanvasGraphNode(
                     id=node_id,
@@ -451,6 +537,41 @@ class SqlAlchemyProductionRecipeRepository:
                 ids["child_design"],
                 CanvasPortType.SUBJECTS,
                 "identity_source",
+            ),
+            (
+                ids["style_preset"],
+                CanvasPortType.IMAGE_REFERENCES,
+                ids["child_design"],
+                CanvasPortType.IMAGE_REFERENCES,
+                "style_source",
+            ),
+            (
+                ids["style_preset"],
+                CanvasPortType.IMAGE_REFERENCES,
+                ids["cat_design"],
+                CanvasPortType.IMAGE_REFERENCES,
+                "style_source",
+            ),
+            (
+                ids["style_preset"],
+                CanvasPortType.IMAGE_REFERENCES,
+                ids["pair_design"],
+                CanvasPortType.IMAGE_REFERENCES,
+                "style_source",
+            ),
+            (
+                ids["style_preset"],
+                CanvasPortType.IMAGE_REFERENCES,
+                ids["storyboard"],
+                CanvasPortType.IMAGE_REFERENCES,
+                "style_source",
+            ),
+            (
+                ids["style_preset"],
+                CanvasPortType.IMAGE_REFERENCES,
+                ids["anchors"],
+                CanvasPortType.IMAGE_REFERENCES,
+                "style_source",
             ),
             (
                 cat.id,
@@ -576,24 +697,20 @@ class SqlAlchemyProductionRecipeRepository:
         target_duration_seconds: int,
         inspiration_key: str | None,
     ) -> None:
-        identity_keys = tuple(
-            reference["semanticKey"]
-            for subject in _fixed_ip_subject_documents()
-            for reference in subject["references"]
-        )
+        required_keys = CANON_V3_REQUIRED_KEYS
         assets = list(
             session.scalars(
                 select(Asset).where(
                     Asset.scope == "canon",
                     Asset.status.in_(("ready", "approved")),
-                    Asset.semantic_key.in_(identity_keys),
+                    Asset.semantic_key.in_(required_keys),
                 )
             )
         )
         assets_by_key = {asset.semantic_key: asset for asset in assets}
-        missing = [key for key in identity_keys if key not in assets_by_key]
+        missing = [key for key in required_keys if key not in assets_by_key]
         if missing:
-            raise ValueError(f"创建组合包前请补齐 Canon 身份参考：{', '.join(missing)}")
+            raise ValueError(f"创建组合包前请补齐 Canon-v3 参考：{', '.join(missing)}")
 
         session.add(
             StoryBriefRecord(
@@ -608,7 +725,7 @@ class SqlAlchemyProductionRecipeRepository:
                 target_duration_seconds=target_duration_seconds,
                 constraints_json=[
                     "固定儿童与固定猫咪身份",
-                    "原创二维水彩画风",
+                    "原创二维治愈数字插画，统一线条、材质与光线",
                     "无对白",
                     "原生环境声、动作声与轻音乐",
                     "每镜包含开始、小变化、温暖收尾三个时间节拍",
@@ -616,74 +733,124 @@ class SqlAlchemyProductionRecipeRepository:
                 ],
             )
         )
-        for document in _fixed_ip_subject_documents():
-            subject = Subject(
-                id=uuid.uuid4(),
-                production_run_id=project_id,
-                kind=document["kind"],
-                role=document["role"],
-                status="ready",
-            )
-            session.add(subject)
-            session.flush()
-            references = [
-                {
-                    "assetId": str(assets_by_key[reference["semanticKey"]].id),
-                    "semanticRole": reference["semanticRole"],
-                    "instruction": reference["instruction"],
-                }
-                for reference in document["references"]
-            ]
-            revision_document = {
-                "name": document["name"],
-                "kind": document["kind"],
-                "role": document["role"],
-                "identityAnchors": document["identityAnchors"],
-                "immutableTraits": document["immutableTraits"],
-                "relationshipNotes": document["relationshipNotes"],
-                "dramaticFunction": document["dramaticFunction"],
-                "visualRisks": document["visualRisks"],
-                "references": references,
-            }
-            revision = SubjectRevision(
-                id=uuid.uuid4(),
-                subject_id=subject.id,
-                revision=1,
-                name=document["name"],
-                identity_anchors_json=document["identityAnchors"],
-                immutable_traits_json=document["immutableTraits"],
-                relationship_notes=document["relationshipNotes"],
-                dramatic_function=document["dramaticFunction"],
-                visual_risks_json=document["visualRisks"],
-                revision_hash=hashlib.sha256(
-                    json.dumps(
-                        revision_document,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                ).hexdigest(),
-                approval_status="approved",
-            )
-            session.add(revision)
-            session.flush()
-            subject.current_revision_id = revision.id
-            for order, reference in enumerate(document["references"], 1):
-                session.add(
-                    SubjectReference(
-                        id=uuid.uuid4(),
-                        subject_revision_id=revision.id,
-                        asset_id=assets_by_key[reference["semanticKey"]].id,
-                        semantic_role=reference["semanticRole"],
-                        sort_order=order,
-                        instruction=reference["instruction"],
-                    )
-                )
+        ensure_canon_v3_subjects(
+            session,
+            project_id=project_id,
+            assets_by_key=assets_by_key,
+        )
+        ensure_canon_v3_visual_profile(
+            session,
+            project_id=project_id,
+            assets_by_key=assets_by_key,
+        )
 
     def get_instance(self, instance_id: uuid.UUID) -> dict[str, Any]:
         with self._sessions() as session:
             row = self._required(session, ProductionRecipeInstance, instance_id)
             return self._instance_json(session, row)
+
+    def validate_storyboard_character_references(
+        self,
+        instance_id: uuid.UUID,
+        reference_asset_ids: tuple[uuid.UUID, ...],
+    ) -> None:
+        """Enforce that character-led storyboards use the approved child and cat slots."""
+
+        with self._sessions() as session:
+            self._required(session, ProductionRecipeInstance, instance_id)
+            revision = session.scalar(
+                select(CharacterDesignRevision)
+                .where(
+                    CharacterDesignRevision.production_recipe_instance_id == instance_id,
+                    CharacterDesignRevision.status == "approved",
+                )
+                .order_by(CharacterDesignRevision.revision.desc())
+                .limit(1)
+            )
+            if revision is None:
+                raise WorkflowConflictError(
+                    "基于固定角色补充分镜需要先批准本集儿童、猫咪和同框比例设计"
+                )
+
+            selected_assets = list(
+                session.scalars(
+                    select(CharacterDesignAsset).where(
+                        CharacterDesignAsset.character_design_revision_id == revision.id,
+                        CharacterDesignAsset.selected.is_(True),
+                    )
+                )
+            )
+            selected_by_id = {asset.asset_id: asset for asset in selected_assets}
+            provided_ids = set(reference_asset_ids)
+            unapproved_ids = provided_ids.difference(selected_by_id)
+            if unapproved_ids:
+                raise WorkflowConflictError(
+                    "基于固定角色补充分镜只能引用当前已批准的角色设计素材，"
+                    "普通参考图不能替代 Canon 身份"
+                )
+
+            provided_slots = {
+                selected_by_id[asset_id].slot
+                for asset_id in provided_ids
+                if asset_id in selected_by_id
+            }
+            required_slots = {
+                CharacterDesignSlot.CHILD.value,
+                CharacterDesignSlot.CAT.value,
+            }
+            missing_slots = required_slots.difference(provided_slots)
+            if missing_slots:
+                missing_labels = [
+                    label
+                    for slot, label in (
+                        (CharacterDesignSlot.CHILD.value, "儿童"),
+                        (CharacterDesignSlot.CAT.value, "猫咪"),
+                    )
+                    if slot in missing_slots
+                ]
+                raise WorkflowConflictError(
+                    f"基于固定角色补充分镜必须同时包含已批准的{'和'.join(missing_labels)}角色设计素材"
+                )
+
+    def validate_anchor_prompt_readiness(
+        self,
+        instance_id: uuid.UUID,
+        shot_id: uuid.UUID,
+    ) -> None:
+        """Reject anchor generation when its audited layered prompt is absent or stale."""
+
+        with self._sessions() as session:
+            instance = self._required(session, ProductionRecipeInstance, instance_id)
+            shot = self._required(session, ShotCard, shot_id)
+            scene = self._required(session, Scene, shot.scene_id)
+            if scene.production_run_id != instance.production_run_id or not scene.active:
+                raise WorkflowConflictError("镜头所属场景已过期，请重新生成分镜")
+            beat = session.scalar(
+                select(ShotBeat).where(
+                    ShotBeat.shot_card_id == shot.id,
+                    ShotBeat.scene_id == scene.id,
+                    ShotBeat.status == "approved",
+                )
+            )
+            if beat is None or beat.prompt_id is None:
+                raise WorkflowConflictError(
+                    "镜头尚未完成服务端分层 Prompt 编译和分镜人工批准"
+                )
+            prompt = self._required(session, PromptRecord, beat.prompt_id)
+            snapshot = dict(prompt.input_snapshot_json or {})
+            project = self._required(session, ProductionRun, instance.production_run_id)
+            if (
+                prompt.status != "succeeded"
+                or prompt.call_purpose != "storyboard_prompt_compilation"
+                or str(snapshot.get("storyRevisionId")) != str(beat.story_revision_id)
+                or str(snapshot.get("visualProfileRevisionId"))
+                != str(project.current_visual_profile_revision_id)
+                or int(snapshot.get("sceneLookDraftRevision") or 0)
+                != scene.look_draft_revision
+            ):
+                raise WorkflowConflictError(
+                    "镜头 Prompt 已因剧情、视觉档案或场景资产更新而过期，请重新编译"
+                )
 
     def update_instance(
         self,
@@ -875,6 +1042,12 @@ class SqlAlchemyProductionRecipeRepository:
                 for previous in previous_approved:
                     previous.status = StoryRevisionStatus.SUPERSEDED.value
             self._apply_review_to_target(session, effective_payload, target_row)
+            if (
+                isinstance(target_row, StoryRevisionRecord)
+                and effective_payload.target_type in {"story_revision", "episode_rules"}
+                and effective_payload.decision.value in _APPROVING_DECISIONS
+            ):
+                materialize_approved_story_scenes(session, target_row)
             session.flush()
             return _review_json(row)
 
@@ -930,6 +1103,12 @@ class SqlAlchemyProductionRecipeRepository:
                     raise WorkflowConflictError("现有镜头已有付费历史，不能重建配方分镜")
                 session.execute(delete(ShotCard).where(ShotCard.scene_id.in_(scene_ids)))
             order_by_scene: dict[uuid.UUID, int] = {}
+            scene_contexts = {
+                scene_id: _scene_continuity_document(
+                    self._required(session, Scene, scene_id)
+                )
+                for scene_id in scene_ids
+            }
             for beat, document in zip(beats, beat_documents, strict=True):
                 order_by_scene[beat.scene_id] = order_by_scene.get(beat.scene_id, 0) + 1
                 order = order_by_scene[beat.scene_id]
@@ -947,7 +1126,12 @@ class SqlAlchemyProductionRecipeRepository:
                     scene_id=beat.scene_id,
                     sort_order=order,
                     title=beat.title[:100],
-                    direction=_healing_shot_direction(beat, temporal_beats, rules),
+                    direction=_healing_shot_direction(
+                        beat,
+                        temporal_beats,
+                        rules,
+                        scene_contexts.get(beat.scene_id, {}),
+                    ),
                     duration_seconds=beat.duration_seconds,
                     anchor_mode="generate",
                     reference_bindings_json=[],
@@ -1092,7 +1276,7 @@ class SqlAlchemyProductionRecipeRepository:
         if story is None or not story.episode_rules_json:
             raise WorkflowConflictError("角色设计来源故事不存在或规则未锁定")
         rules = EpisodeRules.model_validate(story.episode_rules_json)
-        keys = canon_v2_reference_keys(rules.environment)
+        keys = canon_reference_keys(instance.canon_profile_id, rules.environment)
         canon_assets = list(
             session.scalars(
                 select(Asset).where(
@@ -1306,6 +1490,7 @@ class SqlAlchemyProductionRecipeRepository:
                     .join(Scene, Scene.id == ShotBeat.scene_id)
                     .where(
                         Scene.production_run_id == parent.production_run_id,
+                        Scene.active.is_(True),
                         ShotBeat.status == "approved",
                     )
                     .order_by(Scene.sort_order, ShotBeat.sort_order)
@@ -1432,6 +1617,7 @@ class SqlAlchemyProductionRecipeRepository:
                 .join(Scene, Scene.id == ShotBeat.scene_id)
                 .where(
                     Scene.production_run_id == row.production_run_id,
+                    Scene.active.is_(True),
                     ShotBeat.status != "superseded",
                 )
             )
@@ -1509,7 +1695,10 @@ class SqlAlchemyProductionRecipeRepository:
             )
         )
         storyboard_approved = bool(
-            storyboard_decision is not None and storyboard_decision.decision in _APPROVING_DECISIONS
+            current_beats
+            and all(beat.prompt_id is not None for beat in current_beats)
+            and storyboard_decision is not None
+            and storyboard_decision.decision in _APPROVING_DECISIONS
         )
         approved_anchor_count = sum(shot.selected_anchor_asset_id is not None for shot in shots)
         approved_video_count = sum(shot.selected_video_asset_id is not None for shot in shots)
@@ -1611,7 +1800,15 @@ class SqlAlchemyProductionRecipeRepository:
         project_id: uuid.UUID,
         rules: EpisodeRules,
     ) -> None:
-        keys = canon_v2_reference_keys(rules.environment)
+        instance = session.scalar(
+            select(ProductionRecipeInstance).where(
+                ProductionRecipeInstance.production_run_id == project_id
+            )
+        )
+        canon_profile_id = (
+            rules.canon_profile_id if instance is None else instance.canon_profile_id
+        )
+        keys = canon_reference_keys(canon_profile_id, rules.environment)
         assets = list(
             session.scalars(
                 select(Asset).where(
@@ -1624,7 +1821,7 @@ class SqlAlchemyProductionRecipeRepository:
         by_key = {asset.semantic_key: asset for asset in assets}
         missing = [key for key in keys if key not in by_key]
         if missing:
-            raise ValueError(f"Canon-v2 缺少可用参考：{', '.join(missing)}")
+            raise ValueError(f"{canon_profile_id} 缺少可用参考：{', '.join(missing)}")
         snapshot = [
             {
                 "assetId": str(by_key[key].id),
@@ -1662,25 +1859,17 @@ class SqlAlchemyProductionRecipeRepository:
                 )
                 + 1
             )
-            bindings = [
-                {
-                    "assetId": str(by_key[key].id),
-                    "usage": "generation_reference",
-                    "role": "style" if key.startswith("style:") else "identity",
-                    "applyTo": "both",
-                }
-                for key in keys
-            ]
+            bindings = visual_profile_bindings(by_key, keys)
             profile = VisualProfileRevision(
                 id=uuid.uuid4(),
                 production_run_id=project_id,
                 revision=revision,
                 profile_hash=digest,
                 source_profile_id=rules.canon_profile_id,
-                person_identity="沿用 Canon-v2 人物脸部身份，不改变年龄与五官",
-                person_hair="沿用 Canon-v2 发型与发色",
-                person_body="沿用 Canon-v2 儿童身体比例",
-                cat_identity="沿用 Canon-v2 猫咪脸部、毛色分区、体型与尾巴环纹",
+                person_identity=f"沿用 {canon_profile_id} 人物脸部身份，不改变年龄与五官",
+                person_hair=f"沿用 {canon_profile_id} 发型与发色",
+                person_body=f"沿用 {canon_profile_id} 儿童身体比例",
+                cat_identity=f"沿用 {canon_profile_id} 猫咪脸部、毛色分区、体型与尾巴环纹",
                 style_positive_json=rules.style_positive,
                 style_negative_json=rules.style_excluded,
                 reference_bindings_json=bindings,
@@ -1692,7 +1881,7 @@ class SqlAlchemyProductionRecipeRepository:
         if project is None:
             raise RecordNotFoundError(f"ProductionRun not found: {project_id}")
         project.current_visual_profile_revision_id = profile.id
-        project.default_reference_bindings_json = profile.reference_bindings_json
+        project.default_reference_bindings_json = generation_reference_bindings(by_key, keys)
 
     @staticmethod
     def _review_target(
@@ -1718,6 +1907,7 @@ class SqlAlchemyProductionRecipeRepository:
                         .join(Scene, Scene.id == ShotBeat.scene_id)
                         .where(
                             Scene.production_run_id == project_id,
+                            Scene.active.is_(True),
                             ShotBeat.status != "superseded",
                         )
                         .order_by(Scene.sort_order, ShotBeat.sort_order)
@@ -1726,6 +1916,16 @@ class SqlAlchemyProductionRecipeRepository:
             )
             if not beats:
                 raise WorkflowConflictError("分镜尚未生成，不能审核")
+            missing_prompt_orders = [
+                str(index)
+                for index, beat in enumerate(beats, 1)
+                if beat.prompt_id is None
+            ]
+            if missing_prompt_orders:
+                raise WorkflowConflictError(
+                    "以下镜头尚未完成服务端分层 Prompt 编译："
+                    + "、".join(missing_prompt_orders)
+                )
             return {
                 "row": row,
                 "project_id": project_id,
@@ -1785,7 +1985,10 @@ class SqlAlchemyProductionRecipeRepository:
             return
         if isinstance(row, StoryRevisionRecord):
             if payload.target_type == "storyboard_revision":
-                scene_ids = select(Scene.id).where(Scene.production_run_id == row.production_run_id)
+                scene_ids = select(Scene.id).where(
+                    Scene.production_run_id == row.production_run_id,
+                    Scene.active.is_(True),
+                )
                 session.execute(
                     update(ShotBeat)
                     .where(
@@ -1925,7 +2128,10 @@ class SqlAlchemyProductionRecipeRepository:
         project_id: uuid.UUID,
         reason: str,
     ) -> None:
-        scene_ids = select(Scene.id).where(Scene.production_run_id == project_id)
+        scene_ids = select(Scene.id).where(
+            Scene.production_run_id == project_id,
+            Scene.active.is_(True),
+        )
         session.execute(
             update(CharacterDesignRevision)
             .where(
@@ -2117,62 +2323,6 @@ def _storyboard_review_hash(beats: list[ShotBeat]) -> str:
     ).hexdigest()
 
 
-def _fixed_ip_subject_documents() -> tuple[dict[str, Any], dict[str, Any]]:
-    """Return the versioned fixed-IP narrative bindings owned by this recipe."""
-    return (
-        {
-            "name": "固定儿童",
-            "kind": "person",
-            "role": "protagonist",
-            "identityAnchors": [
-                "脸部、年龄、五官与短发由 Canon-v2 人物参考锁定",
-                "全片保持同一儿童身体比例，不成人化",
-            ],
-            "immutableTraits": ["固定五官", "固定短发", "儿童身体比例"],
-            "relationshipNotes": "与固定猫咪相互信任，以轻微动作和目光完成日常互动。",
-            "dramaticFunction": "主动完成一个低压力的日常小行动。",
-            "visualRisks": ["年龄漂移", "脸部漂移", "身体比例成人化", "服装跨镜变化"],
-            "references": [
-                {
-                    "semanticKey": "person:headshot",
-                    "semanticRole": "front",
-                    "instruction": "锁定脸型、五官、年龄与发型。",
-                },
-                {
-                    "semanticKey": "person:fullbody",
-                    "semanticRole": "full_body",
-                    "instruction": "锁定儿童身体比例与整体轮廓。",
-                },
-            ],
-        },
-        {
-            "name": "固定猫咪",
-            "kind": "animal",
-            "role": "co_protagonist",
-            "identityAnchors": [
-                "脸部、毛色分区、体型与环纹尾巴由 Canon-v2 猫咪参考锁定",
-                "保持猫科身体结构与四足姿态",
-            ],
-            "immutableTraits": ["固定脸部", "固定毛色分区", "固定环纹尾巴", "四足猫科结构"],
-            "relationshipNotes": "用耳朵、尾巴、步态和靠近动作回应儿童。",
-            "dramaticFunction": "参与小变化并促成温暖收尾。",
-            "visualRisks": ["毛色漂移", "尾巴纹路漂移", "人形肢体", "多余肢体"],
-            "references": [
-                {
-                    "semanticKey": "cat:front",
-                    "semanticRole": "front",
-                    "instruction": "锁定猫咪脸部、眼睛与正面毛色分区。",
-                },
-                {
-                    "semanticKey": "cat:side",
-                    "semanticRole": "side",
-                    "instruction": "锁定猫咪体型、侧面虎斑与环纹尾巴。",
-                },
-            ],
-        },
-    )
-
-
 def _sequence_candidate_json(
     sequence: VideoSequence,
     rendered_asset: Asset | None,
@@ -2303,21 +2453,39 @@ def _healing_shot_direction(
     beat: ShotBeat,
     temporal_beats: tuple[Any, ...],
     rules: EpisodeRules,
+    scene_context: dict[str, Any],
 ) -> str:
     timeline = "；".join(
         f"{item.start_second}-{item.end_second}秒 {item.child_action}，{item.cat_action}，"
         f"镜头：{item.camera}"
         for item in temporal_beats
     )
+    continuity = dict(scene_context.get("continuity") or {})
+    location = str(continuity.get("location") or rules.main_scene)
+    environment = str(continuity.get("environment") or rules.environment)
+    time_weather = str(continuity.get("timeWeather") or rules.time_weather)
+    decorations = "、".join(str(item) for item in continuity.get("decorations") or [])
+    scene_props = "、".join(str(item) for item in continuity.get("props") or rules.core_props)
     return (
-        f"单场景连续镜头。{timeline}。"
+        f"当前场景内连续镜头。{timeline}。"
         f"服装固定：{rules.person_wardrobe}。时间天气固定：{rules.time_weather}。"
-        f"场景固定：{rules.main_scene}。"
+        f"所属场景：{location}（{environment}），时间天气：{time_weather}。"
+        f"关键装饰：{decorations or '无额外装饰'}。场景道具：{scene_props or '无核心道具'}。"
         f"声音：环境声为{'、'.join(rules.sound_plan.ambient)}；"
         f"动作声为{'、'.join(rules.sound_plan.foley)}；"
         f"轻音乐情绪为{rules.sound_plan.music_mood}。"
         "只描述动作、微表情、运镜与声音变化；不得重写人物、猫咪或画风身份。无对白。"
     )
+
+
+def _scene_continuity_document(scene: Scene) -> dict[str, Any]:
+    if not scene.context_note:
+        return {}
+    try:
+        document = json.loads(scene.context_note)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return document if isinstance(document, dict) else {}
 
 
 def _workflow_task_json(row: WorkflowStep) -> dict[str, Any]:
@@ -2333,6 +2501,8 @@ def _workflow_task_json(row: WorkflowStep) -> dict[str, Any]:
         "canvasGroupId": snapshot.get("canvasGroupId"),
         "recipeInstanceId": snapshot.get("recipeInstanceId"),
         "creationMode": snapshot.get("creationMode"),
+        "parentStepId": snapshot.get("parentStepId"),
+        "childStepIds": progress.get("childStepIds", []),
         "workflowStage": snapshot.get("workflowStage"),
         "phase": snapshot.get("phase"),
         "operationKey": row.operation_key,

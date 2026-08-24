@@ -23,6 +23,8 @@ const calls = vi.hoisted(() => ({
   providerCapabilities: vi.fn(),
   createEdge: vi.fn(),
   deleteEdge: vi.fn(),
+  archiveNode: vi.fn(),
+  restoreNode: vi.fn(),
   bindNodeAssets: vi.fn(),
   assets: vi.fn(),
   subjects: vi.fn(),
@@ -83,7 +85,7 @@ const VueFlowStub = defineComponent({
     panOnDrag: { type: Boolean, default: true },
     panActivationKeyCode: { type: String, default: undefined },
   },
-  template: '<div><slot v-for="item in nodes" :name="`node-${item.type}`" :data="item.data" /></div>',
+  template: '<div><div v-for="item in nodes" :data-canvas-node-id="item.id"><slot :name="`node-${item.type}`" :data="item.data" /></div></div>',
 });
 const CanvasLocalConsoleStub = defineComponent({
   props: { title: String, preset: String },
@@ -208,7 +210,7 @@ describe("AigcCanvasWorkspace", () => {
     wrapper.unmount();
   });
 
-  it("keeps the local console at its screen position while the toolbar follows canvas movement", async () => {
+  it("keeps the console centered below the node while the canvas moves without remeasuring DOM", async () => {
     const video = {
       id: "video-fixed-console",
       type: "VideoAssetNode" as const,
@@ -227,10 +229,9 @@ describe("AigcCanvasWorkspace", () => {
       edges: [],
       nodes: [video],
     });
-    let nodeRect = { left: 260, top: 180, right: 540, bottom: 360, width: 280, height: 180, x: 260, y: 180, toJSON: () => ({}) };
     const rectSpy = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
-      return this.matches('[data-canvas-node-id="video-fixed-console"]')
-        ? nodeRect as DOMRect
+      return this.classList.contains("canvas-surface")
+        ? { left: 100, top: 50, right: 1300, bottom: 950, width: 1200, height: 900, x: 100, y: 50, toJSON: () => ({}) } as DOMRect
         : { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
     });
     const wrapper = shallowMount(AigcCanvasWorkspace, {
@@ -249,15 +250,120 @@ describe("AigcCanvasWorkspace", () => {
     await flushPromises();
 
     wrapper.findComponent(CanvasNodeCard).vm.$emit("select-node", video);
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
     await flushPromises();
-    const originalStyle = wrapper.findComponent(CanvasLocalConsole).attributes("style");
+    expect(wrapper.findComponent(CanvasLocalConsole).attributes("style"))
+      .toContain("translate3d(150px, 722px, 0)");
+    const measurementsAfterSelection = rectSpy.mock.calls.length;
+    const scheduledFrames: FrameRequestCallback[] = [];
+    const animationFrameSpy = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      scheduledFrames.push(callback);
+      return scheduledFrames.length;
+    });
 
-    nodeRect = { ...nodeRect, left: 720, right: 1000, x: 720 };
-    wrapper.findComponent(VueFlowStub).vm.$emit("move");
+    wrapper.findComponent(VueFlowStub).vm.$emit("move", {
+      flowTransform: { x: 120, y: -20, zoom: 1 },
+    });
+    wrapper.findComponent(VueFlowStub).vm.$emit("move", {
+      flowTransform: { x: 140, y: -30, zoom: 1 },
+    });
+    wrapper.findComponent(VueFlowStub).vm.$emit("move", {
+      flowTransform: { x: 160, y: -40, zoom: 1 },
+    });
+    expect(scheduledFrames).toHaveLength(1);
+    scheduledFrames[0]?.(performance.now());
     await flushPromises();
 
-    expect(wrapper.findComponent(CanvasLocalConsole).attributes("style")).toBe(originalStyle);
+    expect(wrapper.findComponent(CanvasLocalConsole).attributes("style"))
+      .toContain("translate3d(310px, 682px, 0)");
+    expect(rectSpy.mock.calls.length).toBe(measurementsAfterSelection);
+    animationFrameSpy.mockRestore();
     rectSpy.mockRestore();
+    wrapper.unmount();
+  });
+
+  it("archives a removable selected node and restores it from the undo notice", async () => {
+    const removable = {
+      id: "prompt-removable",
+      type: "PromptArtifactNode" as const,
+      objectType: "prompt_run",
+      objectId: "prompt-run-1",
+      revision: 1,
+      position: { x: 300, y: 200 },
+      availableActions: [
+        { key: "archive_node" as const, label: "从画布移除", enabled: true, execution: "client" as const },
+      ],
+      data: { title: "镜头提示词" },
+    };
+    calls.canvas
+      .mockResolvedValueOnce({
+        projectId: "project-1",
+        canvasV2Enabled: true,
+        layoutVersion: 3,
+        syncStatus: "saved",
+        viewport: { x: 0, y: 0, zoom: 1 },
+        edges: [],
+        nodes: [removable],
+      })
+      .mockResolvedValueOnce({
+        projectId: "project-1",
+        canvasV2Enabled: true,
+        layoutVersion: 4,
+        syncStatus: "saved",
+        viewport: { x: 0, y: 0, zoom: 1 },
+        edges: [],
+        nodes: [],
+      })
+      .mockResolvedValueOnce({
+        projectId: "project-1",
+        canvasV2Enabled: true,
+        layoutVersion: 5,
+        syncStatus: "saved",
+        viewport: { x: 0, y: 0, zoom: 1 },
+        edges: [],
+        nodes: [removable],
+      });
+    calls.archiveNode.mockResolvedValue({
+      projectId: "project-1",
+      nodeId: removable.id,
+      archived: true,
+      layoutVersion: 4,
+    });
+    calls.restoreNode.mockResolvedValue({
+      projectId: "project-1",
+      nodeId: removable.id,
+      archived: false,
+      layoutVersion: 5,
+    });
+    const wrapper = shallowMount(AigcCanvasWorkspace, {
+      props: { projectId: "project-1" },
+      global: {
+        stubs: {
+          VueFlow: VueFlowStub,
+          Background: true,
+          Handle: true,
+          PromptTraceDrawer: true,
+          Teleport: false,
+          CanvasLocalConsole: CanvasLocalConsoleStub,
+        },
+      },
+    });
+    await flushPromises();
+
+    wrapper.findComponent(CanvasNodeCard).vm.$emit("select-node", removable);
+    await flushPromises();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Delete" }));
+    await flushPromises();
+
+    expect(calls.archiveNode).toHaveBeenCalledWith("project-1", removable.id, 3);
+    expect(document.body.textContent).toContain("已从画布移除");
+    const undoButton = document.body.querySelector<HTMLButtonElement>(".canvas-archive-undo button");
+    expect(undoButton).not.toBeNull();
+    undoButton!.click();
+    await flushPromises();
+    expect(calls.restoreNode).toHaveBeenCalledWith("project-1", removable.id, 4);
+    expect(wrapper.findAllComponents(CanvasNodeCard).some((item) => item.props("node").id === removable.id)).toBe(true);
+
     wrapper.unmount();
   });
 

@@ -47,6 +47,7 @@ const categories: LibraryCategory[] = [
   ] },
   { key: "script", label: "脚本", items: [
     { type: "SubjectNode", label: "通用主体", description: "人物、动物、产品、道具与风格" },
+    { type: "StylePresetNode", label: "画风预设", description: "显式画风证据、职责与版本" },
   ] },
   { key: "assets", label: "素材库", items: [
     { type: "ReferenceAssetNode", label: "上传素材", description: "创建语义明确的参考资产节点" },

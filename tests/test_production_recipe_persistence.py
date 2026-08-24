@@ -21,11 +21,16 @@ from cat_video_generator.domain.production_recipes import (
     ProductionRecipeInstanceDraft,
     ProductionRecipeInstancePatch,
     RecipeSequenceRunRequest,
+    StoryboardRecipeRunRequest,
+    recipe_task_source_hash,
 )
+from cat_video_generator.domain.workflow import StepStatus
 from cat_video_generator.infrastructure.db.models import Base
 from cat_video_generator.infrastructure.db.production_recipe_repository import (
-    _fixed_ip_subject_documents,
     _sequence_candidate_json,
+)
+from cat_video_generator.infrastructure.db.visual_preset_profiles import (
+    canon_v3_subject_documents,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +73,9 @@ class _Repository:
         self.episode_rules: EpisodeRules | None = None
         self.materialized_storyboard: dict[str, object] | None = None
         self.suggested_rules: EpisodeRules | None = None
+        self.validated_character_references: tuple[uuid.UUID, ...] | None = None
+        self.validated_anchor_shot_ids: list[uuid.UUID] = []
+        self.child_task_statuses: dict[uuid.UUID, str] = {}
 
     def create_instance(
         self, project_id: uuid.UUID, payload: ProductionRecipeInstanceDraft
@@ -133,11 +141,43 @@ class _Repository:
         assert len(candidate_ids) == 1
         self.suggested_rules = rules
 
+    def validate_storyboard_character_references(
+        self,
+        instance_id: uuid.UUID,
+        reference_asset_ids: tuple[uuid.UUID, ...],
+    ) -> None:
+        assert instance_id == self.instance_id
+        self.validated_character_references = reference_asset_ids
+
+    def validate_anchor_prompt_readiness(
+        self,
+        instance_id: uuid.UUID,
+        shot_id: uuid.UUID,
+    ) -> None:
+        assert instance_id == self.instance_id
+        self.validated_anchor_shot_ids.append(shot_id)
+
+    def record_task_children(
+        self,
+        _parent_step_id: uuid.UUID,
+        child_step_ids: tuple[uuid.UUID, ...],
+    ) -> tuple[dict[str, object], ...]:
+        return tuple(
+            {
+                "stepId": str(step_id),
+                "status": self.child_task_statuses.get(step_id, "pending"),
+            }
+            for step_id in child_step_ids
+        )
+
 
 class _StoryWorkflow:
     def __init__(self) -> None:
         self.story_command: object | None = None
         self.storyboard_durations: tuple[int, ...] | None = None
+        self.storyboard_creation_mode: str | None = None
+        self.storyboard_reference_asset_ids: tuple[uuid.UUID, ...] = ()
+        self.storyboard_instruction: str | None = None
 
     def run_story_strategies(self, project_id: uuid.UUID, payload: object) -> dict[str, object]:
         self.story_command = payload
@@ -154,10 +194,16 @@ class _StoryWorkflow:
         exact_durations: tuple[int, ...] | None = None,
         healing_recipe: bool = False,
         idempotency_key: str | None = None,
+        creation_mode: str = "from_story",
+        reference_asset_ids: tuple[uuid.UUID, ...] = (),
+        instruction: str | None = None,
     ) -> dict[str, object]:
         assert healing_recipe is True
         assert idempotency_key == "board-run-0001"
         self.storyboard_durations = exact_durations
+        self.storyboard_creation_mode = creation_mode
+        self.storyboard_reference_asset_ids = reference_asset_ids
+        self.storyboard_instruction = instruction
         return {"projectId": str(project_id), "beats": []}
 
 
@@ -165,14 +211,16 @@ class _ShotWorkflow:
     def __init__(self) -> None:
         self.anchor_calls: list[dict[str, object]] = []
         self.video_calls: list[dict[str, object]] = []
+        self.anchor_step_id = uuid.uuid4()
+        self.video_step_id = uuid.uuid4()
 
     def generate_anchor(self, shot_id: uuid.UUID, **values: object) -> dict[str, object]:
         self.anchor_calls.append({"shotId": shot_id, **values})
-        return {"stepId": str(uuid.uuid4())}
+        return {"stepId": str(self.anchor_step_id), "status": "pending"}
 
     def generate_video(self, shot_id: uuid.UUID, **values: object) -> dict[str, object]:
         self.video_calls.append({"shotId": shot_id, **values})
-        return {"stepId": str(uuid.uuid4())}
+        return {"stepId": str(self.video_step_id), "status": "queued"}
 
 
 class _SequenceWorkflow:
@@ -206,7 +254,7 @@ def test_model_metadata_contains_recipe_review_and_revision_payloads() -> None:
 
 
 def test_fixed_ip_subject_documents_lock_child_and_cat_to_canon_roles() -> None:
-    documents = _fixed_ip_subject_documents()
+    documents = canon_v3_subject_documents()
 
     assert [item["kind"] for item in documents] == ["person", "animal"]
     assert [item["role"] for item in documents] == ["protagonist", "co_protagonist"]
@@ -287,6 +335,23 @@ def test_service_lists_recipe_and_projects_derived_stage_without_duplicate_state
     assert created["stage"] == "concept"
     assert created["primaryAction"] == "生成故事候选"
     assert "stage" not in repository.row
+
+
+def test_provider_backed_recipe_cost_is_never_presented_as_free_when_unconfigured() -> None:
+    repository = _Repository()
+    unmetered = ProductionRecipeService(repository=repository).get_instance(
+        repository.instance_id
+    )
+    metered = ProductionRecipeService(
+        repository=repository,
+        director_call_cost_micros=12_500,
+    ).get_instance(repository.instance_id)
+
+    assert unmetered["estimatedCostMicros"] is None
+    assert unmetered["costEstimateStatus"] == "unmetered_paid"
+    assert unmetered["costEstimateLabel"] == "付费调用·暂未计量"
+    assert metered["estimatedCostMicros"] == 12_500
+    assert metered["costEstimateStatus"] == "metered"
 
 
 def test_service_derives_video_stage_from_reviewed_anchor_progress() -> None:
@@ -400,14 +465,114 @@ def test_recipe_story_and_storyboard_runs_add_fixed_ip_constraints() -> None:
     }
     storyboard = service.run_storyboard(
         repository.instance_id,
-        PaidRecipeRunRequest(
+        StoryboardRecipeRunRequest(
             idempotencyKey="board-run-0001",
             acceptEstimatedCostMicros=0,
         ),
     )
 
     assert story_workflow.storyboard_durations == (11, 10, 10)
+    assert story_workflow.storyboard_creation_mode == "from_story"
     assert storyboard["materialized"] is True
+
+
+def test_character_storyboard_passes_approved_references_and_instruction() -> None:
+    repository = _Repository()
+    repository.row["progress"] = {
+        "storyApproved": True,
+        "shotCount": 0,
+        "approvedAnchorCount": 0,
+        "approvedVideoCount": 0,
+        "sequenceReady": False,
+        "finalApproved": False,
+        "episodeRulesLocked": True,
+        "characterDesignApproved": True,
+    }
+    story_workflow = _StoryWorkflow()
+    service = ProductionRecipeService(
+        repository=repository,
+        story_workflow=story_workflow,
+    )
+    child_asset_id = uuid.uuid4()
+    cat_asset_id = uuid.uuid4()
+
+    storyboard = service.run_storyboard(
+        repository.instance_id,
+        StoryboardRecipeRunRequest(
+            idempotencyKey="board-run-0001",
+            acceptEstimatedCostMicros=0,
+            creationMode="from_characters",
+            referenceAssetIds=[child_asset_id, cat_asset_id],
+            instruction="孩子和猫咪在雨后一起观察一片发亮的叶子",
+        ),
+    )
+
+    assert storyboard["materialized"] is True
+    assert repository.validated_character_references == (child_asset_id, cat_asset_id)
+    assert story_workflow.storyboard_creation_mode == "from_characters"
+    assert story_workflow.storyboard_reference_asset_ids == (child_asset_id, cat_asset_id)
+    assert story_workflow.storyboard_instruction == "孩子和猫咪在雨后一起观察一片发亮的叶子"
+
+
+def test_recipe_parent_waits_for_all_generated_children_before_review() -> None:
+    repository = _Repository()
+    repository.row["progress"] = {
+        "storyApproved": True,
+        "shotCount": 1,
+        "approvedAnchorCount": 0,
+        "approvedVideoCount": 0,
+        "sequenceReady": False,
+        "finalApproved": False,
+        "storyboardApproved": True,
+    }
+    shot_workflow = _ShotWorkflow()
+    service = ProductionRecipeService(
+        repository=repository,
+        shot_workflow=shot_workflow,
+    )
+    instance = service.get_instance(repository.instance_id)
+    payload = PaidRecipeRunRequest(
+        idempotencyKey="anchor-run-0001",
+        acceptEstimatedCostMicros=0,
+    )
+    payload_document = payload.model_dump(mode="json", by_alias=True)
+    snapshot = {
+        "recipeInstanceId": str(repository.instance_id),
+        "expectedInstanceRevision": repository.row["revision"],
+        "phase": instance["phase"],
+        "shotId": str(uuid.uuid4()),
+        "payload": payload_document,
+        "sourceContentHash": recipe_task_source_hash(
+            payload=payload_document,
+            instance_id=repository.instance_id,
+            expected_revision=int(repository.row["revision"]),
+            phase=str(instance["phase"]),
+        ),
+    }
+    parent_step_id = uuid.uuid4()
+    repository.child_task_statuses[shot_workflow.anchor_step_id] = StepStatus.PENDING.value
+
+    running = service.execute_queued_task(
+        parent_step_id,
+        operation_key="recipe:anchor",
+        input_snapshot=snapshot,
+    )
+
+    assert running.status is StepStatus.QUEUED
+    assert running.next_retry_at is not None
+    assert running.payload["childStepIds"] == [str(shot_workflow.anchor_step_id)]
+
+    repository.child_task_statuses[shot_workflow.anchor_step_id] = (
+        StepStatus.AWAITING_REVIEW.value
+    )
+    review = service.execute_queued_task(
+        parent_step_id,
+        operation_key="recipe:anchor",
+        input_snapshot=snapshot,
+    )
+
+    assert review.status is StepStatus.AWAITING_REVIEW
+    assert review.payload["message"] == "全部子任务已完成，等待人工审核"
 
 
 def test_story_review_can_lock_edited_episode_rules() -> None:
@@ -467,6 +632,7 @@ def test_recipe_candidate_runs_forward_stable_per_candidate_idempotency_keys() -
 
     service.run_anchor(repository.instance_id, shot_id, request)
 
+    assert repository.validated_anchor_shot_ids == [shot_id]
     assert [item["request_idempotency_key"] for item in workflow.anchor_calls] == [
         "paid-stage-0001:anchor:1",
         "paid-stage-0001:anchor:2",

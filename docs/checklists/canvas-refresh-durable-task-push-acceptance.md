@@ -55,7 +55,7 @@
 
 ## 6. 本次自动验收记录
 
-- `alembic heads`：`0024_durable_task_events (head)`。
+- `alembic heads`：`0025_schema_contract_alignment (head)`。
 - `ruff check src tests`：通过。
 - `pytest -q`：225 项通过，1 条第三方 `httpx` 弃用警告。
 - `npm --prefix web run typecheck`：通过。

@@ -404,6 +404,43 @@ class AcceptedVisualAssetPlan(StrictModel):
         return self
 
 
+class SceneAssetSlotReadiness(StrictModel):
+    key: str = Field(min_length=1, max_length=120)
+    display_name: str = Field(alias="displayName", min_length=1, max_length=160)
+    purpose: VisualAssetPurpose
+    required: bool = True
+    asset_ids: list[UUID] = Field(alias="assetIds", default_factory=list, max_length=30)
+    status: Literal["ready", "missing", "stale"]
+
+
+class SceneAssetReadiness(StrictModel):
+    required_slots: list[SceneAssetSlotReadiness] = Field(
+        alias="requiredSlots",
+        default_factory=list,
+        max_length=30,
+    )
+    bound_asset_ids: list[UUID] = Field(
+        alias="boundAssetIds",
+        default_factory=list,
+        max_length=100,
+    )
+    missing_asset_keys: list[str] = Field(
+        alias="missingAssetKeys",
+        default_factory=list,
+        max_length=30,
+    )
+    stale_asset_keys: list[str] = Field(
+        alias="staleAssetKeys",
+        default_factory=list,
+        max_length=30,
+    )
+    scene_look_status: Literal["approved", "missing", "stale"] = Field(
+        alias="sceneLookStatus"
+    )
+    can_compile_shot_prompt: bool = Field(alias="canCompileShotPrompt")
+    blockers: list[str] = Field(default_factory=list, max_length=30)
+
+
 class ReferenceImageDraft(StrictModel):
     display_name: Annotated[str, Field(alias="displayName", min_length=1, max_length=120)]
     purpose: VisualAssetPurpose

@@ -402,7 +402,18 @@ class Scene(Base):
             "(story_mode = 'multi' AND target_shot_count BETWEEN 2 AND 6)",
             name="ck_scenes_story_shape",
         ),
-        UniqueConstraint("production_run_id", "sort_order", name="uq_scenes_run_order"),
+        UniqueConstraint(
+            "story_revision_id",
+            "scene_key",
+            name="uq_scenes_story_revision_key",
+        ),
+        Index(
+            "uq_scenes_active_run_order",
+            "production_run_id",
+            "sort_order",
+            unique=True,
+            postgresql_where=text("active = true"),
+        ),
         Index("ix_scenes_run_status", "production_run_id", "status", "sort_order"),
         {"schema": SCHEMA_NAME},
     )
@@ -413,6 +424,22 @@ class Scene(Base):
         ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
         nullable=False,
     )
+    story_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            f"{SCHEMA_NAME}.story_revisions.id",
+            ondelete="SET NULL",
+            name="fk_scenes_story_revision",
+        ),
+    )
+    scene_key: Mapped[str | None] = mapped_column(String(80))
+    active: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default=text("true"),
+    )
+    stale_reason: Mapped[str | None] = mapped_column(Text)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False)
     title: Mapped[str] = mapped_column(String(120), nullable=False)
     source_text: Mapped[str] = mapped_column(Text, nullable=False)
@@ -637,6 +664,12 @@ class PromptRecord(Base):
         ),
         UniqueConstraint("step_id", "sha256", name="uq_prompt_records_step_hash"),
         Index("ix_prompt_records_sha256", "sha256"),
+        Index(
+            "ix_prompt_records_business_object",
+            "business_object_type",
+            "business_object_id",
+            "created_at",
+        ),
         {"schema": SCHEMA_NAME},
     )
 
@@ -1015,6 +1048,40 @@ class CanvasLayout(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
+
+
+class CanvasNodeArchive(Base):
+    __tablename__ = "canvas_node_archives"
+    __table_args__ = (
+        UniqueConstraint(
+            "production_run_id",
+            "canvas_node_id",
+            name="uq_canvas_node_archives_run_node",
+        ),
+        Index(
+            "ix_canvas_node_archives_run_restored",
+            "production_run_id",
+            "restored_at",
+        ),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    canvas_node_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    node_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    object_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    object_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    reason: Mapped[str | None] = mapped_column(Text)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    archived_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    restored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ProviderCapability(Base):
@@ -1500,6 +1567,7 @@ class Asset(Base):
         Index("ix_assets_sha256_role", "sha256", "role"),
         Index("ix_assets_shot_role", "shot_card_id", "role", "created_at"),
         Index("ix_assets_semantic_selection", "scope", "semantic_key", "status", "created_at"),
+        Index("ix_assets_canvas_history", "production_run_id", "media_type", "created_at"),
         {"schema": SCHEMA_NAME},
     )
 

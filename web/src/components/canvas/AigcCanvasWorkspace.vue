@@ -43,6 +43,7 @@ import type {
   CanvasNodeActionDto,
   CanvasNodeType,
   CanvasPortType,
+  EpisodeVisualProfileDto,
   EpisodeRulesDto,
   PromptRunDto,
   ActualReferenceBindingDto,
@@ -61,6 +62,9 @@ import type {
   SubjectDto,
   SubjectCompletionRunDto,
   SubjectInput,
+  VisualPresetKey,
+  VisualPresetProfileDto,
+  VisualProfileDraft,
 } from "../../api/types";
 import CanvasNodeLibrary from "./CanvasNodeLibrary.vue";
 import CanvasNodeCard from "./CanvasNodeCard.vue";
@@ -71,17 +75,23 @@ import CanvasLocalConsole from "./CanvasLocalConsole.vue";
 import NodeGenerationComposer from "./NodeGenerationComposer.vue";
 import PromptTraceDrawer from "./PromptTraceDrawer.vue";
 import ReferenceAnnotationEditor from "./ReferenceAnnotationEditor.vue";
+import SceneAssetConsole from "./SceneAssetConsole.vue";
 import StoryboardNodeConsole from "./StoryboardNodeConsole.vue";
 import StoryboardWorkflow, { type StoryboardShotDraft } from "./StoryboardWorkflow.vue";
 import SubjectAssistantPanel from "./SubjectAssistantPanel.vue";
 import VideoAssetPanel from "./VideoAssetPanel.vue";
 import VideoEditWorkspace from "./VideoEditWorkspace.vue";
+import VisualEvidenceConsole from "./VisualEvidenceConsole.vue";
+import VisualPresetLibrary from "./VisualPresetLibrary.vue";
 import {
-  clampCanvasPanelPosition,
+  CANVAS_OVERLAY_ANCHOR_GAP,
+  anchorCanvasOverlay,
   consolePresetForNode,
-  positionCanvasPanel,
+  projectCanvasNodeRect,
   resolveCanvasConsoleSize,
+  type CanvasOverlayGeometry,
   type CanvasOverlaySession,
+  type CanvasViewportTransform,
 } from "./canvasPanels";
 import {
   escapeInteraction,
@@ -131,6 +141,13 @@ const subjectLibraryVisible = ref(false);
 const subjectLibrary = ref<SubjectDto[]>([]);
 const subjectLibraryLoading = ref(false);
 const subjectLibraryError = ref("");
+const visualPresetLibraryVisible = ref(false);
+const visualPresetLoading = ref(false);
+const visualPresetApplying = ref(false);
+const visualPresets = ref<VisualPresetProfileDto[]>([]);
+const episodeVisualProfile = ref<EpisodeVisualProfileDto | null>(null);
+const episodeVisualProfileLoading = ref(false);
+const episodeVisualProfileSaving = ref(false);
 const generationComposerNode = ref<CanvasNodeDto | null>(null);
 const generationCapability = ref<GenerationCapabilityDto | null>(null);
 const generationReferences = ref<ActualReferenceBindingDto[]>([]);
@@ -138,14 +155,16 @@ const generationAnnotations = ref<GenerationReferenceAnnotationDto[]>([]);
 const annotationAssetId = ref<string | null>(null);
 const generationLoading = ref(false);
 const interaction = ref<CanvasInteractionState>({ mode: "idle" });
-const contextPanelPosition = ref({ left: 16, top: 88, placement: "below" as "below" | "above" | "right" });
 const localConsoleSession = ref<CanvasOverlaySession | null>(null);
+const localConsoleGeometry = shallowRef<CanvasOverlayGeometry | null>(null);
+const nodeContextMenu = ref<{ nodeId: string; left: number; top: number } | null>(null);
+const archiveUndo = ref<{ nodeId: string; title: string; layoutVersion: number } | null>(null);
+const archivingNodeId = ref<string | null>(null);
 const selectedReferenceNodeIds = ref<Set<string>>(new Set());
 const storyboardCharacterNodeIds = ref<Set<string>>(new Set());
 const videoEditDrafts = reactive<Record<string, VideoEditConsoleDraft>>({});
 const spacePressed = ref(false);
 const panningCanvas = ref(false);
-const toolbarVisible = ref(false);
 const editingBeat = ref<CanvasNodeDto | null>(null);
 const recipeCreateVisible = ref(false);
 const recipeStoryReviewVisible = ref(false);
@@ -167,7 +186,7 @@ let canvasRefreshPromise: Promise<void> | null = null;
 let canvasRefreshQueued = false;
 let queuedRefreshFocus = false;
 let consumedFocusRequest = "";
-const { fitView, setViewport, viewport } = useVueFlow();
+const { findNode, fitView, setViewport, viewport } = useVueFlow();
 const { items: taskCenterItems, projectSignals } = useTaskCenter();
 
 const briefForm = reactive<StoryBriefInput>({
@@ -286,6 +305,15 @@ const selectedNodeId = computed<string | null>({
 const selectedNode = computed(() => canvas.value?.nodes.find(
   (node) => node.id === selectedNodeId.value,
 ) ?? null);
+const showContextToolbar = computed(() => Boolean(
+  selectedNode.value && ["ImageAssetNode", "VideoAssetNode"].includes(selectedNode.value.type),
+));
+const contextMenuNode = computed(() => canvas.value?.nodes.find(
+  (node) => node.id === nodeContextMenu.value?.nodeId,
+) ?? null);
+const contextMenuArchiveAction = computed(() => (
+  contextMenuNode.value ? archiveAction(contextMenuNode.value) : undefined
+));
 const referenceSelectionTarget = computed(() => {
   const state = interaction.value;
   if (state.mode !== "reference_picking") return null;
@@ -306,12 +334,14 @@ const localConsoleTitle = computed(() => {
   return String(selectedNode.value.data.title ?? selectedNode.value.objectType ?? selectedNode.value.type);
 });
 const contextPanelStyle = computed(() => ({
-  left: `${contextPanelPosition.value.left}px`,
-  top: `${contextPanelPosition.value.top}px`,
+  left: "0px",
+  top: "0px",
+  transform: `translate3d(${localConsoleGeometry.value?.toolbar.left ?? 16}px, ${localConsoleGeometry.value?.toolbar.top ?? 88}px, 0)`,
 }));
 const localConsoleStyle = computed(() => ({
-  left: `${localConsoleSession.value?.left ?? 16}px`,
-  top: `${localConsoleSession.value?.top ?? 160}px`,
+  left: "0px",
+  top: "0px",
+  transform: `translate3d(${localConsoleGeometry.value?.console.left ?? 16}px, ${localConsoleGeometry.value?.console.top ?? 160}px, 0)`,
 }));
 const localConsolePreset = computed(() => localConsoleSession.value?.presetKey ?? "compact");
 const selectedExecutions = computed(() => {
@@ -327,15 +357,7 @@ const storyboardReferenceAssetIds = computed(() => {
   const ids = new Set<string>();
   for (const node of canvas.value?.nodes ?? []) {
     if (!storyboardCharacterNodeIds.value.has(node.id)) continue;
-    const references = Array.isArray(node.data.references)
-      ? node.data.references as Array<Record<string, unknown>>
-      : [];
-    references.forEach((item) => {
-      const id = String(item.assetId ?? item.id ?? "");
-      if (id) ids.add(id);
-    });
-    const direct = String(node.data.assetId ?? "");
-    if (direct) ids.add(direct);
+    storyboardCharacterAssetIds(node).forEach((id) => ids.add(id));
   }
   return [...ids].slice(0, 6);
 });
@@ -356,6 +378,26 @@ const storyboardShots = computed<StoryboardShotDraft[]>(() => (
       soundEffect: String(node.data.soundEffect ?? "环境声"),
       camera: String(node.data.camera ?? "固定机位"),
       prompt: String(node.data.finalPrompt ?? node.data.prompt ?? ""),
+      promptId: String(node.data.promptId ?? "") || undefined,
+      promptInputHash: String(node.data.promptInputHash ?? "") || undefined,
+      promptWarnings: Array.isArray(node.data.promptWarnings) ? node.data.promptWarnings.map(String) : [],
+      promptBlockers: Array.isArray(node.data.promptBlockers) ? node.data.promptBlockers.map(String) : [],
+      referenceBindings: Array.isArray(node.data.referenceBindings)
+        ? node.data.referenceBindings as StoryboardShotDraft["referenceBindings"]
+        : [],
+      temporalBeats: Array.isArray(node.data.temporalBeats)
+        ? node.data.temporalBeats as Array<Record<string, unknown>>
+        : [],
+      compositionAssetIds: Array.isArray(node.data.compositionAssetIds)
+        ? node.data.compositionAssetIds.map(String)
+        : [],
+      sceneId: String(node.data.sceneId ?? "") || undefined,
+      sceneTitle: String(
+        (canvas.value?.nodes ?? []).find((candidate) => (
+          candidate.type === "SceneNode"
+          && candidate.objectId === String(node.data.sceneId ?? "")
+        ))?.data.title ?? "",
+      ) || undefined,
     }))
 ));
 
@@ -373,6 +415,7 @@ const inputPorts: Partial<Record<CanvasNodeType, CanvasPortType[]>> = {
   GenerationBatchNode: ["product_subject", "media_reference[]"],
   ImageAssetNode: ["image_asset[]"],
   VideoAssetNode: ["video_asset"],
+  StylePresetNode: ["image_reference[]"],
   VideoEditNode: ["video_asset", "media_reference[]"],
   VideoSegmentNode: ["edit_recipe"],
   ImageGenerationNode: ["prompt", "shot_beat[]", "subject[]", "image_reference[]", "media_reference[]"],
@@ -418,6 +461,9 @@ function selectionStateFor(node: CanvasNodeDto): "none" | "compatible" | "incomp
   if (interaction.value.mode === "reference_picking" && interaction.value.returnMode === "video_segment_reshoot") {
     return videoReferenceAssetIds(node).length ? "compatible" : "incompatible";
   }
+  if (interaction.value.mode === "reference_picking" && interaction.value.returnMode === "storyboard_characters") {
+    return storyboardCharacterAssetIds(node).length ? "compatible" : "incompatible";
+  }
   return referenceConnection(node, target) ? "compatible" : "incompatible";
 }
 
@@ -452,22 +498,48 @@ function videoReferenceAssetIds(node: CanvasNodeDto): string[] {
   return [...ids];
 }
 
+function storyboardCharacterAssetIds(node: CanvasNodeDto): string[] {
+  if (node.type !== "CharacterDesignNode") return [];
+  const slot = String(node.data.slot ?? "");
+  if (!["child", "cat", "pair_scale"].includes(slot)) return [];
+  const candidates = Array.isArray(node.data.candidates)
+    ? node.data.candidates as Array<Record<string, unknown>>
+    : [];
+  return candidates.flatMap((candidate) => {
+    if (candidate.selected !== true || String(candidate.status ?? "") !== "approved") return [];
+    const id = String(candidate.assetId ?? candidate.id ?? "");
+    return id ? [id] : [];
+  });
+}
+
 function selectCanvasNode(node: CanvasNodeDto) {
+  nodeContextMenu.value = null;
   const target = referenceSelectionTarget.value;
   if (target) {
     const videoPick = interaction.value.mode === "reference_picking"
       && interaction.value.returnMode === "video_segment_reshoot";
-    const compatible = videoPick
-      ? videoReferenceAssetIds(node).length > 0
-      : Boolean(referenceConnection(node, target));
+    const storyboardCharacterPick = interaction.value.mode === "reference_picking"
+      && interaction.value.returnMode === "storyboard_characters";
+    const compatible = storyboardCharacterPick
+      ? storyboardCharacterAssetIds(node).length > 0
+      : videoPick
+        ? videoReferenceAssetIds(node).length > 0
+        : Boolean(referenceConnection(node, target));
     if (!compatible) {
-      ElMessage.warning("该节点与当前生成器没有兼容的参考端口");
+      ElMessage.warning(storyboardCharacterPick
+        ? "只能选择已人工批准的儿童、猫咪或同框比例角色设计"
+        : "该节点与当前生成器没有兼容的参考端口");
       return;
     }
     const next = new Set(selectedReferenceNodeIds.value);
     if (next.has(node.id)) next.delete(node.id);
     else {
-      const nextAssetCount = videoPick
+      const nextAssetCount = storyboardCharacterPick
+        ? [...next, node.id].flatMap((nodeId) => {
+            const source = canvas.value?.nodes.find((item) => item.id === nodeId);
+            return source ? storyboardCharacterAssetIds(source) : [];
+          }).length
+        : videoPick
         ? [...next, node.id].flatMap((nodeId) => {
             const source = canvas.value?.nodes.find((item) => item.id === nodeId);
             return source ? videoReferenceAssetIds(source) : [];
@@ -485,16 +557,19 @@ function selectCanvasNode(node: CanvasNodeDto) {
   selectedGroupId.value = null;
   interaction.value = selectedInteraction(node);
   generationComposerNode.value = null;
+  if (["SubjectNode", "StylePresetNode"].includes(node.type)) {
+    void loadEpisodeVisualProfile();
+  }
   if (["GenerationBatchNode", "ImageGenerationNode", "VideoGenerationNode", "AudioGenerationNode"].includes(node.type)) {
     void openGenerationComposer(node);
   }
-  scheduleContextToolbarPosition();
+  initializeOverlaySession();
 }
 
 function activateCanvasNode(node: CanvasNodeDto) {
   if (node.type === "RecipeGroupNode") {
     selectedNodeId.value = node.id;
-    scheduleContextToolbarPosition();
+    initializeOverlaySession();
     return;
   }
   if (["GenerationBatchNode", "ImageGenerationNode", "VideoGenerationNode", "AudioGenerationNode"].includes(node.type)) {
@@ -515,87 +590,121 @@ function activateCanvasNode(node: CanvasNodeDto) {
     return;
   }
   if (node.type === "SubjectNode") {
-    if (node.objectId) openSubjectAssistant(node);
+    if (Array.isArray(node.data.references) && node.data.references.length) {
+      selectedNodeId.value = node.id;
+      void loadEpisodeVisualProfile();
+      initializeOverlaySession();
+    } else if (node.objectId) openSubjectAssistant(node);
     else subjectVisible.value = true;
     return;
   }
+  if (node.type === "StylePresetNode") {
+    selectedNodeId.value = node.id;
+    void loadEpisodeVisualProfile();
+    initializeOverlaySession();
+    return;
+  }
   selectedNodeId.value = node.id;
-  scheduleContextToolbarPosition();
+  initializeOverlaySession();
 }
 
-let contextPanelFrame: number | null = null;
-let localConsoleFrame: number | null = null;
+let overlayPositionFrame: number | null = null;
+let pendingOverlayViewport: CanvasViewportTransform | null = null;
+let archiveUndoTimer: number | null = null;
 
-function scheduleContextToolbarPosition() {
-  if (contextPanelFrame !== null) cancelAnimationFrame(contextPanelFrame);
-  contextPanelFrame = requestAnimationFrame(() => {
-    contextPanelFrame = null;
-    const nodeId = selectedNodeId.value;
-    if (!nodeId) return;
-    const anchor = document.querySelector<HTMLElement>(`[data-canvas-node-id="${nodeId}"]`);
-    if (!anchor) return;
-    const rect = anchor.getBoundingClientRect();
-    const toolbarWidth = selectedNode.value?.type === "VideoAssetNode" ? 980 : 720;
-    contextPanelPosition.value = {
-      left: Math.max(16, Math.min(window.innerWidth - Math.min(toolbarWidth, window.innerWidth - 32) - 16, rect.left + rect.width / 2 - toolbarWidth / 2)),
-      top: Math.max(80, rect.top - 62),
-      placement: "above",
-    };
-    toolbarVisible.value = rect.bottom >= 72
-      && rect.top <= window.innerHeight
-      && rect.right >= 0
-      && rect.left <= window.innerWidth;
-  });
+function measureCanvasSurfaceRect() {
+  const measured = canvasSurface.value?.getBoundingClientRect();
+  return {
+    left: measured?.left ?? 0,
+    top: measured?.top ?? 0,
+    width: measured?.width || window.innerWidth,
+    height: measured?.height || window.innerHeight,
+  };
 }
 
-function initializeLocalConsolePosition(nodeId: string): boolean {
+function selectedNodeGeometry(node: CanvasNodeDto) {
+  const graphNode = findNode(node.id);
+  const footprint = canvasNodeFootprint(node);
+  const width = Number(graphNode?.dimensions.width ?? 0);
+  const height = Number(graphNode?.dimensions.height ?? 0);
+  return {
+    computedPosition: {
+      x: Number(graphNode?.computedPosition.x ?? graphNode?.position.x ?? node.position.x),
+      y: Number(graphNode?.computedPosition.y ?? graphNode?.position.y ?? node.position.y),
+    },
+    dimensions: {
+      width: width > 0 ? width : footprint.width,
+      height: height > 0 ? height : footprint.height,
+    },
+  };
+}
+
+function updateOverlayGeometry() {
+  const session = localConsoleSession.value;
+  const node = selectedNode.value;
+  if (!session || !node || session.nodeId !== node.id) return;
+  const transform = pendingOverlayViewport ?? viewport.value;
+  pendingOverlayViewport = null;
+  const nodeRect = projectCanvasNodeRect(
+    selectedNodeGeometry(node),
+    transform,
+    session.surfaceRect,
+  );
+  const toolbarWidth = node.type === "VideoAssetNode" ? 980 : 720;
+  const toolbarSize = {
+    width: Math.min(toolbarWidth, Math.max(0, window.innerWidth - 32)),
+    height: 56,
+  };
+  localConsoleGeometry.value = anchorCanvasOverlay(
+    nodeRect,
+    { width: session.width, height: session.height },
+    toolbarSize,
+    session.anchorGap,
+  );
+}
+
+function initializeOverlaySession() {
+  const nodeId = selectedNodeId.value;
+  if (!nodeId) return;
   const node = selectedNode.value;
   const kind = consoleKind.value;
-  if (!node || node.id !== nodeId || !kind) return false;
-  const anchor = document.querySelector<HTMLElement>(`[data-canvas-node-id="${nodeId}"]`);
+  if (!node || node.id !== nodeId || !kind) {
+    localConsoleSession.value = null;
+    localConsoleGeometry.value = null;
+    return;
+  }
   const viewportSize = { width: window.innerWidth, height: window.innerHeight };
   const preset = consolePresetForNode(node.type, kind);
   const panelSize = resolveCanvasConsoleSize(preset, viewportSize);
-  const rect = anchor?.getBoundingClientRect() ?? {
-    left: viewportSize.width / 2,
-    top: Math.max(96, viewportSize.height * 0.24),
-    width: 0,
-    height: 0,
-  };
-  const position = positionCanvasPanel(
-    {
-      left: rect.left + rect.width / 2 - panelSize.width / 2,
-      top: rect.top,
-      width: panelSize.width,
-      height: rect.height,
-    },
-    viewportSize,
-    panelSize,
-  );
+  const existingSession = localConsoleSession.value?.nodeId === nodeId
+    ? localConsoleSession.value
+    : null;
   localConsoleSession.value = {
     nodeId,
     presetKey: preset.key,
     ...panelSize,
-    ...position,
+    surfaceRect: existingSession?.surfaceRect ?? measureCanvasSurfaceRect(),
+    anchorGap: CANVAS_OVERLAY_ANCHOR_GAP,
   };
-  return true;
+  updateOverlayGeometry();
 }
 
-function scheduleLocalConsoleInitialization(nodeId: string) {
-  if (initializeLocalConsolePosition(nodeId)) return;
-  if (localConsoleFrame !== null) cancelAnimationFrame(localConsoleFrame);
-  localConsoleFrame = requestAnimationFrame(() => {
-    localConsoleFrame = null;
-    initializeLocalConsolePosition(nodeId);
+function scheduleOverlayAnchorUpdate(
+  event?: { flowTransform: CanvasViewportTransform } | { node: Node },
+) {
+  if (event && "flowTransform" in event) pendingOverlayViewport = event.flowTransform;
+  if (overlayPositionFrame !== null) return;
+  overlayPositionFrame = requestAnimationFrame(() => {
+    overlayPositionFrame = null;
+    updateOverlayGeometry();
   });
 }
 
 function handleWorkspaceResize() {
-  scheduleContextToolbarPosition();
   const session = localConsoleSession.value;
   const node = selectedNode.value;
   const kind = consoleKind.value;
-  if (!session || !node || session.nodeId !== node.id || !kind) return;
+  if (!session || !node || !kind || session.nodeId !== node.id) return;
   const viewportSize = { width: window.innerWidth, height: window.innerHeight };
   const preset = consolePresetForNode(node.type, kind);
   const panelSize = resolveCanvasConsoleSize(preset, viewportSize);
@@ -603,14 +712,16 @@ function handleWorkspaceResize() {
     ...session,
     presetKey: preset.key,
     ...panelSize,
-    ...clampCanvasPanelPosition(session, viewportSize, panelSize),
+    surfaceRect: measureCanvasSurfaceRect(),
   };
+  updateOverlayGeometry();
 }
 
 function closeContextPanel() {
   interaction.value = { mode: "idle" };
-  toolbarVisible.value = false;
   localConsoleSession.value = null;
+  localConsoleGeometry.value = null;
+  nodeContextMenu.value = null;
   generationComposerNode.value = null;
   void nextTick(() => canvasSurface.value?.focus());
 }
@@ -618,8 +729,20 @@ function closeContextPanel() {
 function selectCanvasGroup(group: CanvasGroupDto) {
   selectedGroupId.value = group.id;
   interaction.value = { mode: "idle" };
-  toolbarVisible.value = false;
+  localConsoleSession.value = null;
+  localConsoleGeometry.value = null;
   generationComposerNode.value = null;
+}
+
+function acceptedRecipeCost(recipe: ProductionRecipeInstanceDto): number {
+  return recipe.estimatedCostMicros ?? 0;
+}
+
+function recipeCostLabel(recipe: ProductionRecipeInstanceDto): string {
+  return recipe.costEstimateLabel
+    ?? (recipe.estimatedCostMicros == null
+      ? "付费调用·暂未计量"
+      : `预计费用 ¥${(recipe.estimatedCostMicros / 1_000_000).toFixed(3)}`);
 }
 
 async function runCanvasGroupAction(group: CanvasGroupDto, actionKey: CanvasGroupActionKey) {
@@ -632,9 +755,16 @@ async function runCanvasGroupAction(group: CanvasGroupDto, actionKey: CanvasGrou
   try {
     if (actionKey === "run_group") {
       const compiled = await canvasApi.compileCanvasGroup(group.id);
-      const estimatedCost = Number(compiled.estimatedCostMicros ?? 0);
+      const rawEstimatedCost = compiled.estimatedCostMicros;
+      const estimatedCost = typeof rawEstimatedCost === "number" ? rawEstimatedCost : 0;
+      const costLabel = String(
+        compiled.costEstimateLabel
+          ?? (rawEstimatedCost == null
+            ? "付费调用·暂未计量，实际费用以供应商账单为准"
+            : `预计费用 ¥${(estimatedCost / 1_000_000).toFixed(3)}`),
+      );
       await ElMessageBox.confirm(
-        `${String(compiled.primaryAction ?? "继续执行")}；本次只运行到下一个人工审核门，预计费用 ¥${(estimatedCost / 1_000_000).toFixed(3)}。`,
+        `${String(compiled.primaryAction ?? "继续执行")}；本次只运行到下一个人工审核门。${costLabel}。`,
         "确认整组执行",
         { confirmButtonText: "执行到审核门", cancelButtonText: "取消" },
       );
@@ -689,6 +819,11 @@ async function runCanvasGroupAction(group: CanvasGroupDto, actionKey: CanvasGrou
 async function completeCreativeBrief() {
   const recipe = activeRecipe.value;
   if (!recipe) return;
+  await ElMessageBox.confirm(
+    `AI 将补全结构化创意简报，完成后仍需人工批准。${recipeCostLabel(recipe)}。`,
+    "确认补全创意",
+    { confirmButtonText: "提交后台任务", cancelButtonText: "取消" },
+  );
   const job = await canvasApi.runRecipeCreativeBrief(recipe.id);
   registerCanvasJob(job, {
     label: "AI 补全创意输入",
@@ -721,9 +856,14 @@ async function reviewCreativeBrief() {
 async function generateCharacterDesign() {
   const recipe = activeRecipe.value;
   if (!recipe) return;
+  await ElMessageBox.confirm(
+    `将按质量档位生成儿童、猫咪和同框比例三个槽位。${recipeCostLabel(recipe)}。`,
+    "确认生成角色设计",
+    { confirmButtonText: "提交后台任务", cancelButtonText: "取消" },
+  );
   const job = await canvasApi.runRecipeCharacterDesign(
     recipe.id,
-    recipe.estimatedCostMicros ?? 0,
+    acceptedRecipeCost(recipe),
   );
   registerCanvasJob(job, {
     label: "一人一猫三槽位角色设计",
@@ -791,16 +931,23 @@ async function runStoryboardCreation(payload: {
   if (!node || node.type !== "StoryboardDirectorNode") return;
   storyboardRunBusy.value = true;
   try {
+    if (activeRecipe.value) {
+      await ElMessageBox.confirm(
+        `${payload.mode === "from_story" ? "将从已批准故事生成分镜" : "将从已批准儿童与猫咪角色图生成分镜"}，完成后仍需逐镜人工确认。${recipeCostLabel(activeRecipe.value)}。`,
+        "确认生成分镜",
+        { confirmButtonText: "提交后台任务", cancelButtonText: "取消" },
+      );
+    }
     const options = {
       creationMode: payload.mode,
       referenceAssetIds: payload.mode === "from_characters" ? storyboardReferenceAssetIds.value : [],
       instruction: payload.instruction || undefined,
     };
     const job = activeRecipe.value
-      ? await canvasApi.runRecipeStoryboard(activeRecipe.value.id, activeRecipe.value.estimatedCostMicros ?? 0, options)
+      ? await canvasApi.runRecipeStoryboard(activeRecipe.value.id, acceptedRecipeCost(activeRecipe.value), options)
       : await canvasApi.createStoryboard(props.projectId, options);
     registerCanvasJob(job, {
-      label: payload.mode === "from_story" ? "剧本生成分镜脚本" : "角色生成分镜脚本",
+      label: payload.mode === "from_story" ? "剧本生成分镜脚本" : "基于固定角色补充分镜",
       nodeId: node.id,
       recipeInstanceId: activeRecipe.value?.id,
       creationMode: payload.mode,
@@ -813,8 +960,29 @@ async function runStoryboardCreation(payload: {
   }
 }
 
-function openManualStoryboard() {
+async function openStoryboardWorkflow() {
+  if (!episodeVisualProfile.value) await loadEpisodeVisualProfile();
+  if (!episodeVisualProfile.value) {
+    ElMessage.error("请先应用并确认一人一猫 Canon 预设，建立本集视觉档案");
+    return;
+  }
   storyboardWorkflowVisible.value = true;
+}
+
+function openManualStoryboard() {
+  void openStoryboardWorkflow();
+}
+
+function openStoryboardScene(sceneId: string) {
+  const sceneNode = canvas.value?.nodes.find((node) => (
+    node.type === "SceneNode" && node.objectId === sceneId
+  ));
+  if (!sceneNode) {
+    ElMessage.warning("对应场景节点尚未投影到画布，请刷新后重试");
+    return;
+  }
+  storyboardWorkflowVisible.value = false;
+  selectCanvasNode(sceneNode);
 }
 
 async function saveStoryboardWorkflow(rows: StoryboardShotDraft[]) {
@@ -912,7 +1080,7 @@ async function finishReferenceSelection() {
     storyboardCharacterNodeIds.value = new Set(selectedReferenceNodeIds.value);
     interaction.value = { mode: "node_selected", nodeId: target.id };
     selectedReferenceNodeIds.value = new Set();
-    scheduleContextToolbarPosition();
+    initializeOverlaySession();
     return;
   }
   const selectedSources = canvas.value.nodes.filter((node) => selectedReferenceNodeIds.value.has(node.id));
@@ -1312,8 +1480,11 @@ async function runRecipePrimary(
       if (recipe.storyCandidates?.some((item) => item.status === "candidate")) {
         ElMessage.info("请在上方三个候选中选择一个，编辑 EpisodeRules 后人工批准");
       } else {
-        await ElMessageBox.confirm("将生成 3 个原创低压力故事候选，不会自动批准。", "生成故事候选");
-        const job = await canvasApi.runRecipeStory(recipe.id);
+        await ElMessageBox.confirm(
+          `将生成 3 个原创低压力故事候选，不会自动批准。${recipeCostLabel(recipe)}。`,
+          "生成故事候选",
+        );
+        const job = await canvasApi.runRecipeStory(recipe.id, acceptedRecipeCost(recipe));
         registerCanvasJob(job, {
           label: "治愈短片故事候选",
           nodeId: selectedNode.value?.id ?? activeGroup.value?.memberNodeIds[0] ?? "recipe",
@@ -1331,9 +1502,12 @@ async function runRecipePrimary(
       const director = canvas.value?.nodes.find((node) => node.type === "StoryboardDirectorNode");
       if (director) {
         selectedNodeId.value = director.id;
-        scheduleContextToolbarPosition();
+        initializeOverlaySession();
       } else {
-        const job = await canvasApi.runRecipeStoryboard(recipe.id);
+        const job = await canvasApi.runRecipeStoryboard(
+          recipe.id,
+          acceptedRecipeCost(recipe),
+        );
         registerCanvasJob(job, {
           label: "治愈短片分镜脚本",
           nodeId: activeGroup.value?.memberNodeIds[0] ?? "recipe",
@@ -1374,7 +1548,7 @@ async function runRecipeAnchor(shot: RecipeShotDto) {
   const recipe = activeRecipe.value;
   if (!recipe || !shot.shotId) return;
   let reason: string | undefined;
-  const estimatedCost = `¥${((recipe.estimatedCostMicros ?? 0) / 1_000_000).toFixed(3)}`;
+  const estimatedCost = recipeCostLabel(recipe);
   if (shot.anchorCandidates.length) {
     const answer = await ElMessageBox.prompt(
       `请描述开场身份、画风、构图或身体结构问题。新锚点会保留旧版本，预计费用 ${estimatedCost}。`,
@@ -1393,7 +1567,7 @@ async function runRecipeAnchor(shot: RecipeShotDto) {
     const job = await canvasApi.runRecipeAnchor(
       recipe.id,
       shot.shotId,
-      recipe.estimatedCostMicros ?? 0,
+      acceptedRecipeCost(recipe),
       reason,
     );
     registerCanvasJob(job, {
@@ -1411,7 +1585,7 @@ async function runRecipeVideo(shot: RecipeShotDto) {
   const recipe = activeRecipe.value;
   if (!recipe || !shot.shotId) return;
   let reason: string | undefined;
-  const estimatedCost = `¥${((recipe.estimatedCostMicros ?? 0) / 1_000_000).toFixed(3)}`;
+  const estimatedCost = recipeCostLabel(recipe);
   if (shot.videoCandidates.length) {
     const answer = await ElMessageBox.prompt(
       `请描述整镜动作、运镜或声音问题。若只在 0.5–13 秒区间畸变，请使用局部重编。预计费用 ${estimatedCost}。`,
@@ -1430,7 +1604,7 @@ async function runRecipeVideo(shot: RecipeShotDto) {
     const job = await canvasApi.runRecipeVideo(
       recipe.id,
       shot.shotId,
-      recipe.estimatedCostMicros ?? 0,
+      acceptedRecipeCost(recipe),
       reason,
     );
     registerCanvasJob(job, {
@@ -1472,7 +1646,7 @@ async function reviewRecipeAsset(
       recipeInstanceId: recipe.id,
       targetType: kind,
       targetId: asset.id,
-      targetHash: asset.sha256,
+      targetHash: asset.sha256 ?? undefined,
       decision,
       blockingDiagnosticPresent: blocking,
       reason,
@@ -1525,7 +1699,7 @@ async function requestRecipeAssetChanges(
       recipeInstanceId: recipe.id,
       targetType: kind,
       targetId: asset.id,
-      targetHash: asset.sha256,
+      targetHash: asset.sha256 ?? undefined,
       decision: "request_changes",
       issues: [answer.value],
       reason: answer.value,
@@ -1683,7 +1857,7 @@ function openVideoEditor(node: CanvasNodeDto, mode: "compact" | "full" = "compac
   interaction.value = mode === "full"
     ? { mode: "fullscreen_editing", nodeId: node.id, returnMode: "video_segment_reshoot" }
     : { mode: "video_segment_reshoot", nodeId: node.id };
-  scheduleContextToolbarPosition();
+  initializeOverlaySession();
 }
 
 function closeVideoEditor() {
@@ -1694,7 +1868,7 @@ function closeVideoEditor() {
   } else if (selectedNode.value?.type === "VideoAssetNode") {
     interaction.value = { mode: "video_selected", nodeId: selectedNode.value.id };
   }
-  scheduleContextToolbarPosition();
+  initializeOverlaySession();
 }
 
 async function composeCanvasSequence(node: CanvasNodeDto) {
@@ -1711,6 +1885,77 @@ async function composeCanvasSequence(node: CanvasNodeDto) {
     ElMessage.success("音画合成已进入后台执行；时间线节点会持续显示进度");
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function openVisualPresetLibrary() {
+  visualPresetLibraryVisible.value = true;
+  if (visualPresets.value.length || visualPresetLoading.value) return;
+  visualPresetLoading.value = true;
+  try {
+    visualPresets.value = await canvasApi.visualPresets();
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    visualPresetLoading.value = false;
+  }
+}
+
+async function loadEpisodeVisualProfile() {
+  if (episodeVisualProfileLoading.value) return;
+  episodeVisualProfileLoading.value = true;
+  try {
+    episodeVisualProfile.value = await canvasApi.episodeVisualProfile(props.projectId);
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.status !== 404) {
+      ElMessage.error(error instanceof Error ? error.message : String(error));
+    }
+  } finally {
+    episodeVisualProfileLoading.value = false;
+  }
+}
+
+async function applyVisualPreset(presetKey: VisualPresetKey) {
+  visualPresetApplying.value = true;
+  try {
+    const applied = await canvasApi.applyVisualPreset(props.projectId, presetKey);
+    episodeVisualProfile.value = applied.visualProfile;
+    visualPresetLibraryVisible.value = false;
+    await loadCanvas(false);
+    const appliedNode = canvas.value?.nodes.find((node) => node.id === applied.canvasNodeId);
+    if (appliedNode) selectCanvasNode(appliedNode);
+    ElMessage.success(`已复用 ${applied.reusedAssetIds.length} 个 Canon 资产并创建显式节点与血缘`);
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    visualPresetApplying.value = false;
+  }
+}
+
+async function saveEpisodeVisualProfile(draft: VisualProfileDraft) {
+  const profile = episodeVisualProfile.value;
+  if (!profile) {
+    ElMessage.warning("请先从素材与预设库应用 Canon-v3 预设");
+    return;
+  }
+  episodeVisualProfileSaving.value = true;
+  try {
+    episodeVisualProfile.value = await canvasApi.updateEpisodeVisualProfile(
+      props.projectId,
+      profile.revision,
+      draft,
+    );
+    await loadCanvas(false);
+    ElMessage.success("本集视觉档案已创建新版本；相关下游资产已标记为过期");
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 409) {
+      await loadEpisodeVisualProfile();
+      ElMessage.warning("视觉档案已被其他操作更新，已加载最新版本，请核对后再保存");
+    } else {
+      ElMessage.error(error instanceof Error ? error.message : String(error));
+    }
+  } finally {
+    episodeVisualProfileSaving.value = false;
   }
 }
 
@@ -1738,7 +1983,10 @@ function runContextToolbarAction(action: CanvasNodeActionDto) {
     case "review_creative": void reviewCreativeBrief(); break;
     case "generate_character_design": void generateCharacterDesign(); break;
     case "review_character_design": {
-      if (node.type === "CharacterDesignNode") break;
+      if (node.type === "CharacterDesignNode") {
+        ElMessage.info("请在角色设计候选区选择一个版本进行审核");
+        break;
+      }
       const characterNode = canvas.value?.nodes.find((item) => (
         item.type === "CharacterDesignNode" && Array.isArray(item.data.candidates) && item.data.candidates.length
       ));
@@ -1748,13 +1996,19 @@ function runContextToolbarAction(action: CanvasNodeActionDto) {
     }
     case "edit_brief": Object.assign(briefForm, node.data); briefVisible.value = true; break;
     case "edit_subject": activateCanvasNode(node); break;
+    case "open_asset_library": void openVisualPresetLibrary(); break;
+    case "apply_visual_preset": void openVisualPresetLibrary(); break;
+    case "edit_episode_visual_profile": {
+      void loadEpisodeVisualProfile();
+      selectCanvasNode(node);
+      break;
+    }
     case "assist_subject": openSubjectAssistant(node); break;
     case "generate_stories": {
       if (activeGroup.value) void runCanvasGroupAction(activeGroup.value, "run_group");
       else void runStories();
       break;
     }
-    case "inspect_story": break;
     case "approve_story": if (node.objectId) void approveStory(node.objectId); break;
     case "inspect_prompt": {
       const promptId = String(node.data.promptId ?? node.data.candidatePromptId ?? node.data.criticPromptId ?? "");
@@ -1775,11 +2029,7 @@ function runContextToolbarAction(action: CanvasNodeActionDto) {
     case "storyboard_manual": openManualStoryboard(); break;
     case "review_storyboard": void reviewStoryboardRevision(); break;
     case "open_scene": {
-      const shot = (canvas.value?.edges ?? []).filter((edge) => edge.sourceNodeId === node.id)
-        .map((edge) => canvas.value?.nodes.find((item) => item.id === edge.targetNodeId))
-        .find((item) => item?.type === "ShotBeatNode");
-      if (shot) selectCanvasNode(shot);
-      else ElMessage.info("该场景还没有可编辑镜头");
+      selectCanvasNode(node);
       break;
     }
     case "edit_shot": editObject(node); break;
@@ -1807,6 +2057,7 @@ function runContextToolbarAction(action: CanvasNodeActionDto) {
     case "export_sequence": {
       const url = String(node.data.contentUrl ?? "");
       if (url) window.open(url, "_blank", "noopener,noreferrer");
+      else ElMessage.info("最终成片尚未批准，暂不能导出");
       break;
     }
     case "upload_reference": requestReferenceUpload(node); break;
@@ -1821,7 +2072,9 @@ function runContextToolbarAction(action: CanvasNodeActionDto) {
       break;
     }
     case "edit": activateCanvasNode(node); break;
-    case "unavailable": break;
+    case "archive_node": void archiveCanvasNode(node); break;
+    case "restore_node": ElMessage.info("请通过移除后的撤销通知恢复节点"); break;
+    case "unavailable": ElMessage.info(action.disabledReason ?? "该节点尚未配置可执行处理器"); break;
     default:
       ElMessage.error(`动作 ${action.key} 缺少前端处理器，已阻止执行`);
   }
@@ -1833,6 +2086,78 @@ function handlePaneClick() {
   closeContextPanel();
 }
 
+function openNodeContextMenu(node: CanvasNodeDto, event: MouseEvent) {
+  selectedGroupId.value = null;
+  interaction.value = selectedInteraction(node);
+  generationComposerNode.value = null;
+  localConsoleSession.value = null;
+  localConsoleGeometry.value = null;
+  nodeContextMenu.value = {
+    nodeId: node.id,
+    left: Math.max(12, Math.min(window.innerWidth - 236, event.clientX)),
+    top: Math.max(12, Math.min(window.innerHeight - 92, event.clientY)),
+  };
+  void nextTick(() => initializeOverlaySession());
+}
+
+function archiveAction(node: CanvasNodeDto): CanvasNodeActionDto | undefined {
+  return node.availableActions?.find((action) => action.key === "archive_node");
+}
+
+async function archiveCanvasNode(node: CanvasNodeDto) {
+  const action = archiveAction(node);
+  nodeContextMenu.value = null;
+  if (!action?.enabled) {
+    ElMessage.info(action?.disabledReason ?? "该节点受当前工作流保护，不能从画布移除");
+    return;
+  }
+  if (!canvas.value || archivingNodeId.value) return;
+  archivingNodeId.value = node.id;
+  try {
+    const result = await canvasApi.archiveNode(
+      props.projectId,
+      node.id,
+      canvas.value.layoutVersion,
+    );
+    closeContextPanel();
+    await loadCanvas(false);
+    if (archiveUndoTimer !== null) window.clearTimeout(archiveUndoTimer);
+    archiveUndo.value = {
+      nodeId: node.id,
+      title: String(node.data.title ?? node.objectType ?? "节点"),
+      layoutVersion: result.layoutVersion,
+    };
+    archiveUndoTimer = window.setTimeout(() => {
+      archiveUndo.value = null;
+      archiveUndoTimer = null;
+    }, 8_000);
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    archivingNodeId.value = null;
+  }
+}
+
+async function restoreArchivedNode() {
+  const pending = archiveUndo.value;
+  if (!pending || !canvas.value) return;
+  try {
+    await canvasApi.restoreNode(
+      props.projectId,
+      pending.nodeId,
+      canvas.value.layoutVersion,
+    );
+    if (archiveUndoTimer !== null) window.clearTimeout(archiveUndoTimer);
+    archiveUndoTimer = null;
+    archiveUndo.value = null;
+    await loadCanvas(false);
+    ElMessage.success("节点已恢复到画布");
+  } catch (error) {
+    await loadCanvas(false);
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  }
+}
+
 function groupExecutionFor(groupId: string) {
   return taskCenterItems.value.find((item) => (
     item.canvasGroupId === groupId
@@ -1842,24 +2167,40 @@ function groupExecutionFor(groupId: string) {
 
 function handleMoveStart() {
   if (spacePressed.value) panningCanvas.value = true;
-  scheduleContextToolbarPosition();
 }
 
 function handleMoveEnd() {
-  scheduleContextToolbarPosition();
   window.setTimeout(() => { panningCanvas.value = false; }, 0);
 }
 
 function handleWorkspaceKeyDown(event: KeyboardEvent) {
   if (event.key === "Escape") {
+    if (nodeContextMenu.value) {
+      event.preventDefault();
+      nodeContextMenu.value = null;
+      return;
+    }
     if (interaction.value.mode === "idle") return;
     event.preventDefault();
     if (interaction.value.mode === "reference_picking") cancelReferenceSelection();
     else {
       interaction.value = escapeInteraction(interaction.value);
       if (interaction.value.mode === "idle") generationComposerNode.value = null;
-      scheduleContextToolbarPosition();
+      if (interaction.value.mode === "idle") {
+        localConsoleSession.value = null;
+        localConsoleGeometry.value = null;
+      }
     }
+    return;
+  }
+  if (
+    (event.key === "Delete" || event.key === "Backspace")
+    && !isEditableTarget(event.target)
+    && selectedNode.value
+    && ["node_selected", "video_selected"].includes(interaction.value.mode)
+  ) {
+    event.preventDefault();
+    void archiveCanvasNode(selectedNode.value);
     return;
   }
   if (event.code !== "Space" || isEditableTarget(event.target)) return;
@@ -2175,6 +2516,7 @@ async function applySubjectAssistant(payload: { acceptedFields: string[]; finalD
 async function openGenerationComposer(node: CanvasNodeDto) {
   selectedNodeId.value = node.id;
   generationComposerNode.value = node;
+  initializeOverlaySession();
   generationCapability.value = null;
   generationReferences.value = [];
   const persistedConfig = node.data.generationConfig;
@@ -2246,7 +2588,7 @@ async function openGenerationComposer(node: CanvasNodeDto) {
     }));
   } finally {
     generationLoading.value = false;
-    scheduleContextToolbarPosition();
+    initializeOverlaySession();
   }
 }
 
@@ -2514,20 +2856,26 @@ function nodeDragStop(event?: { node?: Node }) {
     });
   }
   groupDragSnapshot.value = null;
+  scheduleOverlayAnchorUpdate();
   syncStatus.value = "local";
   void persistLayout(draggedGroup ? "move_group" : "move_node");
 }
 
-watch(selectedNodeId, (nodeId, previousNodeId) => {
+watch([selectedNodeId, consoleKind], async ([nodeId, kind], [previousNodeId, previousKind]) => {
   if (!nodeId) {
-    toolbarVisible.value = false;
     localConsoleSession.value = null;
+    localConsoleGeometry.value = null;
     return;
   }
-  scheduleContextToolbarPosition();
-  if (nodeId !== previousNodeId || localConsoleSession.value?.nodeId !== nodeId) {
+  if (nodeId !== previousNodeId || kind !== previousKind) {
+    if (localConsoleSession.value?.nodeId === nodeId) {
+      initializeOverlaySession();
+      return;
+    }
     localConsoleSession.value = null;
-    scheduleLocalConsoleInitialization(nodeId);
+    localConsoleGeometry.value = null;
+    await nextTick();
+    initializeOverlaySession();
   }
 });
 watch(() => props.projectId, async () => {
@@ -2535,6 +2883,7 @@ watch(() => props.projectId, async () => {
   interaction.value = { mode: "idle" };
   generationComposerNode.value = null;
   localConsoleSession.value = null;
+  localConsoleGeometry.value = null;
   canvas.value = null;
   flowNodes.value = [];
   flowEdges.value = [];
@@ -2560,8 +2909,8 @@ onMounted(async () => {
   window.addEventListener("blur", handleWindowBlur);
 });
 onBeforeUnmount(() => {
-  if (contextPanelFrame !== null) cancelAnimationFrame(contextPanelFrame);
-  if (localConsoleFrame !== null) cancelAnimationFrame(localConsoleFrame);
+  if (overlayPositionFrame !== null) cancelAnimationFrame(overlayPositionFrame);
+  if (archiveUndoTimer !== null) window.clearTimeout(archiveUndoTimer);
   window.removeEventListener("online", replayPendingLayout);
   window.removeEventListener("resize", handleWorkspaceResize);
   window.removeEventListener("keydown", handleWorkspaceKeyDown);
@@ -2623,11 +2972,11 @@ onBeforeUnmount(() => {
         pan-activation-key-code="Space"
         @connect="connect"
         @pane-click="handlePaneClick"
+        @move="scheduleOverlayAnchorUpdate"
         @move-start="handleMoveStart"
-        @move="scheduleContextToolbarPosition"
         @move-end="handleMoveEnd"
+        @node-drag="scheduleOverlayAnchorUpdate"
         @node-drag-start="nodeDragStart"
-        @node-drag="scheduleContextToolbarPosition"
         @node-drag-stop="nodeDragStop"
       >
         <Background pattern-color="#29303a" :gap="24" :size="1" />
@@ -2693,6 +3042,7 @@ onBeforeUnmount(() => {
             @select-history="openReferenceHistory"
             @create-subject="(node) => { selectedNodeId = node.id; subjectVisible = true; }"
             @open-recipe="activateCanvasNode"
+            @open-context-menu="openNodeContextMenu"
           />
           <Handle
             v-for="(port, index) in outputPortsFor(data.node.type)"
@@ -2707,7 +3057,7 @@ onBeforeUnmount(() => {
 
       <Teleport to="body">
         <CanvasContextToolbar
-          v-if="selectedNode && toolbarVisible && !referenceSelectionTarget && !videoEditorNode"
+          v-if="selectedNode && showContextToolbar && localConsoleSession?.nodeId === selectedNode.id && !referenceSelectionTarget && !videoEditorNode"
           :node="selectedNode"
           :style="contextPanelStyle"
           @action="runContextToolbarAction"
@@ -2720,6 +3070,7 @@ onBeforeUnmount(() => {
           :preset="localConsolePreset"
           :fullscreen-available="selectedNode.type === 'StoryboardDirectorNode' || selectedNode.type === 'VideoAssetNode'"
           @fullscreen="selectedNode.type === 'StoryboardDirectorNode' ? openManualStoryboard() : openVideoEditor(selectedNode, 'full')"
+          @close="closeContextPanel"
         >
           <VideoEditWorkspace
             v-if="consoleKind === 'video_segment' && selectedNode.type === 'VideoAssetNode'"
@@ -2769,7 +3120,7 @@ onBeforeUnmount(() => {
             @run="runStoryboardCreation"
             @manual="openManualStoryboard"
             @select-references="startStoryboardReferenceSelection"
-            @open-workflow="storyboardWorkflowVisible = true"
+            @open-workflow="openStoryboardWorkflow"
             @approve="reviewStoryboardRevision"
           />
           <VideoAssetPanel
@@ -2787,6 +3138,22 @@ onBeforeUnmount(() => {
             :busy="busyAction === 'brief' || recipeBusy"
             @save="saveBriefFromConsole"
             @action="runContextToolbarAction"
+          />
+          <SceneAssetConsole
+            v-else-if="selectedNode.type === 'SceneNode' && selectedNode.objectId"
+            :key="selectedNode.id"
+            :project-id="projectId"
+            :scene-id="selectedNode.objectId"
+          />
+          <VisualEvidenceConsole
+            v-else-if="selectedNode.type === 'SubjectNode' || selectedNode.type === 'StylePresetNode'"
+            :key="selectedNode.id"
+            :node="selectedNode"
+            :profile="episodeVisualProfile"
+            :loading="episodeVisualProfileLoading"
+            :saving="episodeVisualProfileSaving"
+            @open-library="openVisualPresetLibrary"
+            @save="saveEpisodeVisualProfile"
           />
           <section v-else-if="selectedNode.type === 'CharacterDesignNode'" class="character-design-console">
             <header>
@@ -2810,6 +3177,26 @@ onBeforeUnmount(() => {
             @action="runContextToolbarAction"
           />
         </CanvasLocalConsole>
+        <aside
+          v-if="nodeContextMenu && contextMenuNode"
+          class="canvas-node-context-menu"
+          :style="{ left: `${nodeContextMenu.left}px`, top: `${nodeContextMenu.top}px` }"
+          role="menu"
+          aria-label="节点菜单"
+          @click.stop
+        >
+          <button
+            type="button"
+            role="menuitem"
+            :aria-disabled="contextMenuArchiveAction?.enabled !== true"
+            :title="contextMenuArchiveAction?.disabledReason ?? '从画布移除'"
+            @click="archiveCanvasNode(contextMenuNode)"
+          >从画布移除</button>
+        </aside>
+        <aside v-if="archiveUndo" class="canvas-archive-undo" role="status" aria-live="polite">
+          <span>“{{ archiveUndo.title }}”已从画布移除</span>
+          <button type="button" @click="restoreArchivedNode">撤销</button>
+        </aside>
       </Teleport>
 
       <aside class="stage-guide">
@@ -2826,6 +3213,7 @@ onBeforeUnmount(() => {
         <button type="button" title="自动布局" @click="autoLayout"><MagicStick /></button>
         <button type="button" title="聚焦全部节点" @click="fitView({ padding: .16, duration: 320 })"><Aim /></button>
         <button type="button" title="刷新画布" @click="loadCanvas()"><Refresh /></button>
+        <button class="asset-library-entry" type="button" title="打开角色库、风格库和最近使用" @click="openVisualPresetLibrary">素材库</button>
         <button v-if="!activeGroup" class="recipe-entry" type="button" title="创建一人一猫治愈短片组合包" @click="recipeCreateVisible = true">一人一猫</button>
       </nav>
 
@@ -2864,16 +3252,28 @@ onBeforeUnmount(() => {
     <StoryboardWorkflow
       v-model="storyboardWorkflowVisible"
       :shots="storyboardShots"
+      :project-id="projectId"
+      :story-revision-id="approvedStory?.objectId ?? undefined"
+      :visual-profile-revision-id="episodeVisualProfile?.id"
       :healing-recipe="Boolean(activeRecipe)"
       :target-duration-seconds="activeRecipe?.targetDurationSeconds ?? Number(canvas?.nodes.find((node) => node.type === 'BriefNode')?.data.targetDurationSeconds ?? 0)"
       :saving="storyboardSaving"
       @save="saveStoryboardWorkflow"
+      @open-scene="openStoryboardScene"
     />
 
     <PromptTraceDrawer
       v-model="promptVisible"
       :prompt="selectedPrompt"
       :loading="promptLoading"
+    />
+
+    <VisualPresetLibrary
+      v-model="visualPresetLibraryVisible"
+      :presets="visualPresets"
+      :loading="visualPresetLoading"
+      :applying="visualPresetApplying"
+      @apply="applyVisualPreset"
     />
 
     <el-dialog v-model="recipeCreateVisible" title="创建一人一猫治愈短片" width="min(560px, calc(100vw - 28px))">
@@ -3105,6 +3505,7 @@ onBeforeUnmount(() => {
 .canvas-toolbar button { width: 36px; height: 36px; padding: 8px; color: #c3cad5; background: transparent; border: 0; border-radius: 9px; cursor: pointer; }
 .canvas-toolbar button:hover { color: #fff; background: #383d45; }
 .canvas-toolbar button.recipe-entry { width: auto; padding-inline: 12px; color: #b9d8c2; font-weight: 700; }
+.canvas-toolbar button.asset-library-entry { width: auto; padding-inline: 12px; color: #d9e4f2; font-weight: 700; }
 .node-library-popover { position: absolute; left: 50%; bottom: 78px; z-index: 12; transform: translateX(-50%); }
 .reference-selection-banner { position: absolute; top: 14px; left: 50%; z-index: 30; display: flex; align-items: center; gap: 10px; min-width: 560px; padding: 10px 12px; transform: translateX(-50%); color: #dfeafa; background: #1d3f61; border: 1px solid #4f88bc; border-radius: 12px; box-shadow: 0 14px 40px rgb(0 0 0 / 38%); }
 .reference-selection-banner div { display: grid; flex: 1; }.reference-selection-banner span { color: #a9c4dd; font-size: 11px; }.reference-selection-banner button { padding: 7px 10px; color: #dbe9f8; background: #254d71; border: 1px solid #5586b1; border-radius: 7px; cursor: pointer; }.reference-selection-banner button.primary { color: #15202b; background: #d7e8f7; }
@@ -3119,6 +3520,9 @@ onBeforeUnmount(() => {
 .asset-history-filters { display: flex; gap: 7px; margin-bottom: 12px; }.asset-history-filters button { padding: 7px 10px; color: #cad3df; background: #292e36; border: 1px solid #3c4450; border-radius: 7px; cursor: pointer; }
 .asset-history-state { padding: 30px; color: #8b96a7; text-align: center; }.asset-history-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 14px; }.asset-history-grid article { display: grid; gap: 5px; padding: 8px; color: #dce3ed; background: #1c2026; border: 1px solid #303741; border-radius: 9px; }.asset-history-grid img, .asset-history-grid video, .audio-placeholder { width: 100%; height: 132px; object-fit: cover; background: #101217; border-radius: 6px; }.asset-history-grid small { color: #7f8a9a; }.audio-placeholder { display: grid; place-items: center; color: #758196; font-size: 11px; letter-spacing: .16em; }
 .subject-library-grid { display: grid; gap: 10px; }.subject-library-grid article { display: grid; gap: 8px; padding: 13px; color: #dce3ed; background: #1c2026; border: 1px solid #303741; border-radius: 10px; }.subject-library-grid article div { display: grid; }.subject-library-grid small { color: #8792a3; }.subject-library-grid p { margin: 0; color: #b9c2cf; }.subject-library-grid .subject-warning { color: #e3ad6d; }.subject-library-grid button { justify-self: start; padding: 7px 10px; color: #15202b; background: #d7e8f7; border: 0; border-radius: 7px; cursor: pointer; }
+.canvas-node-context-menu { position: fixed; z-index: 1400; width: 224px; padding: 6px; color: #eceff4; background: #252525; border: 1px solid #454545; border-radius: 12px; box-shadow: 0 14px 38px rgb(0 0 0 / 42%); }.canvas-node-context-menu button { width: 100%; min-height: 44px; padding: 0 12px; color: inherit; text-align: left; background: transparent; border: 0; border-radius: 8px; cursor: pointer; }.canvas-node-context-menu button:hover,.canvas-node-context-menu button:focus-visible { background: #383838; outline: 2px solid #78aef0; outline-offset: -2px; }.canvas-node-context-menu button[aria-disabled="true"] { color: #777; cursor: not-allowed; }
+.canvas-archive-undo { position: fixed; right: 24px; bottom: 24px; z-index: 1700; display: flex; align-items: center; gap: 18px; min-height: 52px; padding: 8px 10px 8px 16px; color: #eceff4; background: #292929; border: 1px solid #494949; border-radius: 12px; box-shadow: 0 16px 40px rgb(0 0 0 / 40%); animation: archive-undo-in 140ms ease-out; }.canvas-archive-undo button { min-width: 64px; min-height: 40px; color: #9fc8ff; background: transparent; border: 0; border-radius: 8px; cursor: pointer; }.canvas-archive-undo button:hover,.canvas-archive-undo button:focus-visible { color: #fff; background: #3a4654; outline: 2px solid #78aef0; outline-offset: -2px; }
+@keyframes archive-undo-in { from { opacity: 0; transform: translateY(6px); } }
 @media (max-width: 1280px) {
   .stage-guide { display: none; }
   .workflow-actions { left: 12px; right: 12px; bottom: 70px; max-width: none; flex-wrap: wrap; }
@@ -3129,5 +3533,6 @@ onBeforeUnmount(() => {
 }
 @media (prefers-reduced-motion: reduce) {
   .canvas-group-frame { transition: none; }
+  .canvas-archive-undo { animation: none; }
 }
 </style>

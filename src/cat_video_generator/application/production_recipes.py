@@ -7,10 +7,14 @@ import json
 import uuid
 import zipfile
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
 from ..domain.production_recipes import (
+    CANON_V3_PROFILE_ID,
+    CANON_V3_STYLE_NEGATIVE,
+    CANON_V3_STYLE_POSITIVE,
     HEALING_CHILD_CAT_RECIPE,
     CanvasGroupRunRequest,
     CatBehaviorMode,
@@ -24,6 +28,7 @@ from ..domain.production_recipes import (
     RecipeSequenceRunRequest,
     RecipeStage,
     SoundPlan,
+    StoryboardCreationMode,
     StoryboardRecipeRunRequest,
     recipe_task_source_hash,
     split_shot_durations,
@@ -94,6 +99,24 @@ class ProductionRecipeRepository(Protocol):
         candidate_count: int,
     ) -> dict[str, Any]: ...
 
+    def validate_storyboard_character_references(
+        self,
+        instance_id: uuid.UUID,
+        reference_asset_ids: tuple[uuid.UUID, ...],
+    ) -> None: ...
+
+    def validate_anchor_prompt_readiness(
+        self,
+        instance_id: uuid.UUID,
+        shot_id: uuid.UUID,
+    ) -> None: ...
+
+    def record_task_children(
+        self,
+        parent_step_id: uuid.UUID,
+        child_step_ids: tuple[uuid.UUID, ...],
+    ) -> tuple[dict[str, Any], ...]: ...
+
     def get_group(self, group_id: uuid.UUID) -> dict[str, Any]: ...
 
     def save_group_template(self, group_id: uuid.UUID) -> dict[str, Any]: ...
@@ -132,6 +155,9 @@ class StoryRecipeWorkflow(Protocol):
         exact_durations: tuple[int, ...] | None = None,
         healing_recipe: bool = False,
         idempotency_key: str | None = None,
+        creation_mode: str = StoryboardCreationMode.FROM_STORY.value,
+        reference_asset_ids: tuple[uuid.UUID, ...] = (),
+        instruction: str | None = None,
     ) -> dict[str, Any]: ...
 
     def create_generation_batch(self, payload: Any) -> dict[str, Any]: ...
@@ -163,14 +189,16 @@ class ProductionRecipeService:
         story_workflow: StoryRecipeWorkflow | None = None,
         shot_workflow: ShotRecipeWorkflow | None = None,
         sequence_workflow: SequenceRecipeWorkflow | None = None,
-        image_call_cost_micros: int = 0,
-        video_call_cost_micros: int = 0,
+        director_call_cost_micros: int | None = None,
+        image_call_cost_micros: int | None = None,
+        video_call_cost_micros: int | None = None,
         asset_root: Path | None = None,
     ) -> None:
         self._repository = repository
         self._story_workflow = story_workflow
         self._shot_workflow = shot_workflow
         self._sequence_workflow = sequence_workflow
+        self._director_call_cost_micros = director_call_cost_micros
         self._image_call_cost_micros = image_call_cost_micros
         self._video_call_cost_micros = video_call_cost_micros
         self._asset_root = None if asset_root is None else asset_root.expanduser().resolve()
@@ -271,7 +299,6 @@ class ProductionRecipeService:
         operation_key: str,
         input_snapshot: dict[str, object],
     ) -> MediaExecutionResult:
-        del step_id
         instance_id = uuid.UUID(str(input_snapshot["recipeInstanceId"]))
         instance = self.get_instance(instance_id)
         expected_revision = int(input_snapshot["expectedInstanceRevision"])
@@ -314,10 +341,45 @@ class ProductionRecipeService:
                 result = self.run_video(instance_id, uuid.UUID(str(shot_value)), payload)
             else:
                 raise ValueError(f"不支持的持久配方任务：{operation_key}")
-        return MediaExecutionResult(
-            payload=_task_result_summary(operation_key, result),
-            status=StepStatus.AWAITING_REVIEW,
-        )
+        summary = _task_result_summary(operation_key, result)
+        child_step_ids = _result_child_step_ids(result)
+        if not child_step_ids:
+            return MediaExecutionResult(
+                payload=summary,
+                status=StepStatus.AWAITING_REVIEW,
+            )
+
+        child_steps = self._repository.record_task_children(step_id, child_step_ids)
+        child_statuses = {str(item["status"]) for item in child_steps}
+        summary["parentStepId"] = str(step_id)
+        summary["childStepIds"] = [str(item["stepId"]) for item in child_steps]
+        summary["childStatuses"] = [
+            {"stepId": str(item["stepId"]), "status": str(item["status"])}
+            for item in child_steps
+        ]
+        failed_steps = [item for item in child_steps if item["status"] == StepStatus.FAILED.value]
+        if failed_steps:
+            failed_ids = ", ".join(str(item["stepId"]) for item in failed_steps)
+            raise RuntimeError(f"子任务执行失败：{failed_ids}")
+        if StepStatus.SUBMISSION_UNKNOWN.value in child_statuses:
+            summary["message"] = "Provider 提交状态未知，请打开对应子任务进行人工对账"
+            return MediaExecutionResult(payload=summary, status=StepStatus.SUBMISSION_UNKNOWN)
+        active_statuses = {
+            StepStatus.PENDING.value,
+            StepStatus.SUBMITTING.value,
+            StepStatus.QUEUED.value,
+            StepStatus.RUNNING.value,
+        }
+        if child_statuses.intersection(active_statuses):
+            summary["status"] = "running"
+            summary["message"] = "子任务仍在生成或查询 Provider 状态"
+            return MediaExecutionResult(
+                payload=summary,
+                status=StepStatus.QUEUED,
+                next_retry_at=datetime.now(UTC) + timedelta(seconds=2),
+            )
+        summary["message"] = "全部子任务已完成，等待人工审核"
+        return MediaExecutionResult(payload=summary, status=StepStatus.AWAITING_REVIEW)
 
     def run_creative_brief(
         self,
@@ -328,7 +390,7 @@ class ProductionRecipeService:
         instance = _recipe_projection(self._repository.get_instance(instance_id))
         if instance["phase"] != RecipePhaseKey.CREATIVE.value:
             raise ValueError("只有创意阶段可以执行 AI 创意补全")
-        self._accept_cost(payload, 0)
+        self._accept_cost(payload, self._director_call_cost_micros)
         result = workflow.complete_creative_brief(
             uuid.UUID(str(instance["projectId"])),
             theme=str(instance["theme"]),
@@ -347,14 +409,16 @@ class ProductionRecipeService:
             raise ValueError("创意简报人工批准后才能生成故事候选")
         if not instance.get("progress", {}).get("creativeApproved", True):
             raise ValueError("创意简报尚未人工批准")
-        self._accept_cost(payload, 0)
+        self._accept_cost(payload, self._director_call_cost_micros)
         rules = _suggest_episode_rules(str(instance["theme"]))
         command = RecipeStoryCommand(
             idempotency_key=payload.idempotency_key,
             rewrite_instruction=(
                 "生成三个原创、低压力的日常小事件。每个候选必须包含儿童行动、"
-                "猫咪参与、一个小变化和温暖收尾；单一场景、固定儿童与固定猫咪、"
-                "原创柔和水彩画风，无对白。自然猫不得直立劳动、持工具或产生人形肢体。"
+                "猫咪参与、一个小变化和温暖收尾；固定儿童与固定猫咪、原创柔和水彩画风、"
+                "无对白。8至15秒只能设计一个场景；16至60秒仅在叙事必要时换场，"
+                "场景数不得超过总时长除以15秒向上取整，每次换场必须说明叙事目的。"
+                "自然猫不得直立劳动、持工具或产生人形肢体。"
             ),
         )
         result = workflow.run_story_strategies(
@@ -390,7 +454,7 @@ class ProductionRecipeService:
         candidate_count = tier.character_design_candidate_count
         self._accept_cost(
             payload,
-            candidate_count * 3 * self._image_call_cost_micros,
+            _multiply_cost(self._image_call_cost_micros, candidate_count * 3),
         )
         prepared = self._repository.prepare_character_design(
             instance_id,
@@ -410,7 +474,7 @@ class ProductionRecipeService:
     def run_storyboard(
         self,
         instance_id: uuid.UUID,
-        payload: PaidRecipeRunRequest,
+        payload: StoryboardRecipeRunRequest,
     ) -> dict[str, Any]:
         workflow = self._require_story_workflow()
         instance = _recipe_projection(self._repository.get_instance(instance_id))
@@ -423,13 +487,22 @@ class ProductionRecipeService:
             raise ValueError("三个角色设计槽位尚未全部人工批准")
         if int(progress.get("shotCount") or 0) > 0:
             raise ValueError("当前分镜已经生成，请先完成审核或创建明确的新版本")
-        self._accept_cost(payload, 0)
+        reference_asset_ids = tuple(payload.reference_asset_ids)
+        if payload.creation_mode is StoryboardCreationMode.FROM_CHARACTERS:
+            self._repository.validate_storyboard_character_references(
+                instance_id,
+                reference_asset_ids,
+            )
+        self._accept_cost(payload, self._director_call_cost_micros)
         durations = split_shot_durations(int(instance["targetDurationSeconds"]))
         storyboard = workflow.create_storyboard(
             uuid.UUID(str(instance["projectId"])),
             exact_durations=durations,
             healing_recipe=True,
             idempotency_key=payload.idempotency_key,
+            creation_mode=payload.creation_mode.value,
+            reference_asset_ids=reference_asset_ids,
+            instruction=payload.instruction,
         )
         return self._repository.materialize_storyboard(instance_id, storyboard)
 
@@ -446,10 +519,11 @@ class ProductionRecipeService:
             raise ValueError("当前阶段不能生成视觉锚点")
         if not instance.get("progress", {}).get("storyboardApproved", True):
             raise ValueError("分镜尚未人工批准")
+        self._repository.validate_anchor_prompt_readiness(instance_id, shot_id)
         tier = HEALING_CHILD_CAT_RECIPE.quality_tiers[instance["qualityTier"]]
         self._accept_cost(
             payload,
-            tier.anchor_candidate_count * self._image_call_cost_micros,
+            _multiply_cost(self._image_call_cost_micros, tier.anchor_candidate_count),
         )
         results = [
             self._shot_workflow.generate_anchor(
@@ -477,7 +551,7 @@ class ProductionRecipeService:
         tier = HEALING_CHILD_CAT_RECIPE.quality_tiers[instance["qualityTier"]]
         self._accept_cost(
             payload,
-            tier.video_candidate_count * self._video_call_cost_micros,
+            _multiply_cost(self._video_call_cost_micros, tier.video_candidate_count),
         )
         results = [
             self._shot_workflow.generate_video(
@@ -532,6 +606,8 @@ class ProductionRecipeService:
             "primaryAction": instance["primaryAction"],
             "blocker": instance["currentBlocker"],
             "estimatedCostMicros": instance["estimatedCostMicros"],
+            "costEstimateStatus": instance["costEstimateStatus"],
+            "costEstimateLabel": instance["costEstimateLabel"],
             "stopsAtReviewGate": instance["phase"] != RecipePhaseKey.COMPLETE.value,
             "reviewStages": instance["reviewStages"],
         }
@@ -549,7 +625,7 @@ class ProductionRecipeService:
             raise ValueError("该分组未绑定可执行的一人一猫配方")
         instance_id = uuid.UUID(str(instance_id_value))
         instance = self.get_instance(instance_id)
-        self._accept_cost(payload, int(instance["estimatedCostMicros"]))
+        self._accept_cost(payload, instance["estimatedCostMicros"])
         phase = RecipePhaseKey(instance["phase"])
 
         if phase is RecipePhaseKey.COMPLETE:
@@ -571,7 +647,15 @@ class ProductionRecipeService:
         elif phase is RecipePhaseKey.STORYBOARD:
             if int(instance.get("progress", {}).get("shotCount") or 0) > 0:
                 return self._group_stop(group_id, instance, "awaiting_review")
-            result = self.run_storyboard(instance_id, payload)
+            result = self.run_storyboard(
+                instance_id,
+                StoryboardRecipeRunRequest(
+                    idempotencyKey=payload.idempotency_key,
+                    acceptEstimatedCostMicros=payload.accept_estimated_cost_micros,
+                    reason=payload.reason,
+                    creationMode=StoryboardCreationMode.FROM_STORY,
+                ),
+            )
         elif phase is RecipePhaseKey.RENDER:
             result = self._run_next_render_step(instance_id, instance, payload)
         else:
@@ -733,15 +817,40 @@ class ProductionRecipeService:
     def _project_instance(self, source: dict[str, Any]) -> dict[str, Any]:
         document = _recipe_projection(source)
         tier = HEALING_CHILD_CAT_RECIPE.quality_tiers[document["qualityTier"]]
-        if document["phase"] == RecipePhaseKey.CHARACTER_DESIGN.value:
-            estimate = tier.character_design_candidate_count * 3 * self._image_call_cost_micros
+        if document["phase"] in {
+            RecipePhaseKey.CREATIVE.value,
+            RecipePhaseKey.STORY.value,
+            RecipePhaseKey.STORYBOARD.value,
+        }:
+            estimate = self._director_call_cost_micros
+        elif document["phase"] == RecipePhaseKey.CHARACTER_DESIGN.value:
+            estimate = _multiply_cost(
+                self._image_call_cost_micros,
+                tier.character_design_candidate_count * 3,
+            )
         elif document["stage"] == RecipeStage.ANCHORS.value:
-            estimate = tier.anchor_candidate_count * self._image_call_cost_micros
+            estimate = _multiply_cost(
+                self._image_call_cost_micros,
+                tier.anchor_candidate_count,
+            )
         elif document["stage"] == RecipeStage.VIDEO.value:
-            estimate = tier.video_candidate_count * self._video_call_cost_micros
+            estimate = _multiply_cost(
+                self._video_call_cost_micros,
+                tier.video_candidate_count,
+            )
         else:
             estimate = 0
-        return {**document, "estimatedCostMicros": estimate}
+        estimate_status = "unmetered_paid" if estimate is None else "metered"
+        return {
+            **document,
+            "estimatedCostMicros": estimate,
+            "costEstimateStatus": estimate_status,
+            "costEstimateLabel": (
+                "付费调用·暂未计量"
+                if estimate is None
+                else f"预计费用 ¥{estimate / 1_000_000:.3f}"
+            ),
+        }
 
     def _validate_enqueued_operation(
         self,
@@ -775,26 +884,30 @@ class ProductionRecipeService:
             and instance["phase"] == RecipePhaseKey.COMPLETE.value
         ):
             raise ValueError("已完成的分组没有可执行阶段")
-        estimated_cost = (
-            int(instance["estimatedCostMicros"])
-            if operation_key
-            in {
-                "recipe:character_design",
-                "recipe:anchor",
-                "recipe:video",
-                "canvas-group:run",
-            }
-            else 0
-        )
+        estimated_cost = instance["estimatedCostMicros"]
         self._accept_cost(payload, estimated_cost)
 
     @staticmethod
-    def _accept_cost(payload: PaidRecipeRunRequest, estimated_cost_micros: int) -> None:
+    def _accept_cost(
+        payload: PaidRecipeRunRequest,
+        estimated_cost_micros: int | None,
+    ) -> None:
+        if estimated_cost_micros is None:
+            if payload.accept_estimated_cost_micros != 0:
+                raise ValueError(
+                    "该 Provider 调用属于付费但暂未计量；"
+                    "请以 0 作为未计量费用确认值，实际费用以供应商账单为准"
+                )
+            return
         if payload.accept_estimated_cost_micros != estimated_cost_micros:
             raise ValueError(
                 "费用预估已变化："
                 f"当前 {estimated_cost_micros}，提交 {payload.accept_estimated_cost_micros}"
             )
+
+
+def _multiply_cost(unit_cost_micros: int | None, count: int) -> int | None:
+    return None if unit_cost_micros is None else unit_cost_micros * count
 
 
 def _recipe_projection(source: dict[str, Any]) -> dict[str, Any]:
@@ -886,8 +999,8 @@ def _suggest_episode_rules(theme: str) -> EpisodeRules:
     environment = "indoor" if any(marker in theme for marker in indoor_markers) else "outdoor"
     return EpisodeRules(
         personWardrobe="沿用儿童 Canon 身份，本集固定米白上衣与棕色背带裤",
-        timeWeather="依据主题确定后整集保持同一时间与天气",
-        mainScene="依据主题设计一个原创、低压力的单一日常场景",
+        timeWeather="依据主题确定整集时间推进与天气基调，逐场细节由场景连续性规则锁定",
+        mainScene="以批准故事的 scenes 为准；只有叙事必要时换场",
         environment=environment,
         coreProps=[],
         catBehaviorMode=CatBehaviorMode.NATURAL,
@@ -897,9 +1010,9 @@ def _suggest_episode_rules(theme: str) -> EpisodeRules:
             musicMood="轻柔、留白、不抢动作的治愈配乐",
             dialoguePolicy="none",
         ),
-        stylePositive=["原创二维水彩", "柔和纸张纹理", "低对比自然光"],
-        styleExcluded=["真人准写实", "PBR三维塑料感", "冲突画风混用"],
-        canonProfileId="canon-v2-healing-child-cat",
+        stylePositive=list(CANON_V3_STYLE_POSITIVE),
+        styleExcluded=list(CANON_V3_STYLE_NEGATIVE),
+        canonProfileId=CANON_V3_PROFILE_ID,
     )
 
 
@@ -942,3 +1055,40 @@ def _task_result_summary(operation_key: str, result: dict[str, Any]) -> dict[str
         "shotId": result.get("shotId"),
         "assetId": result.get("renderedAssetId") or result.get("id"),
     }
+
+
+def _result_child_step_ids(result: dict[str, Any]) -> tuple[uuid.UUID, ...]:
+    """Collect durable child work created by a recipe operation without guessing asset IDs."""
+
+    ordered: list[uuid.UUID] = []
+    seen: set[uuid.UUID] = set()
+
+    def add(value: object) -> None:
+        if value is None or value == "":
+            return
+        try:
+            step_id = uuid.UUID(str(value))
+        except (TypeError, ValueError):
+            return
+        if step_id not in seen:
+            seen.add(step_id)
+            ordered.append(step_id)
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            candidate_ids = value.get("candidateStepIds")
+            if isinstance(candidate_ids, list):
+                for item in candidate_ids:
+                    add(item)
+            if "stepId" in value:
+                add(value["stepId"])
+            for key in ("candidates", "candidateSteps", "generationBatches", "result"):
+                nested = value.get(key)
+                if nested is not None:
+                    visit(nested)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(result)
+    return tuple(ordered)

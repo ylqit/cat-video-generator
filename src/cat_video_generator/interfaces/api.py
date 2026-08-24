@@ -698,6 +698,10 @@ def create_app(
                 and item.media_type == "image"
             ],
             "plans": workflow["stages"].get("visualAssets", []),
+            "readiness": container.editing.scene_asset_readiness(scene.id).model_dump(
+                mode="json",
+                by_alias=True,
+            ),
         }
 
     @app.get("/api/v1/shots/{shot_id}")
@@ -1170,6 +1174,8 @@ def create_app(
                 canvasGroupId=snapshot.get("canvasGroupId"),
                 recipeInstanceId=snapshot.get("recipeInstanceId"),
                 creationMode=snapshot.get("creationMode"),
+                parentStepId=snapshot.get("parentStepId"),
+                childStepIds=item.progress.get("childStepIds", []),
                 workflowStage=snapshot.get("workflowStage"),
                 phase=snapshot.get("phase"),
                 progress=item.progress,

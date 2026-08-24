@@ -7,6 +7,7 @@ import type {
   CanvasEdgeDto,
   CanvasNodeType,
   CanvasNodeAssetBindingDto,
+  CanvasNodeArchiveResult,
   CanvasTemplateDto,
   CanvasTemplateKey,
   CapabilityCompilationPlan,
@@ -21,6 +22,7 @@ import type {
   ProductionRecipeDefinitionDto,
   ProductionRecipeInstanceDto,
   EpisodeRulesDto,
+  EpisodeVisualProfileDto,
   HumanReviewDecision,
   PromptRunDto,
   ProviderCapabilityDto,
@@ -51,6 +53,7 @@ import type {
   ShotSuggestion,
   ShotSuggestionOutput,
   StoryDiagnosisOutput,
+  StoryboardPromptCompilationDto,
   StoryBriefInput,
   StoryExpansionOutput,
   StoryRewriteOutput,
@@ -63,6 +66,7 @@ import type {
   VisualAssetPurpose,
   VisualProfileDraft,
   VisualProfileRevisionDto,
+  VisualPresetProfileDto,
 } from "./types";
 
 const BASE = "/api/v1";
@@ -587,6 +591,27 @@ export const canvasApi = {
     canvasJson<CanvasEdgeDto>(`/projects/${projectId}/canvas/edges`, "POST", edge),
   deleteEdge: (edgeId: string) =>
     canvasJson<Record<string, unknown>>(`/canvas/edges/${edgeId}`, "DELETE"),
+  archiveNode: (
+    projectId: string,
+    nodeId: string,
+    layoutVersion: number,
+    reason?: string,
+  ) => canvasJson<CanvasNodeArchiveResult>(
+    `/projects/${projectId}/canvas/nodes/${nodeId}/archive`,
+    "POST",
+    { reason },
+    { "If-Match": String(layoutVersion) },
+  ),
+  restoreNode: (
+    projectId: string,
+    nodeId: string,
+    layoutVersion: number,
+  ) => canvasJson<CanvasNodeArchiveResult>(
+    `/projects/${projectId}/canvas/nodes/${nodeId}/restore`,
+    "POST",
+    {},
+    { "If-Match": String(layoutVersion) },
+  ),
   saveBrief: (projectId: string, brief: StoryBriefInput) =>
     canvasJson<Record<string, unknown>>(`/projects/${projectId}/brief`, "PUT", brief),
   createSubject: (projectId: string, subject: SubjectInput) =>
@@ -634,6 +659,34 @@ export const canvasApi = {
       undefined,
       CANVAS_BASE,
     ),
+  visualPresets: () => request<VisualPresetProfileDto[]>(
+    "/visual-presets",
+    undefined,
+    CANVAS_BASE,
+  ),
+  applyVisualPreset: (projectId: string, presetKey: string) =>
+    canvasJson<{
+      preset: VisualPresetProfileDto;
+      visualProfile: EpisodeVisualProfileDto;
+      canvasNodeId: string;
+      canvasNodeIds: string[];
+      reusedAssetIds: string[];
+    }>(`/projects/${projectId}/visual-presets/${presetKey}/apply`, "POST", {}),
+  episodeVisualProfile: (projectId: string) => request<EpisodeVisualProfileDto>(
+    `/projects/${projectId}/visual-profile`,
+    undefined,
+    CANVAS_BASE,
+  ),
+  updateEpisodeVisualProfile: (
+    projectId: string,
+    revision: number,
+    draft: VisualProfileDraft,
+  ) => canvasJson<EpisodeVisualProfileDto>(
+    `/projects/${projectId}/visual-profile`,
+    "PATCH",
+    draft,
+    { "If-Match": String(revision) },
+  ),
   createVideoFilmstrip: (assetId: string, frameCount = 12) =>
     canvasJson<VideoFilmstripDto>(
       `/assets/${assetId}/filmstrip-runs?frameCount=${frameCount}`,
@@ -701,6 +754,19 @@ export const canvasApi = {
     "PUT",
     { shots, healingRecipe },
     { "If-Match": String(revision) },
+  ),
+  compileStoryboardPrompts: (
+    projectId: string,
+    payload: {
+      storyRevisionId: string;
+      visualProfileRevisionId: string;
+      healingRecipe: boolean;
+      shots: Array<Record<string, unknown>>;
+    },
+  ) => canvasJson<StoryboardPromptCompilationDto>(
+    `/projects/${projectId}/storyboard-prompt-compilations`,
+    "POST",
+    payload,
   ),
   createGenerationBatch: (payload: {
     projectId: string;

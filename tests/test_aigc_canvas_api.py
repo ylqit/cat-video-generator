@@ -20,7 +20,38 @@ class _CanvasService:
         self.storyboard_mode: str | None = None
         self.storyboard_references: tuple[uuid.UUID, ...] = ()
         self.manual_storyboard: dict[str, object] | None = None
+        self.prompt_compilation: dict[str, object] | None = None
+        self.archived_node_id: uuid.UUID | None = None
+        self.restored_node_id: uuid.UUID | None = None
         self.subject_completion_run_id = uuid.uuid4()
+        self.visual_profile_revision = 1
+        self.visual_profile_bindings = [
+            {
+                "assetId": str(uuid.uuid4()),
+                "purpose": "person_identity",
+                "instruction": "固定儿童面部身份",
+            },
+            {
+                "assetId": str(uuid.uuid4()),
+                "purpose": "person_body",
+                "instruction": "固定儿童全身比例",
+            },
+            {
+                "assetId": str(uuid.uuid4()),
+                "purpose": "cat_identity",
+                "instruction": "固定猫咪正面身份",
+            },
+            {
+                "assetId": str(uuid.uuid4()),
+                "purpose": "cat_identity",
+                "instruction": "固定猫咪侧面身份",
+            },
+            {
+                "assetId": str(uuid.uuid4()),
+                "purpose": "style",
+                "instruction": "只锁定线条、材质和光线",
+            },
+        ]
 
     def save_brief(self, project_id: uuid.UUID, payload: object) -> dict[str, object]:
         self.brief = payload.model_dump(by_alias=True, mode="json")  # type: ignore[attr-defined]
@@ -31,19 +62,21 @@ class _CanvasService:
         return {"id": str(uuid.uuid4()), "projectId": str(project_id), **self.subject}
 
     def list_subjects(self, project_id: uuid.UUID) -> list[dict[str, object]]:
-        return [{
-            "id": str(uuid.uuid4()),
-            "projectId": str(project_id),
-            "revisionId": str(uuid.uuid4()),
-            "revision": 1,
-            "status": "approved",
-            "name": "蓝色汽水罐",
-            "kind": "product",
-            "role": "hero_product",
-            "identityAnchors": ["蓝色罐身"],
-            "immutableTraits": ["标签文字不变"],
-            "references": [],
-        }]
+        return [
+            {
+                "id": str(uuid.uuid4()),
+                "projectId": str(project_id),
+                "revisionId": str(uuid.uuid4()),
+                "revision": 1,
+                "status": "approved",
+                "name": "蓝色汽水罐",
+                "kind": "product",
+                "role": "hero_product",
+                "identityAnchors": ["蓝色罐身"],
+                "immutableTraits": ["标签文字不变"],
+                "references": [],
+            }
+        ]
 
     def bind_canvas_node_assets(
         self,
@@ -82,9 +115,7 @@ class _CanvasService:
             "promptId": str(uuid.uuid4()),
         }
 
-    def apply_subject_completion(
-        self, run_id: uuid.UUID, payload: object
-    ) -> dict[str, object]:
+    def apply_subject_completion(self, run_id: uuid.UUID, payload: object) -> dict[str, object]:
         assert run_id == self.subject_completion_run_id
         return {
             "runId": str(run_id),
@@ -105,6 +136,93 @@ class _CanvasService:
             }
         ]
 
+    def list_visual_presets(self) -> list[dict[str, object]]:
+        return [
+            {
+                "key": "healing_child_cat_line_texture_v3",
+                "canonProfileId": "canon-v3-healing-child-cat-line-texture",
+                "title": "一人一猫 · 线条材质",
+                "version": 3,
+                "ready": True,
+                "slots": [
+                    {
+                        "assetId": item["assetId"],
+                        "semanticKey": semantic_key,
+                        "title": title,
+                        "contentUrl": f"/api/v1/assets/{item['assetId']}/content",
+                        "thumbnailUrl": f"/api/v1/assets/{item['assetId']}/content",
+                        "approvalStatus": "approved",
+                        "sha256": "a" * 64,
+                        "required": True,
+                        "role": role,
+                        "purpose": item["purpose"],
+                        "instruction": item["instruction"],
+                    }
+                    for item, semantic_key, title, role in zip(
+                        self.visual_profile_bindings,
+                        (
+                            "person:headshot",
+                            "person:fullbody",
+                            "cat:front",
+                            "cat:side",
+                            "style:line_texture",
+                        ),
+                        ("儿童面部", "儿童全身比例", "猫咪正面", "猫咪侧面", "线条材质"),
+                        ("person", "person", "cat", "cat", "style"),
+                        strict=True,
+                    )
+                ],
+            }
+        ]
+
+    def apply_visual_preset(self, project_id: uuid.UUID, preset_key: str) -> dict[str, object]:
+        return {
+            "preset": self.list_visual_presets()[0],
+            "visualProfile": self.get_episode_visual_profile(project_id),
+            "canvasNodeId": str(uuid.uuid4()),
+            "reusedAssetIds": [item["assetId"] for item in self.visual_profile_bindings],
+        }
+
+    def get_episode_visual_profile(self, project_id: uuid.UUID) -> dict[str, object]:
+        return {
+            "id": str(uuid.uuid4()),
+            "projectId": str(project_id),
+            "revision": self.visual_profile_revision,
+            "sourceProfileId": "canon-v3-healing-child-cat-line-texture",
+            "personIdentity": "固定儿童脸型、五官、年龄感与身份特征",
+            "personHair": "固定儿童短发轮廓、发色与发际线",
+            "personBody": "固定儿童全身比例与非成人化身体结构",
+            "catIdentity": "固定猫咪脸部、毛色分区、体型与环纹尾巴",
+            "stylePositive": ["克制轮廓线", "湿润半透明高光", "柔和漫射光"],
+            "styleNegative": ["摄影写实", "复制参考物体或构图"],
+            "referenceBindings": self.visual_profile_bindings,
+            "references": [],
+            "lockedSemanticKeys": [
+                "person:headshot",
+                "person:fullbody",
+                "cat:front",
+                "cat:side",
+                "style:line_texture",
+            ],
+        }
+
+    def update_episode_visual_profile(
+        self,
+        project_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        payload: object,
+    ) -> dict[str, object]:
+        assert expected_revision == self.visual_profile_revision
+        document = payload.model_dump(by_alias=True, mode="json")  # type: ignore[attr-defined]
+        assert document["referenceBindings"] == self.visual_profile_bindings
+        self.visual_profile_revision += 1
+        return {
+            **self.get_episode_visual_profile(project_id),
+            **document,
+            "revision": self.visual_profile_revision,
+        }
+
     def create_video_filmstrip_run(
         self, asset_id: uuid.UUID, *, frame_count: int
     ) -> dict[str, object]:
@@ -116,9 +234,7 @@ class _CanvasService:
             "frames": [],
         }
 
-    def get_video_filmstrip(
-        self, asset_id: uuid.UUID, *, frame_count: int
-    ) -> dict[str, object]:
+    def get_video_filmstrip(self, asset_id: uuid.UUID, *, frame_count: int) -> dict[str, object]:
         return {
             "assetId": str(asset_id),
             "frameCount": frame_count,
@@ -207,6 +323,53 @@ class _CanvasService:
             "shotCount": len(self.manual_storyboard["shots"]),  # type: ignore[arg-type]
         }
 
+    def compile_storyboard_prompts(
+        self,
+        project_id: uuid.UUID,
+        payload: object,
+    ) -> dict[str, object]:
+        self.prompt_compilation = payload.model_dump(by_alias=True, mode="json")  # type: ignore[attr-defined]
+        shot = self.prompt_compilation["shots"][0]  # type: ignore[index]
+        prompt_id = uuid.uuid4()
+        return {
+            "projectId": str(project_id),
+            "storyRevisionId": self.prompt_compilation["storyRevisionId"],
+            "visualProfileRevisionId": self.prompt_compilation["visualProfileRevisionId"],
+            "status": "compiled",
+            "shots": [
+                {
+                    "beatId": shot["beatId"],  # type: ignore[index]
+                    "order": shot["order"],  # type: ignore[index]
+                    "promptId": str(prompt_id),
+                    "finalPrompt": "【全局 Canon】固定儿童与猫咪\n【所属场景】雨后庭院",
+                    "referenceBindings": [
+                        {
+                            "assetId": str(uuid.uuid4()),
+                            "role": "identity",
+                            "purpose": "person_identity",
+                            "source": "canon",
+                            "semanticKey": "person:headshot",
+                            "title": "固定儿童面部",
+                            "sha256": "a" * 64,
+                        },
+                        {
+                            "assetId": str(uuid.uuid4()),
+                            "role": "environment",
+                            "purpose": "scene_look",
+                            "source": "scene",
+                            "semanticKey": "scene:rainy-yard",
+                            "title": "雨后庭院",
+                            "sha256": "b" * 64,
+                        },
+                    ],
+                    "warnings": [],
+                    "blockers": [],
+                    "estimatedCost": {"currency": "CNY", "amountMicros": 0},
+                    "inputHash": "c" * 64,
+                }
+            ],
+        }
+
     def get_prompt_run(self, prompt_id: uuid.UUID) -> dict[str, object]:
         return {
             "id": str(prompt_id),
@@ -239,6 +402,40 @@ class _CanvasService:
             "layoutVersion": 4,
             "syncStatus": "saved",
             **data,
+        }
+
+    def archive_canvas_node(
+        self,
+        project_id: uuid.UUID,
+        node_id: uuid.UUID,
+        *,
+        expected_version: int,
+        reason: str | None = None,
+    ) -> dict[str, object]:
+        assert expected_version == 3
+        self.archived_node_id = node_id
+        return {
+            "projectId": str(project_id),
+            "nodeId": str(node_id),
+            "archived": True,
+            "reason": reason,
+            "layoutVersion": 4,
+        }
+
+    def restore_canvas_node(
+        self,
+        project_id: uuid.UUID,
+        node_id: uuid.UUID,
+        *,
+        expected_version: int,
+    ) -> dict[str, object]:
+        assert expected_version == 4
+        self.restored_node_id = node_id
+        return {
+            "projectId": str(project_id),
+            "nodeId": str(node_id),
+            "archived": False,
+            "layoutVersion": 5,
         }
 
     def list_canvas_templates(self) -> list[dict[str, object]]:
@@ -421,18 +618,20 @@ def test_v2_character_storyboard_and_manual_draft_use_distinct_paths(tmp_path: P
         headers={"If-Match": "1"},
         json={
             "healingRecipe": True,
-            "shots": [{
-                "order": 1,
-                "durationSeconds": 15,
-                "title": "亮叶",
-                "action": "孩子蹲下看叶片，猫咪在旁边嗅闻水珠",
-                "shotSize": "中景",
-                "lighting": "雨后柔光",
-                "dialogue": "",
-                "soundEffect": "雨滴与猫咪脚步",
-                "camera": "固定机位",
-                "prompt": "固定儿童与猫咪，雨后水彩庭院",
-            }],
+            "shots": [
+                {
+                    "order": 1,
+                    "durationSeconds": 15,
+                    "title": "亮叶",
+                    "action": "孩子蹲下看叶片，猫咪在旁边嗅闻水珠",
+                    "shotSize": "中景",
+                    "lighting": "雨后柔光",
+                    "dialogue": "",
+                    "soundEffect": "雨滴与猫咪脚步",
+                    "camera": "固定机位",
+                    "prompt": "固定儿童与猫咪，雨后水彩庭院",
+                }
+            ],
         },
     )
 
@@ -443,6 +642,63 @@ def test_v2_character_storyboard_and_manual_draft_use_distinct_paths(tmp_path: P
     assert manual.status_code == 200
     assert manual.json()["status"] == "awaiting_review"
     assert service.manual_storyboard is not None
+
+
+def test_v2_storyboard_prompt_compilation_preserves_versions_and_reference_roles(
+    tmp_path: Path,
+) -> None:
+    service = _CanvasService()
+    client = _client(tmp_path, service)
+    project_id = uuid.uuid4()
+    story_revision_id = uuid.uuid4()
+    profile_revision_id = uuid.uuid4()
+    scene_id = uuid.uuid4()
+    beat_id = uuid.uuid4()
+
+    response = client.post(
+        f"/api/v2/projects/{project_id}/storyboard-prompt-compilations",
+        json={
+            "storyRevisionId": str(story_revision_id),
+            "visualProfileRevisionId": str(profile_revision_id),
+            "healingRecipe": True,
+            "shots": [
+                {
+                    "beatId": str(beat_id),
+                    "expectedRevision": 3,
+                    "order": 1,
+                    "sceneId": str(scene_id),
+                    "durationSeconds": 15,
+                    "title": "雨后亮叶",
+                    "action": "孩子蹲下观察亮叶，猫咪在旁边嗅闻",
+                    "shotSize": "中景",
+                    "lighting": "雨后柔光",
+                    "dialogue": "",
+                    "soundEffect": "雨滴与猫咪脚步",
+                    "camera": "固定机位",
+                    "temporalBeats": [
+                        {
+                            "startSeconds": 0,
+                            "endSeconds": 5,
+                            "personAction": "孩子蹲下",
+                            "catAction": "猫咪靠近",
+                            "camera": "固定机位",
+                        }
+                    ],
+                    "compositionAssetIds": [],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "compiled"
+    assert service.prompt_compilation is not None
+    assert service.prompt_compilation["shots"][0]["expectedRevision"] == 3  # type: ignore[index]
+    roles = {
+        item["role"] for item in response.json()["shots"][0]["referenceBindings"]
+    }
+    assert roles == {"identity", "environment"}
+    assert response.json()["shots"][0]["inputHash"] == "c" * 64
 
 
 def test_v2_prompt_and_optimistic_canvas_layout_endpoints(tmp_path: Path) -> None:
@@ -504,6 +760,32 @@ def test_v2_layout_ignores_legacy_business_edge_snapshot(tmp_path: Path) -> None
     assert saved.status_code == 200
     assert service.saved_layout is not None
     assert "edges" not in service.saved_layout
+
+
+def test_v2_canvas_node_archive_and_restore_are_versioned(tmp_path: Path) -> None:
+    service = _CanvasService()
+    client = _client(tmp_path, service)
+    project_id = uuid.uuid4()
+    node_id = uuid.uuid4()
+
+    archived = client.post(
+        f"/api/v2/projects/{project_id}/canvas/nodes/{node_id}/archive",
+        headers={"If-Match": "3"},
+        json={"reason": "用户从画布移除"},
+    )
+    restored = client.post(
+        f"/api/v2/projects/{project_id}/canvas/nodes/{node_id}/restore",
+        headers={"If-Match": "4"},
+    )
+
+    assert archived.status_code == 200
+    assert archived.json()["archived"] is True
+    assert archived.json()["layoutVersion"] == 4
+    assert service.archived_node_id == node_id
+    assert restored.status_code == 200
+    assert restored.json()["archived"] is False
+    assert restored.json()["layoutVersion"] == 5
+    assert service.restored_node_id == node_id
 
 
 def test_v2_template_library_and_product_default(tmp_path: Path) -> None:
@@ -572,9 +854,7 @@ def test_subject_assistant_is_explicit_async_and_requires_human_apply(tmp_path: 
             "instruction": "补齐跨镜头身份锚点",
         },
     )
-    inspected = client.get(
-        f"/api/v2/subject-assistant-runs/{service.subject_completion_run_id}"
-    )
+    inspected = client.get(f"/api/v2/subject-assistant-runs/{service.subject_completion_run_id}")
     applied = client.post(
         f"/api/v2/subject-assistant-runs/{service.subject_completion_run_id}/apply",
         json={
@@ -609,6 +889,57 @@ def test_v2_canvas_asset_history_filters_by_media_kind(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert response.json()[0]["mediaType"] == "video"
+
+
+def test_v2_visual_preset_reuses_assets_and_versions_episode_profile(tmp_path: Path) -> None:
+    service = _CanvasService()
+    client = _client(tmp_path, service)
+    project_id = uuid.uuid4()
+
+    presets = client.get("/api/v2/visual-presets")
+    applied = client.post(
+        f"/api/v2/projects/{project_id}/visual-presets/healing_child_cat_line_texture_v3/apply"
+    )
+    current = client.get(f"/api/v2/projects/{project_id}/visual-profile")
+    draft = current.json()
+    draft["stylePositive"] = ["克制轮廓线", "湿润半透明高光", "柔和漫射光", "自然层次"]
+    updated = client.patch(
+        f"/api/v2/projects/{project_id}/visual-profile",
+        headers={"If-Match": "1"},
+        json={
+            key: value
+            for key, value in draft.items()
+            if key
+            in {
+                "personIdentity",
+                "personHair",
+                "personBody",
+                "catIdentity",
+                "stylePositive",
+                "styleNegative",
+                "referenceBindings",
+            }
+        },
+    )
+
+    assert presets.status_code == 200
+    preset = presets.json()[0]
+    assert preset["canonProfileId"] == "canon-v3-healing-child-cat-line-texture"
+    assert [slot["semanticKey"] for slot in preset["slots"]] == [
+        "person:headshot",
+        "person:fullbody",
+        "cat:front",
+        "cat:side",
+        "style:line_texture",
+    ]
+    assert all(slot["contentUrl"] for slot in preset["slots"])
+    assert applied.status_code == 200
+    assert applied.json()["reusedAssetIds"] == [
+        item["assetId"] for item in service.visual_profile_bindings
+    ]
+    assert current.status_code == 200
+    assert updated.status_code == 200
+    assert updated.json()["revision"] == 2
 
 
 def test_video_filmstrip_queues_once_and_returns_distinct_cached_frames(tmp_path: Path) -> None:

@@ -19,6 +19,27 @@ class ProductionRecipeKey(StrEnum):
     HEALING_CHILD_CAT_V1 = "healing_child_cat_v1"
 
 
+class VisualPresetKey(StrEnum):
+    HEALING_CHILD_CAT_LINE_TEXTURE = "healing_child_cat_line_texture_v3"
+
+
+CANON_V2_PROFILE_ID = "canon-v2-healing-child-cat"
+CANON_V3_PROFILE_ID = "canon-v3-healing-child-cat-line-texture"
+CANON_V3_STYLE_POSITIVE = (
+    "细腻柔和的数字插画材质",
+    "克制轮廓线",
+    "湿润半透明高光",
+    "柔和漫射光",
+    "自然层次",
+)
+CANON_V3_STYLE_NEGATIVE = (
+    "摄影写实",
+    "复制参考物体或构图",
+    "绿色污染",
+    "改变儿童或猫咪身份",
+)
+
+
 class QualityTier(StrEnum):
     QUICK = "quick"
     BALANCED = "balanced"
@@ -74,6 +95,30 @@ class CharacterDesignSlot(StrEnum):
     CHILD = "child"
     CAT = "cat"
     PAIR_SCALE = "pair_scale"
+
+
+class VisualPresetSlotDto(StrictModel):
+    semantic_key: str = Field(alias="semanticKey", min_length=1, max_length=160)
+    title: str = Field(min_length=1, max_length=120)
+    role: Literal["person", "cat", "style"]
+    purpose: Literal["identity", "style"]
+    required: bool = True
+    asset_id: uuid.UUID | None = Field(alias="assetId", default=None)
+    content_url: str | None = Field(alias="contentUrl", default=None)
+    thumbnail_url: str | None = Field(alias="thumbnailUrl", default=None)
+    approval_status: str = Field(alias="approvalStatus", default="missing")
+    sha256: str | None = None
+    instruction: str = Field(min_length=1, max_length=1_000)
+
+
+class VisualPresetProfileDto(StrictModel):
+    key: VisualPresetKey
+    canon_profile_id: str = Field(alias="canonProfileId")
+    title: str
+    description: str
+    version: int = Field(ge=1)
+    ready: bool
+    slots: list[VisualPresetSlotDto]
 
 
 class HumanReviewDecision(StrEnum):
@@ -423,3 +468,22 @@ def canon_v2_reference_keys(
         "cat:side",
         f"style:{environment}",
     )
+
+
+def canon_reference_keys(
+    canon_profile_id: str,
+    environment: Literal["indoor", "outdoor"] | str,
+) -> tuple[str, ...]:
+    """Resolve the immutable reference set for old and new recipe instances."""
+
+    if canon_profile_id == CANON_V3_PROFILE_ID:
+        return (
+            "person:headshot",
+            "person:fullbody",
+            "cat:front",
+            "cat:side",
+            "style:line_texture",
+        )
+    if canon_profile_id == CANON_V2_PROFILE_ID:
+        return canon_v2_reference_keys(environment)
+    raise ValueError(f"不支持的 Canon 配置：{canon_profile_id}")

@@ -41,6 +41,7 @@ def test_worker_claims_only_media_canvas_jobs_and_lands_one_audited_candidate(
                 "media:image:batch:",
                 "media:video:batch:",
                 "media:filmstrip:",
+                "video:shot",
                 "video:edit-anchor:",
                 "video:edit-recipe:",
                 "recipe:",
@@ -335,6 +336,62 @@ def test_worker_submits_and_lands_audited_video_batch_candidate(tmp_path: Path) 
         "candidate_persisted",
         f"finished:{StepStatus.AWAITING_REVIEW}",
     ]
+
+
+def test_worker_resumes_submitted_shot_video_without_resubmitting() -> None:
+    step_id = uuid.uuid4()
+    lease = SimpleNamespace(
+        step_id=step_id,
+        operation_key="video:shot",
+        input_snapshot={},
+    )
+    finished: list[dict[str, object]] = []
+
+    class Queue:
+        def claim_next(self, **values: object) -> object:
+            assert "video:shot" in values["operation_prefixes"]  # type: ignore[operator]
+            return lease
+
+        def update_progress(self, *_args: object, **_values: object) -> object:
+            return lease
+
+        def finish(self, _step_id: uuid.UUID, **values: object) -> None:
+            finished.append(values)
+
+    class ShotExecutor:
+        def resume_step(
+            self,
+            claimed_step_id: uuid.UUID,
+            *,
+            wait: bool = False,
+        ) -> dict[str, object]:
+            assert claimed_step_id == step_id
+            assert wait is False
+            return {
+                "stepId": str(step_id),
+                "taskId": "provider-video-1",
+                "status": "running",
+            }
+
+    worker = UniversalMediaWorker(
+        queue=Queue(),  # type: ignore[arg-type]
+        repository=SimpleNamespace(),  # type: ignore[arg-type]
+        gateway=SimpleNamespace(),  # type: ignore[arg-type]
+        asset_store=SimpleNamespace(),  # type: ignore[arg-type]
+        worker_id="shot-video-worker-test",
+        shot_video_executor=ShotExecutor(),
+        provider_poll_interval_seconds=7,
+    )
+
+    result = worker.run_once()
+
+    assert result == {
+        "stepId": str(step_id),
+        "taskId": "provider-video-1",
+        "status": "running",
+    }
+    assert finished[0]["status"] is StepStatus.QUEUED
+    assert finished[0]["next_retry_at"] is not None
 
 
 def test_worker_executes_persisted_subject_completion_and_waits_for_human_review(

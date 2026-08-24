@@ -16,7 +16,23 @@ export interface PanelSize {
 export interface PanelPosition {
   left: number;
   top: number;
-  placement: "below" | "above" | "right";
+  placement: "below" | "above";
+}
+
+export interface CanvasViewportTransform {
+  x: number;
+  y: number;
+  zoom: number;
+}
+
+export interface CanvasNodeGeometry {
+  computedPosition: { x: number; y: number };
+  dimensions: PanelSize;
+}
+
+export interface CanvasOverlayGeometry {
+  toolbar: PanelPosition;
+  console: PanelPosition;
 }
 
 export type CanvasConsolePresetKey = "compact" | "text" | "image" | "video" | "storyboard";
@@ -25,17 +41,19 @@ export interface CanvasConsolePreset extends PanelSize {
   key: CanvasConsolePresetKey;
 }
 
-export interface CanvasOverlaySession extends PanelPosition, PanelSize {
+export interface CanvasOverlaySession extends PanelSize {
   nodeId: string;
   presetKey: CanvasConsolePresetKey;
+  surfaceRect: ScreenRect;
+  anchorGap: number;
 }
 
 export const CANVAS_CONSOLE_PRESETS: Record<CanvasConsolePresetKey, CanvasConsolePreset> = {
-  compact: { key: "compact", width: 720, height: 320 },
-  text: { key: "text", width: 760, height: 360 },
-  image: { key: "image", width: 920, height: 560 },
-  video: { key: "video", width: 1040, height: 560 },
-  storyboard: { key: "storyboard", width: 1120, height: 620 },
+  compact: { key: "compact", width: 660, height: 280 },
+  text: { key: "text", width: 660, height: 320 },
+  image: { key: "image", width: 760, height: 440 },
+  video: { key: "video", width: 860, height: 480 },
+  storyboard: { key: "storyboard", width: 760, height: 420 },
 };
 
 const IMAGE_CONSOLE_NODES = new Set<CanvasNodeType>([
@@ -44,6 +62,8 @@ const IMAGE_CONSOLE_NODES = new Set<CanvasNodeType>([
   "ImageAssetNode",
   "ImageGenerationNode",
   "ReferenceAssetNode",
+  "SceneNode",
+  "StylePresetNode",
 ]);
 
 const VIDEO_CONSOLE_NODES = new Set<CanvasNodeType>([
@@ -60,7 +80,6 @@ const TEXT_CONSOLE_NODES = new Set<CanvasNodeType>([
   "PromptArtifactNode",
   "RecipeGroupNode",
   "ReviewNode",
-  "SceneNode",
   "ShotBeatNode",
   "StoryCandidateNode",
   "StoryCriticNode",
@@ -69,12 +88,7 @@ const TEXT_CONSOLE_NODES = new Set<CanvasNodeType>([
   "TimelineNode",
 ]);
 
-const PANEL_GAP = 12;
-const VIEWPORT_MARGIN = 16;
-
-const clamp = (value: number, minimum: number, maximum: number) => (
-  Math.min(Math.max(value, minimum), Math.max(minimum, maximum))
-);
+export const CANVAS_OVERLAY_ANCHOR_GAP = 12;
 
 export function consolePresetForNode(
   nodeType: CanvasNodeType,
@@ -100,40 +114,36 @@ export function resolveCanvasConsoleSize(
   };
 }
 
-export function clampCanvasPanelPosition(
-  position: PanelPosition,
-  viewport: PanelSize,
-  panel: PanelSize,
-): PanelPosition {
+export function projectCanvasNodeRect(
+  node: CanvasNodeGeometry,
+  viewport: CanvasViewportTransform,
+  surfaceRect: ScreenRect,
+): ScreenRect {
   return {
-    ...position,
-    left: clamp(position.left, VIEWPORT_MARGIN, viewport.width - panel.width - VIEWPORT_MARGIN),
-    top: clamp(position.top, VIEWPORT_MARGIN, viewport.height - panel.height - VIEWPORT_MARGIN),
+    left: surfaceRect.left + viewport.x + node.computedPosition.x * viewport.zoom,
+    top: surfaceRect.top + viewport.y + node.computedPosition.y * viewport.zoom,
+    width: node.dimensions.width * viewport.zoom,
+    height: node.dimensions.height * viewport.zoom,
   };
 }
 
-export function positionCanvasPanel(
-  anchor: ScreenRect,
-  viewport: PanelSize,
+export function anchorCanvasOverlay(
+  nodeRect: ScreenRect,
   panel: PanelSize,
-): PanelPosition {
-  const maxLeft = viewport.width - panel.width - VIEWPORT_MARGIN;
-  const maxTop = viewport.height - panel.height - VIEWPORT_MARGIN;
-  const left = clamp(anchor.left, VIEWPORT_MARGIN, maxLeft);
-  const belowTop = anchor.top + anchor.height + PANEL_GAP;
-
-  if (belowTop <= maxTop) {
-    return { left, top: belowTop, placement: "below" };
-  }
-
-  const aboveTop = anchor.top - panel.height - PANEL_GAP;
-  if (aboveTop >= VIEWPORT_MARGIN) {
-    return { left, top: aboveTop, placement: "above" };
-  }
-
+  toolbar: PanelSize,
+  gap = CANVAS_OVERLAY_ANCHOR_GAP,
+): CanvasOverlayGeometry {
+  const centerX = nodeRect.left + nodeRect.width / 2;
   return {
-    left: clamp(anchor.left + anchor.width + PANEL_GAP, VIEWPORT_MARGIN, maxLeft),
-    top: clamp(anchor.top, VIEWPORT_MARGIN, maxTop),
-    placement: "right",
+    toolbar: {
+      left: centerX - toolbar.width / 2,
+      top: nodeRect.top - toolbar.height - gap,
+      placement: "above",
+    },
+    console: {
+      left: centerX - panel.width / 2,
+      top: nodeRect.top + nodeRect.height + gap,
+      placement: "below",
+    },
   };
 }

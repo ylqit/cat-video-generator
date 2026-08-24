@@ -140,6 +140,10 @@ class VideoEditExecutor(Protocol):
     ) -> MediaExecutionResult: ...
 
 
+class ShotVideoExecutor(Protocol):
+    def resume_step(self, step_id: uuid.UUID, *, wait: bool = False) -> dict[str, Any]: ...
+
+
 class FilmstripWorkRepository(Protocol):
     def filmstrip_work(self, step_id: uuid.UUID) -> dict[str, object]: ...
 
@@ -276,6 +280,7 @@ class UniversalMediaWorker:
         asset_store: DownloadStore,
         worker_id: str,
         video_edit_executor: VideoEditExecutor | None = None,
+        shot_video_executor: ShotVideoExecutor | None = None,
         filmstrip_executor: VideoFilmstripExecutor | None = None,
         recipe_task_executor: RecipeTaskExecutor | None = None,
         provider_poll_interval_seconds: float = 10,
@@ -288,6 +293,7 @@ class UniversalMediaWorker:
         self._asset_store = asset_store
         self._worker_id = worker_id.strip()
         self._video_edit_executor = video_edit_executor
+        self._shot_video_executor = shot_video_executor
         self._filmstrip_executor = filmstrip_executor
         self._recipe_task_executor = recipe_task_executor
         self._provider_poll_interval_seconds = provider_poll_interval_seconds
@@ -300,6 +306,7 @@ class UniversalMediaWorker:
                 "media:image:batch:",
                 "media:video:batch:",
                 "media:filmstrip:",
+                "video:shot",
                 "video:edit-anchor:",
                 "video:edit-recipe:",
                 "recipe:",
@@ -424,6 +431,29 @@ class UniversalMediaWorker:
             if self._filmstrip_executor is None:
                 raise RuntimeError("filmstrip worker executor is not configured")
             return self._filmstrip_executor.execute(lease.step_id)
+        if lease.operation_key.startswith("video:shot"):
+            if self._shot_video_executor is None:
+                raise RuntimeError("shot video worker executor is not configured")
+            result = self._shot_video_executor.resume_step(lease.step_id, wait=False)
+            status = str(result.get("status") or "")
+            if status in {StepStatus.QUEUED.value, StepStatus.RUNNING.value}:
+                return MediaExecutionResult(
+                    payload=dict(result),
+                    status=StepStatus.QUEUED,
+                    next_retry_at=datetime.now(UTC)
+                    + timedelta(seconds=self._provider_poll_interval_seconds),
+                )
+            if status in {StepStatus.AWAITING_REVIEW.value, StepStatus.SUCCEEDED.value}:
+                return MediaExecutionResult(
+                    payload=dict(result),
+                    status=StepStatus.AWAITING_REVIEW,
+                )
+            if status == StepStatus.SUBMISSION_UNKNOWN.value:
+                return MediaExecutionResult(
+                    payload=dict(result),
+                    status=StepStatus.SUBMISSION_UNKNOWN,
+                )
+            raise RuntimeError(f"逐镜视频子任务执行失败：{result}")
         if self._video_edit_executor is None:
             raise RuntimeError("VIDEO_EDIT_V2 worker executor is not configured")
         return self._video_edit_executor.execute(

@@ -66,9 +66,9 @@ function run(action: ToolbarAction) {
 </template>
 
 <style scoped>
-.context-toolbar { position: fixed; z-index: 1200; max-width: calc(100vw - 32px); display: flex; align-items: center; gap: 5px; padding: 6px; color: #dce6f2; background: rgb(31 35 42 / 97%); border: 1px solid #414955; border-radius: 12px; box-shadow: 0 16px 44px rgb(0 0 0 / 48%); transform-origin: center bottom; animation: toolbar-in 140ms ease-out; }
+.context-toolbar { position: fixed; z-index: 1200; max-width: calc(100vw - 32px); display: flex; align-items: center; gap: 5px; padding: 6px; color: #dce6f2; background: rgb(31 35 42 / 97%); border: 1px solid #414955; border-radius: 12px; box-shadow: 0 16px 44px rgb(0 0 0 / 48%); will-change: transform; animation: toolbar-in 140ms ease-out; }
 .toolbar-scroll { min-width: 0; overflow-x: auto; display: flex; gap: 3px; scrollbar-width: thin; }.toolbar-scroll button,.toolbar-close { min-height: 44px; flex: 0 0 auto; padding: 9px 11px; color: #cbd5e2; background: transparent; border: 1px solid transparent; border-radius: 9px; font: inherit; font-size: 11px; cursor: pointer; white-space: nowrap; }.toolbar-scroll button:hover,.toolbar-scroll button:focus-visible,.toolbar-close:hover,.toolbar-close:focus-visible { color: #fff; background: #303741; border-color: #4b5869; outline: none; }.toolbar-scroll button.primary { color: #e8f3ff; background: #244e7c; border-color: #396d9f; }.toolbar-scroll button.unavailable { color: #687486; text-decoration: line-through; text-decoration-thickness: 1px; }.toolbar-scroll button.unavailable:hover,.toolbar-scroll button.unavailable:focus-visible { color: #a7b2c1; background: #292e36; }.toolbar-close { width: 44px; padding: 0; font-size: 19px; }
 .disabled-reason { position: absolute; left: 8px; top: calc(100% + 7px); max-width: 420px; margin: 0; padding: 7px 9px; color: #e9bd7a; background: #292419; border: 1px solid #604e30; border-radius: 8px; box-shadow: 0 10px 28px rgb(0 0 0 / 38%); font-size: 10px; line-height: 1.45; }
-@keyframes toolbar-in { from { opacity: 0; transform: translateY(4px) scale(.98); } }
+@keyframes toolbar-in { from { opacity: 0; } }
 @media (prefers-reduced-motion: reduce) { .context-toolbar { animation: none; } }
 </style>

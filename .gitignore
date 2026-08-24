@@ -33,6 +33,7 @@ docs/LibTV
 !/docs/checklists/one-child-one-cat-six-stage-acceptance.md
 !/docs/checklists/canvas-refresh-durable-task-push-acceptance.md
 !/docs/checklists/libtv-fixed-node-console-acceptance.md
+!/docs/checklists/libtv-child-cat-closed-loop-acceptance.md
 !/docs/workflows/
 /docs/workflows/*
 !/docs/workflows/tutorial-adaptation.md

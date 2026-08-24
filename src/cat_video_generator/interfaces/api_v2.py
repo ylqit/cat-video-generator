@@ -24,6 +24,7 @@ from ..domain.aigc_canvas import (
     SubjectDraft,
 )
 from ..domain.contract_base import StrictModel
+from ..domain.contracts import VisualProfileDraft
 from ..domain.universal_canvas import (
     CanvasTemplateKey,
     VideoEditAnnotation,
@@ -37,9 +38,7 @@ from .sse import parse_event_cursor, stream_events
 class CanvasV2Service(Protocol):
     def save_brief(self, project_id: uuid.UUID, payload: StoryBrief) -> dict[str, Any]: ...
 
-    def create_subject(
-        self, project_id: uuid.UUID, payload: SubjectDraft
-    ) -> dict[str, Any]: ...
+    def create_subject(self, project_id: uuid.UUID, payload: SubjectDraft) -> dict[str, Any]: ...
 
     def create_subject_revision(
         self, subject_id: uuid.UUID, payload: SubjectDraft
@@ -59,13 +58,25 @@ class CanvasV2Service(Protocol):
         self, project_id: uuid.UUID, *, media_kind: str | None = None
     ) -> list[dict[str, Any]]: ...
 
+    def list_visual_presets(self) -> list[dict[str, Any]]: ...
+
+    def apply_visual_preset(self, project_id: uuid.UUID, preset_key: str) -> dict[str, Any]: ...
+
+    def get_episode_visual_profile(self, project_id: uuid.UUID) -> dict[str, Any]: ...
+
+    def update_episode_visual_profile(
+        self,
+        project_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        payload: VisualProfileDraft,
+    ) -> dict[str, Any]: ...
+
     def create_video_filmstrip_run(
         self, asset_id: uuid.UUID, *, frame_count: int
     ) -> dict[str, Any]: ...
 
-    def get_video_filmstrip(
-        self, asset_id: uuid.UUID, *, frame_count: int
-    ) -> dict[str, Any]: ...
+    def get_video_filmstrip(self, asset_id: uuid.UUID, *, frame_count: int) -> dict[str, Any]: ...
 
     def save_node_generation_config(
         self,
@@ -111,17 +122,19 @@ class CanvasV2Service(Protocol):
         payload: ManualStoryboardDraftRequest,
     ) -> dict[str, Any]: ...
 
-    def create_generation_attempt(
-        self, payload: GenerationAttemptRequest
+    def compile_storyboard_prompts(
+        self,
+        project_id: uuid.UUID,
+        payload: StoryboardPromptCompilationRequest,
     ) -> dict[str, Any]: ...
+
+    def create_generation_attempt(self, payload: GenerationAttemptRequest) -> dict[str, Any]: ...
 
     def retry_generation_attempt(
         self, attempt_id: uuid.UUID, payload: RetryGenerationRequest
     ) -> dict[str, Any]: ...
 
-    def review_asset(
-        self, asset_id: uuid.UUID, payload: AssetReviewRequest
-    ) -> dict[str, Any]: ...
+    def review_asset(self, asset_id: uuid.UUID, payload: AssetReviewRequest) -> dict[str, Any]: ...
 
     def get_prompt_run(self, prompt_id: uuid.UUID) -> dict[str, Any]: ...
 
@@ -133,6 +146,23 @@ class CanvasV2Service(Protocol):
         *,
         expected_version: int,
         payload: CanvasLayoutPatch,
+    ) -> dict[str, Any]: ...
+
+    def archive_canvas_node(
+        self,
+        project_id: uuid.UUID,
+        node_id: uuid.UUID,
+        *,
+        expected_version: int,
+        reason: str | None,
+    ) -> dict[str, Any]: ...
+
+    def restore_canvas_node(
+        self,
+        project_id: uuid.UUID,
+        node_id: uuid.UUID,
+        *,
+        expected_version: int,
     ) -> dict[str, Any]: ...
 
     def list_canvas_templates(self) -> list[dict[str, Any]]: ...
@@ -151,13 +181,9 @@ class CanvasV2Service(Protocol):
 
     def delete_canvas_edge(self, edge_id: uuid.UUID) -> dict[str, Any]: ...
 
-    def create_generation_batch(
-        self, payload: GenerationBatchRequest
-    ) -> dict[str, Any]: ...
+    def create_generation_batch(self, payload: GenerationBatchRequest) -> dict[str, Any]: ...
 
-    def create_video_edit_recipe(
-        self, payload: VideoEditRecipeDraft
-    ) -> dict[str, Any]: ...
+    def create_video_edit_recipe(self, payload: VideoEditRecipeDraft) -> dict[str, Any]: ...
 
     def update_video_edit_recipe(
         self,
@@ -236,6 +262,7 @@ class ShotBeatPatch(StrictModel):
 
 class ManualStoryboardShot(StrictModel):
     id: uuid.UUID | None = None
+    scene_id: uuid.UUID | None = Field(alias="sceneId", default=None)
     revision: int | None = Field(default=None, ge=1)
     order: int = Field(ge=1, le=200)
     duration_seconds: int = Field(alias="durationSeconds", ge=1, le=60)
@@ -247,6 +274,12 @@ class ManualStoryboardShot(StrictModel):
     sound_effect: str = Field(alias="soundEffect", default="", max_length=1_000)
     camera: str = Field(default="", max_length=2_000)
     prompt: str = Field(default="", max_length=8_000)
+    prompt_id: uuid.UUID | None = Field(alias="promptId", default=None)
+    prompt_input_hash: str | None = Field(
+        alias="promptInputHash",
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
 
 class ManualStoryboardDraftRequest(StrictModel):
@@ -255,6 +288,50 @@ class ManualStoryboardDraftRequest(StrictModel):
 
     @model_validator(mode="after")
     def validate_shots(self) -> ManualStoryboardDraftRequest:
+        orders = [shot.order for shot in self.shots]
+        if sorted(orders) != list(range(1, len(self.shots) + 1)):
+            raise ValueError("镜头顺序必须从1开始且连续")
+        if self.healing_recipe:
+            if any(not 8 <= shot.duration_seconds <= 15 for shot in self.shots):
+                raise ValueError("治愈组合包每镜必须为8至15秒")
+            if any(shot.dialogue.strip() for shot in self.shots):
+                raise ValueError("治愈组合包禁止对白")
+        return self
+
+
+class StoryboardPromptCompilationShot(StrictModel):
+    beat_id: uuid.UUID | None = Field(alias="beatId", default=None)
+    expected_revision: int = Field(alias="expectedRevision", default=0, ge=0)
+    order: int = Field(ge=1, le=200)
+    scene_id: uuid.UUID = Field(alias="sceneId")
+    duration_seconds: int = Field(alias="durationSeconds", ge=1, le=60)
+    title: str = Field(min_length=1, max_length=160)
+    action: str = Field(min_length=1, max_length=6_000)
+    shot_size: str = Field(alias="shotSize", default="中景", max_length=200)
+    lighting: str = Field(default="", max_length=500)
+    dialogue: str = Field(default="", max_length=4_000)
+    sound_effect: str = Field(alias="soundEffect", default="", max_length=1_000)
+    camera: str = Field(default="", max_length=2_000)
+    temporal_beats: list[dict[str, Any]] = Field(
+        alias="temporalBeats",
+        default_factory=list,
+        max_length=3,
+    )
+    composition_asset_ids: list[uuid.UUID] = Field(
+        alias="compositionAssetIds",
+        default_factory=list,
+        max_length=6,
+    )
+
+
+class StoryboardPromptCompilationRequest(StrictModel):
+    story_revision_id: uuid.UUID = Field(alias="storyRevisionId")
+    visual_profile_revision_id: uuid.UUID = Field(alias="visualProfileRevisionId")
+    shots: list[StoryboardPromptCompilationShot] = Field(min_length=1, max_length=200)
+    healing_recipe: bool = Field(alias="healingRecipe", default=False)
+
+    @model_validator(mode="after")
+    def validate_shots(self) -> StoryboardPromptCompilationRequest:
         orders = [shot.order for shot in self.shots]
         if sorted(orders) != list(range(1, len(self.shots) + 1)):
             raise ValueError("镜头顺序必须从1开始且连续")
@@ -296,6 +373,10 @@ class CanvasLayoutPatch(StrictModel):
     )
     viewport: dict[str, Any]
     operations: list[dict[str, Any]] = Field(default_factory=list, max_length=2_000)
+
+
+class CanvasNodeArchiveRequest(StrictModel):
+    reason: str | None = Field(default=None, max_length=1_000)
 
 
 class TemplateInstanceRequest(StrictModel):
@@ -345,9 +426,7 @@ class VideoEditAnnotationsRequest(StrictModel):
 
 class SubmitVideoEditRequest(StrictModel):
     idempotency_key: str = Field(alias="idempotencyKey", min_length=8, max_length=96)
-    accept_estimated_cost_micros: int = Field(
-        alias="acceptEstimatedCostMicros", ge=0
-    )
+    accept_estimated_cost_micros: int = Field(alias="acceptEstimatedCostMicros", ge=0)
 
 
 def install_canvas_v2_routes(
@@ -378,20 +457,14 @@ def install_canvas_v2_routes(
     ) -> dict[str, Any]:
         return service.instantiate_template(project_id, payload)
 
-    @router.post(
-        "/projects/{project_id}/canvas/nodes", status_code=status.HTTP_201_CREATED
-    )
+    @router.post("/projects/{project_id}/canvas/nodes", status_code=status.HTTP_201_CREATED)
     def create_canvas_node(
         project_id: uuid.UUID, payload: CanvasNodeCreateRequest
     ) -> dict[str, Any]:
         return service.create_canvas_node(project_id, payload)
 
-    @router.post(
-        "/projects/{project_id}/canvas/edges", status_code=status.HTTP_201_CREATED
-    )
-    def create_canvas_edge(
-        project_id: uuid.UUID, payload: CanvasConnection
-    ) -> dict[str, Any]:
+    @router.post("/projects/{project_id}/canvas/edges", status_code=status.HTTP_201_CREATED)
+    def create_canvas_edge(project_id: uuid.UUID, payload: CanvasConnection) -> dict[str, Any]:
         return service.create_canvas_edge(project_id, payload)
 
     @router.delete("/canvas/edges/{edge_id}")
@@ -463,6 +536,33 @@ def install_canvas_v2_routes(
     ) -> list[dict[str, Any]]:
         return service.list_project_assets(project_id, media_kind=kind)
 
+    @router.get("/visual-presets")
+    def list_visual_presets() -> list[dict[str, Any]]:
+        return service.list_visual_presets()
+
+    @router.post("/projects/{project_id}/visual-presets/{preset_key}/apply")
+    def apply_visual_preset(
+        project_id: uuid.UUID,
+        preset_key: str,
+    ) -> dict[str, Any]:
+        return service.apply_visual_preset(project_id, preset_key)
+
+    @router.get("/projects/{project_id}/visual-profile")
+    def get_episode_visual_profile(project_id: uuid.UUID) -> dict[str, Any]:
+        return service.get_episode_visual_profile(project_id)
+
+    @router.patch("/projects/{project_id}/visual-profile")
+    def update_episode_visual_profile(
+        project_id: uuid.UUID,
+        payload: VisualProfileDraft,
+        if_match: str = Header(alias="If-Match"),
+    ) -> dict[str, Any]:
+        return service.update_episode_visual_profile(
+            project_id,
+            expected_revision=parse_version_header(if_match),
+            payload=payload,
+        )
+
     @router.post(
         "/assets/{asset_id}/filmstrip-runs",
         status_code=status.HTTP_202_ACCEPTED,
@@ -532,7 +632,7 @@ def install_canvas_v2_routes(
         payload: StoryboardRunRequest,
     ) -> dict[str, Any]:
         if payload.creation_mode == "from_characters" and not payload.reference_asset_ids:
-            raise ValueError("角色生成分镜至少需要一个角色素材")
+            raise ValueError("基于固定角色补充分镜至少需要一个已批准角色素材")
         create_parameters = inspect.signature(service.create_storyboard).parameters
         if "idempotency_key" not in create_parameters:
             # Compatibility boundary for older CanvasV2 service implementations:
@@ -543,6 +643,7 @@ def install_canvas_v2_routes(
             def run() -> dict[str, Any]:
                 return result
         else:
+
             def run() -> dict[str, Any]:
                 return service.create_storyboard(
                     project_id,
@@ -551,6 +652,7 @@ def install_canvas_v2_routes(
                     reference_asset_ids=tuple(payload.reference_asset_ids),
                     instruction=payload.instruction,
                 )
+
         try:
             record = jobs.submit(
                 kind="storyboard",
@@ -592,6 +694,13 @@ def install_canvas_v2_routes(
             payload=payload,
         )
 
+    @router.post("/projects/{project_id}/storyboard-prompt-compilations")
+    def compile_storyboard_prompts(
+        project_id: uuid.UUID,
+        payload: StoryboardPromptCompilationRequest,
+    ) -> dict[str, Any]:
+        return service.compile_storyboard_prompts(project_id, payload)
+
     @router.post("/generation-attempts", status_code=status.HTTP_202_ACCEPTED)
     def create_generation_attempt(payload: GenerationAttemptRequest) -> dict[str, Any]:
         return service.create_generation_attempt(payload)
@@ -629,9 +738,7 @@ def install_canvas_v2_routes(
         )
 
     @router.post("/video-edit-recipes/{recipe_id}/compile")
-    def compile_video_edit_recipe(
-        recipe_id: uuid.UUID, _payload: dict[str, Any]
-    ) -> dict[str, Any]:
+    def compile_video_edit_recipe(recipe_id: uuid.UUID, _payload: dict[str, Any]) -> dict[str, Any]:
         return service.compile_video_edit_recipe(recipe_id)
 
     @router.post(
@@ -675,6 +782,32 @@ def install_canvas_v2_routes(
             project_id,
             expected_version=parse_version_header(if_match),
             payload=payload,
+        )
+
+    @router.post("/projects/{project_id}/canvas/nodes/{node_id}/archive")
+    def archive_canvas_node(
+        project_id: uuid.UUID,
+        node_id: uuid.UUID,
+        payload: CanvasNodeArchiveRequest,
+        if_match: str = Header(alias="If-Match"),
+    ) -> dict[str, Any]:
+        return service.archive_canvas_node(
+            project_id,
+            node_id,
+            expected_version=parse_version_header(if_match),
+            reason=payload.reason,
+        )
+
+    @router.post("/projects/{project_id}/canvas/nodes/{node_id}/restore")
+    def restore_canvas_node(
+        project_id: uuid.UUID,
+        node_id: uuid.UUID,
+        if_match: str = Header(alias="If-Match"),
+    ) -> dict[str, Any]:
+        return service.restore_canvas_node(
+            project_id,
+            node_id,
+            expected_version=parse_version_header(if_match),
         )
 
     @router.get("/projects/{project_id}/events")

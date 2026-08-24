@@ -30,19 +30,21 @@ describe("StoryboardNodeConsole", () => {
   it("requires both healing Canon subjects before character-driven generation", async () => {
     const wrapper = mount(StoryboardNodeConsole, {
       props: {
-        approvedStoryAvailable: false,
+        approvedStoryAvailable: true,
         selectedReferenceCount: 1,
         healingRecipe: true,
       },
     });
 
-    await wrapper.findAll("button").find((button) => button.text().includes("角色生成分镜脚本"))!.trigger("click");
+    await wrapper.findAll("button").find((button) => button.text().includes("基于固定角色补充分镜"))!.trigger("click");
     expect(wrapper.text()).toContain("必须同时选择固定儿童与固定猫咪素材");
     expect(wrapper.get("button.primary").attributes("disabled")).toBeDefined();
     await wrapper.findAll("button").find((button) => button.text().includes("从画布选择角色素材"))!.trigger("click");
     expect(wrapper.emitted("select-references")).toHaveLength(1);
 
     await wrapper.setProps({ selectedReferenceCount: 2 });
+    expect(wrapper.text()).toContain("请填写本集要发生的低压力事件");
+    expect(wrapper.get("button.primary").attributes("disabled")).toBeDefined();
     await wrapper.get("textarea").setValue("孩子和猫咪一起整理窗台");
     await wrapper.get("button.primary").trigger("click");
     expect(wrapper.emitted("run")?.[0]).toEqual([{

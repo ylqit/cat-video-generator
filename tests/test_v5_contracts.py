@@ -228,6 +228,44 @@ def test_v5_video_input_contract_allows_anchor_as_only_media(resolution: str) ->
     assert plan.bindings[0].provider_role is ProviderMediaRole.FIRST_FRAME
 
 
+def test_v5_first_frame_video_prompt_does_not_rewrite_identity_or_style() -> None:
+    plan = build_shot_input_plan(
+        resolution="720p",
+        duration_seconds=10,
+        anchor=_image_source(1),
+    )
+    context = contracts.ShotPromptContext(
+        project_title="雨后亮叶",
+        scene_title="雨后小院",
+        scene_text="孩子和猫咪观察叶片上的雨珠。",
+        shot_title="靠近亮叶",
+        direction="1. 孩子缓慢蹲下，猫咪自然四足靠近。2. 镜头轻微推进，雨珠滚动。",
+        duration_seconds=10,
+    )
+    profile = contracts.VisualProfileDraft(
+        personIdentity="IDENTITY_SENTINEL_PERSON",
+        personHair="HAIR_SENTINEL",
+        personBody="BODY_SENTINEL",
+        catIdentity="IDENTITY_SENTINEL_CAT",
+        stylePositive=("STYLE_SENTINEL_A", "STYLE_SENTINEL_B", "STYLE_SENTINEL_C"),
+        styleNegative=("NEGATIVE_SENTINEL_A", "NEGATIVE_SENTINEL_B"),
+    )
+
+    prompt = compile_shot_video_prompt_parts(
+        context,
+        plan,
+        binding_descriptions=("@图片1=已批准开场锚点",),
+        visual_profile=profile,
+    ).final.text
+
+    assert "唯一的人物身份、猫咪身份、外观、比例、构图和画风来源" in prompt
+    assert "不得重写、重构或补充人物、猫咪与画风特征" in prompt
+    assert "孩子缓慢蹲下" in prompt
+    assert "IDENTITY_SENTINEL" not in prompt
+    assert "STYLE_SENTINEL" not in prompt
+    assert "NEGATIVE_SENTINEL" not in prompt
+
+
 def test_v5_video_input_contract_rejects_reference_media_with_first_frame() -> None:
     with pytest.raises(ValueError, match="首帧模式不能同时提交普通参考图片"):
         build_shot_input_plan(
