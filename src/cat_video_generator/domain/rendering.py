@@ -98,9 +98,7 @@ class VideoInputPlan(StrictModel):
                 if item.provider_role is ProviderMediaRole.FIRST_FRAME
             ]
             last_frames = [
-                item
-                for item in self.bindings
-                if item.provider_role is ProviderMediaRole.LAST_FRAME
+                item for item in self.bindings if item.provider_role is ProviderMediaRole.LAST_FRAME
             ]
             if len(first_frames) > 1 or len(last_frames) > 1:
                 raise ValueError("一次镜头生成最多使用一张first_frame")
@@ -111,7 +109,8 @@ class VideoInputPlan(StrictModel):
             controlled_roles = [
                 item.provider_role
                 for item in self.bindings
-                if item.provider_role in {
+                if item.provider_role
+                in {
                     ProviderMediaRole.FIRST_FRAME,
                     ProviderMediaRole.LAST_FRAME,
                 }
@@ -123,9 +122,7 @@ class VideoInputPlan(StrictModel):
             ):
                 raise ValueError("首尾帧必须按first_frame、last_frame顺序提交")
             if first_frames and len(self.bindings) != len(controlled_roles):
-                raise ValueError(
-                    "Seedance首帧或首尾帧模式不能同时提交普通参考图片或参考视频"
-                )
+                raise ValueError("Seedance首帧或首尾帧模式不能同时提交普通参考图片或参考视频")
             if any(item.modality is MediaModality.VIDEO for item in self.bindings):
                 raise ValueError("初始镜头生成不接收前序完整视频")
         else:
@@ -135,15 +132,13 @@ class VideoInputPlan(StrictModel):
                 or roles[0] is not ProviderMediaRole.REFERENCE_VIDEO
                 or any(role is not ProviderMediaRole.REFERENCE_IMAGE for role in roles[1:])
             ):
-                raise ValueError(
-                    "区间编辑必须先绑定@视频1和两张真实边界帧，随后才能附加参考图"
-                )
+                raise ValueError("区间编辑必须先绑定@视频1和两张真实边界帧，随后才能附加参考图")
         return self
 
 
 class SequenceClip(StrictModel):
     order: Annotated[int, Field(ge=1)]
-    shot_card_id: UUID
+    creator_shot_id: UUID = Field(alias="creatorShotId")
     source_asset_id: UUID
     source_start_ms: Annotated[int, Field(ge=0)]
     source_end_ms: Annotated[int, Field(gt=0)]

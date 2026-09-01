@@ -4,12 +4,13 @@ import { ElMessage } from "element-plus";
 import { computed, onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 
-import { api, canvasApi } from "../api/client";
-import type { ProjectSummary, VisualPresetProfileDto } from "../api/types";
+import { creatorApi } from "../api/client";
+import type { CreatorReferenceDto, ProjectSummary } from "../api/types";
 
 const router = useRouter();
 const projects = ref<ProjectSummary[]>([]);
-const presets = ref<VisualPresetProfileDto[]>([]);
+const canonReferences = ref<CreatorReferenceDto[]>([]);
+const canonReady = ref(false);
 const loading = ref(true);
 const loadError = ref("");
 const createOpen = ref(false);
@@ -19,16 +20,19 @@ const form = reactive({
   body: "",
   durationSeconds: 8,
   aspectRatio: "9:16" as "9:16" | "16:9" | "1:1",
-  qualityTier: "quick" as "quick" | "balanced" | "premium",
+  qualityTier: "quick" as "quick" | "standard" | "quality",
   wardrobe: "",
   environment: "",
 });
 
-const canonV4 = computed(() => presets.value.find((preset) => preset.key === "healing_child_cat_style_board_v4"));
-const styleBoard = computed(() => canonV4.value?.slots.find((slot) => slot.semanticKey === "style:healing_line_texture_v4" && slot.authority?.providerEligible));
+const styleBoard = computed(() => canonReferences.value.find((item) => item.role === "style_board"));
+const childCanon = computed(() => canonReferences.value.find((item) => item.role === "child_identity"));
+const catCanon = computed(() => canonReferences.value.find((item) => item.role === "cat_identity"));
 const createBlocker = computed(() => {
-  if (!canonV4.value?.ready) return "Canon v4 基础证据尚未齐备";
+  if (!canonReady.value) return "Canon v4 基础证据尚未齐备";
   if (!styleBoard.value?.assetId) return "净化画风板尚不可用";
+  if (!childCanon.value?.assetId) return "儿童 Canon 尚不可用";
+  if (!catCanon.value?.assetId) return "猫咪 Canon 尚不可用";
   if (!form.title.trim()) return "请输入项目名称";
   if (!form.body.trim()) return "请输入故事主题或完整创作要求";
   return "";
@@ -37,12 +41,18 @@ const createBlocker = computed(() => {
 async function loadProjects() {
   loading.value = true;
   loadError.value = "";
-  const [projectResult, presetResult] = await Promise.allSettled([api.projects(), canvasApi.visualPresets()]);
+  const [projectResult, canonResult] = await Promise.allSettled([
+    creatorApi.projects(),
+    creatorApi.canon(),
+  ]);
   if (projectResult.status === "fulfilled") projects.value = projectResult.value;
-  if (presetResult.status === "fulfilled") presets.value = presetResult.value;
+  if (canonResult.status === "fulfilled") {
+    canonReferences.value = canonResult.value.references;
+    canonReady.value = canonResult.value.ready;
+  }
   const failures = [
     ...(projectResult.status === "rejected" ? [`项目列表：${String(projectResult.reason)}`] : []),
-    ...(presetResult.status === "rejected" ? [`Canon 预设：${String(presetResult.reason)}`] : []),
+    ...(canonResult.status === "rejected" ? [`Canon：${String(canonResult.reason)}`] : []),
   ];
   loadError.value = failures.join("\n");
   loading.value = false;
@@ -53,7 +63,7 @@ function openProject(projectId: string) {
 }
 
 async function createProject() {
-  if (createBlocker.value || !canonV4.value || !styleBoard.value?.assetId || creating.value) return;
+  if (createBlocker.value || !styleBoard.value?.assetId || !childCanon.value?.assetId || !catCanon.value?.assetId || creating.value) return;
   creating.value = true;
   try {
     const constraints = [
@@ -61,13 +71,16 @@ async function createProject() {
       form.environment.trim() ? `环境要求：${form.environment.trim()}` : "",
       "固定同一名 8–9 岁短发儿童与同一只灰白虎斑猫；原创柔和数字插画；不复制任何外部角色或品牌。",
     ].filter(Boolean).join("\n");
-    const created = await canvasApi.createChildCatProject({
+    const references: CreatorReferenceDto[] = [
+      { ...childCanon.value },
+      { ...catCanon.value },
+      { ...styleBoard.value },
+    ];
+    const created = await creatorApi.createProject({
       title: form.title.trim(),
       contentDate: new Date().toISOString().slice(0, 10),
       brief: { body: `${form.body.trim()}\n\n${constraints}`, durationSeconds: form.durationSeconds, aspectRatio: form.aspectRatio, qualityTier: form.qualityTier },
-      childCanonProfileId: canonV4.value.canonProfileId,
-      catCanonProfileId: canonV4.value.canonProfileId,
-      styleBoardAssetId: styleBoard.value.assetId,
+      references,
     });
     if (created.providerCallCount !== 0) throw new Error("项目创建不应产生 Provider 调用");
     createOpen.value = false;
@@ -101,9 +114,9 @@ onMounted(loadProjects);
       <form class="create-form" @submit.prevent="createProject">
         <label><span>项目名称</span><input v-model="form.title" autocomplete="off" placeholder="例如：窗边的纸星星" /></label>
         <label class="brief"><span>故事主题或完整创作要求</span><textarea v-model="form.body" rows="7" placeholder="写清楚核心事件、情绪、动作节拍和不希望出现的内容。" /></label>
-        <div class="form-row"><label><span>目标时长</span><select v-model.number="form.durationSeconds"><option :value="5">5 秒</option><option :value="8">8 秒</option><option :value="10">10 秒</option><option :value="15">15 秒</option></select></label><label><span>画幅</span><select v-model="form.aspectRatio"><option value="9:16">9:16 竖屏</option><option value="16:9">16:9 横屏</option><option value="1:1">1:1 方形</option></select></label><label><span>质量档</span><select v-model="form.qualityTier"><option value="quick">Quick</option><option value="balanced">Balanced</option><option value="premium">Premium</option></select></label></div>
+        <div class="form-row"><label><span>目标时长</span><select v-model.number="form.durationSeconds"><option :value="5">5 秒</option><option :value="8">8 秒</option><option :value="10">10 秒</option><option :value="15">15 秒</option></select></label><label><span>画幅</span><select v-model="form.aspectRatio"><option value="9:16">9:16 竖屏</option><option value="16:9">16:9 横屏</option><option value="1:1">1:1 方形</option></select></label><label><span>质量档</span><select v-model="form.qualityTier"><option value="quick">Quick</option><option value="standard">Standard</option><option value="quality">Quality</option></select></label></div>
         <div class="form-row two"><label><span>本集服装（可选）</span><input v-model="form.wardrobe" placeholder="只改变本集服装，不改变发型和身份" /></label><label><span>环境要求（可选）</span><input v-model="form.environment" placeholder="例如：清晨窗边、柔和晨光" /></label></div>
-        <section class="canon-summary"><div><b>儿童 Canon</b><span>{{ canonV4?.title ?? '未加载' }}</span></div><div><b>猫咪 Canon</b><span>{{ canonV4?.title ?? '未加载' }}</span></div><div><b>画风板</b><span>{{ styleBoard?.title ?? '未加载' }}</span></div><p>项目、Brief、两个主体、Canon 引用和初始 Recipe 在同一事务中创建；Provider 调用为 0。</p></section>
+        <section class="canon-summary"><div><b>儿童 Canon</b><span>{{ childCanon?.title ?? '未加载' }}</span></div><div><b>猫咪 Canon</b><span>{{ catCanon?.title ?? '未加载' }}</span></div><div><b>画风板</b><span>{{ styleBoard?.title ?? '未加载' }}</span></div><p>项目、创作要求和三项固定 Canon 会在同一事务中创建；创建项目本身不会产生媒体费用。</p></section>
       </form>
       <template #footer><el-button @click="createOpen = false">取消</el-button><el-button type="primary" :loading="creating" :disabled="Boolean(createBlocker)" :title="createBlocker" @click="createProject">创建并进入剧本</el-button></template>
     </el-dialog>

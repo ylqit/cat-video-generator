@@ -46,6 +46,7 @@ def test_ark_submission_maps_explicit_audio_policy_to_provider_flag() -> None:
                 bindings=[],
             ),
             input_sources=(),
+            model="seedance-test",
         )
 
     assert [item["generate_audio"] for item in calls] == [True, False]

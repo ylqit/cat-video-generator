@@ -1,4 +1,4 @@
-"""Command-line process for durable universal media canvas jobs."""
+"""Command-line worker for durable Creator generation tasks."""
 
 from __future__ import annotations
 
@@ -12,32 +12,37 @@ LOGGER = logging.getLogger(__name__)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the universal media canvas worker")
+    parser = argparse.ArgumentParser(description="Run the Creator generation worker")
     parser.add_argument("--poll-seconds", type=float, default=1.0)
-    parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
     if not 0.1 <= args.poll_seconds <= 60:
         parser.error("--poll-seconds must be between 0.1 and 60")
-    if args.concurrency != 1:
-        parser.error("--concurrency currently must be 1 to preserve paid-task ordering")
 
     container = build_runtime_container()
     try:
         while True:
-            try:
-                result = container.media_canvas_worker.run_once()
-            except Exception:
-                LOGGER.exception("durable task failed; the worker will continue polling")
+            lease = container.task_queue.claim_next(worker_id="creator-worker")
+            if lease is None:
                 if args.once:
-                    raise
+                    return
                 time.sleep(args.poll_seconds)
                 continue
-            if args.once or result is not None:
+            try:
+                result = container.creator_executor.execute(lease.task_id)
+                container.task_queue.finish(
+                    lease,
+                    status=result.status,
+                    next_attempt_at=result.next_attempt_at,
+                    payload=result.payload,
+                )
+            except Exception as exc:
+                container.task_queue.fail(lease, exc)
+                LOGGER.exception("Creator generation task failed")
                 if args.once:
-                    break
-                continue
-            time.sleep(args.poll_seconds)
+                    raise
+            if args.once:
+                return
     finally:
         container.close()
 

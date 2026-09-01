@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "cat-video-generator"
 version = "0.1.0"
-description = "Local scene and shot-card AIGC video production system"
+description = "Creator-only one-child-one-cat video production system"
 requires-python = ">=3.12,<3.14"
 dependencies = [
   "alembic>=1.14,<2",

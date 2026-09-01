@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import uuid
 from pathlib import Path
 
 import pytest
 
-from cat_video_generator.application.shot_queue import ShotProductionService
 from cat_video_generator.config import ConfigurationError, RuntimeSettings
 
 
@@ -56,33 +54,3 @@ def test_video_preflight_rejects_missing_media_tools() -> None:
 
     with pytest.raises(ConfigurationError, match="ffprobe"):
         settings.validate_for_video_generation(allow_paid_generation=True)
-
-
-def test_video_service_runs_preflight_before_accessing_repository() -> None:
-    class BlockingPreflight:
-        def validate_for_video_generation(self, *, allow_paid_generation: bool) -> None:
-            raise ConfigurationError("ffprobe is unavailable")
-
-        def validate_for_range_edit(self, *, allow_paid_generation: bool) -> None:
-            raise AssertionError("wrong preflight")
-
-        def validate_for_local_composition(self) -> None:
-            raise AssertionError("wrong preflight")
-
-    class UnexpectedAccess:
-        def __getattr__(self, name: str) -> object:
-            raise AssertionError(f"unexpected dependency access: {name}")
-
-    service = ShotProductionService(
-        repository=UnexpectedAccess(),
-        gateway=UnexpectedAccess(),
-        asset_store=UnexpectedAccess(),
-        media_probe=UnexpectedAccess(),
-        frame_extractor=None,
-        provider_name="test",
-        resolution="720p",
-        runtime_preflight=BlockingPreflight(),
-    )
-
-    with pytest.raises(ConfigurationError, match="ffprobe"):
-        service.generate_video(uuid.uuid4(), allow_paid_generation=True)

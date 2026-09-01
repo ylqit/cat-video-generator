@@ -133,10 +133,7 @@ class LocalAssetStore:
         for path in resolved:
             command.extend(("-i", str(path)))
         filters: list[str] = []
-        durations = [
-            (clip.source_end_ms - clip.source_start_ms) / 1000
-            for clip in plan.clips
-        ]
+        durations = [(clip.source_end_ms - clip.source_start_ms) / 1000 for clip in plan.clips]
         for index, duration in enumerate(durations):
             # `concat` emits AVTB (1/1_000_000). Keep every source on that
             # time base after frame-rate normalization so a later `xfade`
@@ -176,17 +173,13 @@ class LocalAssetStore:
                 video_filters += f",fade=t=out:st={start:.3f}:d={seconds:.3f}"
                 audio_filters += f",afade=t=out:st={start:.3f}:d={seconds:.3f}"
             filters.append(f"[{index}:v]{video_filters}[v{index}]")
-            filters.append(
-                f"[{index}:a]{audio_filters}[a{index}]"
-            )
+            filters.append(f"[{index}:a]{audio_filters}[a{index}]")
         current_video = "v0"
         current_audio = "a0"
         current_duration = durations[0]
         for index in range(1, len(resolved)):
             transition = plan.clips[index].transition_from_previous
-            transition_type = (
-                SequenceTransitionType.CUT if transition is None else transition.type
-            )
+            transition_type = SequenceTransitionType.CUT if transition is None else transition.type
             video_out = "vout" if index + 1 == len(resolved) else f"vm{index}"
             audio_out = "aout" if index + 1 == len(resolved) else f"am{index}"
             if transition_type is SequenceTransitionType.CROSS_DISSOLVE:

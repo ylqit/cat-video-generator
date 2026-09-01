@@ -4,89 +4,70 @@ import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch 
 import { useRoute, useRouter } from "vue-router";
 import type { RouteLocationNormalized } from "vue-router";
 
-import { canvasApi } from "../api/client";
-import type { ProjectWorkspaceShellDto, WorkspaceModuleId } from "../api/types";
+import { creatorApi } from "../api/client";
+import type { CreatorStateDto } from "../api/types";
 import type { DirectorDirtyRegistration, DirectorDirtyResolution } from "../components/director/directorDirtyState";
 import { DirectorDirtyCoordinator } from "../components/director/directorDirtyState";
-import WorkspaceModuleNavigation from "../components/workspace/WorkspaceModuleNavigation.vue";
-import WorkspaceProjectHeader from "../components/workspace/WorkspaceProjectHeader.vue";
 
 const ScriptWorkspace = defineAsyncComponent(() => import("../components/director/ScriptWorkspace.vue"));
 const AssetWorkspace = defineAsyncComponent(() => import("../components/director/AssetWorkspace.vue"));
 const ProductionWorkspace = defineAsyncComponent(() => import("../components/production/ProductionWorkspace.vue"));
 
-type LoadState = "loading" | "ready" | "refreshing" | "stale" | "error";
+type ModuleId = "script" | "assets" | "production";
+type LoadState = "loading" | "ready" | "error";
 
 const route = useRoute();
 const router = useRouter();
-const shell = ref<ProjectWorkspaceShellDto>();
+const creatorState = ref<CreatorStateDto>();
 const loadState = ref<LoadState>("loading");
 const loadError = ref("");
 const dirtyCoordinator = new DirectorDirtyCoordinator();
 let activeController: AbortController | undefined;
-let requestSequence = 0;
 let removeGuard: (() => void) | undefined;
+let requestSequence = 0;
 
 const projectId = computed(() => String(route.params.projectId ?? ""));
-const activeModuleId = computed<WorkspaceModuleId>(() => {
+const activeModuleId = computed<ModuleId>(() => {
   const value = route.meta.workspaceModule;
   return value === "script" || value === "assets" || value === "production" ? value : "production";
 });
 const focusedItemId = computed(() => typeof route.query.item === "string" ? route.query.item : "");
 const panel = computed(() => typeof route.query.panel === "string" ? route.query.panel : "main");
-const modules = computed(() => [...(shell.value?.modules ?? [])].sort((left, right) => left.order - right.order));
-const activeModule = computed(() => modules.value.find((module) => module.id === activeModuleId.value));
-const activeWorkspaceComponent = computed(() => {
-  if (activeModuleId.value === "script") return ScriptWorkspace;
-  if (activeModuleId.value === "assets") return AssetWorkspace;
-  return ProductionWorkspace;
-});
+const activeWorkspaceComponent = computed(() => activeModuleId.value === "script" ? ScriptWorkspace : activeModuleId.value === "assets" ? AssetWorkspace : ProductionWorkspace);
+const navigation: Array<{ id: ModuleId; label: string; caption: string }> = [
+  { id: "script", label: "剧本", caption: "故事正文" },
+  { id: "assets", label: "角色资产", caption: "Canon 与参考" },
+  { id: "production", label: "生产", caption: "镜头、视频与成片" },
+];
 
-async function loadShell(background = false) {
-  if (!projectId.value) return;
-  activeController?.abort("workspace shell superseded");
+async function load() {
+  activeController?.abort("creator state superseded");
   const controller = new AbortController();
   activeController = controller;
   const sequence = ++requestSequence;
-  const hasShell = shell.value?.project.id === projectId.value;
-  loadState.value = background && hasShell ? "refreshing" : "loading";
+  loadState.value = "loading";
   loadError.value = "";
   try {
-    const result = await canvasApi.workspaceShell(projectId.value, controller.signal);
-    if (sequence !== requestSequence || controller.signal.aborted) return;
-    shell.value = result;
+    creatorState.value = await creatorApi.state(projectId.value, controller.signal);
+    if (controller.signal.aborted || sequence !== requestSequence) return;
     loadState.value = "ready";
-  } catch (error) {
-    if (sequence !== requestSequence || controller.signal.aborted) return;
-    loadError.value = error instanceof Error ? error.message : String(error);
-    loadState.value = hasShell ? "stale" : "error";
+  } catch (reason) {
+    if (controller.signal.aborted || sequence !== requestSequence) return;
+    loadError.value = reason instanceof Error ? reason.message : String(reason);
+    loadState.value = "error";
   } finally {
     if (sequence === requestSequence) activeController = undefined;
   }
 }
 
-function moduleRoute(moduleId: WorkspaceModuleId, nextProjectId = projectId.value) {
-  return { name: `project-${moduleId}`, params: { projectId: nextProjectId } };
-}
-
-function openModule(moduleId: WorkspaceModuleId) {
-  void router.push(moduleRoute(moduleId));
-}
-
-function switchProject(nextProjectId: string) {
-  void router.push(moduleRoute(activeModuleId.value, nextProjectId));
-}
-
-function openNext() {
-  const next = activeModule.value?.nextAction;
-  if (!next) return;
-  void router.push(moduleRoute(next.moduleId));
+function openModule(moduleId: ModuleId) {
+  void router.push({ name: `project-${moduleId}`, params: { projectId: projectId.value } });
 }
 
 async function chooseDirtyResolution(registration: DirectorDirtyRegistration): Promise<DirectorDirtyResolution> {
   try {
     await ElMessageBox.confirm(
-      `${registration.label}还有未保存修改。保存会创建或更新正式版本；放弃不会改动当前业务版本。`,
+      `${registration.label}还有未保存修改。`,
       "离开前处理修改",
       { confirmButtonText: "保存修改", cancelButtonText: "放弃修改", distinguishCancelAndClose: true, closeOnClickModal: false, type: "warning" },
     );
@@ -100,62 +81,47 @@ function registerDirtyState(registration?: DirectorDirtyRegistration) {
   dirtyCoordinator.register(registration);
 }
 
-function leavesCurrentWorkspace(to: RouteLocationNormalized, from: RouteLocationNormalized) {
-  if (String(to.params.projectId ?? "") !== String(from.params.projectId ?? "")) return true;
-  return to.name !== from.name;
+function leavesWorkspace(to: RouteLocationNormalized, from: RouteLocationNormalized) {
+  return String(to.params.projectId ?? "") !== String(from.params.projectId ?? "") || to.name !== from.name;
 }
 
-watch(projectId, () => {
-  shell.value = undefined;
-  loadState.value = "loading";
-  loadError.value = "";
-  void loadShell(false);
-}, { immediate: true });
-
+watch(projectId, load, { immediate: true });
 onMounted(() => {
   removeGuard = router.beforeEach(async (to, from) => {
-    if (!dirtyCoordinator.active || !leavesCurrentWorkspace(to, from)) return true;
+    if (!dirtyCoordinator.active || !leavesWorkspace(to, from)) return true;
     return dirtyCoordinator.resolve(chooseDirtyResolution);
   });
 });
 onBeforeUnmount(() => {
   requestSequence += 1;
-  activeController?.abort("workspace view unmounted");
+  activeController?.abort("creator workspace unmounted");
   removeGuard?.();
 });
 </script>
 
 <template>
-  <div class="project-workspace">
-    <WorkspaceProjectHeader
-      :shell="shell"
-      :active-module="activeModule"
-      :load-state="loadState"
-      :load-error="loadError"
-      @projects="router.push({ name: 'projects' })"
-      @refresh="loadShell(Boolean(shell))"
-      @switch-project="switchProject"
-      @next="openNext"
-    />
-    <WorkspaceModuleNavigation v-if="shell" :modules="modules" :active-module-id="activeModuleId" @select="openModule" />
-    <div v-else class="navigation-skeleton" aria-busy="true"><i v-for="index in 3" :key="index" /></div>
+  <div class="creator-shell">
+    <header class="project-header">
+      <button type="button" aria-label="返回项目" @click="router.push({ name: 'projects' })">←</button>
+      <div><span>ONE CHILD · ONE CAT</span><b>{{ creatorState?.currentStory?.title || "一人一猫创作项目" }}</b></div>
+      <p>{{ creatorState ? `${creatorState.targetDurationSeconds}s · ${creatorState.aspectRatio} · ${creatorState.qualityTier}` : "正在读取项目…" }}</p>
+      <a href="/settings">设置</a>
+    </header>
+    <nav class="module-navigation" aria-label="项目创作入口">
+      <button v-for="item in navigation" :key="item.id" type="button" :class="{ active: activeModuleId === item.id }" @click="openModule(item.id)"><b>{{ item.label }}</b><span>{{ item.caption }}</span></button>
+    </nav>
     <main class="workspace-content">
-      <div v-if="loadState === 'error'" class="shell-error" role="alert"><b>项目工作区状态加载失败</b><p>{{ loadError }}</p><button type="button" @click="loadShell(false)">重新加载</button></div>
+      <div v-if="loadState === 'loading'" class="load-state" aria-busy="true"><i /><b>正在打开简洁创作主线…</b></div>
+      <div v-else-if="loadState === 'error'" class="load-state error" role="alert"><b>项目加载失败</b><p>{{ loadError }}</p><button type="button" @click="load">重新加载</button></div>
       <Suspense v-else :timeout="0">
-        <component
-          :is="activeWorkspaceComponent"
-          :project-id="projectId"
-          :focused-item-id="focusedItemId"
-          :panel="activeModuleId === 'production' ? undefined : panel"
-          @dirty-change="registerDirtyState"
-        />
-        <template #fallback><div class="module-loader" aria-busy="true"><i /><b>正在打开{{ activeModule?.title ?? "项目工作区" }}…</b><span>项目外壳与其他入口仍可使用</span></div></template>
+        <component :is="activeWorkspaceComponent" :project-id="projectId" :initial-state="creatorState" :focused-item-id="focusedItemId" :panel="activeModuleId === 'production' ? undefined : panel" @dirty-change="registerDirtyState" />
+        <template #fallback><div class="load-state" aria-busy="true">正在载入工作区…</div></template>
       </Suspense>
-      <div v-if="loadState === 'stale'" class="stale-warning" role="status">数据可能过期：{{ loadError }}</div>
     </main>
   </div>
 </template>
 
 <style scoped>
-.project-workspace{width:100%;height:100%;display:grid;grid-template-rows:56px 56px minmax(0,1fr);overflow:hidden;color:#e8eef7;background:#0b0f14}.workspace-content{position:relative;min-width:0;min-height:0;margin:12px;overflow:hidden;background:#10151c;border:1px solid #252e39;border-radius:15px}.navigation-skeleton{height:56px;padding:6px 12px;display:grid;grid-template-columns:repeat(3,minmax(0,240px));gap:7px;background:#0e1319;border-bottom:1px solid #252d37}.navigation-skeleton i{border-radius:10px;background:#1a222c;animation:pulse 1.2s ease-in-out infinite alternate}.module-loader{height:100%;display:grid;place-content:center;justify-items:center;gap:8px;color:#7f8e9f}.module-loader i{width:42px;height:42px;border:3px solid #263544;border-top-color:#5f91bf;border-radius:50%;animation:spin .9s linear infinite}.module-loader b{color:#bac7d4;font-size:14px}.module-loader span{font-size:10px}.shell-error{width:min(620px,calc(100% - 40px));margin:50px auto;padding:22px;color:#efcdc7;background:#281b1d;border:1px solid #684044;border-radius:14px}.shell-error p{color:#c99b9b;white-space:pre-wrap}.shell-error button{min-height:44px;padding:0 15px;color:#fff;background:#72444a;border:1px solid #985b63;border-radius:9px;cursor:pointer}.stale-warning{position:absolute;z-index:50;top:10px;right:12px;max-width:min(620px,calc(100% - 24px));padding:9px 12px;color:#e1bd83;background:rgb(49 38 24 / 95%);border:1px solid #735b37;border-radius:9px;font-size:11px}@keyframes pulse{to{opacity:.55}}@keyframes spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.navigation-skeleton i,.module-loader i{animation:none}}@media(max-width:720px){.project-workspace{grid-template-rows:56px 56px minmax(0,1fr)}.workspace-content{margin:8px 8px 66px}}
+.creator-shell{height:100%;display:grid;grid-template-rows:54px 54px minmax(0,1fr);overflow:hidden;color:#e8eef6;background:#090d12}.project-header{padding:0 14px;display:flex;align-items:center;gap:12px;background:#11171e;border-bottom:1px solid #242d37}.project-header>button{width:44px;height:44px;color:#aab8c7;background:#1a222b;border:1px solid #303b47;border-radius:10px;cursor:pointer}.project-header>div{display:grid;gap:2px}.project-header span{color:#6387a9;font-size:9px;font-weight:800;letter-spacing:.14em}.project-header b{font-size:14px}.project-header p{margin-left:auto;color:#77889a;font-size:11px}.project-header a{min-height:44px;padding:0 12px;display:grid;place-items:center;color:#aab8c7;text-decoration:none;background:#1a222b;border:1px solid #303b47;border-radius:10px}.module-navigation{padding:5px 14px;display:flex;gap:6px;background:#0e141a;border-bottom:1px solid #242d37}.module-navigation button{min-width:150px;min-height:44px;padding:5px 13px;display:grid;grid-template-columns:auto auto;align-items:center;gap:8px;color:#8090a1;text-align:left;background:transparent;border:1px solid transparent;border-radius:9px;cursor:pointer}.module-navigation button span{font-size:9px}.module-navigation button.active{color:#eaf4ff;background:#1c2a37;border-color:#36536d}.workspace-content{position:relative;min-height:0;margin:12px;overflow:hidden;background:#10161d;border:1px solid #27313c;border-radius:15px}.load-state{height:100%;display:grid;place-content:center;justify-items:center;gap:10px;color:#8292a3}.load-state i{width:38px;height:38px;border:3px solid #263443;border-top-color:#5c90bd;border-radius:50%;animation:spin .9s linear infinite}.load-state.error{color:#dfa49e}.load-state.error button{min-height:44px;padding:0 14px;color:#fff;background:#6e4148;border:1px solid #94565f;border-radius:9px}@keyframes spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.load-state i{animation:none}}@media(max-width:720px){.creator-shell{grid-template-rows:54px 58px minmax(0,1fr)}.project-header p{display:none}.module-navigation{overflow-x:auto}.module-navigation button{min-width:130px}.workspace-content{margin:8px}}
+@media(max-width:720px){.project-header{padding:0 8px;gap:8px}.project-header>div{min-width:0}.project-header b{overflow:hidden;display:block;max-width:48vw;text-overflow:ellipsis;white-space:nowrap}.project-header a{padding:0 9px}.module-navigation{padding:6px 8px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:4px;overflow:visible}.module-navigation button{min-width:0;padding:4px 5px;grid-template-columns:1fr;justify-items:center;gap:1px;text-align:center}.module-navigation button span{overflow:hidden;max-width:100%;text-overflow:ellipsis;white-space:nowrap}.workspace-content{margin:7px}}
 </style>

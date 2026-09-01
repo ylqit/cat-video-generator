@@ -29,4 +29,3 @@ def test_development_api_reload_uses_an_importable_app_factory(monkeypatch) -> N
             },
         )
     ]
-

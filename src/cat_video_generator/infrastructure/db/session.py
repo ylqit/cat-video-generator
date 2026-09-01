@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from ...config import DatabaseOperation, DatabaseSettings
 from .models import SCHEMA_NAME
 
-ALEMBIC_HEAD = "0031_workflow_task_cancellation"
+ALEMBIC_HEAD = "0001_creator_core_baseline"
 _CONNECTION_TIMEOUT_RETRY_DELAYS = (0.5, 1.5)
 
 
@@ -39,8 +39,8 @@ def create_database_engine(
     settings: DatabaseSettings,
     operation: DatabaseOperation,
     *,
-    pool_size: int = 3,
-    max_overflow: int = 2,
+    pool_size: int = 2,
+    max_overflow: int = 0,
 ) -> Engine:
     settings.validate_for(operation)
     engine = create_engine(

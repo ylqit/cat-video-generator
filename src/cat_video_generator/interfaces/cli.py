@@ -1,10 +1,11 @@
-"""Small operational CLI for the V5 Web studio."""
+"""Small operational CLI for the Creator application."""
 
 from __future__ import annotations
 
 import json
-from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import AsyncIterator
 
 import typer
 import uvicorn
@@ -13,7 +14,6 @@ from ..bootstrap import build_diagnostic_container, build_runtime_container
 from ..config import RuntimeSettings, load_local_env
 from ..infrastructure.db.session import ALEMBIC_HEAD
 from .api import create_app
-from .jobs import JobRegistry
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False)
 
@@ -99,82 +99,15 @@ def create_runtime_app(*, static_dir: Path | None = None):
     """Own one API process' runtime resources and shutdown lifecycle."""
 
     container = build_runtime_container()
-    executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="shot-queue")
-    jobs = JobRegistry(executor=executor)
-    web_app = create_app(container, job_registry=jobs, static_dir=static_dir)
 
-    @web_app.on_event("shutdown")
-    def close_resources() -> None:
-        executor.shutdown(wait=False, cancel_futures=False)
-        container.close()
+    @asynccontextmanager
+    async def lifespan(_application: object) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            container.close()
 
-    return web_app
-
-
-@app.command("canon-repair")
-def repair_canon(
-    source_dir: Path = typer.Option(
-        Path("风格定稿/Canon-v1"),
-        "--source-dir",
-        file_okay=False,
-        dir_okay=True,
-        exists=True,
-    ),
-) -> None:
-    """Validate and relink the approved Canon set into the active asset root."""
-
-    container = build_runtime_container()
-    try:
-        repaired = container.canon.repair_manifest(source_dir / "manifest.json")
-        _echo(
-            {
-                "repaired": len(repaired),
-                "assets": [
-                    {
-                        "id": str(item.id),
-                        "semanticKey": item.semantic_key,
-                        "sha256": item.sha256,
-                        "path": None if item.path is None else str(item.path),
-                    }
-                    for item in repaired
-                ],
-            }
-        )
-    finally:
-        container.close()
-
-
-@app.command("canon-install")
-def install_canon(
-    source_dir: Path = typer.Option(
-        Path("风格定稿/Canon-v4"),
-        "--source-dir",
-        file_okay=False,
-        dir_okay=True,
-        exists=True,
-    ),
-) -> None:
-    """Install a new immutable Canon manifest without overwriting existing semantic keys."""
-
-    container = build_runtime_container()
-    try:
-        installed = container.canon.install_manifest(source_dir / "manifest.json")
-        _echo(
-            {
-                "installed": len(installed),
-                "assets": [
-                    {
-                        "id": str(item.id),
-                        "semanticKey": item.semantic_key,
-                        "sha256": item.sha256,
-                        "path": None if item.path is None else str(item.path),
-                    }
-                    for item in installed
-                ],
-            }
-        )
-    finally:
-        container.close()
+    return create_app(container, static_dir=static_dir, lifespan=lifespan)
 
 
 def _echo(value: object) -> None:

@@ -12,6 +12,8 @@ __pycache__/
 htmlcov/
 var/
 output/
+local-production-archive/
+migration-backups/
 tmp/
 *.part
 docs/设计脚本教程/

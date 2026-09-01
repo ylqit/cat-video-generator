@@ -90,23 +90,18 @@ def _executable(
 
 @dataclass(frozen=True, slots=True)
 class RuntimeSettings:
-    """Ark、媒体与导演运行配置。"""
+    """Ark、媒体与 Creator 运行配置。"""
 
     ark_api_key: str | None
     ark_base_url: str
     ark_image_model: str
     ark_video_model: str
     ark_planning_model: str
-    ark_review_model: str
-    ark_structured_output_mode: str
     ark_video_resolution: str
     ark_director_request_timeout_seconds: float
-    ark_review_request_timeout_seconds: float
     ark_video_api_timeout_seconds: float
     ark_poll_interval_seconds: float
-    ark_task_timeout_seconds: float
     ark_image_request_timeout_seconds: float
-    video_semantic_review_mode: str
     ffmpeg_path: Path | None
     ffprobe_path: Path | None
     work_root: Path
@@ -122,12 +117,8 @@ class RuntimeSettings:
         director_request_timeout = float(
             _number(values, "ARK_DIRECTOR_REQUEST_TIMEOUT_SECONDS", "240", float)
         )
-        review_request_timeout = float(
-            _number(values, "ARK_REVIEW_REQUEST_TIMEOUT_SECONDS", "240", float)
-        )
         video_api_timeout = float(_number(values, "ARK_VIDEO_API_TIMEOUT_SECONDS", "120", float))
         poll_interval = float(_number(values, "ARK_POLL_INTERVAL_SECONDS", "10", float))
-        timeout = float(_number(values, "ARK_TASK_TIMEOUT_SECONDS", "1800", float))
         image_request_timeout = float(
             _number(values, "ARK_IMAGE_REQUEST_TIMEOUT_SECONDS", "600", float)
         )
@@ -135,30 +126,12 @@ class RuntimeSettings:
             value <= 0
             for value in (
                 director_request_timeout,
-                review_request_timeout,
                 video_api_timeout,
                 poll_interval,
-                timeout,
                 image_request_timeout,
             )
         ):
             raise ConfigurationError("Ark轮询间隔和请求超时必须大于0")
-        video_review_mode = (
-            values.get(
-                "VIDEO_SEMANTIC_REVIEW_MODE",
-                "diagnostic",
-            )
-            .strip()
-            .lower()
-        )
-        if video_review_mode not in {"off", "diagnostic"}:
-            raise ConfigurationError("VIDEO_SEMANTIC_REVIEW_MODE必须是off或diagnostic")
-        structured_mode = values.get(
-            "ARK_RESPONSES_STRUCTURED_OUTPUT_MODE",
-            "json_object_schema_prompt",
-        ).strip()
-        if structured_mode not in {"json_schema", "json_object_schema_prompt"}:
-            raise ConfigurationError("无效Ark结构化输出模式")
         ffmpeg_path, ffmpeg_warning = _executable(
             values.get("FFMPEG_PATH"),
             "ffmpeg",
@@ -184,11 +157,6 @@ class RuntimeSettings:
                 "ARK_PLANNING_MODEL",
                 "doubao-seed-2-1-pro-260628",
             ).strip(),
-            ark_review_model=values.get(
-                "ARK_REVIEW_MODEL",
-                "doubao-seed-2-1-pro-260628",
-            ).strip(),
-            ark_structured_output_mode=structured_mode,
             ark_video_resolution=values.get(
                 "ARK_VIDEO_RESOLUTION",
                 "720p",
@@ -196,20 +164,15 @@ class RuntimeSettings:
             .strip()
             .lower(),
             ark_director_request_timeout_seconds=director_request_timeout,
-            ark_review_request_timeout_seconds=review_request_timeout,
             ark_video_api_timeout_seconds=video_api_timeout,
             ark_poll_interval_seconds=poll_interval,
-            ark_task_timeout_seconds=timeout,
             ark_image_request_timeout_seconds=image_request_timeout,
-            video_semantic_review_mode=video_review_mode,
             ffmpeg_path=ffmpeg_path,
             ffprobe_path=ffprobe_path,
             work_root=Path(values.get("MEDIA_WORK_ROOT", "var/work")),
             asset_root=Path(values.get("MEDIA_ASSET_ROOT", "var/assets")),
             configuration_warnings=tuple(
-                warning
-                for warning in (ffmpeg_warning, ffprobe_warning)
-                if warning is not None
+                warning for warning in (ffmpeg_warning, ffprobe_warning) if warning is not None
             ),
         )
 
@@ -230,7 +193,6 @@ class RuntimeSettings:
                 self.ark_image_model,
                 self.ark_video_model,
                 self.ark_planning_model,
-                self.ark_review_model,
             )
         ):
             issues.append("Ark图片、视频和规划模型都必须配置")
@@ -245,24 +207,10 @@ class RuntimeSettings:
         self.validate_for_ark_access()
         if self.ffprobe_path is None:
             raise ConfigurationError("视频生成要求ffprobe可用")
-        if self.video_semantic_review_mode == "diagnostic" and self.ffmpeg_path is None:
-            raise ConfigurationError("视频语义诊断要求ffmpeg可用以均匀抽帧")
-
-    def validate_for_range_edit(self, *, allow_paid_generation: bool) -> None:
-        if not allow_paid_generation:
-            raise ConfigurationError("Ark调用需要--allow-paid-generation")
-        self.validate_for_ark_access()
-        if self.ffmpeg_path is None or self.ffprobe_path is None:
-            raise ConfigurationError("区间重拍要求ffmpeg和ffprobe可用")
 
     def validate_for_local_composition(self) -> None:
         if self.ffmpeg_path is None or self.ffprobe_path is None:
             raise ConfigurationError("本地成片合成要求ffmpeg和ffprobe可用")
-
-    def validate_for_generation(self, *, allow_paid_generation: bool) -> None:
-        """Compatibility boundary for callers that predate operation-specific checks."""
-
-        self.validate_for_video_generation(allow_paid_generation=allow_paid_generation)
 
     def preflight_report(self) -> dict[str, object]:
         try:
@@ -273,11 +221,7 @@ class RuntimeSettings:
         ark_ready = not issues
         ffmpeg_available = self.ffmpeg_path is not None
         ffprobe_available = self.ffprobe_path is not None
-        video_ready = (
-            ark_ready
-            and ffprobe_available
-            and (self.video_semantic_review_mode != "diagnostic" or ffmpeg_available)
-        )
+        video_ready = ark_ready and ffprobe_available
         return {
             "provider": self.provider_profile,
             "providerMode": "ark",
@@ -287,15 +231,11 @@ class RuntimeSettings:
             "arkImageModel": self.ark_image_model,
             "arkVideoModel": self.ark_video_model,
             "arkPlanningModel": self.ark_planning_model,
-            "arkReviewModel": self.ark_review_model,
             "arkVideoResolution": self.ark_video_resolution,
             "arkDirectorRequestTimeoutSeconds": self.ark_director_request_timeout_seconds,
-            "arkReviewRequestTimeoutSeconds": self.ark_review_request_timeout_seconds,
             "arkVideoApiTimeoutSeconds": self.ark_video_api_timeout_seconds,
             "arkPollIntervalSeconds": self.ark_poll_interval_seconds,
-            "arkTaskTimeoutSeconds": self.ark_task_timeout_seconds,
             "arkImageRequestTimeoutSeconds": self.ark_image_request_timeout_seconds,
-            "videoSemanticReviewMode": self.video_semantic_review_mode,
             "generationConfigurationValid": not issues,
             "generationConfigurationIssues": issues,
             "configurationWarnings": list(self.configuration_warnings),

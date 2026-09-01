@@ -1,51 +1,34 @@
-"""Composition root for the V5 video-clip workflow monolith."""
+"""Composition root for the Creator-only application."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 from sqlalchemy import Engine, text
 
-from .application.aigc_canvas import AigcCanvasService
-from .application.canon import CanonRepairService
-from .application.production_recipes import ProductionRecipeService
-from .application.sequence_service import SequenceService
-from .application.shot_queue import ProjectEditingService, ShotProductionService
-from .application.universal_media_worker import UniversalMediaWorker, VideoFilmstripExecutor
-from .application.universal_video_edit import UniversalVideoEditExecutor
+from .application.creator_core import CreatorCoreService
+from .application.creator_worker import CreatorSnapshotExecutor
 from .config import DatabaseOperation, DatabaseSettings, RuntimeSettings, load_local_env
-from .infrastructure.ark.runtime import RuntimeArkGateway, RuntimeConfigurationManager
-from .infrastructure.db.aigc_canvas_repository import SqlAlchemyAigcCanvasRepository
-from .infrastructure.db.durable_queue import DurableWorkflowQueue
-from .infrastructure.db.production_recipe_repository import (
-    SqlAlchemyProductionRecipeRepository,
-)
-from .infrastructure.db.repositories import SqlAlchemyWorkflowRepository
+from .infrastructure.ark.gateway import ArkGateway
+from .infrastructure.db.creator_repository import SqlAlchemyCreatorRepository
+from .infrastructure.db.generation_queue import CreatorTaskQueue
 from .infrastructure.db.session import (
     ALEMBIC_HEAD,
     create_database_engine,
     create_session_factory,
     ensure_database_ready,
 )
-from .infrastructure.media.qc import FfmpegFrameExtractor, FfprobeMediaProbe
 from .infrastructure.media.storage import LocalAssetStore
 
 
 @dataclass(slots=True)
 class RuntimeContainer:
     engine: Engine
-    repository: SqlAlchemyWorkflowRepository
-    editing: ProjectEditingService
-    production: ShotProductionService
-    sequences: SequenceService
-    canon: CanonRepairService
-    canvas_v2: AigcCanvasService
-    production_recipes: ProductionRecipeService
-    workflow_queue: DurableWorkflowQueue
-    media_canvas_worker: UniversalMediaWorker
+    creator: CreatorCoreService
+    creator_repository: SqlAlchemyCreatorRepository
+    creator_executor: CreatorSnapshotExecutor
+    task_queue: CreatorTaskQueue
     runtime_settings: RuntimeSettings
-    runtime_configuration: RuntimeConfigurationManager
     alembic_revision: str
 
     def close(self) -> None:
@@ -64,114 +47,50 @@ class DiagnosticContainer:
 
 
 def build_runtime_container() -> RuntimeContainer:
-    """Build the studio without issuing any provider request.
-
-    Missing Ark credentials do not prevent local project editing.  Paid
-    endpoints fail at their natural boundary until the environment is fixed.
-    """
+    """Build services without issuing any Provider request."""
 
     load_local_env()
     database = DatabaseSettings.from_env()
     runtime = RuntimeSettings.from_env()
     engine = _ready_engine(database)
     sessions = create_session_factory(engine)
-    repository = SqlAlchemyWorkflowRepository(
-        sessions,
-        asset_root=runtime.asset_root,
-    )
-    canvas_repository = SqlAlchemyAigcCanvasRepository(
-        sessions,
-        asset_root=runtime.asset_root,
-    )
-    runtime_configuration = RuntimeConfigurationManager(
-        runtime,
-        Path("var/config/runtime-settings.json"),
-    )
-    gateway = RuntimeArkGateway(runtime_configuration)
+    repository = SqlAlchemyCreatorRepository(sessions, asset_root=runtime.asset_root)
+    gateway = ArkGateway(runtime)
     store = LocalAssetStore(
         work_root=runtime.work_root,
         asset_root=runtime.asset_root,
         ffmpeg_path=runtime.ffmpeg_path,
     )
-    probe = FfprobeMediaProbe(runtime.ffprobe_path)
-    extractor = (
-        None
-        if runtime.ffmpeg_path is None
-        else FfmpegFrameExtractor(ffmpeg_path=runtime.ffmpeg_path, work_root=runtime.work_root)
-    )
-    workflow_queue = DurableWorkflowQueue(sessions, gateway=gateway)
-    editing = ProjectEditingService(
-        repository=repository,
-        director=gateway,
-        provider_name=runtime_configuration.provider_profile,
-    )
-    production = ShotProductionService(
-        repository=repository,
-        gateway=gateway,
-        asset_store=store,
-        media_probe=probe,
-        frame_extractor=extractor,
-        provider_name=runtime_configuration.provider_profile,
-        resolution=runtime_configuration.video_resolution,
-        runtime_preflight=runtime_configuration,
-        enable_video_advice=runtime_configuration.semantic_review_enabled,
-        poll_interval_seconds=runtime.ark_poll_interval_seconds,
-        task_timeout_seconds=runtime.ark_task_timeout_seconds,
-    )
-    sequences = SequenceService(
-        repository=repository,
-        asset_store=store,
-        media_probe=probe,
-        resolution=runtime_configuration.video_resolution,
-        runtime_preflight=runtime_configuration,
-    )
-    canvas_v2 = AigcCanvasService(
-        repository=canvas_repository,
-        director=gateway,
-        provider_name=runtime_configuration.provider_profile,
-    )
-    production_recipes = ProductionRecipeService(
-        repository=SqlAlchemyProductionRecipeRepository(sessions),
-        story_workflow=canvas_v2,
-        shot_workflow=production,
-        sequence_workflow=sequences,
-        asset_root=runtime.asset_root,
+    creator = CreatorCoreService(
+        repository,
+        provider_configs={
+            "story_text": {
+                "provider": runtime.provider_profile,
+                "model": runtime.ark_planning_model,
+            },
+            "image": {
+                "provider": runtime.provider_profile,
+                "model": runtime.ark_image_model,
+            },
+            "video": {
+                "provider": runtime.provider_profile,
+                "model": runtime.ark_video_model,
+                "resolution": runtime.ark_video_resolution,
+            },
+        },
     )
     return RuntimeContainer(
         engine=engine,
-        repository=repository,
-        editing=editing,
-        production=production,
-        sequences=sequences,
-        canon=CanonRepairService(repository=repository, asset_store=store),
-        canvas_v2=canvas_v2,
-        production_recipes=production_recipes,
-        workflow_queue=workflow_queue,
-        media_canvas_worker=UniversalMediaWorker(
-            queue=workflow_queue,
-            repository=canvas_repository,
+        creator=creator,
+        creator_repository=repository,
+        creator_executor=CreatorSnapshotExecutor(
+            repository=repository,
             gateway=gateway,
             asset_store=store,
-            worker_id="media-canvas-worker",
-            recipe_task_executor=production_recipes,
-            shot_video_executor=production,
             provider_poll_interval_seconds=runtime.ark_poll_interval_seconds,
-            filmstrip_executor=VideoFilmstripExecutor(
-                repository=canvas_repository,
-                frame_extractor=extractor,
-                asset_store=store,
-            ),
-            video_edit_executor=UniversalVideoEditExecutor(
-                repository=canvas_repository,
-                gateway=gateway,
-                asset_store=store,
-                media_probe=probe,
-                frame_extractor=extractor,
-                resolution=runtime_configuration.video_resolution,
-            ),
         ),
+        task_queue=CreatorTaskQueue(sessions, gateway=gateway),
         runtime_settings=runtime,
-        runtime_configuration=runtime_configuration,
         alembic_revision=ALEMBIC_HEAD,
     )
 
@@ -181,10 +100,7 @@ def build_diagnostic_container() -> DiagnosticContainer:
     database = DatabaseSettings.from_env()
     runtime = RuntimeSettings.from_env()
     engine = create_database_engine(
-        database,
-        DatabaseOperation.READ_ONLY_SMOKE,
-        pool_size=1,
-        max_overflow=0,
+        database, DatabaseOperation.READ_ONLY_SMOKE, pool_size=1, max_overflow=0
     )
     try:
         with engine.connect() as connection:
