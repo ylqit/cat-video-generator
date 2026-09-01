@@ -13,6 +13,7 @@ from uuid import UUID
 from pydantic import Field, model_validator
 
 from .contract_base import StrictModel
+from .production_recipes import ReferenceAuthorityDto
 from .visual_profiles import DEFAULT_SERIES_VISUAL_PROFILE, DEFAULT_STYLE_PROFILE
 
 CURRENT_CONTRACT_VERSION = 5
@@ -112,12 +113,14 @@ class ReferenceBinding(StrictModel):
     usage: ReferenceUsage
     role: ReferenceRole
     apply_to: Annotated[ReferenceTarget, Field(alias="applyTo")]
+    authority: ReferenceAuthorityDto | None = None
 
 
 class LookReferenceBinding(StrictModel):
     asset_id: Annotated[UUID, Field(alias="assetId")]
     purpose: LookReferencePurpose
     instruction: Annotated[str, Field(max_length=1_000)] = ""
+    authority: ReferenceAuthorityDto | None = None
 
 
 class VisualProfileDraft(StrictModel):
@@ -434,9 +437,11 @@ class SceneAssetReadiness(StrictModel):
         default_factory=list,
         max_length=30,
     )
-    scene_look_status: Literal["approved", "missing", "stale"] = Field(
+    scene_look_status: Literal["approved", "missing", "stale", "off"] = Field(
         alias="sceneLookStatus"
     )
+    visual_asset_plan_current: bool = Field(alias="visualAssetPlanCurrent")
+    can_generate_scene_look: bool = Field(alias="canGenerateSceneLook")
     can_compile_shot_prompt: bool = Field(alias="canCompileShotPrompt")
     blockers: list[str] = Field(default_factory=list, max_length=30)
 
@@ -458,11 +463,11 @@ class ShotSuggestion(StrictModel):
     direction: Annotated[str, Field(min_length=1, max_length=6_000)]
     suggested_duration_seconds: Annotated[
         int,
-        Field(alias="suggestedDurationSeconds", ge=8, le=15),
-    ] = 8
+        Field(alias="suggestedDurationSeconds", ge=4, le=15),
+    ] = 4
     anchor_mode: AnchorMode = Field(default=AnchorMode.TEXT_ONLY, alias="anchorMode")
     scene_look_usage: SceneLookUsage = Field(
-        default=SceneLookUsage.APPEARANCE_ONLY,
+        default=SceneLookUsage.OFF,
         alias="sceneLookUsage",
     )
 
@@ -488,7 +493,7 @@ class ShotSuggestionOutput(StrictModel):
 class ShotCardDraft(StrictModel):
     title: Annotated[str, Field(min_length=1, max_length=100)]
     direction: Annotated[str, Field(min_length=1, max_length=6_000)]
-    duration_seconds: Annotated[int, Field(alias="durationSeconds", ge=8, le=15)] = 8
+    duration_seconds: Annotated[int, Field(alias="durationSeconds", ge=4, le=15)] = 4
     anchor_mode: AnchorMode = Field(default=AnchorMode.TEXT_ONLY, alias="anchorMode")
     reference_bindings: list[ReferenceBinding] = Field(
         default_factory=list,
@@ -499,7 +504,7 @@ class ShotCardDraft(StrictModel):
         alias="inheritProjectReferences",
     )
     scene_look_usage: SceneLookUsage = Field(
-        default=SceneLookUsage.APPEARANCE_ONLY,
+        default=SceneLookUsage.OFF,
         alias="sceneLookUsage",
     )
 
@@ -551,7 +556,7 @@ class ShotPacingBeat(StrictModel):
 class ShotPacingPlan(StrictModel):
     recommended_duration_seconds: Annotated[
         int,
-        Field(alias="recommendedDurationSeconds", ge=8, le=15),
+        Field(alias="recommendedDurationSeconds", ge=4, le=15),
     ]
     rationale: Annotated[str, Field(min_length=1, max_length=2_000)]
     beats: list[ShotPacingBeat] = Field(min_length=2, max_length=4)
@@ -586,7 +591,7 @@ class ShotAssistPatch(StrictModel):
     direction: Annotated[str | None, Field(min_length=1, max_length=6_000)] = None
     duration_seconds: Annotated[
         int | None,
-        Field(default=None, alias="durationSeconds", ge=8, le=15),
+        Field(default=None, alias="durationSeconds", ge=4, le=15),
     ]
     scene_look_usage: SceneLookUsage | None = Field(
         default=None,

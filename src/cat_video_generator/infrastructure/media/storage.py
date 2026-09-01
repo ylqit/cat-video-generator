@@ -153,8 +153,25 @@ class LocalAssetStore:
                 seconds = incoming.duration_ms / 1000
                 video_filters += f",fade=t=in:st=0:d={seconds:.3f}"
                 audio_filters += f",afade=t=in:st=0:d={seconds:.3f}"
+            if (
+                index == 0
+                and plan.intro_transition is not None
+                and plan.intro_transition.type is SequenceTransitionType.FADE_BLACK
+            ):
+                seconds = plan.intro_transition.duration_ms / 1000
+                video_filters += f",fade=t=in:st=0:d={seconds:.3f}"
+                audio_filters += f",afade=t=in:st=0:d={seconds:.3f}"
             if outgoing is not None and outgoing.type is SequenceTransitionType.FADE_BLACK:
                 seconds = outgoing.duration_ms / 1000
+                start = duration - seconds
+                video_filters += f",fade=t=out:st={start:.3f}:d={seconds:.3f}"
+                audio_filters += f",afade=t=out:st={start:.3f}:d={seconds:.3f}"
+            if (
+                index + 1 == len(plan.clips)
+                and plan.outro_transition is not None
+                and plan.outro_transition.type is SequenceTransitionType.FADE_BLACK
+            ):
+                seconds = plan.outro_transition.duration_ms / 1000
                 start = duration - seconds
                 video_filters += f",fade=t=out:st={start:.3f}:d={seconds:.3f}"
                 audio_filters += f",afade=t=out:st={start:.3f}:d={seconds:.3f}"

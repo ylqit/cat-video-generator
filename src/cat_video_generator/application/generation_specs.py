@@ -27,6 +27,7 @@ class ProviderInputMode(StrEnum):
     TEXT_ONLY = "text_only"
     REFERENCE_MEDIA = "reference_media"
     FIRST_FRAME = "first_frame"
+    FIRST_LAST_FRAME = "first_last_frame"
 
 
 @dataclass(frozen=True, slots=True)

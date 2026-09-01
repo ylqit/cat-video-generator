@@ -43,6 +43,8 @@ class StepStatus(StrEnum):
     PENDING = "pending"
     SUBMITTING = "submitting"
     SUBMISSION_UNKNOWN = "submission_unknown"
+    CANCELLING = "cancelling"
+    CANCELLATION_UNKNOWN = "cancellation_unknown"
     QUEUED = "queued"
     RUNNING = "running"
     AWAITING_REVIEW = "awaiting_review"
@@ -79,7 +81,12 @@ _RUN_TRANSITIONS = {
 }
 
 _STEP_TRANSITIONS = {
-    StepStatus.PENDING: {StepStatus.SUBMITTING, StepStatus.RUNNING, StepStatus.FAILED},
+    StepStatus.PENDING: {
+        StepStatus.SUBMITTING,
+        StepStatus.RUNNING,
+        StepStatus.FAILED,
+        StepStatus.CANCELLED,
+    },
     StepStatus.SUBMITTING: {
         StepStatus.SUBMISSION_UNKNOWN,
         StepStatus.QUEUED,
@@ -94,7 +101,22 @@ _STEP_TRANSITIONS = {
         StepStatus.FAILED,
         StepStatus.CANCELLED,
     },
+    StepStatus.CANCELLING: {
+        StepStatus.CANCELLATION_UNKNOWN,
+        StepStatus.RUNNING,
+        StepStatus.SUCCEEDED,
+        StepStatus.FAILED,
+        StepStatus.CANCELLED,
+    },
+    StepStatus.CANCELLATION_UNKNOWN: {
+        StepStatus.CANCELLING,
+        StepStatus.RUNNING,
+        StepStatus.SUCCEEDED,
+        StepStatus.FAILED,
+        StepStatus.CANCELLED,
+    },
     StepStatus.QUEUED: {
+        StepStatus.CANCELLING,
         StepStatus.RUNNING,
         StepStatus.AWAITING_REVIEW,
         StepStatus.SUCCEEDED,
@@ -103,6 +125,7 @@ _STEP_TRANSITIONS = {
         StepStatus.CANCELLED,
     },
     StepStatus.RUNNING: {
+        StepStatus.CANCELLING,
         StepStatus.SUCCEEDED,
         StepStatus.AWAITING_REVIEW,
         StepStatus.FAILED,

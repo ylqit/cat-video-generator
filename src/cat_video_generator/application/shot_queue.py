@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -40,11 +41,13 @@ from ..domain.contracts import (
     StoryProjectInput,
     StoryRewriteOutput,
     StoryRewriteStrategy,
+    VisualAssetAction,
     VisualAssetPlanOutput,
     VisualAssetPurpose,
     VisualProfileDraft,
 )
 from ..domain.creative_workflow import shot_snapshot_hash, story_source_hash
+from ..domain.production_recipes import SEEDANCE_2_0_CAPABILITY
 from ..domain.prompts import (
     CompiledPrompt,
     compile_anchor_prompt,
@@ -98,6 +101,30 @@ from .read_models import (
     shot_projection,
     step_projection,
 )
+
+_INTERNAL_CHARACTER_DESIGN_LABEL = re.compile(
+    r"character-design:[0-9a-fA-F-]{36}:(child|cat|pair_scale):candidate:\d+"
+)
+_CHARACTER_DESIGN_LABELS = {
+    "child": "本集儿童设计",
+    "cat": "本集猫咪设计",
+    "pair_scale": "一人一猫同框比例",
+}
+
+
+def _creator_prompt_preview(prompt: str) -> str:
+    """Render legacy storage keys as production roles without mutating history.
+
+    Historical production packages used semantic keys as visible reference
+    titles. They remain immutable audit records and are blocked from new paid
+    submission; this compatibility boundary only makes their editor preview
+    readable while the user recompiles the package through the normal flow.
+    """
+
+    return _INTERNAL_CHARACTER_DESIGN_LABEL.sub(
+        lambda match: _CHARACTER_DESIGN_LABELS[match.group(1)],
+        prompt,
+    )
 
 
 class GatewayUnavailableError(RuntimeError):
@@ -525,6 +552,10 @@ class ProjectEditingService:
         scene_id: uuid.UUID,
         *,
         allow_paid_generation: bool,
+        storyboard_revision_id: uuid.UUID,
+        structure_hash: str,
+        generation_plan_id: uuid.UUID,
+        generation_plan_hash: str,
     ) -> VisualAssetPlanResult:
         self._require_paid_director(
             allow_paid_generation,
@@ -533,31 +564,25 @@ class ProjectEditingService:
         scene = self._repository.get_scene(scene_id)
         project = self._repository.get_project(scene.project_id)
         profile = self._repository.get_visual_profile(project.id)
-        shots = tuple(sorted(self._repository.list_shots(scene.id), key=lambda item: item.order))
-        if not shots:
-            raise ValueError("视觉资产规划需要先接受分镜并建立视频片段")
-        current_shot_hash = shot_snapshot_hash(
-            (item.id, item.draft_revision, item.draft) for item in shots
-        )
-        accepted_storyboard = next(
-            (
-                step
-                for step in reversed(
-                    self._repository.list_steps(
-                        project_id=project.id,
-                        scene_id=scene.id,
-                    )
-                )
-                if step.operation_key == "director:shot-suggestions"
-                and step.status is StepStatus.SUCCEEDED
-                and isinstance(step.input_snapshot.get("acceptedOutput"), dict)
-                and step.input_snapshot["acceptedOutput"].get("appliedShotSnapshotHash")
-                == current_shot_hash
-            ),
-            None,
-        )
-        if accepted_storyboard is None:
-            raise ValueError("视觉资产规划需要当前视频片段来自已接受的分镜版本")
+        storyboard_context = self._repository.storyboard_production_context(scene.id)
+        if not storyboard_context.get("structureApproved"):
+            raise ValueError("视觉资产规划需要先批准当前分镜结构")
+        if not storyboard_context.get("generationPlanApproved"):
+            raise ValueError("视觉资产规划需要先批准 Agent 生成编排")
+        if int(storyboard_context.get("sceneGenerationClipCount") or 0) < 1:
+            raise ValueError("当前场景尚未被生成编排完整覆盖")
+        editorial_shots = list(storyboard_context.get("editorialShots") or [])
+        if not editorial_shots:
+            raise ValueError("当前场景没有已批准的导演分镜")
+        submitted_lineage = {
+            "storyboardRevisionId": str(storyboard_revision_id),
+            "structureHash": structure_hash,
+            "generationPlanId": str(generation_plan_id),
+            "generationPlanHash": generation_plan_hash,
+        }
+        for key, submitted in submitted_lineage.items():
+            if submitted != storyboard_context.get(key):
+                raise RevisionConflictError("页面中的分镜结构或生成编排已过期，请刷新后重试")
         self._assert_scene_stage_available(
             project_id=project.id,
             scene_id=scene.id,
@@ -577,9 +602,14 @@ class ProjectEditingService:
             project_title=project.title,
             scene=scene.draft,
             shot_summaries=tuple(
-                f"{item.order}. {item.draft.title}"
-                f"（{item.draft.duration_seconds}秒）：{item.draft.direction}"
-                for item in shots
+                f"{item['order']}. {item['title']}"
+                f"（{item['durationSeconds']}秒）："
+                f"{item.get('visualDescription') or ''}；"
+                f"儿童：{item.get('childAction') or ''}；"
+                f"猫咪：{item.get('catAction') or ''}；"
+                f"空间关系：{item.get('spatialRelation') or ''}；"
+                f"镜头：{item.get('camera') or ''}"
+                for item in editorial_shots
             ),
             visual_profile=profile.draft,
             existing_assets=tuple(
@@ -590,8 +620,10 @@ class ProjectEditingService:
         )
         snapshot = {
             "sceneStoryHash": story_source_hash(scene.draft),
-            "shotSnapshotHash": current_shot_hash,
-            "storyboardStepId": str(accepted_storyboard.id),
+            "storyboardRevisionId": storyboard_context["storyboardRevisionId"],
+            "structureHash": storyboard_context["structureHash"],
+            "generationPlanId": storyboard_context["generationPlanId"],
+            "generationPlanHash": storyboard_context["generationPlanHash"],
             "visualProfileRevisionId": str(profile.id),
             "visualProfileHash": profile.profile_hash,
             "existingAssetIds": [str(item.id) for item in existing_assets],
@@ -619,20 +651,85 @@ class ProjectEditingService:
         plan: AcceptedVisualAssetPlan,
     ) -> StoredStep:
         step = self._repository.get_step(step_id)
+        self._validate_visual_asset_plan_selection(step, plan, allow_accepted=False)
+        return self._repository.accept_visual_asset_plan(
+            step_id=step.id,
+            expected_storyboard_revision_id=uuid.UUID(
+                str(step.input_snapshot["storyboardRevisionId"])
+            ),
+            expected_structure_hash=str(step.input_snapshot["structureHash"]),
+            expected_generation_plan_id=uuid.UUID(
+                str(step.input_snapshot["generationPlanId"])
+            ),
+            expected_generation_plan_hash=str(
+                step.input_snapshot["generationPlanHash"]
+            ),
+            accepted_output=plan,
+        )
+
+    def revise_visual_asset_plan(
+        self,
+        step_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        plan: AcceptedVisualAssetPlan,
+        note: str = "",
+    ) -> StoredStep:
+        step = self._repository.get_step(step_id)
+        if step.attempt != expected_revision:
+            raise RevisionConflictError("视觉资产规划已更新，请基于最新规划版本重新应用修改")
+        if not isinstance(step.input_snapshot.get("acceptedOutput"), dict):
+            raise ValueError("只有已经采用的视觉资产规划才能创建人工修订版本")
+        assert step.scene_id is not None
+        accepted_steps = [
+            item
+            for item in self._repository.list_steps(
+                project_id=step.project_id,
+                scene_id=step.scene_id,
+            )
+            if item.operation_key == "director:visual-asset-plan"
+            and isinstance(item.input_snapshot.get("acceptedOutput"), dict)
+        ]
+        latest = max(accepted_steps, key=lambda item: item.attempt, default=None)
+        if latest is None or latest.id != step.id:
+            raise RevisionConflictError("视觉资产规划已更新，请基于最新规划版本重新应用修改")
+        self._validate_visual_asset_plan_selection(step, plan, allow_accepted=True)
+        return self._repository.revise_visual_asset_plan(
+            step_id=step.id,
+            expected_revision=expected_revision,
+            accepted_output=plan,
+            note=note.strip(),
+        )
+
+    def _validate_visual_asset_plan_selection(
+        self,
+        step: StoredStep,
+        plan: AcceptedVisualAssetPlan,
+        *,
+        allow_accepted: bool,
+    ) -> None:
         self._validate_scene_stage_step(
             step,
             operation_key="director:visual-asset-plan",
+            allow_accepted=allow_accepted,
         )
         assert step.scene_id is not None
         scene = self._repository.get_scene(step.scene_id)
-        current_shot_hash = shot_snapshot_hash(
-            (item.id, item.draft_revision, item.draft)
-            for item in self._repository.list_shots(scene.id)
-        )
-        expected_hash = str(step.input_snapshot.get("shotSnapshotHash") or "")
-        if current_shot_hash != expected_hash:
+        storyboard_context = self._repository.storyboard_production_context(scene.id)
+        if (
+            not storyboard_context.get("structureApproved")
+            or not storyboard_context.get("generationPlanApproved")
+            or storyboard_context.get("storyboardRevisionId")
+            != step.input_snapshot.get("storyboardRevisionId")
+            or storyboard_context.get("structureHash")
+            != step.input_snapshot.get("structureHash")
+            or storyboard_context.get("generationPlanId")
+            != step.input_snapshot.get("generationPlanId")
+            or storyboard_context.get("generationPlanHash")
+            != step.input_snapshot.get("generationPlanHash")
+        ):
             raise RevisionConflictError(
-                "video clips changed after visual asset planning; generate a new plan"
+                "分镜结构或生成编排在规划后已变化，请保留当前记录并建立新规划"
             )
         output = VisualAssetPlanOutput.model_validate(
             step.input_snapshot.get("providerOutput")
@@ -662,21 +759,15 @@ class ProjectEditingService:
             and item.status in {"approved", "ready"}
             and item.content_ready
         }
-        referenced_ids = {
-            asset_id
-            for item in plan.selections
-            for asset_id in (
-                *item.reference_asset_ids,
-                *(() if item.existing_asset_id is None else (item.existing_asset_id,)),
-            )
-        }
+        referenced_ids: set[uuid.UUID] = set()
+        for item in plan.selections:
+            if item.action is VisualAssetAction.GENERATE:
+                referenced_ids.update(item.reference_asset_ids)
+            elif item.action is VisualAssetAction.EXISTING:
+                assert item.existing_asset_id is not None
+                referenced_ids.add(item.existing_asset_id)
         if not referenced_ids.issubset(available_ids):
             raise ValueError("accepted visual asset plan contains unavailable references")
-        return self._repository.accept_visual_asset_plan(
-            step_id=step.id,
-            expected_shot_snapshot_hash=expected_hash,
-            accepted_output=plan,
-        )
 
     def scene_asset_readiness(self, scene_id: uuid.UUID) -> SceneAssetReadiness:
         return _scene_asset_readiness(self._repository, scene_id)
@@ -1129,6 +1220,7 @@ class ProjectEditingService:
         step: StoredStep,
         *,
         operation_key: str,
+        allow_accepted: bool = False,
     ) -> None:
         if (
             step.kind is not StepKind.DIRECTOR
@@ -1138,7 +1230,7 @@ class ProjectEditingService:
             or step.operation_key != operation_key
         ):
             raise ValueError(f"step is not a succeeded {operation_key} result")
-        if "acceptedAt" in step.input_snapshot:
+        if not allow_accepted and "acceptedAt" in step.input_snapshot:
             raise RevisionConflictError("creative workflow step has already been accepted")
 
     def _approved_story_step(self, scene: StoredScene) -> StoredStep | None:
@@ -1684,6 +1776,70 @@ class ShotProductionService:
             return
         raise ValueError("场景资产未就绪：" + "；".join(readiness.blockers))
 
+    def _generation_clip_production_context(
+        self,
+        shot: StoredShot,
+    ) -> dict[str, Any] | None:
+        load_context = getattr(
+            self._repository,
+            "generation_clip_production_context",
+            None,
+        )
+        if not callable(load_context):
+            return None
+        context = load_context(shot.id)
+        if not context.get("managedByStoryboard"):
+            return None
+        if not context.get("generationPlanApproved"):
+            raise ValueError("当前真实生成片段的 Agent 生成编排尚未批准")
+        if not context.get("productionPackageApproved"):
+            raise ValueError("当前真实生成片段的生产分镜包尚未批准")
+        if not context.get("lineageCurrent"):
+            raise ValueError("生产分镜包或编译 Prompt 已过期，请回到画布重新编译并批准")
+        if not context.get("compiledPrompt"):
+            raise ValueError("当前真实生成片段缺少已批准的编译 Prompt")
+        return context
+
+    def _compiled_production_reference_pairs(
+        self,
+        production_context: dict[str, Any],
+        *,
+        target: ReferenceTarget,
+    ) -> tuple[tuple[ReferenceBinding, StoredAsset], ...]:
+        """Restore the approved provider manifest without re-resolving or reordering it."""
+
+        role_map = {
+            "identity": ReferenceRole.IDENTITY,
+            "appearance": ReferenceRole.IDENTITY,
+            "style": ReferenceRole.STYLE,
+            "scene": ReferenceRole.SCENE,
+            "environment": ReferenceRole.SCENE,
+            "wardrobe": ReferenceRole.SCENE,
+            "prop": ReferenceRole.PROP,
+            "composition": ReferenceRole.COMPOSITION,
+            "scale": ReferenceRole.COMPOSITION,
+        }
+        pairs: list[tuple[ReferenceBinding, StoredAsset]] = []
+        for item in production_context.get("referenceBindings") or []:
+            if not isinstance(item, dict) or item.get("providerIncluded") is not True:
+                continue
+            asset = self._repository.get_asset(uuid.UUID(str(item["assetId"])))
+            pairs.append(
+                (
+                    ReferenceBinding(
+                        assetId=asset.id,
+                        usage=ReferenceUsage.GENERATION_REFERENCE,
+                        role=role_map.get(
+                            str(item.get("role") or item.get("semanticRole") or ""),
+                            ReferenceRole.COMPOSITION,
+                        ),
+                        applyTo=target,
+                    ),
+                    asset,
+                )
+            )
+        return tuple(pairs)
+
     def import_reference(
         self,
         *,
@@ -1764,8 +1920,16 @@ class ShotProductionService:
             "draft": scene.look_draft.model_dump(mode="json", by_alias=True),
         }
 
-    def preview_scene_look_prompt(self, scene_id: uuid.UUID) -> dict[str, Any]:
-        inputs = self._scene_look_inputs(scene_id, strict=False)
+    def _compile_scene_look_generation_input(
+        self,
+        scene_id: uuid.UUID,
+        *,
+        strict: bool,
+        regeneration_instruction: str | None = None,
+    ) -> tuple[SceneLookInputSet, Any, dict[str, Any], str]:
+        """Compile the exact ordered Scene Look request shared by preview and execution."""
+
+        inputs = self._scene_look_inputs(scene_id, strict=strict)
         project = self._repository.get_project(inputs.scene.project_id)
         prompt = compile_scene_look_prompt(
             project_title=project.title,
@@ -1774,31 +1938,81 @@ class ShotProductionService:
             look_plan=inputs.draft.look_plan,
             visual_profile=inputs.profile.draft,
             reference_descriptions=inputs.descriptions,
+            regeneration_instruction=regeneration_instruction,
         )
+        references = [
+            {
+                "assetId": str(asset.id),
+                "sha256": asset.sha256,
+                "semanticKey": asset.semantic_key,
+                "semanticRole": binding.purpose.value,
+                "purpose": binding.purpose.value,
+                "instruction": binding.instruction,
+                "ordinal": index,
+                "locked": True,
+                "providerIncluded": index <= 14,
+                "providerSlot": f"reference_image_{index}" if index <= 14 else None,
+                "omissionReason": (
+                    None
+                    if index <= 14
+                    else "必需引用超出 Seedream 14 张上限，生成已阻断"
+                ),
+                "origin": "scene_look_draft",
+                "contentUrl": f"/api/v1/assets/{asset.id}/content",
+                "evidenceLevel": "frozen",
+            }
+            for index, (binding, asset) in enumerate(
+                zip(inputs.bindings, inputs.assets, strict=True),
+                1,
+            )
+        ]
+        snapshot = {
+            "sceneId": str(inputs.scene.id),
+            "lookDraftRevision": inputs.scene.look_draft_revision,
+            "visualProfileRevisionId": str(inputs.profile.id),
+            "visualProfileRevision": inputs.profile.revision,
+            "lookPlan": inputs.draft.look_plan.model_dump(mode="json", by_alias=True),
+            "references": references,
+            "referenceAssetIds": [item["assetId"] for item in references],
+            "promptSha256": hashlib.sha256(prompt.text.encode("utf-8")).hexdigest(),
+            "provider": self._provider_name,
+            "model": (
+                "unconfigured" if self._gateway is None else self._gateway.image_model
+            ),
+            "capabilityRevision": "seedream-reference-images-v1",
+        }
+        return inputs, prompt, snapshot, _hash_json({"prompt": prompt.text, "snapshot": snapshot})
+
+    def preview_scene_look_prompt(self, scene_id: uuid.UUID) -> dict[str, Any]:
+        inputs, prompt, snapshot, input_hash = self._compile_scene_look_generation_input(
+            scene_id,
+            strict=False,
+        )
+        readiness = _scene_asset_readiness_if_available(self._repository, scene_id)
         return {
             "prompt": prompt.text,
             "charCount": prompt.char_count,
             "utf8Bytes": prompt.utf8_bytes,
-            "referenceCount": len(inputs.assets),
+            "referenceCount": sum(
+                reference["providerIncluded"] for reference in snapshot["references"]
+            ),
             "references": [
-                {
-                    "index": index,
-                    "assetId": str(asset.id),
-                    "sha256": asset.sha256,
-                    "semanticKey": asset.semantic_key,
-                    "purpose": binding.purpose.value,
-                    "instruction": binding.instruction,
-                    "contentReady": asset.content_ready,
-                }
-                for index, (binding, asset) in enumerate(
-                    zip(inputs.bindings, inputs.assets, strict=True),
-                    1,
-                )
+                {**reference, "index": reference["ordinal"], "contentReady": True}
+                for reference in snapshot["references"]
             ],
-            "warnings": list(inputs.warnings),
+            "warnings": [
+                *inputs.warnings,
+                *(() if readiness is None else _scene_look_asset_blockers(readiness)),
+            ],
             "visualProfileRevisionId": str(inputs.profile.id),
             "visualProfileRevision": inputs.profile.revision,
             "draftRevision": inputs.scene.look_draft_revision,
+            "provider": self._provider_name,
+            "model": (
+                "unconfigured" if self._gateway is None else self._gateway.image_model
+            ),
+            "capabilityRevision": snapshot["capabilityRevision"],
+            "inputHash": input_hash,
         }
 
     def validate_scene_look_request(self, scene_id: uuid.UUID, draft_revision: int) -> None:
@@ -1807,6 +2021,11 @@ class ShotProductionService:
             raise RevisionConflictError("请先保存场景视觉基准草稿再生成")
         if scene.look_draft_revision != draft_revision:
             raise RevisionConflictError("场景视觉基准草稿已更新，请重新预览后再生成")
+        readiness = _scene_asset_readiness_if_available(self._repository, scene_id)
+        if readiness is not None:
+            blockers = _scene_look_asset_blockers(readiness)
+            if blockers:
+                raise ValueError("场景视觉资产未就绪：" + "；".join(blockers))
         self._scene_look_inputs(scene_id, strict=True)
 
     def preview_shot_prompt(
@@ -1826,17 +2045,23 @@ class ShotProductionService:
             shot,
             shot_read_model=read_model,
         )
+        try:
+            production_context = self._generation_clip_production_context(shot)
+        except ValueError:
+            production_context = None
         spec = self._compile_shot_generation(
             shot,
             target=target,
             regeneration_instruction=regeneration_instruction,
             require_ready=False,
             compilation=compilation,
+            production_context=production_context,
         )
         return self._prompt_preview_projection(
             shot=shot,
             compilation=compilation,
             spec=spec,
+            production_context=production_context,
             previous_tail=_tail_state_json(
                 _previous_tail_state_from_shot_read_model(read_model)
                 if read_model is not None
@@ -1850,6 +2075,7 @@ class ShotProductionService:
         shot: StoredShot,
         compilation: ShotCompilationContext,
         spec: ShotGenerationSpec,
+        production_context: dict[str, Any] | None,
         previous_tail: dict[str, Any],
     ) -> dict[str, Any]:
         local_analysis = analyze_shot_draft(shot.draft)
@@ -1858,7 +2084,9 @@ class ShotProductionService:
             scene=compilation.scene,
             project=compilation.project,
             spec=spec,
+            production_context=production_context,
         )
+        prompt_preview = _creator_prompt_preview(spec.prompt.text)
         return {
             "target": spec.target.value,
             "providerInputMode": spec.provider_input_mode.value,
@@ -1866,8 +2094,8 @@ class ShotProductionService:
             "blockers": list(spec.blockers),
             "inputHash": spec.input_hash,
             "sourceRevisionHash": spec.source_revision_hash,
-            "prompt": spec.prompt.text,
-            "creativeBody": spec.creative_body,
+            "prompt": prompt_preview,
+            "creativeBody": _creator_prompt_preview(spec.creative_body),
             "systemShell": spec.system_shell,
             "charCount": spec.prompt.char_count,
             "utf8Bytes": spec.prompt.utf8_bytes,
@@ -1885,6 +2113,21 @@ class ShotProductionService:
             "actualInputCount": spec.actual_input_count,
             "references": references,
             "actualInputs": references,
+            "upstreamLineage": (
+                []
+                if production_context is None
+                else list(production_context.get("referenceBindings") or [])
+            ),
+            "providerReferencePolicy": (
+                "approved_anchor_only_baked_lineage"
+                if spec.target is ReferenceTarget.VIDEO
+                and shot.selected_anchor_asset_id is not None
+                and production_context is not None
+                else "compiled_production_references"
+                if production_context is not None
+                else "draft_reference_resolution"
+            ),
+            "legacyPromptLabels": prompt_preview != spec.prompt.text,
             "previousTail": previous_tail,
         }
 
@@ -1895,7 +2138,17 @@ class ShotProductionService:
         scene: StoredScene,
         project: StoredProject,
         spec: ShotGenerationSpec,
+        production_context: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
+        manifest_by_asset = {
+            str(item.get("assetId")): item
+            for item in (
+                []
+                if production_context is None
+                else production_context.get("referenceBindings") or []
+            )
+            if isinstance(item, dict) and item.get("assetId")
+        }
         return [
             {
                 "index": index,
@@ -1906,6 +2159,14 @@ class ShotProductionService:
                 "sourceLayer": _shot_assist_asset_layer(shot, scene, project, asset),
                 "responsibility": spec.descriptions[index - 1],
                 "contentReady": asset.content_ready,
+                "sha256": asset.sha256,
+                "purpose": manifest_by_asset.get(str(asset.id), {}).get("purpose"),
+                "providerIncluded": True,
+                "providerSlot": (
+                    manifest_by_asset.get(str(asset.id), {}).get("providerSlot")
+                    or f"reference_image_{index}"
+                ),
+                "locked": manifest_by_asset.get(str(asset.id), {}).get("locked", False),
             }
             for index, asset in enumerate(spec.sources, 1)
         ]
@@ -1943,17 +2204,23 @@ class ShotProductionService:
                     shot,
                     read_model=read_model,
                 )
+                try:
+                    production_context = self._generation_clip_production_context(shot)
+                except ValueError:
+                    production_context = None
                 spec = self._compile_shot_generation(
                     shot,
                     target=ReferenceTarget.VIDEO,
                     require_ready=False,
                     compilation=compilation,
+                    production_context=production_context,
                 )
                 references = self._spec_reference_projection(
                     shot=shot,
                     scene=scene,
                     project=read_model.project,
                     spec=spec,
+                    production_context=production_context,
                 )
                 latest_attempts_by_operation: dict[str, dict[str, Any]] = {}
                 for item in reversed(shot_data["attempts"]):
@@ -2195,28 +2462,36 @@ class ShotProductionService:
         )
         previous_tail_state = _previous_tail_state_from_shot_read_model(read_model)
         previous_tail = _tail_state_json(previous_tail_state)
+        try:
+            production_context = self._generation_clip_production_context(shot)
+        except ValueError:
+            production_context = None
         anchor_spec = self._compile_shot_generation(
             shot,
             target=ReferenceTarget.ANCHOR,
             require_ready=False,
             compilation=compilation,
+            production_context=production_context,
         )
         video_spec = self._compile_shot_generation(
             shot,
             target=ReferenceTarget.VIDEO,
             require_ready=False,
             compilation=compilation,
+            production_context=production_context,
         )
         anchor_preview = self._prompt_preview_projection(
             shot=shot,
             compilation=compilation,
             spec=anchor_spec,
+            production_context=production_context,
             previous_tail=previous_tail,
         )
         video_preview = self._prompt_preview_projection(
             shot=shot,
             compilation=compilation,
             spec=video_spec,
+            production_context=production_context,
             previous_tail=previous_tail,
         )
         prompts_by_step = {item.step_id: item for item in read_model.prompts}
@@ -2557,12 +2832,14 @@ class ShotProductionService:
     ) -> None:
         self._require_paid_gateway(allow_paid_generation)
         shot = self._repository.get_shot(shot_id)
+        production_context = self._generation_clip_production_context(shot)
         self._assert_scene_assets_ready(shot.scene_id)
         spec = self._compile_shot_generation(
             shot,
             target=ReferenceTarget.ANCHOR,
             regeneration_instruction=regeneration_instruction,
             require_ready=True,
+            production_context=production_context,
         )
         self._assert_expected_input_hash(spec, expected_input_hash)
 
@@ -2580,12 +2857,14 @@ class ShotProductionService:
             )
         self._require_paid_gateway(allow_paid_generation)
         shot = self._repository.get_shot(shot_id)
+        production_context = self._generation_clip_production_context(shot)
         self._assert_scene_assets_ready(shot.scene_id)
         spec = self._compile_shot_generation(
             shot,
             target=ReferenceTarget.VIDEO,
             regeneration_instruction=regeneration_instruction,
             require_ready=True,
+            production_context=production_context,
         )
         self._assert_expected_input_hash(spec, expected_input_hash)
 
@@ -2601,12 +2880,14 @@ class ShotProductionService:
     ) -> dict[str, Any]:
         shot = self._repository.get_shot(shot_id)
         self._require_paid_gateway(allow_paid_generation)
+        production_context = self._generation_clip_production_context(shot)
         self._assert_scene_assets_ready(shot.scene_id)
         spec = self._compile_shot_generation(
             shot,
             target=ReferenceTarget.ANCHOR,
             regeneration_instruction=reason if regenerate else None,
             require_ready=True,
+            production_context=production_context,
         )
         self._assert_expected_input_hash(spec, expected_input_hash)
         step, _ = self._new_paid_step(
@@ -2659,6 +2940,14 @@ class ShotProductionService:
                     "qc": qc,
                     "providerUrl": result.url,
                     "syntheticFixture": self._provider_name == "local-fake-provider",
+                    "generationInputHash": spec.input_hash,
+                    "referenceManifest": spec.snapshot.get(
+                        "providerReferenceManifest", []
+                    ),
+                    "upstreamLineage": spec.snapshot.get(
+                        "productionReferenceBindings", []
+                    ),
+                    "providerOrderEvidence": "frozen",
                     "advisories": (
                         ["画面边缘大面积接近纯黑，请人工确认是否存在异常黑边"]
                         if qc.get("blackBorderDetected")
@@ -2693,43 +2982,23 @@ class ShotProductionService:
         draft_revision: int,
         regenerate: bool = False,
         reason: str | None = None,
+        expected_input_hash: str | None = None,
     ) -> dict[str, Any]:
         self.validate_scene_look_request(scene_id, draft_revision)
         self._require_paid_gateway(allow_paid_generation)
-        inputs = self._scene_look_inputs(scene_id, strict=True)
+        if expected_input_hash is None:
+            raise ValueError("付费生成必须先查看服务端 Scene Look 输入预览")
+        inputs, prompt, snapshot, input_hash = self._compile_scene_look_generation_input(
+            scene_id,
+            strict=True,
+            regeneration_instruction=reason if regenerate else None,
+        )
+        if input_hash != expected_input_hash:
+            raise RevisionConflictError("Scene Look 输入已变化，请重新查看引用、Prompt 与费用")
         scene = inputs.scene
         project = self._repository.get_project(scene.project_id)
         references = inputs.assets
-        prompt = compile_scene_look_prompt(
-            project_title=project.title,
-            scene_title=scene.draft.title,
-            scene_text=scene.draft.source_text,
-            look_plan=inputs.draft.look_plan,
-            visual_profile=inputs.profile.draft,
-            reference_descriptions=inputs.descriptions,
-            regeneration_instruction=reason if regenerate else None,
-        )
-        snapshot = {
-            "sceneId": str(scene.id),
-            "lookDraftRevision": scene.look_draft_revision,
-            "visualProfileRevisionId": str(inputs.profile.id),
-            "visualProfileRevision": inputs.profile.revision,
-            "lookPlan": inputs.draft.look_plan.model_dump(mode="json", by_alias=True),
-            "references": [
-                {
-                    "assetId": str(asset.id),
-                    "sha256": asset.sha256,
-                    "semanticKey": asset.semantic_key,
-                    "purpose": binding.purpose.value,
-                    "instruction": binding.instruction,
-                }
-                for binding, asset in zip(inputs.bindings, references, strict=True)
-            ],
-            "referenceAssetIds": [str(item.id) for item in references],
-            "promptSha256": hashlib.sha256(prompt.text.encode("utf-8")).hexdigest(),
-        }
         operation_key = "image:scene-look"
-        input_hash = _hash_json({"prompt": prompt.text, "snapshot": snapshot})
         operation_steps = [
             item
             for item in self._repository.list_steps(
@@ -2836,6 +3105,9 @@ class ShotProductionService:
                     "lookDraftRevision": scene.look_draft_revision,
                     "promptSha256": snapshot["promptSha256"],
                     "referenceAssetIds": snapshot["referenceAssetIds"],
+                    "generationInputHash": input_hash,
+                    "referenceManifest": snapshot["references"],
+                    "providerOrderEvidence": "frozen",
                 },
             )
             self._repository.update_step(step.id, status=StepStatus.AWAITING_REVIEW)
@@ -2883,6 +3155,7 @@ class ShotProductionService:
         allow_paid_generation: bool,
         regenerate: bool = False,
         reason: str | None = None,
+        expected_input_hash: str | None = None,
     ) -> dict[str, Any]:
         self._require_paid_gateway(allow_paid_generation)
         spec = self._compile_reference_image(
@@ -2892,6 +3165,10 @@ class ShotProductionService:
             draft=draft,
             regeneration_instruction=reason if regenerate else None,
         )
+        if expected_input_hash is None:
+            raise ValueError("付费生成必须先查看服务端参考图输入预览")
+        if spec.input_hash != expected_input_hash:
+            raise RevisionConflictError("参考图输入已变化，请重新查看有序引用、Prompt 与费用")
         steps = [
             item
             for item in self._repository.list_steps(project_id=project_id)
@@ -3018,6 +3295,26 @@ class ShotProductionService:
                     ).hexdigest(),
                     "sourceRevision": spec.draft.source_revision,
                     "referenceAssetIds": [str(item.id) for item in spec.sources],
+                    "generationInputHash": spec.input_hash,
+                    "referenceManifest": [
+                        {
+                            "assetId": str(source.id),
+                            "sha256": source.sha256,
+                            "semanticRole": spec.draft.purpose.value,
+                            "purpose": spec.draft.purpose.value,
+                            "instruction": spec.descriptions[index - 1],
+                            "ordinal": index,
+                            "locked": False,
+                            "providerIncluded": True,
+                            "providerSlot": f"reference_image_{index}",
+                            "omissionReason": None,
+                            "origin": "visual_asset_plan",
+                            "contentUrl": f"/api/v1/assets/{source.id}/content",
+                            "evidenceLevel": "frozen",
+                        }
+                        for index, source in enumerate(spec.sources, 1)
+                    ],
+                    "providerOrderEvidence": "frozen",
                     "providerModel": result.model,
                     "providerUrl": result.url,
                     "syntheticFixture": self._provider_name == "local-fake-provider",
@@ -3061,6 +3358,12 @@ class ShotProductionService:
         scene = None if scene_id is None else self._repository.get_scene(scene_id)
         if scene is not None and scene.project_id != project.id:
             raise ValueError("scene belongs to another project")
+        self._validate_visual_asset_plan_reference(
+            project_id=project.id,
+            scene_id=scene_id,
+            scope=scope,
+            draft=draft,
+        )
         profile = self._repository.get_visual_profile(project.id)
         available = {
             item.id: item
@@ -3147,6 +3450,110 @@ class ShotProductionService:
             input_hash=input_hash,
         )
 
+    def preview_reference_image(
+        self,
+        *,
+        project_id: uuid.UUID,
+        scene_id: uuid.UUID | None,
+        scope: str,
+        draft: ReferenceImageDraft,
+        regeneration_instruction: str | None = None,
+    ) -> dict[str, Any]:
+        spec = self._compile_reference_image(
+            project_id=project_id,
+            scene_id=scene_id,
+            scope=scope,
+            draft=draft,
+            regeneration_instruction=regeneration_instruction,
+        )
+        references = [
+            {
+                "assetId": str(asset.id),
+                "sha256": asset.sha256,
+                "semanticRole": spec.draft.purpose.value,
+                "purpose": spec.draft.purpose.value,
+                "instruction": spec.descriptions[index - 1],
+                "ordinal": index,
+                "locked": False,
+                "providerIncluded": True,
+                "providerSlot": f"reference_image_{index}",
+                "omissionReason": None,
+                "origin": "visual_asset_plan",
+                "contentUrl": f"/api/v1/assets/{asset.id}/content",
+                "evidenceLevel": "frozen",
+            }
+            for index, asset in enumerate(spec.sources, 1)
+        ]
+        return {
+            "provider": self._provider_name,
+            "model": self._gateway.image_model,
+            "mode": "image_to_image" if references else "text_to_image",
+            "capabilityRevision": "seedream-reference-images-v1",
+            "prompt": spec.prompt.text,
+            "references": references,
+            "blockers": [],
+            "warnings": [],
+            "estimatedCostMicros": None,
+            "inputHash": spec.input_hash,
+            "operationKey": spec.operation_key,
+        }
+
+    def _validate_visual_asset_plan_reference(
+        self,
+        *,
+        project_id: uuid.UUID,
+        scene_id: uuid.UUID | None,
+        scope: str,
+        draft: ReferenceImageDraft,
+    ) -> None:
+        try:
+            source_step_id = uuid.UUID(draft.source_revision)
+        except ValueError:
+            return
+        step = self._repository.get_step(source_step_id)
+        if step.operation_key != "director:visual-asset-plan":
+            return
+        if step.project_id != project_id or step.scene_id is None:
+            raise ValueError("视觉资产生成来源不属于当前项目场景")
+        accepted = step.input_snapshot.get("acceptedOutput")
+        if not isinstance(accepted, dict):
+            raise RevisionConflictError("请先人工接受该视觉资产规划，再生成参考图")
+        storyboard_context = self._repository.storyboard_production_context(step.scene_id)
+        if (
+            not storyboard_context.get("structureApproved")
+            or not storyboard_context.get("generationPlanApproved")
+            or storyboard_context.get("storyboardRevisionId")
+            != step.input_snapshot.get("storyboardRevisionId")
+            or storyboard_context.get("structureHash")
+            != step.input_snapshot.get("structureHash")
+            or storyboard_context.get("generationPlanId")
+            != step.input_snapshot.get("generationPlanId")
+            or storyboard_context.get("generationPlanHash")
+            != step.input_snapshot.get("generationPlanHash")
+        ):
+            raise RevisionConflictError(
+                "分镜结构或生成编排已更新，请保留当前规划记录并建立新规划"
+            )
+        plan = AcceptedVisualAssetPlan.model_validate(accepted)
+        matching = [
+            item
+            for item in plan.selections
+            if item.display_name == draft.display_name
+            and item.purpose is draft.purpose
+            and item.action.value == "generate"
+        ]
+        if len(matching) != 1:
+            raise ValueError("当前图片不属于已接受规划中的唯一生成项")
+        selection = matching[0]
+        expected_scene_id = step.scene_id if selection.target_scope.value == "scene" else None
+        if scope != selection.target_scope.value or scene_id != expected_scene_id:
+            raise ValueError("图片作用范围与已接受的视觉资产规划不一致")
+        if (
+            selection.prompt != draft.prompt
+            or selection.reference_asset_ids != draft.reference_asset_ids
+        ):
+            raise RevisionConflictError("视觉资产选择稿已变化，请重新保存规划后再生成")
+
     def generate_video(
         self,
         shot_id: uuid.UUID,
@@ -3163,12 +3570,14 @@ class ShotProductionService:
             )
         self._require_paid_gateway(allow_paid_generation)
         shot = self._repository.get_shot(shot_id)
+        production_context = self._generation_clip_production_context(shot)
         self._assert_scene_assets_ready(shot.scene_id)
         spec = self._compile_shot_generation(
             shot,
             target=ReferenceTarget.VIDEO,
             regeneration_instruction=reason if regenerate else None,
             require_ready=True,
+            production_context=production_context,
         )
         self._assert_expected_input_hash(spec, expected_input_hash)
         if spec.input_plan is None:
@@ -3230,7 +3639,11 @@ class ShotProductionService:
                 return {"stepId": str(step.id), "status": "failed", "taskId": task.task_id}
             if not task.video_url:
                 raise ValueError("succeeded provider task has no downloadable video URL")
-            return self._land_video(step, task.video_url)
+            return self._land_video(
+                step,
+                task.video_url,
+                last_frame_url=task.last_frame_url,
+            )
 
     def _continue_submitted_video(
         self,
@@ -3254,7 +3667,11 @@ class ShotProductionService:
         if submitted_status is StepStatus.RUNNING:
             self._repository.update_step(step.id, status=StepStatus.RUNNING)
         if submitted_status is StepStatus.SUCCEEDED and task.video_url:
-            return self._land_video(self._repository.get_step(step.id), task.video_url)
+            return self._land_video(
+                self._repository.get_step(step.id),
+                task.video_url,
+                last_frame_url=task.last_frame_url,
+            )
         return self.resume_step(step.id, wait=False)
 
     def decide_asset(
@@ -3544,7 +3961,13 @@ class ShotProductionService:
             raise
         return self._continue_submitted_video(step, task)
 
-    def _land_video(self, step: StoredStep, video_url: str) -> dict[str, Any]:
+    def _land_video(
+        self,
+        step: StoredStep,
+        video_url: str,
+        *,
+        last_frame_url: str | None = None,
+    ) -> dict[str, Any]:
         if step.shot_card_id is None:
             raise ValueError("video step is not bound to a shot card")
         shot = self._repository.get_shot(step.shot_card_id)
@@ -3559,6 +3982,12 @@ class ShotProductionService:
         if existing_asset is not None:
             if step.status in {StepStatus.QUEUED, StepStatus.RUNNING}:
                 self._repository.update_step(step.id, status=StepStatus.AWAITING_REVIEW)
+            tail_frame = self._provider_tail_result(
+                source_video=existing_asset,
+                shot_id=shot.id,
+                step_id=step.id,
+                last_frame_url=last_frame_url,
+            )
             return {
                 "stepId": str(step.id),
                 "taskId": step.provider_task_id,
@@ -3566,6 +3995,7 @@ class ShotProductionService:
                 "status": "awaiting_review",
                 "qc": existing_asset.metadata.get("qc", {}),
                 "reused": True,
+                "tailFrame": tail_frame,
             }
         landed = self._asset_store.download(video_url, suffix=".mp4")
         if step.operation_key == "video:range-edit":
@@ -3625,6 +4055,14 @@ class ShotProductionService:
                     video_url if step.operation_key == "video:range-edit" else None
                 ),
                 "taskId": step.provider_task_id,
+                "generationInputHash": step.input_snapshot.get("inputHash"),
+                "referenceManifest": step.input_snapshot.get(
+                    "providerReferenceManifest", []
+                ),
+                "upstreamLineage": step.input_snapshot.get(
+                    "productionReferenceBindings", []
+                ),
+                "providerOrderEvidence": "frozen",
                 "rangeEdit": (
                     None
                     if step.operation_key != "video:range-edit"
@@ -3638,13 +4076,89 @@ class ShotProductionService:
         )
         self._repository.update_step(step.id, status=StepStatus.AWAITING_REVIEW)
         self._record_video_review(shot, step, asset)
+        tail_frame = self._provider_tail_result(
+            source_video=asset,
+            shot_id=shot.id,
+            step_id=step.id,
+            last_frame_url=last_frame_url,
+        )
         return {
             "stepId": str(step.id),
             "taskId": step.provider_task_id,
             "assetId": str(asset.id),
             "status": "awaiting_review",
             "qc": qc,
+            "tailFrame": tail_frame,
         }
+
+    def _provider_tail_result(
+        self,
+        *,
+        source_video: StoredAsset,
+        shot_id: uuid.UUID,
+        step_id: uuid.UUID,
+        last_frame_url: str | None,
+    ) -> dict[str, Any] | None:
+        if not last_frame_url:
+            return None
+        try:
+            tail = self._land_provider_tail_frame(
+                source_video=source_video,
+                shot_id=shot_id,
+                step_id=step_id,
+                last_frame_url=last_frame_url,
+            )
+            return {"status": "ready", "assetId": str(tail.id), "source": "provider"}
+        except Exception as exc:
+            return {"status": "unavailable", "error": _error_payload(exc)}
+
+    def _land_provider_tail_frame(
+        self,
+        *,
+        source_video: StoredAsset,
+        shot_id: uuid.UUID,
+        step_id: uuid.UUID,
+        last_frame_url: str,
+    ) -> StoredAsset:
+        if source_video.media_type != "video":
+            raise ValueError("供应商尾帧必须关联一个视频版本")
+        existing = next(
+            (
+                asset
+                for asset in reversed(self._repository.list_assets(shot_id=shot_id))
+                if asset.role == "shot_tail_frame"
+                and asset.metadata.get("sourceVideoAssetId") == str(source_video.id)
+                and asset.metadata.get("sourceVideoSha256") == source_video.sha256
+                and asset.content_ready
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing
+        landed = self._asset_store.download(last_frame_url, suffix=".png")
+        qc = self._media_probe.inspect_image(landed.path)
+        if qc.get("passed") is False:
+            raise ValueError(f"供应商返回尾帧技术检查失败：{qc}")
+        duration_ms = source_video.metadata.get("qc", {}).get("durationMs")
+        return self._repository.add_asset(
+            landed=landed,
+            role="shot_tail_frame",
+            media_type="image",
+            scope="shot",
+            status="approved",
+            project_id=source_video.project_id,
+            scene_id=source_video.scene_id,
+            shot_id=shot_id,
+            step_id=step_id,
+            semantic_key=f"shot:{shot_id}:tail:{source_video.id}",
+            metadata={
+                "sourceVideoAssetId": str(source_video.id),
+                "sourceVideoSha256": source_video.sha256,
+                "providerReturned": True,
+                "timestampMs": duration_ms,
+                "qc": qc,
+            },
+        )
 
     def _record_video_review(
         self,
@@ -3655,8 +4169,75 @@ class ShotProductionService:
         if self._frame_extractor is None:
             return
         frames: tuple[Path, ...] = ()
+        editorial_frames: tuple[Path, ...] = ()
         try:
             duration_ms = int(asset.metadata["qc"]["durationMs"])
+            production_context = self._repository.generation_clip_production_context(
+                shot.id
+            )
+            compiled_shot = production_context.get("compiledShot")
+            director_shots = (
+                compiled_shot.get("directorShots")
+                if isinstance(compiled_shot, dict)
+                else None
+            )
+            thumbnail_windows = [
+                item
+                for item in (director_shots or [])[1:]
+                if isinstance(item, dict)
+                and item.get("beatId")
+                and isinstance(item.get("startSecond"), int)
+                and isinstance(item.get("endSecond"), int)
+                and item["endSecond"] > item["startSecond"]
+            ]
+            if thumbnail_windows:
+                timestamps_ms = tuple(
+                    min(
+                        duration_ms - 1,
+                        max(
+                            0,
+                            round(
+                                (
+                                    int(item["startSecond"])
+                                    + int(item["endSecond"])
+                                )
+                                * 500
+                            ),
+                        ),
+                    )
+                    for item in thumbnail_windows
+                )
+                editorial_frames = self._frame_extractor.extract_frames_at(
+                    asset,
+                    timestamps_ms=timestamps_ms,
+                )
+                for window, timestamp_ms, frame in zip(
+                    thumbnail_windows,
+                    timestamps_ms,
+                    editorial_frames,
+                    strict=True,
+                ):
+                    beat_id = str(window["beatId"])
+                    self._repository.add_asset(
+                        landed=self._asset_store.import_local(frame),
+                        role="editorial_thumbnail",
+                        media_type="image",
+                        scope="shot",
+                        status="ready",
+                        project_id=shot.project_id,
+                        scene_id=shot.scene_id,
+                        shot_id=shot.id,
+                        step_id=step.id,
+                        semantic_key=(
+                            f"shot:{shot.id}:video:{asset.id}:editorial:{beat_id}"
+                        ),
+                        metadata={
+                            "sourceVideoAssetId": str(asset.id),
+                            "shotBeatId": beat_id,
+                            "timestampMs": timestamp_ms,
+                            "localExtraction": True,
+                        },
+                    )
             duration_seconds = math.ceil(duration_ms / 1000)
             count = min(8, max(6, math.ceil(duration_seconds / 3) + 3))
             frames = self._frame_extractor.extract_review_frames(asset, count=count)
@@ -3681,9 +4262,53 @@ class ShotProductionService:
                 )
             if not self._semantic_review_enabled or self._gateway is None:
                 return
+            diagnostic_reference_assets: list[StoredAsset] = []
+            diagnostic_reference_labels: list[str] = []
+            seen_reference_hashes: set[str] = set()
+            visual_profile = self._repository.get_visual_profile(shot.project_id)
+            for binding in visual_profile.draft.reference_bindings:
+                reference_asset = self._repository.get_asset(binding.asset_id)
+                if (
+                    reference_asset.semantic_key
+                    and reference_asset.semantic_key.startswith("style_source:")
+                ):
+                    continue
+                if (
+                    not reference_asset.content_ready
+                    or reference_asset.sha256 in seen_reference_hashes
+                ):
+                    continue
+                seen_reference_hashes.add(reference_asset.sha256)
+                diagnostic_reference_assets.append(reference_asset)
+                diagnostic_reference_labels.append(
+                    f"Canon {binding.purpose.value}：{reference_asset.display_name}"
+                )
+            for design_asset in self._repository.approved_character_design_assets(
+                shot.project_id
+            ):
+                if not design_asset.content_ready or design_asset.sha256 in seen_reference_hashes:
+                    continue
+                seen_reference_hashes.add(design_asset.sha256)
+                slot = str(
+                    design_asset.metadata.get("characterDesignSlot")
+                    or design_asset.metadata.get("slot")
+                    or design_asset.role
+                )
+                diagnostic_reference_assets.append(design_asset)
+                diagnostic_reference_labels.append(
+                    f"已批准本集设计 {slot}：{design_asset.display_name}"
+                )
             result = self._gateway.diagnose_video_frames(
-                prompt=compile_video_review_prompt(self._prompt_context(shot)),
+                prompt=(
+                    compile_video_review_prompt(self._prompt_context(shot))
+                    + "\n固定特征发生真实改变时标记 mismatch；图片信息不足时标记 uncertain；"
+                    "不要仅根据文字推测 consistent。AI 结果只进入人工审核。"
+                ),
                 frame_paths=frames,
+                reference_paths=tuple(
+                    asset.require_path() for asset in diagnostic_reference_assets
+                ),
+                reference_labels=tuple(diagnostic_reference_labels),
             )
             warnings = tuple(
                 {"severity": "suggestion", "message": item} for item in result.violations
@@ -3699,6 +4324,9 @@ class ShotProductionService:
                     "confidence": result.confidence,
                     "evidence": list(result.evidence),
                     "shotBoundariesSeconds": list(result.shot_boundaries_seconds),
+                    "identityReferenceAssetIds": [
+                        str(item.id) for item in diagnostic_reference_assets
+                    ],
                 },
             )
         except Exception as exc:
@@ -3712,7 +4340,7 @@ class ShotProductionService:
                 evidence={},
             )
         finally:
-            for frame in frames:
+            for frame in (*editorial_frames, *frames):
                 frame.unlink(missing_ok=True)
 
     def _record_anchor_review(
@@ -3747,6 +4375,7 @@ class ShotProductionService:
                 ),
                 evidence={
                     "confidence": result.confidence,
+                    "identityAssessment": result.identity_assessment,
                     "evidence": list(result.evidence),
                     "requestHash": result.request_hash,
                 },
@@ -3770,6 +4399,7 @@ class ShotProductionService:
         regeneration_instruction: str | None = None,
         require_ready: bool,
         compilation: ShotCompilationContext | None = None,
+        production_context: dict[str, Any] | None = None,
     ) -> ShotGenerationSpec:
         """Compile the exact assets, prompt and audit snapshot for one target."""
 
@@ -3782,18 +4412,28 @@ class ShotProductionService:
         scene = compilation.scene
         project = compilation.project
         context = self._prompt_context(shot, compilation=compilation)
+        if target is ReferenceTarget.VIDEO and production_context is not None:
+            context = context.model_copy(
+                update={"direction": str(production_context["compiledPrompt"])}
+            )
         blockers: list[str] = []
         warnings: tuple[str, ...] = ()
 
         if target is ReferenceTarget.ANCHOR:
             if shot.draft.anchor_mode is not AnchorMode.GENERATE:
                 blockers.append("当前锚点方式不是“生成新锚点”，无需提交锚点生成任务")
-            reference_pairs = self._resolved_reference_pairs(
-                shot,
-                target=ReferenceTarget.ANCHOR,
-                strict=False,
-                compilation=compilation,
-            )
+            if production_context is not None:
+                reference_pairs = self._compiled_production_reference_pairs(
+                    production_context,
+                    target=ReferenceTarget.ANCHOR,
+                )
+            else:
+                reference_pairs = self._resolved_reference_pairs(
+                    shot,
+                    target=ReferenceTarget.ANCHOR,
+                    strict=False,
+                    compilation=compilation,
+                )
             sources = tuple(asset for _binding, asset in reference_pairs)
             if len(sources) > 14:
                 blockers.append("Seedream最多允许14张参考图")
@@ -3806,10 +4446,19 @@ class ShotProductionService:
                 )
                 for index, (binding, asset) in enumerate(reference_pairs, 1)
             )
-            anchor_brief, anchor_brief_step_id = self._accepted_anchor_brief(
-                shot,
-                compilation=compilation,
-            )
+            if production_context is None:
+                anchor_brief, anchor_brief_step_id = self._accepted_anchor_brief(
+                    shot,
+                    compilation=compilation,
+                )
+            else:
+                anchor_brief = self._production_anchor_brief(production_context)
+                anchor_brief_step_id = None
+                if anchor_brief is None:
+                    anchor_brief, anchor_brief_step_id = self._accepted_anchor_brief(
+                        shot,
+                        compilation=compilation,
+                    )
             if anchor_brief is None:
                 blockers.append(
                     "请先填写并接受开场静态画面稿，或使用可选的 LLM 创作分析生成建议"
@@ -3838,6 +4487,21 @@ class ShotProductionService:
                 strict=False,
                 compilation=compilation,
             )
+            if production_context is not None and anchor is None:
+                production_pairs = self._compiled_production_reference_pairs(
+                    production_context,
+                    target=ReferenceTarget.VIDEO,
+                )
+                references = tuple(asset for _binding, asset in production_pairs)
+                descriptions = tuple(
+                    _video_reference_description(
+                        index,
+                        binding,
+                        scene_look_usage=shot.draft.scene_look_usage,
+                        asset=asset,
+                    )
+                    for index, (binding, asset) in enumerate(production_pairs, 1)
+                )
             if (
                 shot.draft.anchor_mode is AnchorMode.GENERATE
                 and shot.selected_anchor_asset_id is None
@@ -3846,20 +4510,35 @@ class ShotProductionService:
             sources = (() if anchor is None else (anchor,)) + references
             if shot.draft.anchor_mode is AnchorMode.EXISTING and anchor is None:
                 blockers.append("请先选择一张已批准的片段开场图")
+            reference_limit_exceeded = (
+                anchor is None
+                and len(references) > SEEDANCE_2_0_CAPABILITY.maximum_image_references
+            )
+            if reference_limit_exceeded:
+                blockers.append(
+                    "当前视频模型最多允许"
+                    f"{SEEDANCE_2_0_CAPABILITY.maximum_image_references}张参考图；"
+                    "请在费用确认前人工精简，系统不会静默删除人物或猫咪身份参考"
+                )
             input_plan = build_shot_input_plan(
                 resolution=self._video_resolution,
                 duration_seconds=shot.draft.duration_seconds,
                 anchor=None if anchor is None else _media_source(anchor),
-                references=tuple(_media_source(item) for item in references),
+                references=(
+                    ()
+                    if reference_limit_exceeded
+                    else tuple(_media_source(item) for item in references)
+                ),
             )
             prompt_parts = compile_shot_video_prompt_parts(
                 context,
                 input_plan,
-                binding_descriptions=descriptions,
+                binding_descriptions=() if reference_limit_exceeded else descriptions,
                 regeneration_instruction=regeneration_instruction,
                 visual_profile=profile.draft,
                 semantic_aliases=_semantic_reference_aliases(sources),
                 strict_semantic_links=False,
+                precompiled_creative_body=production_context is not None,
             )
             warnings = prompt_parts.link_warnings
             blockers.extend(prompt_parts.link_warnings)
@@ -3875,6 +4554,11 @@ class ShotProductionService:
                     else ProviderInputMode.TEXT_ONLY
                 )
             )
+            if _INTERNAL_CHARACTER_DESIGN_LABEL.search(prompt.text):
+                blockers.append(
+                    "当前制作包 Prompt 使用历史内部素材标识；"
+                    "请在生产画布重新编译并确认制作包后再生成"
+                )
 
         for source in sources:
             if _is_synthetic_fixture(source):
@@ -3915,6 +4599,7 @@ class ShotProductionService:
                 "anchorBriefStepId": (
                     None if target is ReferenceTarget.VIDEO else anchor_brief_step_id
                 ),
+                "productionPackage": production_context,
             }
         )
         snapshot: dict[str, Any] = {
@@ -3933,6 +4618,78 @@ class ShotProductionService:
                 None if target is ReferenceTarget.VIDEO else anchor_brief_step_id
             ),
         }
+        if target is ReferenceTarget.ANCHOR and production_context is not None:
+            provider_reference_manifest = [
+                item
+                for item in production_context.get("referenceBindings") or []
+                if isinstance(item, dict) and item.get("providerIncluded") is True
+            ]
+        else:
+            provider_reference_manifest = [
+                {
+                    "assetId": str(source.id),
+                    "sha256": source.sha256,
+                    "semanticRole": (
+                        "approved_anchor"
+                        if provider_input_mode is ProviderInputMode.FIRST_FRAME and index == 1
+                        else "reference"
+                    ),
+                    "purpose": (
+                        "video_first_frame"
+                        if provider_input_mode is ProviderInputMode.FIRST_FRAME and index == 1
+                        else target.value
+                    ),
+                    "instruction": (
+                        "批准锚点是视频 Provider 唯一图片输入；人物、猫咪、场景与画风已烘焙其中"
+                        if provider_input_mode is ProviderInputMode.FIRST_FRAME and index == 1
+                        else "按服务端编译顺序作为实际供应商图片输入"
+                    ),
+                    "ordinal": index,
+                    "locked": True,
+                    "providerIncluded": True,
+                    "providerSlot": (
+                        "first_frame"
+                        if provider_input_mode is ProviderInputMode.FIRST_FRAME and index == 1
+                        else f"reference_image_{index}"
+                    ),
+                    "omissionReason": None,
+                    "origin": (
+                        "approved_anchor"
+                        if provider_input_mode is ProviderInputMode.FIRST_FRAME
+                        else "shot_generation"
+                    ),
+                    "contentUrl": f"/api/v1/assets/{source.id}/content",
+                    "evidenceLevel": "frozen",
+                }
+                for index, source in enumerate(sources, 1)
+            ]
+        snapshot["providerReferenceManifest"] = provider_reference_manifest
+        if production_context is not None:
+            snapshot.update(
+                {
+                    "storyboardRevisionId": production_context["storyboardRevisionId"],
+                    "structureHash": production_context["structureHash"],
+                    "generationPlanId": production_context["generationPlanId"],
+                    "generationPlanHash": production_context["generationPlanHash"],
+                    "productionPackageHash": production_context[
+                        "productionPackageHash"
+                    ],
+                    "compiledPromptId": production_context["compiledPromptId"],
+                    "compiledPromptInputHash": production_context[
+                        "compiledPromptInputHash"
+                    ],
+                    "compiledPromptHash": production_context["compiledPromptHash"],
+                    "productionReferenceBindings": production_context.get(
+                        "referenceBindings", []
+                    ),
+                    "videoReferencePolicy": (
+                        "approved_anchor_only_baked_lineage"
+                        if target is ReferenceTarget.VIDEO
+                        and shot.selected_anchor_asset_id is not None
+                        else "compiled_production_references"
+                    ),
+                }
+            )
         if input_plan is None:
             snapshot["referenceAssetIds"] = [item["assetId"] for item in source_assets]
             snapshot["durationSeconds"] = shot.draft.duration_seconds
@@ -3956,6 +4713,43 @@ class ShotProductionService:
             source_revision_hash=source_revision_hash,
             blockers=unique_blockers,
             warnings=warnings,
+        )
+
+    @staticmethod
+    def _production_anchor_brief(
+        production_context: dict[str, Any],
+    ) -> str | None:
+        shot = production_context.get("compiledShot")
+        if not isinstance(shot, dict):
+            return None
+        director_shots = shot.get("directorShots")
+        first = (
+            director_shots[0]
+            if isinstance(director_shots, list)
+            and director_shots
+            and isinstance(director_shots[0], dict)
+            else shot
+        )
+        title = str(first.get("title") or shot.get("title") or "开场状态")
+        visible_state = str(
+            first.get("continuityIn")
+            or first.get("visualDescription")
+            or shot.get("action")
+            or "人物、猫咪与场景保持已批准的开场状态"
+        )
+        child_action = str(first.get("childAction") or "保持动作开始前的自然准备姿态")
+        cat_action = str(first.get("catAction") or "保持自然四足准备姿态")
+        spatial_relation = str(first.get("spatialRelation") or "保持已批准的人猫相对比例")
+        contact = str(first.get("contactOcclusion") or "接触与遮挡遵循批准分镜")
+        shot_size = str(first.get("shotSize") or "中景")
+        lighting = str(first.get("lighting") or "遵循已批准 Scene Look")
+        return (
+            f"真实生成片段《{title}》的 t=0 开场静态画面：{visible_state}。"
+            f"儿童处于即将开始“{child_action}”之前的稳定姿态；"
+            f"猫咪处于即将开始“{cat_action}”之前的自然四足姿态；"
+            f"空间关系：{spatial_relation}；接触与遮挡：{contact}；"
+            f"景别：{shot_size}；光线：{lighting}。"
+            "只表现动作发生前的单帧状态，不提前展示后续动作、变化或收尾。"
         )
 
     def _new_paid_step(
@@ -4321,6 +5115,38 @@ class ShotProductionService:
                 if semantic_key != expected:
                     continue
             bindings.append(binding)
+        design_purposes = (
+            LookReferencePurpose.WARDROBE,
+            LookReferencePurpose.CAT_IDENTITY,
+            LookReferencePurpose.COMPOSITION,
+        )
+        load_design_assets = getattr(
+            self._repository,
+            "approved_character_design_assets",
+            None,
+        )
+        approved_design_assets = (
+            load_design_assets(scene.project_id)
+            if callable(load_design_assets)
+            else ()
+        )
+        for purpose, asset in zip(
+            design_purposes,
+            approved_design_assets,
+            strict=False,
+        ):
+            if any(binding.asset_id == asset.id for binding in bindings):
+                continue
+            bindings.append(
+                LookReferenceBinding(
+                    assetId=asset.id,
+                    purpose=purpose,
+                    instruction=(
+                        "当前批准的本集角色设计；只锁定造型、身份外观或同框比例，"
+                        "不得替换 Canon 身份"
+                    ),
+                )
+            )
         return SceneLookDraft(
             visualProfileRevisionId=profile.id,
             lookPlan=look_plan,
@@ -4340,7 +5166,37 @@ class ShotProductionService:
         warnings: list[str] = []
         seen_ids: set[uuid.UUID] = set()
         seen_hashes: set[str] = set()
-        for binding in _order_look_bindings(draft.reference_bindings):
+        load_design_assets = getattr(
+            self._repository,
+            "approved_character_design_assets",
+            None,
+        )
+        approved_design_assets = (
+            load_design_assets(scene.project_id)
+            if callable(load_design_assets)
+            else ()
+        )
+        required_design_bindings: list[LookReferenceBinding] = []
+        for purpose, asset in zip(
+            (
+                LookReferencePurpose.WARDROBE,
+                LookReferencePurpose.CAT_IDENTITY,
+                LookReferencePurpose.COMPOSITION,
+            ),
+            approved_design_assets,
+            strict=False,
+        ):
+            required_design_bindings.append(
+                LookReferenceBinding(
+                    assetId=asset.id,
+                    purpose=purpose,
+                    instruction="当前批准的本集儿童、猫咪或同框比例设计",
+                )
+            )
+        ordered_bindings = _order_look_bindings(
+            [*draft.reference_bindings, *required_design_bindings]
+        )
+        for binding in ordered_bindings:
             asset = self._repository.get_asset(binding.asset_id)
             if asset.id in seen_ids or asset.sha256 in seen_hashes:
                 continue
@@ -4360,6 +5216,26 @@ class ShotProductionService:
             LookReferencePurpose.CAT_IDENTITY: "至少选择一张猫咪身份参考",
             LookReferencePurpose.STYLE: "至少选择一张画风参考",
         }
+        requires_design_assets = getattr(
+            self._repository,
+            "requires_character_design_assets",
+            None,
+        )
+        design_assets_required = bool(
+            callable(requires_design_assets)
+            and requires_design_assets(scene.project_id)
+        )
+        if design_assets_required:
+            required.update(
+                {
+                    LookReferencePurpose.WARDROBE: "缺少当前批准的儿童本集造型",
+                    LookReferencePurpose.COMPOSITION: "缺少当前批准的一人一猫同框比例图",
+                }
+            )
+            if len(approved_design_assets) != 3:
+                warnings.append(
+                    "Scene Look 需要当前批准的儿童、猫咪和同框比例三个角色设计槽位"
+                )
         warnings.extend(message for purpose, message in required.items() if purpose not in purposes)
         if len(assets) > 14:
             warnings.append("Seedream 最多允许 14 张参考图")
@@ -4493,7 +5369,9 @@ class ShotProductionService:
         spec: ShotGenerationSpec,
         expected_input_hash: str | None,
     ) -> None:
-        if expected_input_hash is not None and spec.input_hash != expected_input_hash:
+        if expected_input_hash is None:
+            raise ValueError("付费生成必须先查看服务端实际输入并提交 expectedInputHash")
+        if spec.input_hash != expected_input_hash:
             raise RevisionConflictError(
                 "生成输入已变化，请重新查看实际素材与 Prompt 后再确认费用"
             )
@@ -4648,6 +5526,14 @@ def _merge_generation_references(
         if item.usage is ReferenceUsage.GENERATION_REFERENCE
         and item.asset_id != scene_look_asset_id
     ]
+    # Environment, wardrobe, prop and composition assets remain ordinary
+    # reference media even when the composite Scene Look is disabled.
+    ordered.extend(
+        item
+        for item in scene_references
+        if item.usage is ReferenceUsage.GENERATION_REFERENCE
+        and item.asset_id != scene_look_asset_id
+    )
     include_scene_look = scene_look_usage in {
         SceneLookUsage.APPEARANCE_ONLY,
         SceneLookUsage.FULL_REFERENCE,
@@ -4657,13 +5543,6 @@ def _merge_generation_references(
     )
     if target is ReferenceTarget.VIDEO and has_approved_anchor:
         include_scene_look = False
-    if include_scene_look:
-        ordered.extend(
-            item
-            for item in scene_references
-            if item.usage is ReferenceUsage.GENERATION_REFERENCE
-            and item.asset_id != scene_look_asset_id
-        )
     if include_scene_look and scene_look_asset_id is not None:
         ordered.append(
             ReferenceBinding(
@@ -4692,9 +5571,15 @@ def _merge_generation_references(
 
 def _scene_asset_readiness(repository: ShotQueueStore, scene_id: uuid.UUID) -> SceneAssetReadiness:
     scene = repository.get_scene(scene_id)
-    shots = tuple(sorted(repository.list_shots(scene.id), key=lambda item: item.order))
-    current_shot_hash = shot_snapshot_hash(
-        (item.id, item.draft_revision, item.draft) for item in shots
+    load_storyboard_context = getattr(
+        repository,
+        "storyboard_production_context",
+        None,
+    )
+    storyboard_context = (
+        load_storyboard_context(scene.id)
+        if callable(load_storyboard_context)
+        else {}
     )
     accepted_plan_step = next(
         (
@@ -4710,11 +5595,36 @@ def _scene_asset_readiness(repository: ShotQueueStore, scene_id: uuid.UUID) -> S
         ),
         None,
     )
-    plan_is_current = bool(
-        accepted_plan_step is not None
-        and accepted_plan_step.input_snapshot.get("shotSnapshotHash")
-        == current_shot_hash
-    )
+    if callable(load_storyboard_context):
+        plan_is_current = bool(
+            accepted_plan_step is not None
+            and storyboard_context.get("structureApproved")
+            and storyboard_context.get("generationPlanApproved")
+            and accepted_plan_step.input_snapshot.get("storyboardRevisionId")
+            == storyboard_context.get("storyboardRevisionId")
+            and accepted_plan_step.input_snapshot.get("structureHash")
+            == storyboard_context.get("structureHash")
+            and accepted_plan_step.input_snapshot.get("generationPlanId")
+            == storyboard_context.get("generationPlanId")
+            and accepted_plan_step.input_snapshot.get("generationPlanHash")
+            == storyboard_context.get("generationPlanHash")
+        )
+    else:
+        list_shots = getattr(repository, "list_shots", None)
+        current_shot_hash = (
+            shot_snapshot_hash(
+                (shot.id, shot.draft_revision, shot.draft)
+                for shot in list_shots(scene.id)
+            )
+            if callable(list_shots)
+            else None
+        )
+        plan_is_current = bool(
+            accepted_plan_step is not None
+            and current_shot_hash is not None
+            and accepted_plan_step.input_snapshot.get("shotSnapshotHash")
+            == current_shot_hash
+        )
     accepted_plan = (
         None
         if accepted_plan_step is None
@@ -4727,62 +5637,55 @@ def _scene_asset_readiness(repository: ShotQueueStore, scene_id: uuid.UUID) -> S
         include_canon=True,
     )
     assets_by_id = {item.id: item for item in all_assets}
-    bound_ids = tuple(
-        binding.asset_id
-        for binding in (() if scene.look_draft is None else scene.look_draft.reference_bindings)
+    bound_bindings = (
+        () if scene.look_draft is None else tuple(scene.look_draft.reference_bindings)
     )
+    bound_ids = tuple(binding.asset_id for binding in bound_bindings)
     bound_assets = tuple(
-        asset
-        for asset_id in bound_ids
-        if (asset := assets_by_id.get(asset_id)) is not None
+        (asset, binding)
+        for binding in bound_bindings
+        if (asset := assets_by_id.get(binding.asset_id)) is not None
     )
     continuity = _scene_continuity_context(scene)
 
-    slot_specs: list[tuple[str, str, VisualAssetPurpose, uuid.UUID | None]] = [
-        ("wardrobe", "本集服饰与配件", VisualAssetPurpose.WARDROBE, None),
-        ("environment", "当前场景环境", VisualAssetPurpose.ENVIRONMENT, None),
-    ]
-    for index, label in enumerate(
-        _required_scene_objects(continuity),
-        start=1,
-    ):
-        slot_specs.append(
-            (f"prop-{index}", label, VisualAssetPurpose.PROP, None)
-        )
-    if accepted_plan is not None:
-        for selection in accepted_plan.selections:
-            if selection.action.value == "skip":
-                continue
-            matching_index = next(
-                (
-                    index
-                    for index, (_key, _name, purpose, _asset_id) in enumerate(slot_specs)
-                    if purpose is selection.purpose
-                    and purpose in {
-                        VisualAssetPurpose.WARDROBE,
-                        VisualAssetPurpose.ENVIRONMENT,
-                    }
-                ),
-                None,
+    accepted_selections = (
+        []
+        if accepted_plan is None
+        else [
+            selection
+            for selection in accepted_plan.selections
+            if selection.action.value != "skip"
+        ]
+    )
+    if accepted_plan is None or not accepted_plan.selections:
+        slot_specs: list[tuple[str, str, VisualAssetPurpose, uuid.UUID | None]] = [
+            ("wardrobe", "本集服饰与配件", VisualAssetPurpose.WARDROBE, None),
+            ("environment", "当前场景环境", VisualAssetPurpose.ENVIRONMENT, None),
+        ]
+        for index, label in enumerate(
+            _required_scene_objects(continuity),
+            start=1,
+        ):
+            slot_specs.append(
+                (f"prop-{index}", label, VisualAssetPurpose.PROP, None)
             )
-            expected_asset_id = selection.existing_asset_id
-            replacement = (
+    else:
+        slot_specs = [
+            (
                 selection.suggestion_key,
                 selection.display_name,
                 selection.purpose,
-                expected_asset_id,
+                selection.existing_asset_id,
             )
-            if matching_index is None:
-                slot_specs.append(replacement)
-            else:
-                slot_specs[matching_index] = replacement
+            for selection in accepted_selections
+        ]
 
     slots: list[SceneAssetSlotReadiness] = []
     for key, display_name, purpose, expected_asset_id in slot_specs:
         candidates = [
             asset
-            for asset in bound_assets
-            if asset.reference_purpose == purpose.value
+            for asset, binding in bound_assets
+            if binding.purpose.value == purpose.value
             and (
                 expected_asset_id is None
                 or asset.id == expected_asset_id
@@ -4809,36 +5712,46 @@ def _scene_asset_readiness(repository: ShotQueueStore, scene_id: uuid.UUID) -> S
             )
         )
 
-    scene_look_status: str = "missing"
+    list_scene_shots = getattr(repository, "list_shots", None)
+    scene_look_required = (
+        True
+        if not callable(list_scene_shots)
+        else any(
+            shot.draft.scene_look_usage is not SceneLookUsage.OFF
+            for shot in list_scene_shots(scene.id)
+        )
+    )
+    scene_look_status: str = "missing" if scene_look_required else "off"
     selected_look = (
         None
         if scene.selected_look_asset_id is None
         else assets_by_id.get(scene.selected_look_asset_id)
     )
-    if selected_look is not None:
+    if scene_look_required and selected_look is not None:
         look_revision = selected_look.metadata.get("lookDraftRevision")
         look_is_current = look_revision in {None, scene.look_draft_revision}
         if selected_look.status == "stale" or not look_is_current:
             scene_look_status = "stale"
-        elif selected_look.status in {"approved", "ready"} and selected_look.content_ready:
+        elif selected_look.status == "approved" and selected_look.content_ready:
             scene_look_status = "approved"
 
     missing_keys = [item.key for item in slots if item.status == "missing"]
     stale_keys = [item.key for item in slots if item.status == "stale"]
-    blockers: list[str] = []
+    asset_blockers: list[str] = []
     if accepted_plan is None:
-        blockers.append("尚未人工接受当前场景的视觉资产规划")
+        asset_blockers.append("尚未人工接受当前场景的视觉资产规划")
     elif not plan_is_current:
-        blockers.append("分镜已更新，视觉资产规划需要重新生成并接受")
+        asset_blockers.append("分镜结构或生成编排已更新，视觉资产规划需要重新生成并接受")
     if missing_keys:
         labels = "、".join(item.display_name for item in slots if item.status == "missing")
-        blockers.append(f"缺少已批准并绑定的场景资产：{labels}")
+        asset_blockers.append(f"缺少已批准并绑定的场景资产：{labels}")
     if stale_keys:
         labels = "、".join(item.display_name for item in slots if item.status == "stale")
-        blockers.append(f"场景资产已过期：{labels}")
-    if scene_look_status == "missing":
+        asset_blockers.append(f"场景资产已过期：{labels}")
+    blockers = list(asset_blockers)
+    if scene_look_required and scene_look_status == "missing":
         blockers.append("尚未选择已批准的场景视觉基准（Scene Look）")
-    elif scene_look_status == "stale":
+    elif scene_look_required and scene_look_status == "stale":
         blockers.append("已选择的场景视觉基准已过期")
     bound_asset_ids = list(dict.fromkeys(
         [*bound_ids]
@@ -4850,9 +5763,41 @@ def _scene_asset_readiness(repository: ShotQueueStore, scene_id: uuid.UUID) -> S
         missingAssetKeys=missing_keys,
         staleAssetKeys=stale_keys,
         sceneLookStatus=scene_look_status,
+        visualAssetPlanCurrent=plan_is_current,
+        canGenerateSceneLook=not asset_blockers,
         canCompileShotPrompt=not blockers,
         blockers=blockers,
     )
+
+
+def _scene_asset_readiness_if_available(
+    repository: ShotQueueStore,
+    scene_id: uuid.UUID,
+) -> SceneAssetReadiness | None:
+    """Keep standalone Scene Look stores compatible with Recipe-aware readiness.
+
+    Scene asset planning requires the step and asset collections. Older standalone
+    stores intentionally expose neither; their strict reference validation remains
+    authoritative instead of manufacturing an incomplete Recipe projection.
+    """
+
+    if not callable(getattr(repository, "list_steps", None)) or not callable(
+        getattr(repository, "list_assets", None)
+    ):
+        return None
+    return _scene_asset_readiness(repository, scene_id)
+
+
+def _scene_look_asset_blockers(
+    readiness: SceneAssetReadiness,
+) -> tuple[str, ...]:
+    if readiness.can_generate_scene_look:
+        return ()
+    scene_look_only = {
+        "尚未选择已批准的场景视觉基准（Scene Look）",
+        "已选择的场景视觉基准已过期",
+    }
+    return tuple(item for item in readiness.blockers if item not in scene_look_only)
 
 
 
@@ -4917,6 +5862,9 @@ def _creative_step_json(step: StoredStep) -> dict[str, Any]:
         "providerOutput": step.input_snapshot.get("providerOutput"),
         "acceptedOutput": step.input_snapshot.get("acceptedOutput"),
         "acceptedAt": step.input_snapshot.get("acceptedAt"),
+        "source": step.input_snapshot.get("source"),
+        "manualRevisionOfStepId": step.input_snapshot.get("manualRevisionOfStepId"),
+        "manualRevisionNote": step.input_snapshot.get("manualRevisionNote"),
         "error": step.error,
         "createdAt": None if step.created_at is None else step.created_at.isoformat(),
     }
@@ -4946,7 +5894,7 @@ def _video_reference_description(
     index: int,
     binding: ReferenceBinding,
     *,
-    scene_look_usage: SceneLookUsage = SceneLookUsage.APPEARANCE_ONLY,
+    scene_look_usage: SceneLookUsage = SceneLookUsage.OFF,
     asset: StoredAsset | None = None,
 ) -> str:
     scene_responsibilities = {
@@ -4970,6 +5918,13 @@ def _video_reference_description(
         ReferenceRole.COMPOSITION: "本片段构图、机位和主体空间关系",
     }
     responsibility = responsibilities[binding.role]
+    semantic = "" if asset is None else asset.semantic_key or ""
+    if ":child:candidate:" in semantic:
+        responsibility = "当前唯一儿童身份与本集造型来源；锁定脸型、短发、年龄感与本集服装"
+    elif ":cat:candidate:" in semantic:
+        responsibility = "当前唯一猫咪身份与本集造型来源；锁定灰白分区、虎斑、四足结构与尾巴环纹"
+    elif ":pair_scale:candidate:" in semantic:
+        responsibility = "只锁定一人一猫相对比例与自然接触尺度，不重新设计身份"
     purpose = "" if asset is None else str(asset.metadata.get("referencePurpose") or "")
     if purpose == "wardrobe":
         responsibility = "只继承本场服装与配件，不改变人物脸、发型、年龄、猫咪毛色或体型"
@@ -4986,6 +5941,12 @@ def _asset_subject_label(asset: StoredAsset | None) -> str:
     if asset is None:
         return "未命名参考素材"
     semantic = asset.semantic_key or ""
+    if ":child:candidate:" in semantic:
+        return "本集儿童设计"
+    if ":cat:candidate:" in semantic:
+        return "本集猫咪设计"
+    if ":pair_scale:candidate:" in semantic:
+        return "一人一猫同框比例"
     if semantic.startswith("person:"):
         return f"人物“小孩”参考（{asset.display_name}）"
     if semantic.startswith("cat:"):
@@ -5080,6 +6041,8 @@ def _shot_assist_asset_layer(
     project: StoredProject,
     asset: StoredAsset,
 ) -> str:
+    if (asset.semantic_key or "").startswith("character-design:"):
+        return "episode_design"
     if asset.role == "shot_tail_frame":
         return "previous_tail"
     if shot.selected_anchor_asset_id == asset.id:

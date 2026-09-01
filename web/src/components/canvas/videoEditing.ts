@@ -3,6 +3,18 @@ export interface VideoSelection {
   endMs: number;
 }
 
+export interface VideoEditConsoleDraft extends VideoSelection {
+  instruction: string;
+  referenceAssetIds: string[];
+  annotations: Array<{
+    frameTimestampMs: number;
+    coordinateSpace?: "source_normalized";
+    tool: "rectangle" | "brush" | "arrow" | "text" | "marker";
+    points: Array<{ x: number; y: number }>;
+    label: string;
+  }>;
+}
+
 export interface ScreenRect {
   left: number;
   top: number;

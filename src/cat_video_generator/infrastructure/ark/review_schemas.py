@@ -4,6 +4,10 @@ IMAGE_DIAGNOSTIC_SCHEMA = {
     "type": "object",
     "properties": {
         "identityOk": {"type": "boolean"},
+        "identityAssessment": {
+            "type": "string",
+            "enum": ["consistent", "uncertain", "mismatch"],
+        },
         "styleOk": {"type": "boolean"},
         "constraintsOk": {"type": "boolean"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
@@ -24,6 +28,7 @@ IMAGE_DIAGNOSTIC_SCHEMA = {
     },
     "required": [
         "identityOk",
+        "identityAssessment",
         "styleOk",
         "constraintsOk",
         "confidence",

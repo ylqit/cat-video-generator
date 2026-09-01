@@ -24,7 +24,7 @@ from cat_video_generator.infrastructure.media.storage import LocalAssetStore
 
 
 def test_v5_database_models_expose_creation_flow_columns() -> None:
-    assert ALEMBIC_HEAD == "0028_story_event_candidates"
+    assert ALEMBIC_HEAD == "0031_workflow_task_cancellation"
     assert hasattr(models.ProductionRun, "default_reference_bindings_json")
     assert hasattr(models.ProductionRun, "current_visual_profile_revision_id")
     assert hasattr(models.VisualProfileRevision, "profile_hash")
@@ -197,6 +197,55 @@ def test_sequence_renderer_compiles_fades_and_cross_dissolve(
     assert "concat=n=2:v=1:a=1" in filter_graph
     assert "xfade=transition=fade" in filter_graph
     assert "acrossfade" in filter_graph
+
+
+def test_sequence_renderer_compiles_project_boundary_fades(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ffmpeg = tmp_path / "ffmpeg.exe"
+    ffmpeg.write_bytes(b"fixture")
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"video")
+    plan = ProjectSequencePlan(
+        duration_ms=8_000,
+        clips=[
+            SequenceClip(
+                order=1,
+                shot_card_id=uuid.uuid4(),
+                source_asset_id=uuid.uuid4(),
+                source_start_ms=0,
+                source_end_ms=8_000,
+                timeline_start_ms=0,
+                timeline_end_ms=8_000,
+            )
+        ],
+        introTransition={"type": "fade_black", "durationMs": 500},
+        outroTransition={"type": "fade_black", "durationMs": 500},
+    )
+    captured: list[str] = []
+
+    def fake_run(command: list[str], *, timeout: int, label: str) -> None:
+        captured.extend(command)
+        Path(command[-1]).write_bytes(b"composite")
+
+    monkeypatch.setattr(
+        "cat_video_generator.infrastructure.media.storage._run",
+        fake_run,
+    )
+    store = LocalAssetStore(
+        work_root=tmp_path / "work",
+        asset_root=tmp_path / "assets",
+        ffmpeg_path=ffmpeg,
+    )
+
+    store.compose_sequence((source,), plan)
+    filter_graph = captured[captured.index("-filter_complex") + 1]
+
+    assert "fade=t=in:st=0:d=0.500" in filter_graph
+    assert "afade=t=in:st=0:d=0.500" in filter_graph
+    assert "fade=t=out:st=7.500:d=0.500" in filter_graph
+    assert "afade=t=out:st=7.500:d=0.500" in filter_graph
 
 
 def test_sequence_renderer_handles_dissolve_after_a_cut(tmp_path: Path) -> None:

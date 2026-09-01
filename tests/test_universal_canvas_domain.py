@@ -170,7 +170,7 @@ def test_video_edit_recipe_enforces_one_provider_sized_interval_and_normalized_m
         )
 
 
-def test_ark_capability_compiler_exposes_two_stage_calls_and_cost_before_submit() -> None:
+def test_new_video_edit_recipe_never_hides_two_image_calls_behind_compilation() -> None:
     recipe = VideoEditRecipeDraft(
         projectId=uuid.uuid4(),
         sourceAssetId=uuid.uuid4(),
@@ -196,14 +196,36 @@ def test_ark_capability_compiler_exposes_two_stage_calls_and_cost_before_submit(
         videoCallCostMicros=8_000,
     )
 
+    with pytest.raises(
+        ValueError,
+        match="无法直接接收当前标注和参考素材",
+    ):
+        compile_video_edit_plan(recipe, capability)
+
+
+def test_direct_video_edit_compiles_to_zero_image_calls_and_one_video_call() -> None:
+    recipe = VideoEditRecipeDraft(
+        projectId=uuid.uuid4(),
+        sourceAssetId=uuid.uuid4(),
+        startMs=4_000,
+        endMs=10_000,
+        instruction="保持身份，只调整选中区间内的动作",
+        referenceAssetIds=[uuid.uuid4()],
+    )
+    capability = ProviderEditCapability(
+        provider="ark",
+        model="seedance-test",
+        supportsDirectAnnotations=False,
+        maxDirectReferenceImages=1,
+        supportsControlAnchors=True,
+        imageCallCostMicros=1_500,
+        videoCallCostMicros=8_000,
+    )
+
     plan = compile_video_edit_plan(recipe, capability)
 
-    assert plan.mode == "two_stage"
-    assert plan.image_call_count == 2
+    assert plan.mode == "direct"
+    assert plan.image_call_count == 0
     assert plan.video_call_count == 1
-    assert plan.estimated_cost_micros == 11_000
-    assert [stage.kind for stage in plan.stages] == [
-        "control_anchor",
-        "control_anchor",
-        "video_edit",
-    ]
+    assert plan.estimated_cost_micros == 8_000
+    assert [stage.kind for stage in plan.stages] == ["video_edit"]

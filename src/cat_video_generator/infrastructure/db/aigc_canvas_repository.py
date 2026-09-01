@@ -11,19 +11,27 @@ import hashlib
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Sequence
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
-from ...application.ports import LandedAsset, StoredAsset
+from ...application.ports import LandedAsset, StoredAsset, reference_display_name
 from ...domain.aigc_canvas import (
     CanvasConnection,
+    CanvasDiagnostic,
     CanvasNodeType,
     CanvasPortType,
+    CompiledProviderReference,
+    CreativeStoryCandidate,
+    CreativeStoryCandidateBatch,
+    GenerationInputPreview,
+    NodeGenerationConfigDraft,
+    ProductionFlowNodeKind,
     PromptRunDraft,
     StoryBrief,
     StoryCandidateOutput,
@@ -35,7 +43,12 @@ from ...domain.aigc_canvas import (
     SubjectCompletionProposal,
     SubjectDraft,
     SubjectRole,
+    WorkspaceModuleId,
+    WorkspaceStatus,
     approve_story_revision,
+    character_design_generation_input,
+    creative_brief_canvas_node_id,
+    generation_input_hash,
     subject_completion_missing_fields,
 )
 from ...domain.contracts import VisualProfileDraft
@@ -43,9 +56,24 @@ from ...domain.production_recipes import (
     CANON_V3_PROFILE_ID,
     CANON_V3_STYLE_NEGATIVE,
     CANON_V3_STYLE_POSITIVE,
+    CANON_V4_PROFILE_ID,
+    CANON_V4_STYLE_BOARD_KEY,
+    CANON_V4_STYLE_NEGATIVE,
+    CANON_V4_STYLE_POSITIVE,
+    CANON_V4_STYLE_SOURCE_EXCLUSIONS,
+    CANON_V4_STYLE_SOURCE_KEY,
+    SEEDANCE_2_0_CAPABILITY,
+    SEEDREAM_5_0_CAPABILITY,
+    CharacterDesignSlot,
+    EditorialCutIntent,
+    EditorialShotDescriptor,
+    GenerationPlanStatus,
     ProductionRecipeKey,
+    RecipeDispatchError,
+    StoryboardRevisionStatus,
     VisualPresetKey,
-    build_temporal_beats,
+    canon_reference_keys,
+    plan_generation_clips,
 )
 from ...domain.rendering import MediaSource, VideoInputPlan, build_shot_input_plan
 from ...domain.universal_canvas import (
@@ -68,6 +96,8 @@ from .models import (
     CharacterDesignAsset,
     CharacterDesignRevision,
     GenerationAttempt,
+    GenerationClipShot,
+    GenerationPlan,
     HumanReviewDecisionRecord,
     MediaGenerationBatch,
     NodeGenerationConfig,
@@ -80,6 +110,7 @@ from .models import (
     ShotBeat,
     ShotCard,
     ShotSubjectState,
+    StoryboardRevision,
     StoryBriefRecord,
     StoryEventCandidateRecord,
     StoryRevisionRecord,
@@ -96,13 +127,20 @@ from .models import (
     WorkflowStep,
 )
 from .repositories import RecordNotFoundError, WorkflowConflictError
+from .story_revision_lifecycle import (
+    invalidate_story_production_lineage,
+    requires_legacy_story_approval_contract,
+    story_revision_contract_kind,
+)
 from .story_scenes import materialize_approved_story_scenes
 from .story_scenes import normalized_story_scenes as _normalized_story_scenes
 from .story_scenes import scene_look_plan_from_outline as _scene_look_plan_from_outline
+from .storyboard_hashing import generation_plan_input_hash, storyboard_structure_hash
 from .visual_preset_profiles import (
     CANON_V3_REQUIRED_KEYS,
-    ensure_canon_v3_subjects,
-    ensure_canon_v3_visual_profile,
+    CANON_V4_REQUIRED_KEYS,
+    ensure_canon_subjects,
+    ensure_canon_visual_profile,
     episode_visual_profile_json,
     generation_reference_bindings,
     load_canon_assets,
@@ -120,6 +158,15 @@ class StoredCanvasSubject:
     status: str
 
 
+@dataclass(frozen=True, slots=True)
+class _GenerationBatchPlan:
+    payload: Any
+    node: CanvasGraphNode
+    batch: MediaGenerationBatch
+    steps: tuple[WorkflowStep, ...]
+    prompts: tuple[PromptRecord, ...]
+
+
 class SqlAlchemyAigcCanvasRepository:
     def __init__(
         self,
@@ -133,6 +180,109 @@ class SqlAlchemyAigcCanvasRepository:
             if asset_root is None
             else asset_root.expanduser().resolve()
         )
+
+    def create_child_cat_project(self, payload: Any) -> dict[str, Any]:
+        """Create the unpaid one-child-one-cat production foundation atomically."""
+
+        title = payload.title.strip()
+        brief_body = payload.brief.body.strip()
+        if not title:
+            raise ValueError("项目名称不能为空")
+        if not brief_body:
+            raise ValueError("创作要求不能为空")
+        if payload.child_canon_profile_id != CANON_V4_PROFILE_ID:
+            raise ValueError("儿童 Canon 必须选择当前的一人一猫 Canon v4")
+        if payload.cat_canon_profile_id != CANON_V4_PROFILE_ID:
+            raise ValueError("猫咪 Canon 必须选择当前的一人一猫 Canon v4")
+        with self._sessions.begin() as session:
+            assets_by_key = load_canon_assets(session, CANON_V4_REQUIRED_KEYS)
+            style_board = assets_by_key[CANON_V4_STYLE_BOARD_KEY]
+            if payload.style_board_asset_id != style_board.id:
+                raise ValueError("画风板必须选择已批准的 Canon v4 净化画风板")
+            project = ProductionRun(
+                id=uuid.uuid4(),
+                title=title,
+                content_date=payload.content_date or date.today(),
+                status="active",
+                canvas_v2_enabled=False,
+                canvas_template_key="short_drama",
+                universal_canvas_enabled=False,
+                product_ad_template_enabled=False,
+                video_edit_v2_enabled=True,
+                default_reference_bindings_json=[],
+            )
+            session.add(project)
+            session.flush()
+            brief = StoryBriefRecord(
+                id=uuid.uuid4(),
+                production_run_id=project.id,
+                revision=1,
+                theme=brief_body,
+                audience="喜欢原创、低压力日常短视频的观众",
+                genre="原创一人一猫治愈短片",
+                tone="安静、温暖、低对白、动作清楚",
+                aspect_ratio=payload.brief.aspect_ratio,
+                target_duration_seconds=payload.brief.duration_seconds,
+                constraints_json=[
+                    "固定同一名 8–9 岁儿童的脸型、五官、短发与身体比例",
+                    "固定同一只灰白虎斑猫的毛色、虎斑、四足结构与环纹尾巴",
+                    "统一使用已批准的净化画风板",
+                    "保持原创角色与原创日常陪伴叙事",
+                ],
+            )
+            session.add(brief)
+            scene = Scene(
+                id=uuid.uuid4(),
+                production_run_id=project.id,
+                sort_order=1,
+                title="本集场景",
+                source_text=brief_body,
+                story_mode="single",
+                target_shot_count=1,
+                status=SceneStatus.DRAFT.value,
+            )
+            session.add(scene)
+            visual_profile = ensure_canon_visual_profile(
+                session,
+                project_id=project.id,
+                canon_profile_id=CANON_V4_PROFILE_ID,
+                assets_by_key=assets_by_key,
+            )
+            subjects = ensure_canon_subjects(
+                session,
+                project_id=project.id,
+                assets_by_key=assets_by_key,
+                canon_profile_id=CANON_V4_PROFILE_ID,
+            )
+            project.current_visual_profile_revision_id = visual_profile.id
+            project.default_reference_bindings_json = generation_reference_bindings(
+                assets_by_key,
+                CANON_V4_REQUIRED_KEYS,
+            )
+            recipe = ProductionRecipeInstance(
+                id=uuid.uuid4(),
+                production_run_id=project.id,
+                recipe_key=ProductionRecipeKey.HEALING_CHILD_CAT_V1.value,
+                recipe_version=1,
+                revision=1,
+                theme=brief_body,
+                inspiration_key=None,
+                target_duration_seconds=payload.brief.duration_seconds,
+                quality_tier=payload.brief.quality_tier,
+                canon_profile_id=CANON_V4_PROFILE_ID,
+                lifecycle_status="active",
+            )
+            session.add(recipe)
+            session.flush()
+            return {
+                "projectId": str(project.id),
+                "briefId": str(brief.id),
+                "recipeInstanceId": str(recipe.id),
+                "subjectIds": {
+                    role: str(subject.id) for role, subject in subjects.items()
+                },
+                "providerCallCount": 0,
+            }
 
     def save_brief(self, project_id: uuid.UUID, payload: StoryBrief) -> dict[str, Any]:
         document = payload.model_dump(mode="json", by_alias=True)
@@ -606,7 +756,121 @@ class SqlAlchemyAigcCanvasRepository:
             query = select(Asset).where(Asset.production_run_id == project_id)
             if media_kind is not None:
                 query = query.where(Asset.media_type == media_kind)
-            rows = session.scalars(query.order_by(Asset.created_at.desc(), Asset.id).limit(200))
+            rows = list(
+                session.scalars(query.order_by(Asset.created_at.desc(), Asset.id).limit(200))
+            )
+            row_ids = [row.id for row in rows]
+            design_bindings = list(
+                session.scalars(
+                    select(CharacterDesignAsset)
+                    .where(CharacterDesignAsset.asset_id.in_(row_ids))
+                    .order_by(CharacterDesignAsset.created_at, CharacterDesignAsset.id)
+                )
+            ) if row_ids else []
+            design_revisions = {
+                revision.id: revision
+                for revision in session.scalars(
+                    select(CharacterDesignRevision).where(
+                        CharacterDesignRevision.id.in_(
+                            [binding.character_design_revision_id for binding in design_bindings]
+                        )
+                    )
+                )
+            }
+            current_design_revision_ids: dict[uuid.UUID, uuid.UUID] = {}
+            for revision in session.scalars(
+                select(CharacterDesignRevision)
+                .where(CharacterDesignRevision.production_run_id == project_id)
+                .order_by(
+                    CharacterDesignRevision.production_recipe_instance_id,
+                    CharacterDesignRevision.revision.desc(),
+                    CharacterDesignRevision.id,
+                )
+            ):
+                current_design_revision_ids.setdefault(
+                    revision.production_recipe_instance_id,
+                    revision.id,
+                )
+            design_binding_by_asset_id = {binding.asset_id: binding for binding in design_bindings}
+
+            def character_design_document(row: Asset) -> dict[str, Any] | None:
+                binding = design_binding_by_asset_id.get(row.id)
+                if binding is None:
+                    return None
+                revision = design_revisions.get(binding.character_design_revision_id)
+                if revision is None:
+                    return None
+                return {
+                    "recipeInstanceId": str(revision.production_recipe_instance_id),
+                    "revisionId": str(revision.id),
+                    "revision": revision.revision,
+                    "revisionStatus": revision.status,
+                    "isCurrentRevision": (
+                        current_design_revision_ids.get(
+                            revision.production_recipe_instance_id
+                        )
+                        == revision.id
+                    ),
+                    "slot": binding.slot,
+                    "candidateIndex": binding.candidate_index,
+                    "semanticRole": binding.semantic_role,
+                    "selected": binding.selected,
+                }
+
+            def review_action(row: Asset, design: dict[str, Any] | None) -> dict[str, Any]:
+                if design is not None:
+                    character_design_metadata = dict(
+                        dict(row.metadata_json or {}).get("characterDesign") or {}
+                    )
+                    if character_design_metadata.get("validationOnly") is True:
+                        return {
+                            "executable": False,
+                            "route": "readonly",
+                            "recipeInstanceId": design["recipeInstanceId"],
+                            "targetType": "character_design",
+                            "targetId": str(row.id),
+                            "targetHash": row.sha256,
+                            "disabledReason": (
+                                "引用顺序验证候选只用于审计，不能审核或替换生产版本"
+                            ),
+                        }
+                    current = bool(design["isCurrentRevision"])
+                    executable = bool(
+                        current
+                        and row.media_type == "image"
+                        and row.status != "stale"
+                        and design["revisionStatus"] != "stale"
+                    )
+                    return {
+                        "executable": executable,
+                        "route": "recipe_character_design" if executable else "readonly",
+                        "recipeInstanceId": design["recipeInstanceId"],
+                        "targetType": "character_design",
+                        "targetId": str(row.id),
+                        "targetHash": row.sha256,
+                        **(
+                            {}
+                            if executable
+                            else {"disabledReason": "仅当前角色设计 Revision 可执行审核"}
+                        ),
+                    }
+                legacy_reviewable = bool(
+                    row.scope != "canon"
+                    and row.producing_step_id is not None
+                    and row.media_type in {"image", "video", "audio"}
+                    and row.status != "stale"
+                )
+                return {
+                    "executable": legacy_reviewable,
+                    "route": "legacy_asset" if legacy_reviewable else "readonly",
+                    "targetId": str(row.id),
+                    **(
+                        {}
+                        if legacy_reviewable
+                        else {"disabledReason": "导入或不可变资产没有可执行的审核目标"}
+                    ),
+                }
+
             return [
                 {
                     "id": str(row.id),
@@ -620,6 +884,8 @@ class SqlAlchemyAigcCanvasRepository:
                     "metadata": row.metadata_json,
                     "contentUrl": f"/api/v1/assets/{row.id}/content",
                     "createdAt": None if row.created_at is None else row.created_at.isoformat(),
+                    "characterDesign": (design := character_design_document(row)),
+                    "reviewAction": review_action(row, design),
                 }
                 for row in rows
             ]
@@ -628,7 +894,16 @@ class SqlAlchemyAigcCanvasRepository:
         """Return reusable visual evidence packages without copying their assets."""
 
         with self._sessions() as session:
-            return [visual_preset_profile_json(session)]
+            return [
+                visual_preset_profile_json(
+                    session,
+                    VisualPresetKey.HEALING_CHILD_CAT_STYLE_BOARD_V4,
+                ),
+                visual_preset_profile_json(
+                    session,
+                    VisualPresetKey.HEALING_CHILD_CAT_LINE_TEXTURE,
+                ),
+            ]
 
     def apply_visual_preset(
         self,
@@ -639,36 +914,75 @@ class SqlAlchemyAigcCanvasRepository:
             resolved_key = VisualPresetKey(preset_key)
         except ValueError as exc:
             raise ValueError(f"不支持的视觉预设：{preset_key}") from exc
-        if resolved_key is not VisualPresetKey.HEALING_CHILD_CAT_LINE_TEXTURE:
+        if resolved_key not in {
+            VisualPresetKey.HEALING_CHILD_CAT_STYLE_BOARD_V4,
+            VisualPresetKey.HEALING_CHILD_CAT_LINE_TEXTURE,
+        }:
             raise ValueError(f"不支持的视觉预设：{preset_key}")
+
+        is_v4 = resolved_key is VisualPresetKey.HEALING_CHILD_CAT_STYLE_BOARD_V4
+        canon_profile_id = CANON_V4_PROFILE_ID if is_v4 else CANON_V3_PROFILE_ID
+        required_keys = CANON_V4_REQUIRED_KEYS if is_v4 else CANON_V3_REQUIRED_KEYS
+        style_key = CANON_V4_STYLE_BOARD_KEY if is_v4 else "style:line_texture"
+        style_positive = CANON_V4_STYLE_POSITIVE if is_v4 else CANON_V3_STYLE_POSITIVE
+        style_negative = CANON_V4_STYLE_NEGATIVE if is_v4 else CANON_V3_STYLE_NEGATIVE
 
         with self._sessions.begin() as session:
             project = self._require_project(session, project_id, lock=True)
-            assets_by_key = load_canon_assets(session, CANON_V3_REQUIRED_KEYS)
-            profile = ensure_canon_v3_visual_profile(
+            previous_visual_profile_id = project.current_visual_profile_revision_id
+            assets_by_key = load_canon_assets(session, required_keys)
+            profile = ensure_canon_visual_profile(
                 session,
                 project_id=project_id,
+                canon_profile_id=canon_profile_id,
                 assets_by_key=assets_by_key,
             )
-            subjects_by_role = ensure_canon_v3_subjects(
+            subjects_by_role = ensure_canon_subjects(
                 session,
                 project_id=project_id,
                 assets_by_key=assets_by_key,
+                canon_profile_id=canon_profile_id,
             )
             project.canvas_v2_enabled = True
             project.universal_canvas_enabled = True
+            recipe = session.scalar(
+                select(ProductionRecipeInstance)
+                .where(
+                    ProductionRecipeInstance.production_run_id == project_id,
+                    ProductionRecipeInstance.lifecycle_status == "active",
+                )
+                .order_by(ProductionRecipeInstance.created_at.desc())
+                .limit(1)
+                .with_for_update()
+            )
+            canon_profile_changed = bool(
+                recipe is not None and recipe.canon_profile_id != canon_profile_id
+            )
+            if recipe is not None and canon_profile_changed:
+                recipe.canon_profile_id = canon_profile_id
+                recipe.revision += 1
 
-            node_id = uuid.uuid5(project_id, "style-preset:line-texture")
+            node_id = uuid.uuid5(project_id, f"style-preset:{resolved_key.value}")
             node = session.get(CanvasGraphNode, node_id)
-            style_asset = assets_by_key["style:line_texture"]
+            style_asset = assets_by_key[style_key]
+            style_references = [visual_reference_json(style_asset, required=True)]
+            if is_v4:
+                source_asset = load_canon_assets(session, (CANON_V4_STYLE_SOURCE_KEY,))[
+                    CANON_V4_STYLE_SOURCE_KEY
+                ]
+                style_references.insert(
+                    0,
+                    visual_reference_json(source_asset, required=False),
+                )
             node_data = {
-                "title": "线条材质画风",
+                "title": "原创治愈线条材质画风 v4" if is_v4 else "线条材质画风（历史 v3）",
                 "presetKey": resolved_key.value,
-                "canonProfileId": CANON_V3_PROFILE_ID,
-                "references": [visual_reference_json(style_asset, required=True)],
-                "stylePositive": list(CANON_V3_STYLE_POSITIVE),
-                "styleExcluded": list(CANON_V3_STYLE_NEGATIVE),
+                "canonProfileId": canon_profile_id,
+                "references": style_references,
+                "stylePositive": list(style_positive),
+                "styleExcluded": list(style_negative),
                 "locked": True,
+                "active": True,
             }
             if node is None:
                 node = CanvasGraphNode(
@@ -688,6 +1002,22 @@ class SqlAlchemyAigcCanvasRepository:
                     node.revision += 1
                     node.data_json = node_data
 
+            for historical_style_node in session.scalars(
+                select(CanvasGraphNode).where(
+                    CanvasGraphNode.production_run_id == project_id,
+                    CanvasGraphNode.node_type == CanvasNodeType.STYLE_PRESET.value,
+                    CanvasGraphNode.id != node.id,
+                )
+            ):
+                historical_data = dict(historical_style_node.data_json or {})
+                if historical_data.get("active") is not False:
+                    historical_style_node.data_json = {
+                        **historical_data,
+                        "active": False,
+                        "historical": True,
+                    }
+                    historical_style_node.revision += 1
+
             applied_nodes = [node]
             for subject in subjects_by_role.values():
                 revision = self._required(
@@ -699,7 +1029,7 @@ class SqlAlchemyAigcCanvasRepository:
                 subject_data = {
                     **_subject_json(session, subject, revision, references),
                     "title": revision.name,
-                    "canonProfileId": CANON_V3_PROFILE_ID,
+                    "canonProfileId": canon_profile_id,
                     "locked": True,
                 }
                 subject_node = session.get(CanvasGraphNode, subject.id)
@@ -733,6 +1063,18 @@ class SqlAlchemyAigcCanvasRepository:
                 .limit(1)
             )
             if group is not None:
+                for member in list(
+                    session.scalars(
+                        select(CanvasGroupMember).where(CanvasGroupMember.group_id == group.id)
+                    )
+                ):
+                    member_node = session.get(CanvasGraphNode, member.canvas_node_id)
+                    if (
+                        member_node is not None
+                        and member_node.node_type == CanvasNodeType.STYLE_PRESET.value
+                        and member_node.id != node.id
+                    ):
+                        session.delete(member)
                 max_order = int(
                     session.scalar(
                         select(func.coalesce(func.max(CanvasGroupMember.sort_order), 0)).where(
@@ -825,6 +1167,12 @@ class SqlAlchemyAigcCanvasRepository:
                             )
                         )
 
+            if (
+                previous_visual_profile_id is not None
+                and previous_visual_profile_id != profile.id
+            ) or canon_profile_changed:
+                self._invalidate_visual_profile_dependents(session, project_id)
+
             self._record_event(
                 session,
                 project_id,
@@ -838,11 +1186,11 @@ class SqlAlchemyAigcCanvasRepository:
                 },
             )
             return {
-                "preset": visual_preset_profile_json(session),
-                "visualProfile": episode_visual_profile_json(profile),
+                "preset": visual_preset_profile_json(session, resolved_key),
+                "visualProfile": episode_visual_profile_json(session, profile),
                 "canvasNodeId": str(node.id),
                 "canvasNodeIds": [str(item.id) for item in applied_nodes],
-                "reusedAssetIds": [str(assets_by_key[key].id) for key in CANON_V3_REQUIRED_KEYS],
+                "reusedAssetIds": [str(assets_by_key[key].id) for key in required_keys],
             }
 
     def get_episode_visual_profile(self, project_id: uuid.UUID) -> dict[str, Any]:
@@ -855,7 +1203,7 @@ class SqlAlchemyAigcCanvasRepository:
                 VisualProfileRevision,
                 project.current_visual_profile_revision_id,
             )
-            return episode_visual_profile_json(profile)
+            return episode_visual_profile_json(session, profile)
 
     def update_episode_visual_profile(
         self,
@@ -888,7 +1236,9 @@ class SqlAlchemyAigcCanvasRepository:
                 (str(item.asset_id), item.purpose.value) for item in payload.reference_bindings
             }
             if submitted_bindings != current_bindings:
-                raise WorkflowConflictError("Canon-v3 必需身份与画风槽位不允许删除、换绑或改变职责")
+                raise WorkflowConflictError(
+                    "当前 Canon 必需身份与画风槽位不允许删除、换绑或改变职责"
+                )
 
             profile_document = {
                 **document,
@@ -911,7 +1261,7 @@ class SqlAlchemyAigcCanvasRepository:
             )
             if existing is not None:
                 project.current_visual_profile_revision_id = existing.id
-                return episode_visual_profile_json(existing)
+                return episode_visual_profile_json(session, existing)
 
             revision = (
                 int(
@@ -943,47 +1293,13 @@ class SqlAlchemyAigcCanvasRepository:
             session.flush()
             project.current_visual_profile_revision_id = profile.id
 
-            assets_by_key = load_canon_assets(session, CANON_V3_REQUIRED_KEYS)
+            required_keys = canon_reference_keys(current.source_profile_id, "indoor")
+            assets_by_key = load_canon_assets(session, required_keys)
             project.default_reference_bindings_json = generation_reference_bindings(
                 assets_by_key,
-                CANON_V3_REQUIRED_KEYS,
+                required_keys,
             )
-            session.execute(
-                Asset.__table__.update()
-                .where(
-                    Asset.production_run_id == project_id,
-                    Asset.scope != "canon",
-                    Asset.status.in_(("ready", "approved")),
-                    or_(
-                        Asset.role.like("character_design_%"),
-                        Asset.role.in_(
-                            (
-                                "scene_look",
-                                "generated_reference",
-                                "shot_anchor",
-                                "shot_tail_frame",
-                                "video_candidate",
-                                "shot_video",
-                                "shot_video_edit",
-                                "project_sequence",
-                            )
-                        ),
-                    ),
-                )
-                .values(status="stale")
-            )
-            sources = list(
-                session.scalars(
-                    select(CanvasGraphNode).where(
-                        CanvasGraphNode.production_run_id == project_id,
-                        CanvasGraphNode.node_type.in_(
-                            (CanvasNodeType.SUBJECT.value, CanvasNodeType.STYLE_PRESET.value)
-                        ),
-                    )
-                )
-            )
-            for source in sources:
-                self._mark_graph_downstream_stale(session, source.id)
+            self._invalidate_visual_profile_dependents(session, project_id)
             self._record_event(
                 session,
                 project_id,
@@ -994,7 +1310,7 @@ class SqlAlchemyAigcCanvasRepository:
                     "revision": profile.revision,
                 },
             )
-            return episode_visual_profile_json(profile)
+            return episode_visual_profile_json(session, profile)
 
     def create_video_filmstrip_run(
         self, asset_id: uuid.UUID, *, frame_count: int
@@ -1142,14 +1458,17 @@ class SqlAlchemyAigcCanvasRepository:
         expected_revision: int,
         payload: Any,
     ) -> dict[str, Any]:
-        document = payload.model_dump(mode="json", by_alias=True)
-        input_hash = _json_hash(document)
         with self._sessions.begin() as session:
             node = self._required(session, CanvasGraphNode, node_id, lock=True)
             if node.revision != expected_revision:
                 raise WorkflowConflictError(
                     f"生成节点版本冲突：当前 {node.revision}，提交 {expected_revision}"
                 )
+            preview = self._compile_node_generation_input(session, node, payload)
+            document = payload.model_dump(mode="json", by_alias=True)
+            document["actualReferences"] = preview["references"]
+            document["inputHash"] = preview["inputHash"]
+            input_hash = str(preview["inputHash"])
             revision = node.revision + 1
             row = NodeGenerationConfig(
                 id=uuid.uuid4(),
@@ -1159,10 +1478,7 @@ class SqlAlchemyAigcCanvasRepository:
                 model=payload.model,
                 mode=payload.mode,
                 config_json=document,
-                actual_reference_bindings_json=[
-                    item.model_dump(mode="json", by_alias=True)
-                    for item in payload.actual_references
-                ],
+                actual_reference_bindings_json=list(preview["references"]),
                 input_hash=input_hash,
             )
             session.add(row)
@@ -1193,6 +1509,232 @@ class SqlAlchemyAigcCanvasRepository:
                 **document,
             }
 
+    def preview_generation_input(
+        self,
+        node_id: uuid.UUID,
+        payload: NodeGenerationConfigDraft,
+    ) -> dict[str, Any]:
+        with self._sessions() as session:
+            node = self._required(session, CanvasGraphNode, node_id)
+            return self._compile_node_generation_input(session, node, payload)
+
+    def _compile_node_generation_input(
+        self,
+        session: Session,
+        node: CanvasGraphNode,
+        payload: NodeGenerationConfigDraft,
+    ) -> dict[str, Any]:
+        media_kind = (
+            "video"
+            if node.node_type == CanvasNodeType.VIDEO_GENERATION.value
+            else "audio"
+            if node.node_type == CanvasNodeType.AUDIO_GENERATION.value
+            else "image"
+        )
+        capability = self._resolve_provider_capability(
+            session,
+            provider=payload.provider,
+            model=payload.model,
+            media_kind=media_kind,
+        )
+        blockers: list[str] = []
+        warnings: list[str] = []
+        if capability is None:
+            blockers.append("当前 Provider、模型和媒体类型没有启用的能力档案")
+            capabilities: dict[str, Any] = {}
+            capability_revision = "unavailable"
+        else:
+            capabilities = dict(capability["capabilities"])
+            capability_revision = str(
+                capabilities.get("capabilityRevision")
+                or capability["updatedAt"]
+                or capability["id"]
+            )
+            supported_modes = {
+                str(item) for item in capabilities.get("modes", [])
+            }
+            if supported_modes and payload.mode not in supported_modes:
+                blockers.append(
+                    f"当前 {payload.model} 不支持 {payload.mode} 生成模式"
+                )
+
+        drafts = [item.model_dump(mode="json", by_alias=True) for item in payload.actual_references]
+        requested_ids = [uuid.UUID(str(item["assetId"])) for item in drafts]
+        assets = {
+            asset.id: asset
+            for asset in session.scalars(select(Asset).where(Asset.id.in_(requested_ids)))
+        }
+        maximum = int(
+            capabilities.get("maxReferenceImages") or (1 if media_kind == "video" else 14)
+        )
+        if payload.mode == "image_to_video":
+            maximum = min(maximum, 1)
+        elif payload.mode == "first_last_frame":
+            maximum = min(maximum, 2)
+        compiled: list[dict[str, Any]] = []
+        seen_ids: set[uuid.UUID] = set()
+        seen_hashes: set[str] = set()
+        for draft in drafts:
+            asset_id = uuid.UUID(str(draft["assetId"]))
+            asset = assets.get(asset_id)
+            if asset is None:
+                blockers.append(f"引用素材 {asset_id} 不存在")
+                continue
+            if asset.production_run_id not in {None, node.production_run_id}:
+                blockers.append(f"引用素材 {asset_id} 不属于当前项目")
+                continue
+            if asset.media_type != "image":
+                blockers.append(f"引用素材 {asset_id} 不是图片")
+                continue
+            if asset.status not in {"approved", "ready"}:
+                blockers.append(f"引用素材 {asset_id} 尚未批准")
+                continue
+            path = _resolve_asset_path(asset.storage_key, self._asset_root)
+            if not path.is_file():
+                blockers.append(f"引用素材 {asset_id} 文件不可读取")
+                continue
+            if asset.id in seen_ids or asset.sha256 in seen_hashes:
+                warnings.append(f"引用素材 {asset_id} 与前序素材重复，已按首次出现位置去重")
+                continue
+            seen_ids.add(asset.id)
+            seen_hashes.add(asset.sha256)
+            ordinal = len(compiled) + 1
+            provider_included = ordinal <= maximum
+            omission_reason = None
+            if not provider_included:
+                omission_reason = f"当前 {payload.model} 最多接受 {maximum} 张参考图"
+                if bool(draft.get("locked")):
+                    blockers.append(f"锁定引用 @{ordinal} 超出模型参考图上限，不能静默省略")
+            provider_slot = (
+                "first_frame"
+                if provider_included
+                and payload.mode in {"image_to_video", "first_last_frame"}
+                and ordinal == 1
+                else "last_frame"
+                if provider_included
+                and payload.mode == "first_last_frame"
+                and ordinal == 2
+                else f"reference_image_{ordinal}"
+                if provider_included
+                else None
+            )
+            metadata = dict(asset.metadata_json or {})
+            compiled.append(
+                CompiledProviderReference(
+                    assetId=asset.id,
+                    sourceNodeId=draft.get("sourceNodeId"),
+                    sourceType=str(draft.get("sourceType") or "canvas"),
+                    subjectRevisionId=draft.get("subjectRevisionId"),
+                    semanticRole=str(draft.get("semanticRole") or "reference"),
+                    purpose=str(draft.get("purpose") or "reference"),
+                    instruction=str(draft.get("instruction") or ""),
+                    ordinal=ordinal,
+                    locked=bool(draft.get("locked", False)),
+                    sha256=asset.sha256,
+                    providerIncluded=provider_included,
+                    providerSlot=provider_slot,
+                    omissionReason=omission_reason,
+                    origin=str(draft.get("origin") or "canvas_reference"),
+                    title=str(
+                        metadata.get("displayName")
+                        or metadata.get("title")
+                        or asset.semantic_key
+                        or asset.role
+                    ),
+                    contentUrl=f"/api/v1/assets/{asset.id}/content",
+                    evidenceLevel="frozen",
+                ).model_dump(mode="json", by_alias=True)
+            )
+        input_document = {
+            "provider": payload.provider,
+            "model": payload.model,
+            "mode": payload.mode,
+            "capabilityRevision": capability_revision,
+            "prompt": payload.draft_prompt,
+            "aspectRatio": payload.aspect_ratio,
+            "resolution": payload.resolution,
+            "durationSeconds": payload.duration_seconds,
+            "audioEnabled": payload.audio_enabled,
+            "candidateCount": payload.candidate_count,
+            "cameraMotion": payload.camera_motion,
+            "referenceAnnotations": [
+                item.model_dump(mode="json", by_alias=True)
+                for item in payload.reference_annotations
+            ],
+            "references": compiled,
+        }
+        included_reference_count = sum(
+            1 for item in compiled if item.get("providerIncluded") is True
+        )
+        if payload.mode == "image_to_video" and included_reference_count != 1:
+            blockers.append("图生视频必须且只能选择一张已批准开场图")
+        if payload.mode == "first_last_frame" and included_reference_count != 2:
+            blockers.append("首尾帧模式必须按顺序选择一张开场图和一张结尾图")
+        input_image_cost = capabilities.get("inputImageCostMicros")
+        output_image_cost = capabilities.get("outputImageCostMicros")
+        if media_kind == "image" and input_image_cost is not None and output_image_cost is not None:
+            estimated_cost_micros = payload.candidate_count * (
+                int(output_image_cost) + included_reference_count * int(input_image_cost)
+            )
+        else:
+            raw_estimate = capabilities.get("estimatedCostMicros")
+            estimated_cost_micros = None if raw_estimate is None else int(raw_estimate)
+        preview = GenerationInputPreview(
+            provider=payload.provider,
+            model=payload.model,
+            mode=payload.mode,
+            capabilityRevision=capability_revision,
+            prompt=payload.draft_prompt,
+            references=compiled,
+            blockers=list(dict.fromkeys(blockers)),
+            warnings=list(dict.fromkeys(warnings)),
+            estimatedCostMicros=estimated_cost_micros,
+            inputHash=generation_input_hash(input_document),
+        )
+        return preview.model_dump(mode="json", by_alias=True)
+
+    def _resolve_provider_capability(
+        self,
+        session: Session,
+        *,
+        provider: str,
+        model: str,
+        media_kind: str,
+    ) -> dict[str, Any] | None:
+        row = session.scalar(
+            select(ProviderCapability).where(
+                ProviderCapability.provider == provider,
+                ProviderCapability.model == model,
+                ProviderCapability.media_kind == media_kind,
+                ProviderCapability.active.is_(True),
+            )
+        )
+        if row is not None:
+            return {
+                "id": str(row.id),
+                "provider": row.provider,
+                "model": row.model,
+                "mediaKind": row.media_kind,
+                "capabilities": dict(row.capabilities_json or {}),
+                "active": True,
+                "updatedAt": (None if row.updated_at is None else row.updated_at.isoformat()),
+            }
+        if (
+            media_kind == "image"
+            and provider == SEEDREAM_5_0_CAPABILITY.provider
+            and model == SEEDREAM_5_0_CAPABILITY.model
+        ):
+            return {
+                "id": f"builtin:{SEEDREAM_5_0_CAPABILITY.capability_revision}",
+                "provider": provider,
+                "model": model,
+                "mediaKind": media_kind,
+                "capabilities": SEEDREAM_5_0_CAPABILITY.provider_capability_document(),
+                "active": True,
+                "updatedAt": None,
+            }
+        return None
+
     def list_provider_capabilities(self, *, media_kind: str | None = None) -> list[dict[str, Any]]:
         with self._sessions() as session:
             query = select(ProviderCapability).where(ProviderCapability.active.is_(True))
@@ -1205,7 +1747,9 @@ class SqlAlchemyAigcCanvasRepository:
                 )
             )
             documents: list[dict[str, Any]] = []
+            known: set[tuple[str, str, str]] = set()
             for row in rows:
+                known.add((row.provider, row.model, row.media_kind))
                 capabilities = dict(row.capabilities_json)
                 if row.media_kind == "video":
                     capabilities.setdefault(
@@ -1227,6 +1771,23 @@ class SqlAlchemyAigcCanvasRepository:
                         "updatedAt": (
                             None if row.updated_at is None else row.updated_at.isoformat()
                         ),
+                    }
+                )
+            builtin_key = (
+                SEEDREAM_5_0_CAPABILITY.provider,
+                SEEDREAM_5_0_CAPABILITY.model,
+                "image",
+            )
+            if media_kind in {None, "image"} and builtin_key not in known:
+                documents.append(
+                    {
+                        "id": f"builtin:{SEEDREAM_5_0_CAPABILITY.capability_revision}",
+                        "provider": builtin_key[0],
+                        "model": builtin_key[1],
+                        "mediaKind": builtin_key[2],
+                        "capabilities": (SEEDREAM_5_0_CAPABILITY.provider_capability_document()),
+                        "active": True,
+                        "updatedAt": None,
                     }
                 )
             return documents
@@ -1263,7 +1824,7 @@ class SqlAlchemyAigcCanvasRepository:
                         status=subject.status,
                     )
                 )
-            return tuple(result)
+            return _preferred_stored_subjects(result)
 
     def begin_generation_attempt(self, **values: object) -> tuple[dict[str, Any], bool]:
         attempt_id = uuid.uuid4()
@@ -1297,7 +1858,12 @@ class SqlAlchemyAigcCanvasRepository:
     def finish_generation_attempt(self, attempt_id: str, **values: object) -> None:
         with self._sessions.begin() as session:
             row = self._required(session, GenerationAttempt, uuid.UUID(attempt_id), lock=True)
-            row.status = str(values["status"])
+            next_status = str(values["status"])
+            if row.status == "succeeded":
+                if next_status == "succeeded":
+                    return
+                raise WorkflowConflictError("生成尝试已处于成功终态，不允许逆转")
+            row.status = next_status
             if "response" in values:
                 row.response_json = values["response"]  # type: ignore[assignment]
             if "error" in values:
@@ -1398,7 +1964,13 @@ class SqlAlchemyAigcCanvasRepository:
             prompt.status = status
             prompt.completed_at = datetime.now(UTC)
             if "raw_response" in values:
-                raw = dict(values["raw_response"])  # type: ignore[arg-type]
+                raw_response = values["raw_response"]
+                if isinstance(raw_response, dict):
+                    raw = dict(raw_response)
+                elif isinstance(raw_response, str):
+                    raw = {"text": raw_response}
+                else:
+                    raise TypeError("raw_response must be a dict or string")
                 response_id = values.get("provider_response_id")
                 if response_id is not None:
                     raw["_providerResponseId"] = response_id
@@ -1415,14 +1987,118 @@ class SqlAlchemyAigcCanvasRepository:
             step.completed_at = prompt.completed_at
             step.error_json = prompt.error_json
 
+    def get_succeeded_story_candidate_batch(self, **values: object) -> dict[str, object] | None:
+        project_id = uuid.UUID(str(values["project_id"]))
+        business_object_id = uuid.UUID(str(values["business_object_id"]))
+        with self._sessions() as session:
+            prompt = session.scalar(
+                select(PromptRecord)
+                .join(WorkflowStep, WorkflowStep.id == PromptRecord.step_id)
+                .where(
+                    WorkflowStep.production_run_id == project_id,
+                    PromptRecord.business_object_type == values["business_object_type"],
+                    PromptRecord.business_object_id == business_object_id,
+                    PromptRecord.call_purpose == values["call_purpose"],
+                    PromptRecord.input_hash == values["input_hash"],
+                    PromptRecord.status == "succeeded",
+                )
+                .order_by(PromptRecord.completed_at.desc(), PromptRecord.created_at.desc())
+                .limit(1)
+            )
+            if prompt is None:
+                return None
+            structured = prompt.structured_response_json
+            if not isinstance(structured, dict):
+                raise WorkflowConflictError("成功故事 Prompt 缺少结构化恢复结果")
+            try:
+                batch = CreativeStoryCandidateBatch.model_validate(structured.get("batch"))
+                raw_diagnostics = structured.get("diagnostics", [])
+                if not isinstance(raw_diagnostics, list):
+                    raise ValueError("diagnostics must be a list")
+                diagnostics = [CanvasDiagnostic.model_validate(item) for item in raw_diagnostics]
+            except (TypeError, ValueError) as exc:
+                raise WorkflowConflictError("成功故事 Prompt 的恢复结果无效") from exc
+            return {
+                "promptId": prompt.id,
+                "batch": batch,
+                "diagnostics": tuple(diagnostics),
+            }
+
+    def get_story_candidates(
+        self,
+        *,
+        project_id: uuid.UUID,
+        candidate_ids: Sequence[uuid.UUID],
+    ) -> tuple[dict[str, Any], ...]:
+        ordered_ids = tuple(candidate_ids)
+        if not ordered_ids:
+            return ()
+        if len(set(ordered_ids)) != len(ordered_ids):
+            raise WorkflowConflictError("成功故事生成尝试包含重复的候选版本引用")
+        with self._sessions() as session:
+            stories = list(
+                session.scalars(
+                    select(StoryRevisionRecord).where(
+                        StoryRevisionRecord.production_run_id == project_id,
+                        StoryRevisionRecord.id.in_(ordered_ids),
+                    )
+                )
+            )
+            stories_by_id = {story.id: story for story in stories}
+            if any(candidate_id not in stories_by_id for candidate_id in ordered_ids):
+                raise WorkflowConflictError(
+                    "成功故事生成尝试引用的候选版本不存在或不属于当前项目"
+                )
+            scores_by_story_id = {
+                score.story_revision_id: score
+                for score in session.scalars(
+                    select(StoryScore).where(StoryScore.story_revision_id.in_(ordered_ids))
+                )
+            }
+            prompt_ids = {
+                story.candidate_prompt_id
+                for story in stories
+                if story.candidate_prompt_id is not None
+            }
+            prompts_by_id = {
+                prompt.id: prompt
+                for prompt in (
+                    session.scalars(select(PromptRecord).where(PromptRecord.id.in_(prompt_ids)))
+                    if prompt_ids
+                    else ()
+                )
+            }
+            return tuple(
+                _story_json(
+                    stories_by_id[candidate_id],
+                    scores_by_story_id.get(candidate_id),
+                    prompts_by_id.get(stories_by_id[candidate_id].candidate_prompt_id),
+                )
+                for candidate_id in ordered_ids
+            )
+
     def save_story_candidate(self, **values: object) -> dict[str, Any]:
         project_id = uuid.UUID(str(values["project_id"]))
         candidate = values["candidate"]
-        scorecard = values["scorecard"]
-        if not isinstance(candidate, StoryCandidateOutput) or not isinstance(
-            scorecard, StoryScorecard
-        ):
-            raise TypeError("candidate and scorecard must use Canvas V2 contracts")
+        scorecard = values.get("scorecard")
+        if isinstance(candidate, CreativeStoryCandidate):
+            if scorecard is not None:
+                raise TypeError("creative story candidates do not accept a legacy scorecard")
+            title = candidate.title
+            logline = candidate.summary or candidate.title
+            synopsis = candidate.body
+            scene_plan: list[dict[str, Any]] = []
+            critic_prompt_id = None
+        elif isinstance(candidate, StoryCandidateOutput):
+            if not isinstance(scorecard, StoryScorecard):
+                raise TypeError("legacy story candidates require a Canvas V2 scorecard")
+            title = candidate.title
+            logline = candidate.logline
+            synopsis = candidate.synopsis
+            scene_plan = [item.model_dump(mode="json", by_alias=True) for item in candidate.scenes]
+            critic_prompt_id = values.get("critic_prompt_id")
+        else:
+            raise TypeError("candidate must use a supported creative or legacy story contract")
         with self._sessions.begin() as session:
             self._require_project(session, project_id, lock=True)
             revision = (
@@ -1448,35 +2124,209 @@ class SqlAlchemyAigcCanvasRepository:
                     else str(values["strategy"])
                 ),
                 status=StoryRevisionStatus.CANDIDATE.value,
-                title=candidate.title,
-                logline=candidate.logline,
-                synopsis=candidate.synopsis,
+                title=title,
+                logline=logline,
+                synopsis=synopsis,
                 subject_ids_json=[str(item) for item in values["subject_ids"]],
-                scene_plan_json=[
-                    item.model_dump(mode="json", by_alias=True) for item in candidate.scenes
-                ],
+                scene_plan_json=scene_plan,
                 candidate_prompt_id=values["candidate_prompt_id"],
-                critic_prompt_id=values["critic_prompt_id"],
+                critic_prompt_id=critic_prompt_id,
             )
             session.add(row)
             session.flush()
-            score = StoryScore(
-                id=uuid.uuid4(),
-                story_revision_id=row.id,
-                opening_hook=scorecard.opening_hook,
-                causal_completeness=scorecard.causal_completeness,
-                subject_necessity=scorecard.subject_necessity,
-                emotional_arc=scorecard.emotional_arc,
-                visualizability=scorecard.visualizability,
-                duration_fit=scorecard.duration_fit,
-                continuity_risk=scorecard.continuity_risk,
-                safety=scorecard.safety,
-                rationale=scorecard.rationale,
-                warnings_json=list(scorecard.warnings),
+            score: StoryScore | None = None
+            if isinstance(scorecard, StoryScorecard):
+                score = StoryScore(
+                    id=uuid.uuid4(),
+                    story_revision_id=row.id,
+                    opening_hook=scorecard.opening_hook,
+                    causal_completeness=scorecard.causal_completeness,
+                    subject_necessity=scorecard.subject_necessity,
+                    emotional_arc=scorecard.emotional_arc,
+                    visualizability=scorecard.visualizability,
+                    duration_fit=scorecard.duration_fit,
+                    continuity_risk=scorecard.continuity_risk,
+                    safety=scorecard.safety,
+                    rationale=scorecard.rationale,
+                    warnings_json=list(scorecard.warnings),
+                )
+                session.add(score)
+                session.flush()
+            prompt = (
+                None
+                if row.candidate_prompt_id is None
+                else session.scalar(
+                    select(PromptRecord).where(PromptRecord.id == row.candidate_prompt_id)
+                )
             )
-            session.add(score)
+            return _story_json(row, score, prompt)
+
+    def save_story_candidate_batch(self, **values: object) -> tuple[dict[str, Any], ...]:
+        project_id = uuid.UUID(str(values["project_id"]))
+        candidates = tuple(values["candidates"])  # type: ignore[arg-type]
+        if not candidates or len(candidates) > 5:
+            raise ValueError("creative story candidate batch must contain 1 to 5 candidates")
+        if not all(isinstance(candidate, CreativeStoryCandidate) for candidate in candidates):
+            raise TypeError("candidate batch must use CreativeStoryCandidate contracts")
+        with self._sessions.begin() as session:
+            self._require_project(session, project_id, lock=True)
+            candidate_prompt_id = uuid.UUID(str(values["candidate_prompt_id"]))
+            existing = list(
+                session.scalars(
+                    select(StoryRevisionRecord)
+                    .where(
+                        StoryRevisionRecord.production_run_id == project_id,
+                        StoryRevisionRecord.candidate_prompt_id == candidate_prompt_id,
+                    )
+                    .order_by(StoryRevisionRecord.revision)
+                    .with_for_update()
+                )
+            )
+            if existing:
+                expected_brief_id = uuid.UUID(str(values["brief_id"]))
+                expected_strategy = (
+                    values["strategy"].value
+                    if isinstance(values["strategy"], StoryStrategy)
+                    else str(values["strategy"])
+                )
+                expected_subject_ids = [str(item) for item in values["subject_ids"]]
+                content_matches = len(existing) == len(candidates) and all(
+                    row.brief_id == expected_brief_id
+                    and row.strategy == expected_strategy
+                    and row.subject_ids_json == expected_subject_ids
+                    and row.parent_revision_id is None
+                    and row.source_event_candidate_id is None
+                    and row.status == StoryRevisionStatus.CANDIDATE.value
+                    and row.title == candidate.title
+                    and row.logline == (candidate.summary or candidate.title)
+                    and row.synopsis == candidate.body
+                    and row.scene_plan_json == []
+                    and row.episode_rules_json == {}
+                    and row.critic_prompt_id is None
+                    and row.approved_at is None
+                    for row, candidate in zip(existing, candidates, strict=True)
+                )
+                if not content_matches:
+                    raise WorkflowConflictError("故事候选批次已部分物化或与成功 Prompt 内容不一致")
+                prompt = session.scalar(
+                    select(PromptRecord).where(PromptRecord.id == candidate_prompt_id)
+                )
+                return tuple(_story_json(row, None, prompt) for row in existing)
+            latest_revision = int(
+                session.scalar(
+                    select(func.coalesce(func.max(StoryRevisionRecord.revision), 0)).where(
+                        StoryRevisionRecord.production_run_id == project_id
+                    )
+                )
+                or 0
+            )
+            rows: list[StoryRevisionRecord] = []
+            for offset, candidate in enumerate(candidates, 1):
+                row = StoryRevisionRecord(
+                    id=uuid.uuid4(),
+                    production_run_id=project_id,
+                    brief_id=values["brief_id"],
+                    revision=latest_revision + offset,
+                    strategy=(
+                        values["strategy"].value
+                        if isinstance(values["strategy"], StoryStrategy)
+                        else str(values["strategy"])
+                    ),
+                    status=StoryRevisionStatus.CANDIDATE.value,
+                    title=candidate.title,
+                    logline=candidate.summary or candidate.title,
+                    synopsis=candidate.body,
+                    subject_ids_json=[str(item) for item in values["subject_ids"]],
+                    scene_plan_json=[],
+                    candidate_prompt_id=candidate_prompt_id,
+                    critic_prompt_id=None,
+                )
+                session.add(row)
+                rows.append(row)
             session.flush()
-            return _story_json(row, score)
+            prompt = session.scalar(
+                select(PromptRecord).where(
+                    PromptRecord.id == uuid.UUID(str(values["candidate_prompt_id"]))
+                )
+            )
+            return tuple(_story_json(row, None, prompt) for row in rows)
+
+    def save_story_revision_edit(self, **values: object) -> dict[str, Any]:
+        revision_id = uuid.UUID(str(values["revision_id"]))
+        expected_revision = int(values["expected_revision"])
+        idempotency_key = str(values["idempotency_key"])
+        title = str(values["title"]).strip()
+        body = str(values["body"]).strip()
+        summary_value = values.get("summary")
+        summary = None if summary_value is None else str(summary_value).strip()
+        if not title or len(title) > 200:
+            raise ValueError("剧情标题必须为 1 至 200 个字符")
+        if not body or len(body) > 200_000:
+            raise ValueError("剧情正文必须为 1 至 200000 个字符")
+        if summary is not None and (not summary or len(summary) > 4_000):
+            raise ValueError("剧情摘要必须为 1 至 4000 个字符")
+        if not 8 <= len(idempotency_key) <= 96:
+            raise ValueError("剧情编辑幂等键必须为 8 至 96 个字符")
+        edit_id = uuid.uuid5(revision_id, f"story-document-edit:{idempotency_key}")
+        revision_conflict: IntegrityError | None = None
+        for _attempt in range(3):
+            try:
+                with self._sessions.begin() as session:
+                    source = self._required(session, StoryRevisionRecord, revision_id)
+                    self._required(session, ProductionRun, source.production_run_id, lock=True)
+                    source = self._required(
+                        session,
+                        StoryRevisionRecord,
+                        revision_id,
+                        lock=True,
+                    )
+                    if source.revision != expected_revision:
+                        raise WorkflowConflictError("剧情版本冲突，请刷新来源版本后重试")
+                    existing = session.scalar(
+                        select(StoryRevisionRecord).where(StoryRevisionRecord.id == edit_id)
+                    )
+                    if existing is not None:
+                        content_matches = (
+                            existing.parent_revision_id == source.id
+                            and existing.title == title
+                            and existing.synopsis == body
+                            and existing.logline == (summary or title)
+                        )
+                        if not content_matches:
+                            raise WorkflowConflictError("剧情编辑幂等键已用于不同内容")
+                        return _story_json(existing, None)
+                    latest_revision = int(
+                        session.scalar(
+                            select(func.coalesce(func.max(StoryRevisionRecord.revision), 0)).where(
+                                StoryRevisionRecord.production_run_id == source.production_run_id
+                            )
+                        )
+                        or 0
+                    )
+                    edited = StoryRevisionRecord(
+                        id=edit_id,
+                        production_run_id=source.production_run_id,
+                        brief_id=source.brief_id,
+                        parent_revision_id=source.id,
+                        source_event_candidate_id=source.source_event_candidate_id,
+                        revision=latest_revision + 1,
+                        strategy=source.strategy,
+                        status=StoryRevisionStatus.CANDIDATE.value,
+                        title=title,
+                        logline=summary or title,
+                        synopsis=body,
+                        subject_ids_json=list(source.subject_ids_json),
+                        scene_plan_json=[],
+                        episode_rules_json=dict(source.episode_rules_json or {}),
+                        candidate_prompt_id=None,
+                        critic_prompt_id=None,
+                    )
+                    session.add(edited)
+                    session.flush()
+                    return _story_json(edited, None)
+            except IntegrityError as error:
+                revision_conflict = error
+        raise WorkflowConflictError("剧情新版本分配冲突，请重试") from revision_conflict
 
     def save_story_event_candidate(self, **values: object) -> dict[str, Any]:
         project_id = uuid.UUID(str(values["project_id"]))
@@ -1498,8 +2348,7 @@ class SqlAlchemyAigcCanvasRepository:
             candidate_index = int(values["candidate_index"])
             existing = session.scalar(
                 select(StoryEventCandidateRecord).where(
-                    StoryEventCandidateRecord.production_recipe_instance_id
-                    == recipe_instance_id,
+                    StoryEventCandidateRecord.production_recipe_instance_id == recipe_instance_id,
                     StoryEventCandidateRecord.batch_id == batch_id,
                     StoryEventCandidateRecord.candidate_index == candidate_index,
                 )
@@ -1549,8 +2398,7 @@ class SqlAlchemyAigcCanvasRepository:
             latest_candidate = session.scalar(
                 select(StoryEventCandidateRecord)
                 .where(
-                    StoryEventCandidateRecord.production_recipe_instance_id
-                    == recipe_instance_id
+                    StoryEventCandidateRecord.production_recipe_instance_id == recipe_instance_id
                 )
                 .order_by(StoryEventCandidateRecord.created_at.desc())
                 .limit(1)
@@ -1560,11 +2408,9 @@ class SqlAlchemyAigcCanvasRepository:
             row = session.scalar(
                 select(StoryEventCandidateRecord)
                 .where(
-                    StoryEventCandidateRecord.production_recipe_instance_id
-                    == recipe_instance_id,
+                    StoryEventCandidateRecord.production_recipe_instance_id == recipe_instance_id,
                     StoryEventCandidateRecord.batch_id == latest_candidate.batch_id,
-                    StoryEventCandidateRecord.status
-                    == StoryEventCandidateStatus.SELECTED.value,
+                    StoryEventCandidateRecord.status == StoryEventCandidateStatus.SELECTED.value,
                 )
                 .order_by(StoryEventCandidateRecord.selected_at.desc())
                 .limit(1)
@@ -1600,6 +2446,7 @@ class SqlAlchemyAigcCanvasRepository:
             status = approve_story_revision(
                 StoryRevisionStatus(row.status),
                 scorecard=scorecard,
+                requires_scorecard=requires_legacy_story_approval_contract(row),
                 revision_subject_ids=tuple(uuid.UUID(item) for item in row.subject_ids_json),
                 required_subject_ids=required_subject_ids,
             )
@@ -1612,33 +2459,56 @@ class SqlAlchemyAigcCanvasRepository:
                 )
                 .with_for_update()
             )
-            for previous in session.scalars(
-                select(StoryRevisionRecord).where(
-                    StoryRevisionRecord.production_run_id == row.production_run_id,
-                    StoryRevisionRecord.status == StoryRevisionStatus.APPROVED.value,
-                    StoryRevisionRecord.id != row.id,
+            previous_approved = list(
+                session.scalars(
+                    select(StoryRevisionRecord).where(
+                        StoryRevisionRecord.production_run_id == row.production_run_id,
+                        StoryRevisionRecord.status == StoryRevisionStatus.APPROVED.value,
+                        StoryRevisionRecord.id != row.id,
+                    )
                 )
-            ):
+            )
+            if previous_approved:
+                invalidate_story_production_lineage(
+                    session,
+                    project_id=row.production_run_id,
+                    story_ids=tuple(previous.id for previous in previous_approved),
+                    reason="当前剧情已切换到新的故事版本",
+                )
+            for previous in previous_approved:
                 previous.status = StoryRevisionStatus.SUPERSEDED.value
             row.status = status.value
             row.approved_at = datetime.now(UTC)
-            materialize_approved_story_scenes(session, row)
-            return _story_json(row, score)
+            if row.scene_plan_json:
+                materialize_approved_story_scenes(session, row)
+            prompt = (
+                None
+                if row.candidate_prompt_id is None
+                else session.scalar(
+                    select(PromptRecord).where(PromptRecord.id == row.candidate_prompt_id)
+                )
+            )
+            return _story_json(row, score, prompt)
 
-    def get_storyboard_context(self, project_id: uuid.UUID) -> dict[str, Any]:
+    def get_storyboard_context(
+        self,
+        project_id: uuid.UUID,
+        *,
+        source_story_revision_id: uuid.UUID | None = None,
+    ) -> dict[str, Any]:
         with self._sessions() as session:
             self._require_project(session, project_id)
+            story_query = select(StoryRevisionRecord).where(
+                StoryRevisionRecord.production_run_id == project_id,
+                StoryRevisionRecord.status == StoryRevisionStatus.APPROVED.value,
+            )
+            if source_story_revision_id is not None:
+                story_query = story_query.where(StoryRevisionRecord.id == source_story_revision_id)
             story = session.scalar(
-                select(StoryRevisionRecord)
-                .where(
-                    StoryRevisionRecord.production_run_id == project_id,
-                    StoryRevisionRecord.status == StoryRevisionStatus.APPROVED.value,
-                )
-                .order_by(StoryRevisionRecord.revision.desc())
-                .limit(1)
+                story_query.order_by(StoryRevisionRecord.revision.desc()).limit(1)
             )
             if story is None:
-                raise ValueError("故事尚未人工批准，不能生成分镜")
+                raise ValueError("选择的剧情脚本不存在、未批准或不属于当前项目")
             brief = session.scalar(
                 select(StoryBriefRecord)
                 .where(StoryBriefRecord.production_run_id == project_id)
@@ -1650,21 +2520,64 @@ class SqlAlchemyAigcCanvasRepository:
             score = session.scalar(
                 select(StoryScore).where(StoryScore.story_revision_id == story.id)
             )
-            subjects = list(
-                session.scalars(
-                    select(Subject)
-                    .where(Subject.production_run_id == project_id, Subject.status != "archived")
-                    .order_by(Subject.created_at)
+            candidate_prompt = (
+                None
+                if story.candidate_prompt_id is None
+                else session.scalar(
+                    select(PromptRecord).where(PromptRecord.id == story.candidate_prompt_id)
                 )
             )
+            subjects = _preferred_subject_rows(
+                session,
+                list(
+                    session.scalars(
+                        select(Subject)
+                        .where(
+                            Subject.production_run_id == project_id,
+                            Subject.status != "archived",
+                        )
+                        .order_by(Subject.created_at)
+                    )
+                ),
+            )
+            storyboard_revision = session.scalar(
+                select(StoryboardRevision)
+                .where(
+                    StoryboardRevision.production_run_id == project_id,
+                    StoryboardRevision.story_revision_id == story.id,
+                    StoryboardRevision.status != StoryboardRevisionStatus.SUPERSEDED.value,
+                )
+                .order_by(StoryboardRevision.revision.desc())
+                .limit(1)
+            )
             existing = list(
-                session.scalars(select(ShotBeat).where(ShotBeat.story_revision_id == story.id))
+                session.scalars(
+                    select(ShotBeat).where(
+                        ShotBeat.story_revision_id == story.id,
+                        ShotBeat.status != "superseded",
+                        *(
+                            ()
+                            if storyboard_revision is None
+                            else (ShotBeat.storyboard_revision_id == storyboard_revision.id,)
+                        ),
+                    )
+                )
+            )
+            generation_plan = (
+                None
+                if storyboard_revision is None
+                else session.scalar(
+                    select(GenerationPlan)
+                    .where(GenerationPlan.storyboard_revision_id == storyboard_revision.id)
+                    .order_by(GenerationPlan.revision.desc())
+                    .limit(1)
+                )
             )
             return {
                 "projectId": str(project_id),
                 "storyId": str(story.id),
                 "brief": _brief_json(brief),
-                "story": _story_json(story, score),
+                "story": _story_json(story, score, candidate_prompt),
                 "subjects": [
                     _subject_json(
                         session,
@@ -1676,9 +2589,107 @@ class SqlAlchemyAigcCanvasRepository:
                     if subject.current_revision_id is not None
                 ],
                 "existing": (
-                    None if not existing else _storyboard_json(project_id, story.id, existing)
+                    None
+                    if not existing
+                    else {
+                        **_storyboard_json(project_id, story.id, existing),
+                        "storyboardRevisionId": (
+                            None if storyboard_revision is None else str(storyboard_revision.id)
+                        ),
+                        "structureHash": (
+                            None
+                            if storyboard_revision is None
+                            else storyboard_revision.structure_hash
+                        ),
+                        "inputBindings": (
+                            []
+                            if storyboard_revision is None
+                            else storyboard_revision.input_bindings_json
+                        ),
+                        "generationPlanId": (
+                            None if generation_plan is None else str(generation_plan.id)
+                        ),
+                        "generationPlanHash": (
+                            None if generation_plan is None else generation_plan.input_hash
+                        ),
+                    }
                 ),
             }
+
+    def get_storyboard_reference_inputs(
+        self,
+        project_id: uuid.UUID,
+        asset_ids: tuple[uuid.UUID, ...],
+    ) -> dict[str, Any]:
+        """Resolve approved character-design images in deterministic slot order."""
+
+        requested = tuple(dict.fromkeys(asset_ids))
+        with self._sessions() as session:
+            self._require_project(session, project_id)
+            selected = list(
+                session.scalars(
+                    select(CharacterDesignAsset)
+                    .join(
+                        CharacterDesignRevision,
+                        CharacterDesignRevision.id
+                        == CharacterDesignAsset.character_design_revision_id,
+                    )
+                    .where(
+                        CharacterDesignAsset.asset_id.in_(requested),
+                        CharacterDesignAsset.selected.is_(True),
+                        CharacterDesignRevision.production_run_id == project_id,
+                        CharacterDesignRevision.status == "approved",
+                    )
+                )
+            )
+            by_asset_id = {item.asset_id: item for item in selected}
+            if set(requested) != set(by_asset_id):
+                raise WorkflowConflictError(
+                    "分镜多模态输入只能使用当前已批准角色设计版本中的选中素材"
+                )
+            slot_order = {"child": 0, "cat": 1, "pair_scale": 2}
+            selected.sort(key=lambda item: slot_order.get(item.slot, 99))
+            assets = {
+                asset.id: asset
+                for asset in session.scalars(
+                    select(Asset).where(Asset.id.in_([item.asset_id for item in selected]))
+                )
+            }
+            instructions = {
+                "child": "锁定儿童本集造型、儿童身体比例与身份外观，不改写剧情",
+                "cat": "锁定猫咪脸部、毛色分区、体型和自然四足结构，不改写剧情",
+                "pair_scale": "锁定一人一猫相对比例、空间接触和同框构图，不改写剧情",
+            }
+            bindings: list[dict[str, Any]] = []
+            paths: list[Path] = []
+            for ordinal, selected_asset in enumerate(selected, 1):
+                asset = assets.get(selected_asset.asset_id)
+                if (
+                    asset is None
+                    or asset.media_type != "image"
+                    or asset.status not in {"approved", "ready"}
+                ):
+                    raise WorkflowConflictError("分镜角色图片缺失、不是图片或尚未批准")
+                path = _resolve_asset_path(asset.storage_key, self._asset_root)
+                if not path.is_file():
+                    raise WorkflowConflictError(f"分镜角色图片文件不可读取：{asset.id}")
+                bindings.append(
+                    {
+                        "assetId": str(asset.id),
+                        "sha256": asset.sha256,
+                        "ordinal": ordinal,
+                        "semanticRole": selected_asset.slot,
+                        "purpose": selected_asset.semantic_role,
+                        "instruction": instructions.get(
+                            selected_asset.slot,
+                            "只作为角色或构图参考，不改写批准剧情",
+                        ),
+                        "sourceType": "approved_character_design",
+                        "sourceRevisionId": str(selected_asset.character_design_revision_id),
+                    }
+                )
+                paths.append(path)
+            return {"bindings": bindings, "paths": tuple(paths)}
 
     def save_storyboard_plan(
         self,
@@ -1688,6 +2699,7 @@ class SqlAlchemyAigcCanvasRepository:
         plan: Any,
         durations: tuple[int, ...],
         prompt_id: uuid.UUID,
+        input_bindings: list[dict[str, Any]],
     ) -> dict[str, Any]:
         with self._sessions.begin() as session:
             self._require_project(session, project_id, lock=True)
@@ -1702,7 +2714,70 @@ class SqlAlchemyAigcCanvasRepository:
             )
             if existing:
                 return _storyboard_json(project_id, story.id, existing)
+            storyboard_revision = StoryboardRevision(
+                id=uuid.uuid4(),
+                production_run_id=project_id,
+                story_revision_id=story.id,
+                revision=1,
+                status=StoryboardRevisionStatus.DRAFT.value,
+                structure_hash="0" * 64,
+                source_step_id=(
+                    None
+                    if (prompt := session.get(PromptRecord, prompt_id)) is None
+                    else prompt.step_id
+                ),
+                input_bindings_json=input_bindings,
+            )
+            session.add(storyboard_revision)
+            session.flush()
             outlines = _normalized_story_scenes(story)
+            derived_from_beats = not outlines
+            if derived_from_beats:
+                duration_by_order = {
+                    beat.order: duration
+                    for beat, duration in zip(plan.beats, durations, strict=True)
+                }
+                grouped_beats: dict[int, list[Any]] = {}
+                for beat in plan.beats:
+                    grouped_beats.setdefault(beat.scene_order, []).append(beat)
+                scene_orders = sorted(grouped_beats)
+                if scene_orders != list(range(1, len(scene_orders) + 1)):
+                    raise ValueError("从完整故事派生的场景必须从 1 开始连续编号")
+                outlines = []
+                for scene_order in scene_orders:
+                    scene_beats = grouped_beats[scene_order]
+                    scene_label = next(
+                        (
+                            beat.scene_label.strip()
+                            for beat in scene_beats
+                            if beat.scene_label and beat.scene_label.strip()
+                        ),
+                        f"场景 {scene_order}",
+                    )
+                    directions = list(
+                        dict.fromkeys(
+                            (beat.visual_description or beat.action).strip() for beat in scene_beats
+                        )
+                    )
+                    outlines.append(
+                        {
+                            "sceneKey": f"storyboard-scene-{scene_order:02d}",
+                            "title": scene_label,
+                            "purpose": "由完整故事正文自然派生",
+                            "synopsis": " ".join(directions),
+                            "durationWeight": sum(
+                                duration_by_order[beat.order] for beat in scene_beats
+                            ),
+                            "continuity": {
+                                "location": "",
+                                "environment": "",
+                                "timeWeather": "",
+                                "decorations": [],
+                                "props": [],
+                                "transitionReason": "",
+                            },
+                        }
+                    )
             scenes = list(
                 session.scalars(
                     select(Scene)
@@ -1741,6 +2816,9 @@ class SqlAlchemyAigcCanvasRepository:
                     source_text="待编译",
                     story_mode="single",
                     target_shot_count=1,
+                    look_plan_json={},
+                    look_draft_json={},
+                    look_draft_revision=0,
                     status=SceneStatus.READY.value,
                 )
                 session.add(row)
@@ -1764,7 +2842,9 @@ class SqlAlchemyAigcCanvasRepository:
                     ensure_ascii=False,
                     sort_keys=True,
                 )
-                next_look_plan = _scene_look_plan_from_outline(outline)
+                next_look_plan = (
+                    {} if derived_from_beats else _scene_look_plan_from_outline(outline)
+                )
                 if scene.look_plan_json != next_look_plan:
                     scene.look_plan_json = next_look_plan
                     scene.look_draft_json = {}
@@ -1772,6 +2852,7 @@ class SqlAlchemyAigcCanvasRepository:
                     scene.selected_look_asset_id = None
                 scene.status = SceneStatus.READY.value
             beats: list[ShotBeat] = []
+            diagnostics: list[CanvasDiagnostic] = []
             for beat_plan, duration in zip(plan.beats, durations, strict=True):
                 if beat_plan.scene_order > len(scenes):
                     raise ValueError("分镜 Beat 引用了不存在的场景")
@@ -1781,13 +2862,28 @@ class SqlAlchemyAigcCanvasRepository:
                     id=uuid.uuid4(),
                     scene_id=scene.id,
                     story_revision_id=story.id,
+                    storyboard_revision_id=storyboard_revision.id,
                     prompt_id=prompt_id,
                     sort_order=beats_by_scene[beat_plan.scene_order],
                     revision=1,
                     title=beat_plan.title,
                     action=beat_plan.action,
+                    visual_description=beat_plan.visual_description or beat_plan.action,
+                    child_action=beat_plan.child_action,
+                    cat_action=beat_plan.cat_action,
+                    spatial_relation=beat_plan.spatial_relation,
+                    contact_occlusion=beat_plan.contact_occlusion,
+                    shot_size=beat_plan.shot_size,
                     camera=beat_plan.camera,
+                    lighting=beat_plan.lighting,
                     dialogue=beat_plan.dialogue,
+                    sound_effect=beat_plan.sound_effect,
+                    music_intent=beat_plan.music_intent,
+                    wardrobe_state=beat_plan.wardrobe_state,
+                    prop_state=beat_plan.prop_state,
+                    continuity_in=beat_plan.continuity_in,
+                    continuity_out=beat_plan.continuity_out,
+                    cut_intent=beat_plan.cut_intent,
                     duration_seconds=duration,
                     status="ready",
                 )
@@ -1796,11 +2892,37 @@ class SqlAlchemyAigcCanvasRepository:
             for index, scene in enumerate(scenes, 1):
                 shot_count = beats_by_scene[index]
                 if shot_count == 0:
-                    raise ValueError(f"场景“{scene.title}”尚未被任何镜头覆盖")
+                    diagnostics.append(
+                        CanvasDiagnostic(
+                            code="storyboard_scene_uncovered",
+                            severity="warning",
+                            message=f"旧版场景“{scene.title}”未被当前分镜使用。",
+                            targetId=str(scene.id),
+                        )
+                    )
+                    continue
                 scene.target_shot_count = shot_count
                 scene.story_mode = "single" if shot_count == 1 else "multi"
             session.flush()
-            return _storyboard_json(project_id, story.id, beats)
+            storyboard_revision.structure_hash = storyboard_structure_hash(beats)
+            generation_plan = _create_generation_plan_for_beats(
+                session,
+                storyboard=storyboard_revision,
+                beats=beats,
+            )
+            session.flush()
+            return {
+                **_storyboard_json(project_id, story.id, beats),
+                "storyboardRevisionId": str(storyboard_revision.id),
+                "revision": storyboard_revision.revision,
+                "structureHash": storyboard_revision.structure_hash,
+                "inputBindings": storyboard_revision.input_bindings_json,
+                "generationPlanId": str(generation_plan.id),
+                "generationPlanHash": generation_plan.input_hash,
+                "diagnostics": [
+                    item.model_dump(mode="json", by_alias=True) for item in diagnostics
+                ],
+            }
 
     def update_shot_beat(
         self,
@@ -1811,50 +2933,125 @@ class SqlAlchemyAigcCanvasRepository:
     ) -> dict[str, Any]:
         patch = payload.model_dump(exclude_none=True)
         with self._sessions.begin() as session:
-            current = self._required(session, ShotBeat, beat_id, lock=True)
+            located_beat = session.get(ShotBeat, beat_id)
+            if located_beat is None:
+                raise RecordNotFoundError(f"ShotBeat not found: {beat_id}")
+            if located_beat.storyboard_revision_id is None:
+                raise WorkflowConflictError("旧分镜尚未进入版本聚合，请先完成 0029 迁移")
+            source_storyboard = self._required(
+                session,
+                StoryboardRevision,
+                located_beat.storyboard_revision_id,
+                lock=True,
+            )
+            source_plans = list(
+                session.scalars(
+                    select(GenerationPlan)
+                    .where(GenerationPlan.storyboard_revision_id == source_storyboard.id)
+                    .order_by(GenerationPlan.revision, GenerationPlan.id)
+                    .with_for_update(of=GenerationPlan)
+                )
+            )
+            current = session.scalar(
+                select(ShotBeat)
+                .where(ShotBeat.id == beat_id)
+                .with_for_update(of=ShotBeat)
+            )
+            if current is None:
+                raise RecordNotFoundError(f"ShotBeat not found: {beat_id}")
             if current.revision != expected_revision:
                 raise WorkflowConflictError("分镜 Beat 已被更新，请比较版本后重试")
-            current.status = "superseded"
-            duration_seconds = patch.get("duration_seconds", current.duration_seconds)
-            temporal_beats = current.temporal_beats_json
-            if len(temporal_beats) == 3 and 8 <= duration_seconds <= 15:
-                temporal_beats = [
-                    item.model_dump(mode="json", by_alias=True)
-                    for item in build_temporal_beats(
-                        duration_seconds,
-                        actions=tuple(
-                            (
-                                str(item["childAction"]),
-                                str(item["catAction"]),
-                                str(item["camera"]),
-                            )
-                            for item in temporal_beats
-                        ),
+            if current.storyboard_revision_id != source_storyboard.id:
+                raise WorkflowConflictError("分镜版本已变化，请刷新后重试")
+            source_beats = list(
+                session.scalars(
+                    select(ShotBeat)
+                    .join(Scene, Scene.id == ShotBeat.scene_id)
+                    .where(
+                        ShotBeat.storyboard_revision_id == source_storyboard.id,
+                        ShotBeat.status != "superseded",
                     )
-                ]
-            row = ShotBeat(
-                id=uuid.uuid4(),
-                scene_id=current.scene_id,
-                shot_card_id=current.shot_card_id,
-                story_revision_id=current.story_revision_id,
-                prompt_id=current.prompt_id,
-                sort_order=current.sort_order,
-                revision=current.revision + 1,
-                title=patch.get("title", current.title),
-                action=patch.get("action", current.action),
-                camera=patch.get("camera", current.camera),
-                dialogue=patch.get("dialogue", current.dialogue),
-                duration_seconds=duration_seconds,
-                temporal_beats_json=temporal_beats,
-                status="ready",
+                    .order_by(Scene.sort_order, ShotBeat.sort_order)
+                    .with_for_update(of=ShotBeat)
+                )
             )
-            session.add(row)
+            if current.id not in {beat.id for beat in source_beats}:
+                raise WorkflowConflictError("只能编辑当前活动分镜版本")
+            next_storyboard = StoryboardRevision(
+                id=uuid.uuid4(),
+                production_run_id=source_storyboard.production_run_id,
+                story_revision_id=source_storyboard.story_revision_id,
+                revision=source_storyboard.revision + 1,
+                status="draft",
+                structure_hash="0" * 64,
+                source_step_id=source_storyboard.source_step_id,
+                input_bindings_json=list(source_storyboard.input_bindings_json),
+            )
+            session.add(next_storyboard)
             session.flush()
-            subject_states = patch.get("subject_states")
-            if subject_states is None:
-                for state in session.scalars(
-                    select(ShotSubjectState).where(ShotSubjectState.shot_beat_id == current.id)
-                ):
+            source_storyboard.status = "superseded"
+            for source_plan in source_plans:
+                source_plan.status = GenerationPlanStatus.STALE.value
+            source_states = {
+                source.id: list(
+                    session.scalars(
+                        select(ShotSubjectState).where(ShotSubjectState.shot_beat_id == source.id)
+                    )
+                )
+                for source in source_beats
+            }
+            saved: list[ShotBeat] = []
+            edited: ShotBeat | None = None
+            for source in source_beats:
+                source.status = "superseded"
+                values = patch if source.id == current.id else {}
+                duration_seconds = int(values.get("duration_seconds", source.duration_seconds))
+                row = ShotBeat(
+                    id=uuid.uuid4(),
+                    scene_id=source.scene_id,
+                    shot_card_id=None,
+                    story_revision_id=source.story_revision_id,
+                    storyboard_revision_id=next_storyboard.id,
+                    prompt_id=None,
+                    reference_bindings_json=list(source.reference_bindings_json),
+                    reference_binding_revision=source.reference_binding_revision,
+                    sort_order=source.sort_order,
+                    revision=source.revision + 1,
+                    title=values.get("title", source.title),
+                    action=values.get("action", source.action),
+                    visual_description=values.get("visual_description", source.visual_description),
+                    child_action=values.get("child_action", source.child_action),
+                    cat_action=values.get("cat_action", source.cat_action),
+                    spatial_relation=values.get("spatial_relation", source.spatial_relation),
+                    contact_occlusion=values.get("contact_occlusion", source.contact_occlusion),
+                    shot_size=values.get("shot_size", source.shot_size),
+                    camera=values.get("camera", source.camera),
+                    lighting=values.get("lighting", source.lighting),
+                    dialogue=values.get("dialogue", source.dialogue),
+                    sound_effect=values.get("sound_effect", source.sound_effect),
+                    music_intent=values.get("music_intent", source.music_intent),
+                    wardrobe_state=values.get("wardrobe_state", source.wardrobe_state),
+                    prop_state=values.get("prop_state", source.prop_state),
+                    continuity_in=values.get("continuity_in", source.continuity_in),
+                    continuity_out=values.get("continuity_out", source.continuity_out),
+                    cut_intent=values.get("cut_intent", source.cut_intent),
+                    duration_seconds=duration_seconds,
+                    temporal_beats_json=[
+                        {
+                            "phase": "editorial",
+                            "startSecond": 0,
+                            "endSecond": duration_seconds,
+                            "childAction": values.get("child_action", source.child_action),
+                            "catAction": values.get("cat_action", source.cat_action),
+                            "camera": values.get("camera", source.camera),
+                        }
+                    ],
+                    status="ready",
+                )
+                session.add(row)
+                session.flush()
+                saved.append(row)
+                for state in source_states[source.id]:
                     session.add(
                         ShotSubjectState(
                             id=uuid.uuid4(),
@@ -1866,39 +3063,256 @@ class SqlAlchemyAigcCanvasRepository:
                             interaction=state.interaction,
                         )
                     )
-            else:
-                self._save_subject_states(session, row.id, subject_states)
-            session.execute(
-                GenerationAttempt.__table__.update()
-                .where(
-                    GenerationAttempt.business_object_type == "shot_beat",
-                    GenerationAttempt.business_object_id == current.id,
-                    GenerationAttempt.status.in_(("pending", "succeeded")),
-                )
-                .values(status="stale")
+                if source.id == current.id:
+                    edited = row
+                    if patch.get("subject_states") is not None:
+                        session.execute(
+                            ShotSubjectState.__table__.delete().where(
+                                ShotSubjectState.shot_beat_id == row.id
+                            )
+                        )
+                        self._save_subject_states(session, row.id, patch["subject_states"])
+            next_storyboard.structure_hash = storyboard_structure_hash(saved)
+            _create_generation_plan_for_beats(
+                session,
+                storyboard=next_storyboard,
+                beats=saved,
             )
-            if current.shot_card_id is not None:
-                shot = self._required(session, ShotCard, current.shot_card_id, lock=True)
-                shot.selected_anchor_asset_id = None
-                shot.selected_video_asset_id = None
-                shot.status = "ready"
-                session.execute(
-                    Asset.__table__.update()
-                    .where(
-                        Asset.shot_card_id == current.shot_card_id,
-                        Asset.status != "stale",
+            project = self._required(session, ProductionRun, source_storyboard.production_run_id)
+            project.selected_sequence_id = None
+            if edited is None:
+                raise WorkflowConflictError("编辑目标未能进入新分镜版本")
+            return _beat_json(edited)
+
+    def replace_shot_beat_references(
+        self,
+        beat_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        payload: Any,
+    ) -> dict[str, Any]:
+        """Replace optional production references without changing story structure."""
+
+        with self._sessions.begin() as session:
+            located_beat = session.get(ShotBeat, beat_id)
+            if located_beat is None:
+                raise RecordNotFoundError(f"ShotBeat not found: {beat_id}")
+            storyboard = None
+            locked_plans: list[GenerationPlan] = []
+            if located_beat.storyboard_revision_id is not None:
+                storyboard = self._required(
+                    session,
+                    StoryboardRevision,
+                    located_beat.storyboard_revision_id,
+                    lock=True,
+                )
+                locked_plans = list(
+                    session.scalars(
+                        select(GenerationPlan)
+                        .where(GenerationPlan.storyboard_revision_id == storyboard.id)
+                        .order_by(GenerationPlan.revision, GenerationPlan.id)
+                        .with_for_update(of=GenerationPlan)
                     )
-                    .values(status="stale")
                 )
-                scene = self._required(session, Scene, current.scene_id)
-                session.execute(
-                    VideoSequence.__table__.update()
-                    .where(VideoSequence.production_run_id == scene.production_run_id)
-                    .values(status="rejected")
+            active_beats = (
+                []
+                if storyboard is None
+                else list(
+                    session.scalars(
+                        select(ShotBeat)
+                        .join(Scene, Scene.id == ShotBeat.scene_id)
+                        .where(
+                            ShotBeat.storyboard_revision_id == storyboard.id,
+                            ShotBeat.status != "superseded",
+                        )
+                        .order_by(Scene.sort_order, ShotBeat.sort_order, ShotBeat.id)
+                        .with_for_update(of=ShotBeat)
+                    )
                 )
-                project = self._required(session, ProductionRun, scene.production_run_id)
-                project.selected_sequence_id = None
-            return _beat_json(row)
+            )
+            beat = next((item for item in active_beats if item.id == beat_id), None)
+            if storyboard is None:
+                beat = session.scalar(
+                    select(ShotBeat)
+                    .where(ShotBeat.id == beat_id)
+                    .with_for_update(of=ShotBeat)
+                )
+            if beat is None:
+                raise RecordNotFoundError(f"ShotBeat not found: {beat_id}")
+            if storyboard is not None and beat.storyboard_revision_id != storyboard.id:
+                raise WorkflowConflictError("镜头所属分镜版本已变化，请刷新后重试")
+            if beat.reference_binding_revision != expected_revision:
+                raise WorkflowConflictError("镜头引用已经更新，请比较最新引用 revision 后再保存")
+            scene = self._required(session, Scene, beat.scene_id)
+            normalized: list[dict[str, Any]] = []
+            seen_ids: set[uuid.UUID] = set()
+            seen_hashes: set[str] = set()
+            for item in payload.bindings:
+                asset = self._required(session, Asset, item.asset_id)
+                if (
+                    asset.production_run_id not in {None, scene.production_run_id}
+                    or asset.media_type != "image"
+                    or asset.status not in {"approved", "ready"}
+                ):
+                    raise WorkflowConflictError(
+                        f"镜头引用 {asset.id} 不属于当前项目、不是图片或尚未批准"
+                    )
+                path = _resolve_asset_path(asset.storage_key, self._asset_root)
+                if not path.is_file():
+                    raise WorkflowConflictError(f"镜头引用文件不可读取：{asset.id}")
+                if asset.id in seen_ids or asset.sha256 in seen_hashes:
+                    continue
+                seen_ids.add(asset.id)
+                seen_hashes.add(asset.sha256)
+                normalized.append(
+                    {
+                        "assetId": str(asset.id),
+                        "sha256": asset.sha256,
+                        "semanticRole": item.semantic_role,
+                        "purpose": f"shot_{item.semantic_role}",
+                        "instruction": item.instruction,
+                        "ordinal": len(normalized) + 1,
+                        "sourceType": "editorial_shot_reference",
+                        "locked": False,
+                    }
+                )
+            plan_ids = [plan.id for plan in locked_plans]
+            mappings = list(
+                session.scalars(
+                    select(GenerationClipShot)
+                    .where(
+                        *(
+                            (GenerationClipShot.shot_beat_id == beat.id,)
+                            if not plan_ids
+                            else (GenerationClipShot.generation_plan_id.in_(plan_ids),)
+                        ),
+                    )
+                    .order_by(
+                        GenerationClipShot.generation_plan_id,
+                        GenerationClipShot.shot_card_id,
+                        GenerationClipShot.ordinal,
+                    )
+                    .with_for_update(of=GenerationClipShot)
+                )
+            )
+            clip_ids = sorted({mapping.shot_card_id for mapping in mappings}, key=str)
+            locked_clips = (
+                []
+                if not clip_ids
+                else list(
+                    session.scalars(
+                        select(ShotCard)
+                        .where(ShotCard.id.in_(clip_ids))
+                        .order_by(
+                            ShotCard.generation_plan_id,
+                            ShotCard.plan_sort_order,
+                            ShotCard.id,
+                        )
+                        .with_for_update(of=ShotCard)
+                    )
+                )
+            )
+            target_clip_ids = [
+                mapping.shot_card_id for mapping in mappings if mapping.shot_beat_id == beat.id
+            ]
+            provider_evidence = (
+                None
+                if not target_clip_ids
+                else session.scalar(
+                    select(WorkflowStep.id)
+                    .where(
+                        WorkflowStep.shot_card_id.in_(target_clip_ids),
+                        or_(
+                            WorkflowStep.provider_task_id.is_not(None),
+                            WorkflowStep.status == "submission_unknown",
+                        ),
+                    )
+                    .limit(1)
+                )
+            )
+            output_asset = (
+                None
+                if not target_clip_ids
+                else session.scalar(
+                    select(Asset.id).where(Asset.shot_card_id.in_(target_clip_ids)).limit(1)
+                )
+            )
+            references_changed = normalized != list(beat.reference_bindings_json or [])
+            if references_changed and (
+                provider_evidence is not None or output_asset is not None
+            ):
+                raise WorkflowConflictError(
+                    "该镜头所属生成片段已有 Provider 提交证据或输出资产；"
+                    "必须创建新分镜版本，不能原地改写引用"
+                )
+            if not references_changed:
+                return _beat_json(beat)
+            beat.reference_bindings_json = normalized
+            beat.reference_binding_revision += 1
+            beat.prompt_id = None
+            if storyboard is not None:
+                storyboard.structure_hash = storyboard_structure_hash(active_beats)
+                storyboard.status = StoryboardRevisionStatus.DRAFT.value
+                storyboard.approved_structure_at = None
+                storyboard.production_package_hash = None
+                storyboard.production_approved_at = None
+                for active_beat in active_beats:
+                    if active_beat.status == "approved":
+                        active_beat.status = "ready"
+                beats_by_id = {active_beat.id: active_beat for active_beat in active_beats}
+                mappings_by_plan: dict[uuid.UUID, list[GenerationClipShot]] = {}
+                for mapping in mappings:
+                    mappings_by_plan.setdefault(mapping.generation_plan_id, []).append(mapping)
+                clips_by_plan: dict[uuid.UUID, list[ShotCard]] = {}
+                for clip in locked_clips:
+                    if clip.generation_plan_id is not None:
+                        clips_by_plan.setdefault(clip.generation_plan_id, []).append(clip)
+                for plan in locked_plans:
+                    if plan.status == GenerationPlanStatus.STALE.value:
+                        continue
+                    plan_mappings = mappings_by_plan.get(plan.id, [])
+                    mappings_by_clip: dict[uuid.UUID, list[GenerationClipShot]] = {}
+                    for mapping in plan_mappings:
+                        mappings_by_clip.setdefault(mapping.shot_card_id, []).append(mapping)
+                    clip_documents = []
+                    for clip in clips_by_plan.get(plan.id, []):
+                        clip_mappings = mappings_by_clip.get(clip.id, [])
+                        clip_documents.append(
+                            {
+                                "durationSeconds": clip.duration_seconds,
+                                "shotBeatIds": [
+                                    str(beats_by_id[mapping.shot_beat_id].id)
+                                    for mapping in clip_mappings
+                                    if mapping.shot_beat_id in beats_by_id
+                                ],
+                            }
+                        )
+                    plan.input_hash = generation_plan_input_hash(
+                        structure_hash=storyboard.structure_hash,
+                        provider=plan.provider,
+                        model=plan.model,
+                        capability_revision=plan.capability_revision,
+                        clips=clip_documents,
+                    )
+                    plan.status = GenerationPlanStatus.PROPOSED.value
+                    plan.approved_at = None
+            target_clip_id_set = set(target_clip_ids)
+            for clip in locked_clips:
+                if clip.id in target_clip_id_set:
+                    clip.prompt_id = None
+                    clip.status = "ready"
+            self._record_event(
+                session,
+                scene.production_run_id,
+                "shot_reference_bindings_replaced",
+                {
+                    "shotBeatId": str(beat.id),
+                    "referenceBindingRevision": beat.reference_binding_revision,
+                    "assetIds": [item["assetId"] for item in normalized],
+                    "downstreamStatus": "stale",
+                },
+            )
+            return _beat_json(beat)
 
     def save_manual_storyboard(
         self,
@@ -1927,18 +3341,49 @@ class SqlAlchemyAigcCanvasRepository:
                 .order_by(StoryBriefRecord.revision.desc())
                 .limit(1)
             )
+            source_storyboard = session.scalar(
+                select(StoryboardRevision)
+                .where(
+                    StoryboardRevision.production_run_id == project_id,
+                    StoryboardRevision.status != "superseded",
+                )
+                .order_by(StoryboardRevision.revision.desc())
+                .limit(1)
+                .with_for_update()
+            )
+            source_plans = (
+                []
+                if source_storyboard is None
+                else list(
+                    session.scalars(
+                        select(GenerationPlan)
+                        .where(GenerationPlan.storyboard_revision_id == source_storyboard.id)
+                        .order_by(GenerationPlan.revision, GenerationPlan.id)
+                        .with_for_update(of=GenerationPlan)
+                    )
+                )
+            )
             active_beats = list(
                 session.scalars(
                     select(ShotBeat)
                     .where(
                         ShotBeat.story_revision_id == story.id,
                         ShotBeat.status != "superseded",
+                        *(
+                            ()
+                            if source_storyboard is None
+                            else (ShotBeat.storyboard_revision_id == source_storyboard.id,)
+                        ),
                     )
                     .order_by(ShotBeat.sort_order)
-                    .with_for_update()
+                    .with_for_update(of=ShotBeat)
                 )
             )
-            current_revision = max((beat.revision for beat in active_beats), default=0)
+            current_revision = (
+                source_storyboard.revision
+                if source_storyboard is not None
+                else max((beat.revision for beat in active_beats), default=0)
+            )
             if current_revision != expected_revision:
                 raise WorkflowConflictError("人工分镜草稿已被更新，请比较最新版本后重试")
             if (
@@ -1949,18 +3394,26 @@ class SqlAlchemyAigcCanvasRepository:
             ):
                 raise ValueError("治愈组合包镜头总时长必须与项目目标时长完全一致")
 
-            scenes = list(
+            active_scenes = list(
                 session.scalars(
                     select(Scene)
                     .where(
                         Scene.production_run_id == project_id,
-                        Scene.story_revision_id == story.id,
                         Scene.active.is_(True),
                     )
                     .order_by(Scene.sort_order)
                     .with_for_update()
                 )
             )
+            scenes = [scene for scene in active_scenes if scene.story_revision_id == story.id]
+            superseded_scenes = [
+                scene for scene in active_scenes if scene.story_revision_id != story.id
+            ]
+            for scene in superseded_scenes:
+                scene.active = False
+                scene.stale_reason = f"场景规划已切换到剧情 revision {story.revision}"
+            if superseded_scenes:
+                session.flush()
             if not scenes:
                 outlines = _normalized_story_scenes(story) or [
                     {"title": "人工分镜场景", "synopsis": "由人工镜头表建立"}
@@ -1998,12 +3451,99 @@ class SqlAlchemyAigcCanvasRepository:
                 session.flush()
 
             active_by_id = {beat.id: beat for beat in active_beats}
+            submitted_ids = {draft.id for draft in payload.shots if draft.id is not None}
+            omitted_beat_ids = {beat.id for beat in active_beats if beat.id not in submitted_ids}
+            source_plan_ids = [plan.id for plan in source_plans]
+            locked_mappings = (
+                []
+                if not source_plan_ids
+                else list(
+                    session.scalars(
+                        select(GenerationClipShot)
+                        .where(GenerationClipShot.generation_plan_id.in_(source_plan_ids))
+                        .order_by(
+                            GenerationClipShot.generation_plan_id,
+                            GenerationClipShot.shot_card_id,
+                            GenerationClipShot.ordinal,
+                        )
+                        .with_for_update(of=GenerationClipShot)
+                    )
+                )
+            )
+            locked_clip_ids = sorted(
+                {mapping.shot_card_id for mapping in locked_mappings},
+                key=str,
+            )
+            if locked_clip_ids:
+                list(
+                    session.scalars(
+                        select(ShotCard)
+                        .where(ShotCard.id.in_(locked_clip_ids))
+                        .order_by(
+                            ShotCard.generation_plan_id,
+                            ShotCard.plan_sort_order,
+                            ShotCard.id,
+                        )
+                        .with_for_update(of=ShotCard)
+                    )
+                )
+            omitted_clip_ids = {
+                mapping.shot_card_id
+                for mapping in locked_mappings
+                if mapping.shot_beat_id in omitted_beat_ids
+            }
+            if not omitted_clip_ids:
+                omitted_clip_ids = {
+                    beat.shot_card_id
+                    for beat in active_beats
+                    if beat.id in omitted_beat_ids and beat.shot_card_id is not None
+                }
+            if omitted_clip_ids:
+                paid_step_count = int(
+                    session.scalar(
+                        select(func.count())
+                        .select_from(WorkflowStep)
+                        .where(WorkflowStep.shot_card_id.in_(omitted_clip_ids))
+                    )
+                    or 0
+                )
+                output_count = int(
+                    session.scalar(
+                        select(func.count())
+                        .select_from(Asset)
+                        .where(Asset.shot_card_id.in_(omitted_clip_ids))
+                    )
+                    or 0
+                )
+                if paid_step_count or output_count:
+                    raise WorkflowConflictError("已有付费任务或输出历史的导演分镜不能删除")
             scenes_by_id = {scene.id: scene for scene in scenes}
             for beat in active_beats:
                 beat.status = "superseded"
+            if source_storyboard is not None:
+                source_storyboard.status = "superseded"
+                for source_plan in source_plans:
+                    source_plan.status = GenerationPlanStatus.STALE.value
             per_scene_count = {scene.id: 0 for scene in scenes}
             next_revision = current_revision + 1
+            storyboard_revision = StoryboardRevision(
+                id=uuid.uuid4(),
+                production_run_id=project_id,
+                story_revision_id=story.id,
+                revision=(1 if source_storyboard is None else source_storyboard.revision + 1),
+                status="draft",
+                structure_hash="0" * 64,
+                source_step_id=(
+                    None if source_storyboard is None else source_storyboard.source_step_id
+                ),
+                input_bindings_json=(
+                    [] if source_storyboard is None else list(source_storyboard.input_bindings_json)
+                ),
+            )
+            session.add(storyboard_revision)
+            session.flush()
             saved: list[ShotBeat] = []
+            diagnostics: list[CanvasDiagnostic] = list(payload.diagnostics)
             for index, draft in enumerate(payload.shots):
                 source = active_by_id.get(draft.id)
                 if draft.scene_id is not None:
@@ -2015,83 +3555,50 @@ class SqlAlchemyAigcCanvasRepository:
                 else:
                     scene = scenes[min(index, len(scenes) - 1)]
                 per_scene_count[scene.id] += 1
-                if (draft.prompt_id is None) != (draft.prompt_input_hash is None):
-                    raise ValueError("Prompt ID 与输入哈希必须同时提交")
-                validated_prompt_id: uuid.UUID | None = None
-                if draft.prompt_id is not None:
-                    prompt = self._required(
-                        session,
-                        PromptRecord,
-                        draft.prompt_id,
-                        lock=True,
-                    )
-                    step = self._required(session, WorkflowStep, prompt.step_id)
-                    snapshot = prompt.input_snapshot_json or {}
-                    compiled_shot = snapshot.get("shot")
-                    if (
-                        step.production_run_id != project_id
-                        or prompt.status != "succeeded"
-                        or prompt.call_purpose != "storyboard_prompt_compilation"
-                        or prompt.input_hash != draft.prompt_input_hash
-                        or snapshot.get("storyRevisionId") != str(story.id)
-                        or snapshot.get("visualProfileRevisionId")
-                        != str(project.current_visual_profile_revision_id)
-                        or snapshot.get("sceneId") != str(scene.id)
-                        or not isinstance(compiled_shot, dict)
-                        or int(compiled_shot.get("order", 0)) != draft.order
-                        or int(compiled_shot.get("durationSeconds", 0))
-                        != draft.duration_seconds
-                        or str(compiled_shot.get("title") or "").strip()
-                        != draft.title.strip()
-                        or str(compiled_shot.get("action") or "").strip()
-                        != draft.action.strip()
-                        or str(compiled_shot.get("camera") or "").strip()
-                        != draft.camera.strip()
-                        or str(compiled_shot.get("dialogue") or "").strip()
-                        != draft.dialogue.strip()
-                    ):
-                        raise WorkflowConflictError(
-                            f"镜头 {draft.order} 的已编译 Prompt 与当前镜头或上游版本不一致"
-                        )
-                    validated_prompt_id = prompt.id
-                temporal_beats = []
-                if payload.healing_recipe:
-                    phase_actions = (
-                        (
-                            draft.action,
-                            "猫咪以固定行为模式自然参与",
-                            draft.camera or "固定机位",
-                        ),
-                        (
-                            "发生一个微小可见变化",
-                            "猫咪对变化做出自然反应",
-                            draft.camera or "固定机位",
-                        ),
-                        (
-                            "儿童与猫咪在温暖状态中收尾",
-                            "猫咪保持猫科身体结构",
-                            draft.camera or "固定机位",
-                        ),
-                    )
-                    temporal_beats = [
-                        item.model_dump(mode="json", by_alias=True)
-                        for item in build_temporal_beats(
-                            draft.duration_seconds,
-                            actions=phase_actions,
-                        )
-                    ]
+                temporal_beats = [
+                    {
+                        "phase": "editorial",
+                        "startSecond": 0,
+                        "endSecond": draft.duration_seconds,
+                        "direction": draft.direction,
+                        "childAction": draft.child_action,
+                        "catAction": draft.cat_action,
+                        "camera": draft.camera,
+                    }
+                ]
                 row = ShotBeat(
                     id=uuid.uuid4(),
                     scene_id=scene.id,
-                    shot_card_id=None if source is None else source.shot_card_id,
+                    shot_card_id=None,
                     story_revision_id=story.id,
-                    prompt_id=validated_prompt_id,
+                    storyboard_revision_id=storyboard_revision.id,
+                    prompt_id=None,
+                    reference_bindings_json=(
+                        [] if source is None else list(source.reference_bindings_json)
+                    ),
+                    reference_binding_revision=(
+                        1 if source is None else source.reference_binding_revision
+                    ),
                     sort_order=per_scene_count[scene.id],
                     revision=next_revision,
                     title=draft.title,
-                    action=draft.action,
+                    action=draft.direction,
+                    visual_description=draft.visual_description or draft.direction,
+                    child_action=draft.child_action,
+                    cat_action=draft.cat_action,
+                    spatial_relation=draft.spatial_relation,
+                    contact_occlusion=draft.contact_occlusion,
+                    shot_size=draft.shot_size,
                     camera=draft.camera,
+                    lighting=draft.lighting,
                     dialogue=draft.dialogue,
+                    sound_effect=draft.sound_effect,
+                    music_intent=draft.music_intent,
+                    wardrobe_state=draft.wardrobe_state,
+                    prop_state=draft.prop_state,
+                    continuity_in=draft.continuity_in,
+                    continuity_out=draft.continuity_out,
+                    cut_intent=draft.cut_intent,
                     duration_seconds=draft.duration_seconds,
                     temporal_beats_json=temporal_beats,
                     status="ready",
@@ -2101,33 +3608,35 @@ class SqlAlchemyAigcCanvasRepository:
             for scene in scenes:
                 shot_count = per_scene_count[scene.id]
                 if shot_count == 0:
-                    raise ValueError(f"场景“{scene.title}”尚未被任何镜头覆盖")
+                    diagnostics.append(
+                        CanvasDiagnostic(
+                            code="storyboard_scene_uncovered",
+                            severity="warning",
+                            message=f"旧版场景“{scene.title}”未被当前分镜使用。",
+                            targetId=str(scene.id),
+                        )
+                    )
+                    continue
                 scene.target_shot_count = shot_count
                 scene.story_mode = "single" if shot_count == 1 else "multi"
-            session.execute(
-                Asset.__table__.update()
-                .where(
-                    Asset.production_run_id == project_id,
-                    Asset.status != "stale",
-                )
-                .values(status="stale")
-            )
-            session.execute(
-                VideoSequence.__table__.update()
-                .where(VideoSequence.production_run_id == project_id)
-                .values(status="rejected")
+            storyboard_revision.structure_hash = storyboard_structure_hash(saved)
+            generation_plan = _create_generation_plan_for_beats(
+                session,
+                storyboard=storyboard_revision,
+                beats=saved,
             )
             project.selected_sequence_id = None
             session.flush()
             result = _storyboard_json(project_id, story.id, saved)
             result["revision"] = next_revision
-            result["status"] = (
-                "awaiting_review"
-                if all(row.prompt_id is not None for row in saved)
-                else "draft"
-            )
-            if result["status"] == "draft":
-                result["blockers"] = ["仍有镜头未完成服务端分层 Prompt 编译"]
+            result["status"] = "draft"
+            result["storyboardRevisionId"] = str(storyboard_revision.id)
+            result["structureHash"] = storyboard_revision.structure_hash
+            result["generationPlanId"] = str(generation_plan.id)
+            result["generationPlanHash"] = generation_plan.input_hash
+            result["diagnostics"] = [
+                item.model_dump(mode="json", by_alias=True) for item in diagnostics
+            ]
             return result
 
     def compile_storyboard_prompts(
@@ -2162,15 +3671,78 @@ class SqlAlchemyAigcCanvasRepository:
             ):
                 raise WorkflowConflictError("本集视觉档案已更新，请重新准备分镜资产")
 
+            storyboard_revision: StoryboardRevision | None = None
+            generation_plan: GenerationPlan | None = None
+            plan_beats_by_clip: dict[uuid.UUID, list[ShotBeat]] = {}
+            if payload.storyboard_revision_id is not None:
+                storyboard_revision = self._required(
+                    session,
+                    StoryboardRevision,
+                    payload.storyboard_revision_id,
+                    lock=True,
+                )
+                if (
+                    storyboard_revision.production_run_id != project_id
+                    or storyboard_revision.story_revision_id != story.id
+                    or storyboard_revision.status
+                    not in {"structure_approved", "production_approved"}
+                    or storyboard_revision.structure_hash != payload.structure_hash
+                ):
+                    raise WorkflowConflictError("分镜结构版本或哈希已过期")
+                generation_plan = self._required(
+                    session,
+                    GenerationPlan,
+                    payload.generation_plan_id,
+                    lock=True,
+                )
+                if (
+                    generation_plan.storyboard_revision_id != storyboard_revision.id
+                    or generation_plan.status != "approved"
+                    or generation_plan.input_hash != payload.generation_plan_hash
+                ):
+                    raise WorkflowConflictError("Agent 生成编排尚未批准或已过期")
+                mappings = list(
+                    session.scalars(
+                        select(GenerationClipShot)
+                        .join(ShotCard, ShotCard.id == GenerationClipShot.shot_card_id)
+                        .where(GenerationClipShot.generation_plan_id == generation_plan.id)
+                        .order_by(
+                            ShotCard.plan_sort_order,
+                            GenerationClipShot.ordinal,
+                        )
+                    )
+                )
+                mapped_beats = {
+                    beat.id: beat
+                    for beat in session.scalars(
+                        select(ShotBeat).where(
+                            ShotBeat.storyboard_revision_id == storyboard_revision.id,
+                            ShotBeat.status != "superseded",
+                        )
+                    )
+                }
+                for mapping in mappings:
+                    beat = mapped_beats.get(mapping.shot_beat_id)
+                    if beat is not None:
+                        plan_beats_by_clip.setdefault(mapping.shot_card_id, []).append(beat)
+                if set(mapped_beats) != {
+                    beat.id for clip_beats in plan_beats_by_clip.values() for beat in clip_beats
+                }:
+                    raise WorkflowConflictError("生成编排未完整覆盖当前导演分镜")
+
             recipe = session.scalar(
                 select(ProductionRecipeInstance).where(
                     ProductionRecipeInstance.production_run_id == project_id,
                     ProductionRecipeInstance.lifecycle_status == "active",
                 )
             )
+            if recipe is not None and (storyboard_revision is None or generation_plan is None):
+                raise WorkflowConflictError(
+                    "配方项目必须从已批准的 StoryboardRevision 与 GenerationPlan 编译 Prompt"
+                )
             global_blockers: list[str] = []
-            if recipe is not None and profile.source_profile_id != CANON_V3_PROFILE_ID:
-                global_blockers.append("一人一猫组合包必须使用当前 Canon-v3 本集视觉档案")
+            if recipe is not None and profile.source_profile_id != recipe.canon_profile_id:
+                global_blockers.append("当前本集视觉档案与配方锁定的 Canon 版本不一致")
 
             profile_asset_ids = [
                 uuid.UUID(str(binding["assetId"]))
@@ -2197,11 +3769,10 @@ class SqlAlchemyAigcCanvasRepository:
                     for asset in profile_assets.values()
                     if asset.semantic_key and asset.status in {"approved", "ready"}
                 }
-                absent_keys = sorted(set(CANON_V3_REQUIRED_KEYS).difference(semantic_keys))
+                recipe_required_keys = canon_reference_keys(recipe.canon_profile_id, "indoor")
+                absent_keys = sorted(set(recipe_required_keys).difference(semantic_keys))
                 if absent_keys:
-                    global_blockers.append(
-                        "Canon-v3 必需证据槽位缺失：" + "、".join(absent_keys)
-                    )
+                    global_blockers.append("当前 Canon 必需证据槽位缺失：" + "、".join(absent_keys))
 
             appearance_bindings: list[dict[str, Any]] = []
             if recipe is not None:
@@ -2215,16 +3786,26 @@ class SqlAlchemyAigcCanvasRepository:
                     .order_by(CharacterDesignRevision.revision.desc())
                     .limit(1)
                 )
-                selected_designs = [] if design is None else list(
-                    session.scalars(
-                        select(CharacterDesignAsset).where(
-                            CharacterDesignAsset.character_design_revision_id == design.id,
-                            CharacterDesignAsset.selected.is_(True),
+                selected_designs = (
+                    []
+                    if design is None
+                    else list(
+                        session.scalars(
+                            select(CharacterDesignAsset).where(
+                                CharacterDesignAsset.character_design_revision_id == design.id,
+                                CharacterDesignAsset.selected.is_(True),
+                            )
                         )
                     )
                 )
-                selected_slots = {item.slot for item in selected_designs}
-                if design is None or selected_slots != {"child", "cat", "pair_scale"}:
+                slot_order = {slot.value: index for index, slot in enumerate(CharacterDesignSlot)}
+                selected_designs.sort(key=lambda item: slot_order.get(item.slot, len(slot_order)))
+                selected_slots = [item.slot for item in selected_designs]
+                if (
+                    design is None
+                    or len(selected_designs) != 3
+                    or set(selected_slots) != {"child", "cat", "pair_scale"}
+                ):
                     global_blockers.append("本集儿童、猫咪与同框比例图尚未逐槽批准")
                 else:
                     design_assets = {
@@ -2260,12 +3841,37 @@ class SqlAlchemyAigcCanvasRepository:
                 )
             }
             results: list[dict[str, Any]] = []
+            production_inputs_changed = False
+            quality_diagnostics = payload.diagnostics
             for shot in payload.shots:
+                clip = None
+                clip_beats: list[ShotBeat] = []
+                if generation_plan is not None:
+                    if shot.shot_card_id is None:
+                        raise WorkflowConflictError("生产 Prompt 必须指定真实生成片段")
+                    clip = self._required(
+                        session,
+                        ShotCard,
+                        shot.shot_card_id,
+                        lock=True,
+                    )
+                    clip_beats = plan_beats_by_clip.get(clip.id, [])
+                    if (
+                        clip.generation_plan_id != generation_plan.id
+                        or not clip_beats
+                        or [beat.id for beat in clip_beats] != shot.editorial_shot_ids
+                        or clip.duration_seconds != shot.duration_seconds
+                    ):
+                        raise WorkflowConflictError(f"生成片段 {shot.order} 与已批准编排不一致")
+                    if clip.scene_id != shot.scene_id:
+                        raise WorkflowConflictError(f"生成片段 {shot.order} 的场景已改变")
                 scene = scenes.get(shot.scene_id)
                 if scene is None:
                     raise WorkflowConflictError("镜头所属场景不属于当前剧情脚本")
                 beat = None
-                if shot.beat_id is not None:
+                if clip_beats:
+                    beat = clip_beats[0]
+                elif shot.beat_id is not None:
                     beat = self._required(session, ShotBeat, shot.beat_id, lock=True)
                     if (
                         beat.story_revision_id != story.id
@@ -2280,11 +3886,20 @@ class SqlAlchemyAigcCanvasRepository:
                     raise WorkflowConflictError("新镜头的 expectedRevision 必须为 0")
 
                 blockers = list(global_blockers)
-                warnings: list[str] = []
+                warnings: list[str] = [
+                    item.message
+                    for item in quality_diagnostics
+                    if item.severity == "warning"
+                ]
                 scene_bindings, scene_blockers, scene_warnings = _scene_prompt_bindings(
                     session,
                     scene,
                     profile,
+                    storyboard_revision=storyboard_revision,
+                    generation_plan=generation_plan,
+                    scene_look_usage=(
+                        "off" if clip is None else str(clip.scene_look_usage)
+                    ),
                 )
                 blockers.extend(scene_blockers)
                 warnings.extend(scene_warnings)
@@ -2317,34 +3932,148 @@ class SqlAlchemyAigcCanvasRepository:
                 else:
                     warnings.append("当前镜头未绑定额外构图参考，将仅使用分镜描述与同框比例图")
 
+                editorial_reference_bindings: list[dict[str, Any]] = []
+                for editorial_beat in clip_beats or ([] if beat is None else [beat]):
+                    for binding in editorial_beat.reference_bindings_json:
+                        if not isinstance(binding, dict) or not binding.get("assetId"):
+                            blockers.append(f"导演分镜 {editorial_beat.title} 包含无效引用")
+                            continue
+                        asset = session.get(Asset, uuid.UUID(str(binding["assetId"])))
+                        if (
+                            asset is None
+                            or asset.production_run_id not in {None, project_id}
+                            or asset.media_type != "image"
+                            or asset.status not in {"approved", "ready"}
+                            or asset.sha256 != binding.get("sha256")
+                        ):
+                            blockers.append(
+                                f"导演分镜 {editorial_beat.title} 的按需引用已缺失或过期"
+                            )
+                            continue
+                        editorial_reference_bindings.append(
+                            _compiled_reference_binding(
+                                asset,
+                                role=str(binding.get("semanticRole") or "composition"),
+                                purpose=str(binding.get("purpose") or "shot_reference"),
+                                source="editorial_shot",
+                            )
+                        )
+
                 canon_bindings = [
                     _compiled_reference_binding(
                         asset,
-                        role=(
-                            "style"
-                            if str(binding.get("purpose")) == "style"
-                            else "identity"
-                        ),
+                        role=("style" if str(binding.get("purpose")) == "style" else "identity"),
                         purpose=str(binding.get("purpose") or asset.semantic_key or "identity"),
                         source="canon",
                     )
                     for binding in profile.reference_bindings_json
                     if binding.get("assetId")
-                    and (
-                        asset := profile_assets.get(uuid.UUID(str(binding["assetId"])))
-                    )
+                    and (asset := profile_assets.get(uuid.UUID(str(binding["assetId"]))))
                     is not None
                 ]
-                reference_bindings = [
-                    *canon_bindings,
-                    *appearance_bindings,
-                    *scene_bindings,
-                    *composition_bindings,
-                ]
+                if profile.source_profile_id == CANON_V4_PROFILE_ID:
+                    style_board_bindings = [
+                        binding
+                        for binding in canon_bindings
+                        if binding.get("semanticKey") == CANON_V4_STYLE_BOARD_KEY
+                    ]
+                    environment_bindings = [
+                        binding
+                        for binding in scene_bindings
+                        if (binding.get("authority") or {}).get("role") == "environment"
+                    ]
+                    if len(style_board_bindings) != 1:
+                        blockers.append("Canon-v4 必须且只能绑定一张可提交 Provider 的纯画风板")
+                    if not environment_bindings:
+                        blockers.append("当前镜头缺少一张已批准的环境参考")
+                    if len(environment_bindings) > 1:
+                        warnings.append("当前场景存在多张环境参考；视频请求只使用排序第一张作为空间权威")
+                    raw_reference_bindings = [
+                        *appearance_bindings,
+                        *environment_bindings[:1],
+                        *style_board_bindings,
+                    ]
+                    omitted_special_count = len(composition_bindings) + len(
+                        editorial_reference_bindings
+                    )
+                    if omitted_special_count:
+                        warnings.append(
+                            "Canon-v4 视频请求已使用职责唯一的五类权威参考；"
+                            "额外构图引用仅保留在审计与镜头正文中"
+                        )
+                else:
+                    raw_reference_bindings = [
+                        *canon_bindings,
+                        *appearance_bindings,
+                        *scene_bindings,
+                        *composition_bindings,
+                        *editorial_reference_bindings,
+                    ]
+                reference_bindings, reference_blockers, reference_warnings = (
+                    _compile_provider_reference_manifest(raw_reference_bindings, maximum=14)
+                )
+                blockers.extend(reference_blockers)
+                warnings.extend(reference_warnings)
                 shot_document = shot.model_dump(mode="json", by_alias=True)
+                if clip is not None:
+                    cursor = 0
+                    director_windows: list[dict[str, Any]] = []
+                    for index, editorial_beat in enumerate(clip_beats, 1):
+                        director_windows.append(
+                            {
+                                "order": index,
+                                "beatId": str(editorial_beat.id),
+                                "startSecond": cursor,
+                                "endSecond": cursor + editorial_beat.duration_seconds,
+                                "title": editorial_beat.title,
+                                "direction": editorial_beat.action,
+                                "visualDescription": editorial_beat.visual_description,
+                                "childAction": editorial_beat.child_action,
+                                "catAction": editorial_beat.cat_action,
+                                "spatialRelation": editorial_beat.spatial_relation,
+                                "contactOcclusion": editorial_beat.contact_occlusion,
+                                "shotSize": editorial_beat.shot_size,
+                                "camera": editorial_beat.camera,
+                                "lighting": editorial_beat.lighting,
+                                "soundEffect": editorial_beat.sound_effect,
+                                "musicIntent": editorial_beat.music_intent,
+                                "continuityIn": editorial_beat.continuity_in,
+                                "continuityOut": editorial_beat.continuity_out,
+                                "cutIntent": editorial_beat.cut_intent,
+                            }
+                        )
+                        cursor += editorial_beat.duration_seconds
+                    current_direction = "\n".join(
+                        editorial_beat.action.strip()
+                        for editorial_beat in clip_beats
+                        if editorial_beat.action.strip()
+                    )
+                    shot_document.update(
+                        {
+                            "title": clip.title,
+                            # The approved editable ShotBeat rows are the
+                            # current creative source. A generation-plan clip
+                            # is an execution projection and may retain the
+                            # wording it was originally compiled from.
+                            "direction": current_direction or clip.direction,
+                            "action": current_direction or clip.direction,
+                            "durationSeconds": clip.duration_seconds,
+                            "camera": "按编号导演分镜与时间窗口执行",
+                            "dialogue": "",
+                            "directorShots": director_windows,
+                        }
+                    )
                 input_snapshot = {
                     "storyRevisionId": str(story.id),
                     "storyRevision": story.revision,
+                    "storyboardRevisionId": (
+                        None if storyboard_revision is None else str(storyboard_revision.id)
+                    ),
+                    "structureHash": payload.structure_hash,
+                    "generationPlanId": (
+                        None if generation_plan is None else str(generation_plan.id)
+                    ),
+                    "generationPlanHash": payload.generation_plan_hash,
                     "visualProfileRevisionId": str(profile.id),
                     "visualProfileRevision": profile.revision,
                     "sceneId": str(scene.id),
@@ -2354,14 +4083,59 @@ class SqlAlchemyAigcCanvasRepository:
                     "warnings": warnings,
                     "blockers": blockers,
                 }
+                compiled_prompt_text = _compile_storyboard_prompt_text(
+                    profile=profile,
+                    story=story,
+                    scene=scene,
+                    shot=shot_document,
+                    reference_bindings=reference_bindings,
+                    healing_recipe=payload.healing_recipe,
+                )
+                input_snapshot["promptBundle"] = {
+                    "creativeText": compiled_prompt_text,
+                    "referenceManifest": reference_bindings,
+                    "executionParams": {
+                        "providerInputMode": "reference_media",
+                        "aspectRatio": "9:16",
+                        "durationSeconds": shot.duration_seconds,
+                        "referenceCount": sum(
+                            1
+                            for binding in reference_bindings
+                            if binding.get("providerIncluded") is True
+                        ),
+                    },
+                    "auditSnapshot": {
+                        "storyRevisionId": str(story.id),
+                        "storyboardRevisionId": (
+                            None if storyboard_revision is None else str(storyboard_revision.id)
+                        ),
+                        "generationPlanId": (
+                            None if generation_plan is None else str(generation_plan.id)
+                        ),
+                        "visualProfileRevisionId": str(profile.id),
+                    },
+                }
                 input_hash = _json_hash(input_snapshot)
+                if clip is not None:
+                    current_prompt = (
+                        None
+                        if clip.prompt_id is None
+                        else session.get(PromptRecord, clip.prompt_id)
+                    )
+                    if current_prompt is None or current_prompt.input_hash != input_hash:
+                        production_inputs_changed = True
                 result: dict[str, Any] = {
                     "beatId": None if beat is None else str(beat.id),
                     "order": shot.order,
-                    "finalPrompt": "",
+                    "finalPrompt": compiled_prompt_text,
+                    "promptBundle": input_snapshot["promptBundle"],
                     "promptId": None,
                     "referenceBindings": reference_bindings,
                     "warnings": warnings,
+                    "diagnostics": [
+                        item.model_dump(mode="json", by_alias=True)
+                        for item in quality_diagnostics
+                    ],
                     "blockers": list(dict.fromkeys(blockers)),
                     "estimatedCost": {"currency": "CNY", "amountMicros": 0},
                     "inputHash": input_hash,
@@ -2370,17 +4144,12 @@ class SqlAlchemyAigcCanvasRepository:
                     results.append(result)
                     continue
 
-                final_prompt = _compile_storyboard_prompt_text(
-                    profile=profile,
-                    story=story,
-                    scene=scene,
-                    shot=shot_document,
-                    reference_bindings=reference_bindings,
-                    healing_recipe=payload.healing_recipe,
-                )
+                final_prompt = compiled_prompt_text
                 prompt_hash = hashlib.sha256(final_prompt.encode("utf-8")).hexdigest()
                 business_object_id = (
-                    beat.id
+                    clip.id
+                    if clip is not None
+                    else beat.id
                     if beat is not None
                     else uuid.uuid5(
                         project_id,
@@ -2392,9 +4161,7 @@ class SqlAlchemyAigcCanvasRepository:
                     f"{project_id}:{operation_key}:{input_hash}:{prompt_hash}".encode()
                 ).hexdigest()
                 step = session.scalar(
-                    select(WorkflowStep).where(
-                        WorkflowStep.idempotency_key == idempotency_key
-                    )
+                    select(WorkflowStep).where(WorkflowStep.idempotency_key == idempotency_key)
                 )
                 if step is None:
                     now = datetime.now(UTC)
@@ -2402,7 +4169,13 @@ class SqlAlchemyAigcCanvasRepository:
                         id=uuid.uuid4(),
                         production_run_id=project_id,
                         scene_id=scene.id,
-                        shot_card_id=None if beat is None else beat.shot_card_id,
+                        shot_card_id=(
+                            clip.id
+                            if clip is not None
+                            else None
+                            if beat is None
+                            else beat.shot_card_id
+                        ),
                         kind=StepKind.DIRECTOR.value,
                         status=StepStatus.SUCCEEDED.value,
                         attempt=1,
@@ -2435,7 +4208,11 @@ class SqlAlchemyAigcCanvasRepository:
                         call_purpose="storyboard_prompt_compilation",
                         node_id=business_object_id,
                         business_object_type=(
-                            "shot_beat" if beat is not None else "storyboard_draft_shot"
+                            "generation_clip"
+                            if clip is not None
+                            else "shot_beat"
+                            if beat is not None
+                            else "storyboard_draft_shot"
                         ),
                         business_object_id=business_object_id,
                         template_name="storyboard.layered-shot.v1",
@@ -2461,18 +4238,32 @@ class SqlAlchemyAigcCanvasRepository:
                     )
                     session.add(prompt)
                     session.flush()
-                if beat is not None and _shot_matches_persisted_beat(shot_document, beat):
+                if clip is not None:
+                    clip.prompt_id = prompt.id
+                    for editorial_beat in clip_beats:
+                        editorial_beat.prompt_id = prompt.id
+                elif beat is not None and _shot_matches_persisted_beat(shot_document, beat):
                     beat.prompt_id = prompt.id
                 result.update(finalPrompt=final_prompt, promptId=str(prompt.id))
                 results.append(result)
 
+            if (
+                production_inputs_changed
+                and storyboard_revision is not None
+                and storyboard_revision.status == "production_approved"
+            ):
+                storyboard_revision.status = "structure_approved"
+                storyboard_revision.production_package_hash = None
+                storyboard_revision.production_approved_at = None
             return {
                 "projectId": str(project_id),
                 "storyRevisionId": str(story.id),
-                "visualProfileRevisionId": str(profile.id),
-                "status": (
-                    "blocked" if any(item["blockers"] for item in results) else "compiled"
+                "storyboardRevisionId": (
+                    None if storyboard_revision is None else str(storyboard_revision.id)
                 ),
+                "generationPlanId": (None if generation_plan is None else str(generation_plan.id)),
+                "visualProfileRevisionId": str(profile.id),
+                "status": ("blocked" if any(item["blockers"] for item in results) else "compiled"),
                 "shots": results,
             }
 
@@ -2521,6 +4312,11 @@ class SqlAlchemyAigcCanvasRepository:
     def review_asset(self, asset_id: uuid.UUID, payload: Any) -> dict[str, Any]:
         with self._sessions.begin() as session:
             asset = self._required(session, Asset, asset_id, lock=True)
+            character_design = dict(dict(asset.metadata_json or {}).get("characterDesign") or {})
+            if character_design.get("validationOnly") is True:
+                raise WorkflowConflictError(
+                    "引用顺序验证候选只能保留审计，不能批准、拒绝或替换生产版本"
+                )
             next_status = "approved" if payload.decision == "approve" else "rejected"
             if asset.status == next_status:
                 return {
@@ -2650,6 +4446,135 @@ class SqlAlchemyAigcCanvasRepository:
             step = self._required(session, WorkflowStep, prompt.step_id)
             return _prompt_json(prompt, step)
 
+    def get_asset_generation_lineage(self, asset_id: uuid.UUID) -> dict[str, Any]:
+        with self._sessions() as session:
+            asset = self._required(session, Asset, asset_id)
+            metadata = dict(asset.metadata_json or {})
+            batch_id_value = metadata.get("batchId")
+            batch = (
+                None
+                if not batch_id_value
+                else session.get(MediaGenerationBatch, uuid.UUID(str(batch_id_value)))
+            )
+            step = (
+                None
+                if asset.producing_step_id is None
+                else session.get(WorkflowStep, asset.producing_step_id)
+            )
+            prompt = (
+                None
+                if step is None
+                else session.scalar(select(PromptRecord).where(PromptRecord.step_id == step.id))
+            )
+            references = (
+                list(metadata.get("referenceManifest") or [])
+                if batch is None
+                else list(batch.reference_manifest_json or [])
+            )
+            reference_ids = [
+                uuid.UUID(str(item["assetId"]))
+                for item in references
+                if isinstance(item, dict) and item.get("assetId")
+            ]
+            reference_assets = {
+                row.id: row
+                for row in session.scalars(select(Asset).where(Asset.id.in_(reference_ids)))
+            }
+            semantic_instructions = {
+                "person:headshot": (
+                    "所选素材可确认为儿童面部 Canon；历史 Provider 槽位仍以证据等级为准"
+                ),
+                "person:fullbody": (
+                    "所选素材可确认为儿童全身比例 Canon；"
+                    "历史 Provider 槽位仍以证据等级为准"
+                ),
+                "cat:front": (
+                    "所选素材可确认为猫咪正面 Canon；历史 Provider 槽位仍以证据等级为准"
+                ),
+                "cat:side": (
+                    "所选素材可确认为猫咪侧面结构 Canon；历史 Provider 槽位仍以证据等级为准"
+                ),
+                "style:line_texture": (
+                    "所选素材可确认为线条材质画风参考；"
+                    "历史 Provider 槽位仍以证据等级为准"
+                ),
+            }
+            enriched_references: list[dict[str, Any]] = []
+            for item in references:
+                if not isinstance(item, dict) or not item.get("assetId"):
+                    continue
+                document = dict(item)
+                reference_asset = reference_assets.get(uuid.UUID(str(item["assetId"])))
+                if reference_asset is not None:
+                    semantic_key = str(reference_asset.semantic_key or reference_asset.role)
+                    asset_metadata = dict(reference_asset.metadata_json or {})
+                    document["sha256"] = document.get("sha256") or reference_asset.sha256
+                    document["semanticRole"] = (
+                        semantic_key
+                        if document.get("semanticRole") in {None, "", "reference"}
+                        else document["semanticRole"]
+                    )
+                    document["purpose"] = (
+                        semantic_key
+                        if document.get("purpose") in {None, "", "reference"}
+                        else document["purpose"]
+                    )
+                    document["instruction"] = document.get(
+                        "instruction"
+                    ) or semantic_instructions.get(
+                        semantic_key,
+                        "历史记录可确认选择了该素材，但不能据此补写过去的 Provider 槽位职责",
+                    )
+                    document["title"] = document.get("title") or str(
+                        asset_metadata.get("displayName")
+                        or asset_metadata.get("title")
+                        or reference_asset.semantic_key
+                        or reference_asset.role
+                    )
+                    document["contentUrl"] = f"/api/v1/assets/{reference_asset.id}/content"
+                if document.get("evidenceLevel") != "frozen":
+                    document["providerSlot"] = None
+                enriched_references.append(document)
+            references = enriched_references
+            evidence_levels = {
+                str(item.get("evidenceLevel") or "unknown")
+                for item in references
+                if isinstance(item, dict)
+            }
+            evidence = (
+                "frozen"
+                if evidence_levels == {"frozen"}
+                else "unknown"
+                if "unknown" in evidence_levels or not evidence_levels
+                else "selected_only"
+            )
+            return {
+                "assetId": str(asset.id),
+                "assetSha256": asset.sha256,
+                "contentUrl": f"/api/v1/assets/{asset.id}/content",
+                "batchId": None if batch is None else str(batch.id),
+                "stepId": None if step is None else str(step.id),
+                "promptId": None if prompt is None else str(prompt.id),
+                "prompt": (None if prompt is None else prompt.final_prompt or prompt.prompt_text),
+                "provider": None if batch is None else batch.provider,
+                "model": None if batch is None else batch.model,
+                "providerTaskId": None if step is None else step.provider_task_id,
+                "inputHash": (
+                    metadata.get("generationInputHash")
+                    if batch is None
+                    else batch.reference_manifest_hash or None
+                ),
+                "providerOrderEvidence": evidence,
+                "providerOrderNotice": (
+                    None
+                    if evidence == "frozen"
+                    else "历史任务仅能确认所选素材，Provider 槽位顺序未知"
+                    if evidence == "unknown"
+                    else "历史任务保存了素材选择，但不能证明图片 Worker 的最终 Provider 槽位顺序"
+                ),
+                "references": references,
+            }
+
     def list_canvas_templates(self) -> list[dict[str, Any]]:
         return [item.model_dump(mode="json", by_alias=True) for item in list_template_specs()]
 
@@ -2665,28 +4590,29 @@ class SqlAlchemyAigcCanvasRepository:
             prompt = session.scalar(select(PromptRecord).where(PromptRecord.step_id == step.id))
             if prompt is None or prompt.status != "pending":
                 raise WorkflowConflictError("图片候选缺少待执行的精确 Prompt")
-            asset_ids = {
-                uuid.UUID(str(item)) for item in batch.input_json.get("referenceAssetIds", [])
-            }
-            incoming_nodes = list(
-                session.scalars(
-                    select(CanvasGraphNode)
-                    .join(
-                        CanvasGraphEdge,
-                        CanvasGraphEdge.source_node_id == CanvasGraphNode.id,
-                    )
-                    .where(
-                        CanvasGraphEdge.target_node_id == batch.canvas_node_id,
-                        CanvasGraphEdge.target_port == "media_reference[]",
-                        CanvasGraphNode.object_type == "asset",
-                        CanvasGraphNode.object_id.is_not(None),
-                    )
+            included = [
+                item
+                for item in batch.reference_manifest_json
+                if isinstance(item, dict) and item.get("providerIncluded") is True
+            ]
+            if not batch.reference_manifest_hash:
+                raise WorkflowConflictError(
+                    "历史图片任务没有可证明的冻结输入哈希，不能按新链路提交"
                 )
-            )
-            asset_ids.update(
-                node.object_id for node in incoming_nodes if node.object_id is not None
-            )
-            assets = [self._required(session, Asset, asset_id) for asset_id in asset_ids]
+            if included and any(item.get("evidenceLevel") != "frozen" for item in included):
+                raise WorkflowConflictError(
+                    "历史图片任务无法证明 Provider 引用顺序，不能在未知顺序下提交"
+                )
+            assets: list[Asset] = []
+            for item in sorted(included, key=lambda value: int(value.get("ordinal") or 0)):
+                asset = self._required(session, Asset, uuid.UUID(str(item["assetId"])))
+                if asset.production_run_id not in {None, batch.production_run_id}:
+                    raise WorkflowConflictError("图片生成冻结引用不属于当前项目")
+                if asset.media_type != "image":
+                    raise WorkflowConflictError("图片生成冻结引用不是图片")
+                if item.get("sha256") and asset.sha256 != item.get("sha256"):
+                    raise WorkflowConflictError("图片生成冻结引用的 SHA 已变化")
+                assets.append(asset)
             return {
                 "batchId": str(batch.id),
                 "candidateIndex": int(step.input_snapshot_json["candidateIndex"]),
@@ -2694,6 +4620,8 @@ class SqlAlchemyAigcCanvasRepository:
                 "referencePaths": tuple(
                     _resolve_asset_path(asset.storage_key, self._asset_root) for asset in assets
                 ),
+                "referenceManifest": tuple(included),
+                "inputHash": batch.reference_manifest_hash,
             }
 
     def complete_image_candidate(
@@ -2716,6 +4644,17 @@ class SqlAlchemyAigcCanvasRepository:
                 lock=True,
             )
             candidate_index = int(step.input_snapshot_json["candidateIndex"])
+            character_design = batch.input_json.get("characterDesign")
+            validation_only = bool(
+                isinstance(character_design, dict)
+                and character_design.get("validationOnly") is True
+            )
+            candidate_index_offset = (
+                int(character_design.get("candidateIndexOffset") or 0)
+                if isinstance(character_design, dict)
+                else 0
+            )
+            stored_candidate_index = candidate_index_offset + candidate_index
             prompt = session.scalar(
                 select(PromptRecord).where(PromptRecord.step_id == step.id).with_for_update()
             )
@@ -2735,7 +4674,7 @@ class SqlAlchemyAigcCanvasRepository:
                     "character-design:"
                     f"{batch.input_json['characterDesign']['revisionId']}:"
                     f"{batch.input_json['characterDesign']['slot']}:"
-                    f"candidate:{candidate_index}"
+                    f"candidate:{stored_candidate_index}"
                     if isinstance(batch.input_json.get("characterDesign"), dict)
                     else f"batch:{batch.id}:candidate:{candidate_index}"
                 ),
@@ -2747,16 +4686,27 @@ class SqlAlchemyAigcCanvasRepository:
                 byte_size=landed.byte_size,
                 metadata_json={
                     "batchId": str(batch.id),
-                    "candidateIndex": candidate_index,
+                    "candidateIndex": stored_candidate_index,
+                    "batchCandidateIndex": candidate_index,
                     "providerUrl": provider_url,
                     "providerModel": provider_model,
                     "promptId": str(prompt.id),
                     "characterDesign": batch.input_json.get("characterDesign"),
+                    "generationInputHash": batch.reference_manifest_hash,
+                    "referenceManifest": batch.reference_manifest_json,
+                    "providerOrderEvidence": (
+                        "frozen"
+                        if all(
+                            item.get("evidenceLevel") == "frozen"
+                            for item in batch.reference_manifest_json
+                            if isinstance(item, dict)
+                        )
+                        else "unknown"
+                    ),
                 },
             )
             session.add(asset)
             session.flush()
-            character_design = batch.input_json.get("characterDesign")
             if isinstance(character_design, dict):
                 revision_id = uuid.UUID(str(character_design["revisionId"]))
                 revision = self._required(session, CharacterDesignRevision, revision_id, lock=True)
@@ -2768,26 +4718,27 @@ class SqlAlchemyAigcCanvasRepository:
                         character_design_revision_id=revision.id,
                         asset_id=asset.id,
                         slot=str(character_design["slot"]),
-                        candidate_index=candidate_index,
+                        candidate_index=stored_candidate_index,
                         semantic_role=str(character_design["semanticRole"]),
                         selected=False,
                     )
                 )
                 session.flush()
-                bindings = list(
-                    session.scalars(
-                        select(CharacterDesignAsset).where(
-                            CharacterDesignAsset.character_design_revision_id == revision.id
+                if not validation_only:
+                    bindings = list(
+                        session.scalars(
+                            select(CharacterDesignAsset).where(
+                                CharacterDesignAsset.character_design_revision_id == revision.id
+                            )
                         )
                     )
-                )
-                expected = int(character_design["candidateCount"])
-                counts = {
-                    slot: sum(1 for item in bindings if item.slot == slot)
-                    for slot in ("child", "cat", "pair_scale")
-                }
-                if all(count >= expected for count in counts.values()):
-                    revision.status = "awaiting_review"
+                    expected = int(character_design["candidateCount"])
+                    counts = {
+                        slot: sum(1 for item in bindings if item.slot == slot)
+                        for slot in ("child", "cat", "pair_scale")
+                    }
+                    if all(count >= expected for count in counts.values()):
+                        revision.status = "awaiting_review"
             output_ids = [*batch.output_asset_ids_json, str(asset.id)]
             batch.output_asset_ids_json = output_ids
             if len(output_ids) >= batch.candidate_count:
@@ -2798,21 +4749,37 @@ class SqlAlchemyAigcCanvasRepository:
                 {
                     "id": str(asset.id),
                     "assetId": str(asset.id),
-                    "title": f"候选 {candidate_index}",
+                    "title": (
+                        f"验证候选 {stored_candidate_index}"
+                        if validation_only
+                        else f"候选 {stored_candidate_index}"
+                    ),
                     "thumbnailUrl": f"/api/v1/assets/{asset.id}/content",
                     "promptId": str(prompt.id),
-                    "status": "candidate",
+                    "status": "validation_candidate" if validation_only else "candidate",
+                    "validationOnly": validation_only,
+                    "selected": False,
+                    "inputHash": batch.reference_manifest_hash,
                 },
             ]
-            node.status = batch.status
-            node.data_json = {
-                **node.data_json,
-                "status": batch.status,
-                "candidates": sorted(
-                    candidates,
-                    key=lambda item: int(str(item["title"]).split()[-1]),
-                ),
-            }
+            if validation_only:
+                node.data_json = {
+                    **node.data_json,
+                    "candidates": sorted(
+                        candidates,
+                        key=lambda item: int(str(item["title"]).split()[-1]),
+                    ),
+                }
+            else:
+                node.status = batch.status
+                node.data_json = {
+                    **node.data_json,
+                    "status": batch.status,
+                    "candidates": sorted(
+                        candidates,
+                        key=lambda item: int(str(item["title"]).split()[-1]),
+                    ),
+                }
             prompt.status = "succeeded"
             prompt.raw_response_json = {"url": provider_url, "model": provider_model}
             prompt.structured_response_json = {"assetId": str(asset.id)}
@@ -2825,7 +4792,8 @@ class SqlAlchemyAigcCanvasRepository:
                 {
                     "batchId": str(batch.id),
                     "assetId": str(asset.id),
-                    "candidateIndex": candidate_index,
+                    "candidateIndex": stored_candidate_index,
+                    "validationOnly": validation_only,
                 },
             )
             return str(asset.id)
@@ -2852,16 +4820,29 @@ class SqlAlchemyAigcCanvasRepository:
                 raise ValueError("视频生成配置必须是对象")
             included_references = [
                 item
-                for item in config.get("actualReferences", [])
+                for item in batch.reference_manifest_json
                 if isinstance(item, dict) and item.get("providerIncluded") is True
             ]
+            if not batch.reference_manifest_hash:
+                raise WorkflowConflictError(
+                    "历史视频任务没有可证明的冻结输入哈希，不能按新链路提交"
+                )
+            if included_references and any(
+                item.get("evidenceLevel") != "frozen" for item in included_references
+            ):
+                raise WorkflowConflictError(
+                    "历史视频任务无法证明 Provider 引用顺序，不能在未知顺序下提交"
+                )
+            included_references.sort(key=lambda value: int(value.get("ordinal") or 0))
             assets: list[Asset] = []
             for item in included_references:
                 asset = self._required(session, Asset, uuid.UUID(str(item["assetId"])))
-                if asset.production_run_id != batch.production_run_id:
+                if asset.production_run_id not in {None, batch.production_run_id}:
                     raise WorkflowConflictError("视频生成引用不属于当前项目")
                 if asset.media_type != "image":
                     raise ValueError("首期视频生成只接受图片引用")
+                if item.get("sha256") and asset.sha256 != item.get("sha256"):
+                    raise WorkflowConflictError("视频生成冻结引用的 SHA 已变化")
                 assets.append(asset)
             sources = tuple(
                 MediaSource(
@@ -2874,14 +4855,17 @@ class SqlAlchemyAigcCanvasRepository:
                 for asset in assets
             )
             mode = str(config.get("mode", "text_to_video"))
-            if mode in {"image_to_video", "first_last_frame"} and len(sources) != 1:
+            if mode == "image_to_video" and len(sources) != 1:
                 raise ValueError("当前 Ark 首帧视频模式必须且只能提交一张实际引用图")
+            if mode == "first_last_frame" and len(sources) != 2:
+                raise ValueError("当前 Ark 首尾帧模式必须且只能提交两张有序控制图")
             resolution = str(config.get("resolution", "720p")).lower()
             duration_seconds = int(config.get("durationSeconds", 8))
             plan: VideoInputPlan = build_shot_input_plan(
                 resolution=resolution,
                 duration_seconds=duration_seconds,
                 anchor=sources[0] if mode in {"image_to_video", "first_last_frame"} else None,
+                last_frame=sources[1] if mode == "first_last_frame" else None,
                 references=(() if mode in {"image_to_video", "first_last_frame"} else sources),
             )
             return {
@@ -2893,6 +4877,8 @@ class SqlAlchemyAigcCanvasRepository:
                     _resolve_asset_path(asset.storage_key, self._asset_root) for asset in assets
                 ),
                 "providerTaskId": step.provider_task_id,
+                "referenceManifest": tuple(included_references),
+                "inputHash": batch.reference_manifest_hash,
             }
 
     def record_video_candidate_submission(
@@ -2921,6 +4907,15 @@ class SqlAlchemyAigcCanvasRepository:
                 else StepStatus.QUEUED.value
             )
             step.submitted_at = step.submitted_at or datetime.now(UTC)
+            step.progress_json = {
+                **dict(step.progress_json or {}),
+                "providerStatus": provider_status,
+                "message": (
+                    "Provider 已开始生成，任务会继续跟踪"
+                    if provider_status == "running"
+                    else "Provider 已接收任务，正在排队"
+                ),
+            }
 
     def complete_video_candidate(
         self,
@@ -2929,10 +4924,17 @@ class SqlAlchemyAigcCanvasRepository:
         landed: LandedAsset,
         provider_url: str,
         provider_model: str,
+        last_frame_landed: LandedAsset | None = None,
+        last_frame_provider_url: str | None = None,
     ) -> str:
         with self._sessions.begin() as session:
             step = self._required(session, WorkflowStep, step_id, lock=True)
-            existing = session.scalar(select(Asset).where(Asset.producing_step_id == step.id))
+            existing = session.scalar(
+                select(Asset).where(
+                    Asset.producing_step_id == step.id,
+                    Asset.role == "video_candidate",
+                )
+            )
             if existing is not None:
                 return str(existing.id)
             batch = self._required(
@@ -2967,10 +4969,42 @@ class SqlAlchemyAigcCanvasRepository:
                     "providerModel": provider_model,
                     "providerTaskId": step.provider_task_id,
                     "promptId": str(prompt.id),
+                    "generationInputHash": batch.reference_manifest_hash,
+                    "referenceManifest": batch.reference_manifest_json,
+                    "providerOrderEvidence": "frozen",
                 },
             )
             session.add(asset)
             session.flush()
+            tail_frame: Asset | None = None
+            if last_frame_landed is not None and last_frame_provider_url:
+                tail_frame = Asset(
+                    id=uuid.uuid4(),
+                    production_run_id=batch.production_run_id,
+                    producing_step_id=step.id,
+                    canvas_node_id=batch.canvas_node_id,
+                    role="shot_tail_frame",
+                    semantic_key=f"batch:{batch.id}:candidate:{candidate_index}:tail",
+                    scope="canvas_node",
+                    status="approved",
+                    media_type="image",
+                    storage_key=_asset_storage_key(last_frame_landed.path, self._asset_root),
+                    sha256=last_frame_landed.sha256,
+                    byte_size=last_frame_landed.byte_size,
+                    metadata_json={
+                        "batchId": str(batch.id),
+                        "candidateIndex": candidate_index,
+                        "sourceVideoAssetId": str(asset.id),
+                        "sourceVideoSha256": landed.sha256,
+                        "providerReturned": True,
+                        "providerUrl": last_frame_provider_url,
+                        "providerModel": provider_model,
+                        "providerTaskId": step.provider_task_id,
+                        "generationInputHash": batch.reference_manifest_hash,
+                    },
+                )
+                session.add(tail_frame)
+                session.flush()
             output_ids = [*batch.output_asset_ids_json, str(asset.id)]
             batch.output_asset_ids_json = output_ids
             if len(output_ids) >= batch.candidate_count:
@@ -2989,6 +5023,9 @@ class SqlAlchemyAigcCanvasRepository:
                         "contentUrl": f"/api/v1/assets/{asset.id}/content",
                         "promptId": str(prompt.id),
                         "status": "candidate",
+                        "tailFrameAssetId": (
+                            str(tail_frame.id) if tail_frame is not None else None
+                        ),
                     },
                 ],
             }
@@ -2997,8 +5034,14 @@ class SqlAlchemyAigcCanvasRepository:
                 "url": provider_url,
                 "model": provider_model,
                 "providerTaskId": step.provider_task_id,
+                "lastFrameUrl": last_frame_provider_url,
             }
-            prompt.structured_response_json = {"assetId": str(asset.id)}
+            prompt.structured_response_json = {
+                "assetId": str(asset.id),
+                "tailFrameAssetId": (
+                    str(tail_frame.id) if tail_frame is not None else None
+                ),
+            }
             prompt.output_hash = landed.sha256
             prompt.completed_at = datetime.now(UTC)
             self._record_event(
@@ -3010,6 +5053,9 @@ class SqlAlchemyAigcCanvasRepository:
                     "assetId": str(asset.id),
                     "candidateIndex": candidate_index,
                     "mediaKind": "video",
+                    "tailFrameAssetId": (
+                        str(tail_frame.id) if tail_frame is not None else None
+                    ),
                 },
             )
             return str(asset.id)
@@ -3208,6 +5254,14 @@ class SqlAlchemyAigcCanvasRepository:
                 else []
             )
             anchors.sort(key=lambda item: 0 if item.metadata_json.get("boundary") == "start" else 1)
+            references = list(
+                session.scalars(
+                    select(Asset)
+                    .join(VideoEditReference, VideoEditReference.asset_id == Asset.id)
+                    .where(VideoEditReference.recipe_id == recipe.id)
+                    .order_by(VideoEditReference.ordinal)
+                )
+            )
             return {
                 "ready": len(anchors) == len(anchor_step_ids),
                 "recipeId": str(recipe.id),
@@ -3219,6 +5273,9 @@ class SqlAlchemyAigcCanvasRepository:
                     else _resolve_asset_path(source.storage_key, self._asset_root)
                 ),
                 "anchors": tuple(_stored_asset(item, self._asset_root) for item in anchors),
+                "references": tuple(
+                    _stored_asset(item, self._asset_root) for item in references
+                ),
                 "startMs": recipe.start_ms,
                 "endMs": recipe.end_ms,
                 "providerTaskId": step.provider_task_id,
@@ -3230,7 +5287,7 @@ class SqlAlchemyAigcCanvasRepository:
         step_id: uuid.UUID,
         *,
         input_plan: dict[str, Any],
-        input_assets: tuple[StoredAsset, StoredAsset, StoredAsset],
+        input_assets: tuple[StoredAsset, ...],
     ) -> None:
         """Freeze the exact provider bindings before the paid video request."""
 
@@ -3885,136 +5942,522 @@ class SqlAlchemyAigcCanvasRepository:
             return {"id": str(edge_id), "deleted": True, "targetStatus": target.status}
 
     def create_generation_batch(self, payload: Any) -> dict[str, Any]:
-        input_document = payload.model_dump(mode="json", by_alias=True)
-        batch_id = uuid.uuid4()
+        """Persist one media batch without ever exposing a dangling step foreign key."""
+
         with self._sessions.begin() as session:
-            project = self._require_project(session, payload.project_id, lock=True)
-            project.universal_canvas_enabled = True
-            if project.canvas_template_key == CanvasTemplateKey.PRODUCT_AD.value:
-                project.product_ad_template_enabled = True
-            node = self._required(session, CanvasGraphNode, payload.canvas_node_id, lock=True)
-            allowed_node_types = {
-                "image": {
-                    CanvasNodeType.GENERATION_BATCH.value,
-                    CanvasNodeType.IMAGE_GENERATION.value,
-                    CanvasNodeType.CHARACTER_DESIGN.value,
-                },
-                "video": {CanvasNodeType.VIDEO_GENERATION.value},
-            }
-            if (
-                node.production_run_id != payload.project_id
-                or node.node_type not in allowed_node_types[payload.media_kind]
-            ):
-                raise ValueError(f"{payload.media_kind}生成批次与画布节点类型不匹配")
-            existing = session.scalar(
-                select(MediaGenerationBatch).where(
-                    MediaGenerationBatch.idempotency_key == payload.idempotency_key
-                )
-            )
+            plan, existing = self._plan_generation_batch(session, payload)
             if existing is not None:
                 return _generation_batch_json(session, existing)
-            batch = MediaGenerationBatch(
-                id=batch_id,
+            if plan is None:  # pragma: no cover - guarded by the mutually exclusive return
+                raise RuntimeError("generation batch planning returned no result")
+            self._persist_generation_batch_plans(session, (plan,))
+            return _generation_batch_json(session, plan.batch)
+
+    def create_generation_batches(
+        self,
+        payloads: Sequence[Any],
+        *,
+        parent_step_id: uuid.UUID,
+    ) -> tuple[dict[str, Any], ...]:
+        """Atomically schedule one explicit character-design generation stage.
+
+        The method owns validation, persistence ordering, parent/child linkage, and
+        rollback semantics.  Worker steps are flushed before batches reference them;
+        therefore a worker can only observe the complete requested stage.  Canon v4
+        uses ``child + cat`` followed by ``pair_scale``; legacy runs may still submit
+        all three slots in one stage.
+        """
+
+        normalized = tuple(payloads)
+        if not normalized:
+            raise ValueError("角色设计阶段至少需要一个图片批次")
+        slots: list[str] = []
+        revision_ids: set[str] = set()
+        validation_modes: set[bool] = set()
+        project_ids = {payload.project_id for payload in normalized}
+        for payload in normalized:
+            character_design = payload.input.get("characterDesign")
+            if not isinstance(character_design, dict):
+                raise ValueError("角色设计批次缺少 characterDesign 输入快照")
+            slots.append(str(character_design.get("slot") or ""))
+            revision_ids.add(str(character_design.get("revisionId") or ""))
+            validation_modes.add(character_design.get("validationOnly") is True)
+        slot_set = set(slots)
+        allowed_slot_sets = {
+            frozenset({"child", "cat"}),
+            frozenset({"pair_scale"}),
+            frozenset({"child", "cat", "pair_scale"}),
+        }
+        if len(slot_set) != len(slots) or frozenset(slot_set) not in allowed_slot_sets:
+            raise ValueError(
+                "角色设计阶段必须是 child+cat、pair_scale，或历史兼容的完整三槽位"
+            )
+        if (
+            len(project_ids) != 1
+            or len(revision_ids) != 1
+            or len(validation_modes) != 1
+            or "" in revision_ids
+        ):
+            raise ValueError("同一角色设计阶段的批次必须属于同一项目和角色设计版本")
+
+        dispatch_context = {
+            "parentStepId": str(parent_step_id),
+            "projectId": str(normalized[0].project_id),
+            "characterDesignRevisionId": next(iter(revision_ids)),
+            "slots": slots,
+        }
+        try:
+            with self._sessions.begin() as session:
+                parent = self._required(session, WorkflowStep, parent_step_id, lock=True)
+                if parent.production_run_id != normalized[0].project_id:
+                    raise ValueError("角色设计父任务与图片批次不属于同一项目")
+                if parent.operation_key not in {
+                    "recipe:character_design",
+                    "recipe:character_design_validation",
+                    "canvas-group:run",
+                }:
+                    raise ValueError("角色设计批次只能绑定角色设计或整组执行父任务")
+                validation_only = next(iter(validation_modes))
+                if validation_only and slot_set != {"child", "cat", "pair_scale"}:
+                    raise ValueError("引用顺序验证必须完整覆盖三个角色设计槽位")
+                if (
+                    parent.operation_key == "recipe:character_design_validation"
+                ) != validation_only:
+                    raise ValueError("角色设计父任务与三槽位批次的验证模式不一致")
+                recipe_instance_id = parent.input_snapshot_json.get("recipeInstanceId")
+                if not recipe_instance_id:
+                    raise ValueError("角色设计父任务缺少 recipeInstanceId 输入快照")
+                revision = self._required(
+                    session,
+                    CharacterDesignRevision,
+                    uuid.UUID(next(iter(revision_ids))),
+                    lock=True,
+                )
+                if revision.production_run_id != normalized[
+                    0
+                ].project_id or revision.production_recipe_instance_id != uuid.UUID(
+                    str(recipe_instance_id)
+                ):
+                    raise ValueError("角色设计版本、配方和父任务上下文不一致")
+
+                plans: list[_GenerationBatchPlan] = []
+                existing_batches: list[MediaGenerationBatch] = []
+                for payload in normalized:
+                    plan, existing = self._plan_generation_batch(session, payload)
+                    if existing is not None:
+                        self._validate_existing_character_batch(session, existing, payload)
+                        existing_batches.append(existing)
+                    elif plan is not None:
+                        plans.append(plan)
+                if existing_batches and plans:
+                    for batch in existing_batches:
+                        self._require_pristine_generation_batch(session, batch)
+                if plans:
+                    self._persist_generation_batch_plans(session, tuple(plans))
+
+                ordered_batches: list[MediaGenerationBatch] = []
+                by_key = {batch.idempotency_key: batch for batch in existing_batches}
+                by_key.update({plan.batch.idempotency_key: plan.batch for plan in plans})
+                child_steps: list[WorkflowStep] = []
+                for payload in normalized:
+                    batch = by_key[payload.idempotency_key]
+                    ordered_batches.append(batch)
+                    child_steps.extend(self._generation_batch_steps(session, batch))
+                self._link_generation_children(session, parent, child_steps)
+                return tuple(_generation_batch_json(session, batch) for batch in ordered_batches)
+        except RecipeDispatchError:
+            raise
+        except SQLAlchemyError as exc:
+            raise RecipeDispatchError(
+                "角色设计图片批次调度失败；数据库事务已回滚，供应商尚未提交",
+                context=dispatch_context,
+            ) from exc
+
+    def _plan_generation_batch(
+        self,
+        session: Session,
+        payload: Any,
+    ) -> tuple[_GenerationBatchPlan | None, MediaGenerationBatch | None]:
+        project = self._require_project(session, payload.project_id, lock=True)
+        project.universal_canvas_enabled = True
+        if project.canvas_template_key == CanvasTemplateKey.PRODUCT_AD.value:
+            project.product_ad_template_enabled = True
+        node = self._required(session, CanvasGraphNode, payload.canvas_node_id, lock=True)
+        allowed_node_types = {
+            "image": {
+                CanvasNodeType.GENERATION_BATCH.value,
+                CanvasNodeType.IMAGE_GENERATION.value,
+                CanvasNodeType.CHARACTER_DESIGN.value,
+            },
+            "video": {CanvasNodeType.VIDEO_GENERATION.value},
+        }
+        if (
+            node.production_run_id != payload.project_id
+            or node.node_type not in allowed_node_types[payload.media_kind]
+        ):
+            raise ValueError(f"{payload.media_kind}生成批次与画布节点类型不匹配")
+        existing = session.scalar(
+            select(MediaGenerationBatch).where(
+                MediaGenerationBatch.idempotency_key == payload.idempotency_key
+            )
+        )
+        if existing is not None:
+            return None, existing
+
+        preview = self._compile_generation_batch_input(session, node, payload)
+        expected_input_hash = payload.expected_input_hash
+        if not expected_input_hash:
+            raise WorkflowConflictError("付费生成必须先读取服务端输入预览并提交 expectedInputHash")
+        if expected_input_hash != preview["inputHash"]:
+            raise WorkflowConflictError("生成引用、Prompt、模型或费用已变化，请重新预览后确认")
+        if preview["blockers"]:
+            raise WorkflowConflictError("；".join(preview["blockers"]))
+        frozen_input = {
+            **payload.input,
+            "referenceManifest": preview["references"],
+            "referenceManifestHash": preview["inputHash"],
+            "inputHash": preview["inputHash"],
+        }
+        batch = MediaGenerationBatch(
+            id=uuid.uuid4(),
+            production_run_id=payload.project_id,
+            canvas_node_id=node.id,
+            media_kind=payload.media_kind,
+            candidate_count=payload.candidate_count,
+            provider=payload.provider,
+            model=payload.model,
+            status="pending",
+            idempotency_key=payload.idempotency_key,
+            input_json=frozen_input,
+            reference_manifest_json=preview["references"],
+            reference_manifest_hash=preview["inputHash"],
+        )
+        input_document = payload.model_dump(mode="json", by_alias=True)
+        input_document["input"] = frozen_input
+        base_prompt = str(
+            payload.input.get("prompt") or json.dumps(payload.input, ensure_ascii=False)
+        )
+        steps: list[WorkflowStep] = []
+        prompts: list[PromptRecord] = []
+        for candidate_index in range(1, payload.candidate_count + 1):
+            candidate_snapshot = {
+                **input_document,
+                "batchId": str(batch.id),
+                "candidateIndex": candidate_index,
+            }
+            input_hash = _json_hash(candidate_snapshot)
+            step = WorkflowStep(
+                id=uuid.uuid4(),
                 production_run_id=payload.project_id,
-                canvas_node_id=node.id,
-                media_kind=payload.media_kind,
-                candidate_count=payload.candidate_count,
+                kind=(
+                    StepKind.IMAGE.value if payload.media_kind == "image" else StepKind.VIDEO.value
+                ),
+                status=StepStatus.PENDING.value,
+                attempt=1,
+                operation_key=(
+                    f"media:{payload.media_kind}:batch:{batch.id}:candidate:{candidate_index}"
+                ),
+                idempotency_key=hashlib.sha256(
+                    f"{payload.idempotency_key}:{candidate_index}".encode("utf-8")
+                ).hexdigest(),
                 provider=payload.provider,
                 model=payload.model,
-                status="pending",
-                idempotency_key=payload.idempotency_key,
-                input_json=payload.input,
+                input_hash=input_hash,
+                request_hash=input_hash,
+                input_snapshot_json=candidate_snapshot,
             )
-            session.add(batch)
-            session.flush()
-            base_prompt = str(
-                payload.input.get("prompt") or json.dumps(payload.input, ensure_ascii=False)
+            final_prompt = (
+                f"{base_prompt}\n\n候选 {candidate_index}/{payload.candidate_count}："
+                "保持全部主体身份锚点，提供与其他候选不同的构图或机位。"
             )
-            candidate_step_ids: list[str] = []
-            for candidate_index in range(1, payload.candidate_count + 1):
-                candidate_snapshot = {
-                    **input_document,
-                    "batchId": str(batch.id),
-                    "candidateIndex": candidate_index,
-                }
-                input_hash = _json_hash(candidate_snapshot)
-                step = WorkflowStep(
+            steps.append(step)
+            prompts.append(
+                PromptRecord(
                     id=uuid.uuid4(),
-                    production_run_id=payload.project_id,
-                    kind=(
-                        StepKind.IMAGE.value
+                    step_id=step.id,
+                    purpose=(
+                        PromptPurpose.IMAGE.value
                         if payload.media_kind == "image"
-                        else StepKind.VIDEO.value
+                        else PromptPurpose.VIDEO.value
                     ),
-                    status=StepStatus.PENDING.value,
-                    attempt=1,
-                    operation_key=(
-                        f"media:{payload.media_kind}:batch:{batch.id}:candidate:{candidate_index}"
-                    ),
-                    idempotency_key=hashlib.sha256(
-                        f"{payload.idempotency_key}:{candidate_index}".encode("utf-8")
-                    ).hexdigest(),
-                    provider=payload.provider,
                     model=payload.model,
-                    input_hash=input_hash,
-                    request_hash=input_hash,
+                    prompt_text=final_prompt,
+                    sha256=hashlib.sha256(final_prompt.encode("utf-8")).hexdigest(),
+                    call_purpose=f"{payload.media_kind}_generation_candidate_{candidate_index}",
+                    node_id=node.id,
+                    business_object_type="media_generation_batch",
+                    business_object_id=batch.id,
+                    template_name=f"media.{payload.media_kind}.candidate.v1",
+                    template_version="1.0.0",
+                    user_prompt=base_prompt,
+                    final_prompt=final_prompt,
+                    provider_request_json={
+                        "candidateIndex": candidate_index,
+                        "candidateCount": payload.candidate_count,
+                        "input": frozen_input,
+                        "referenceManifest": preview["references"],
+                        "referenceManifestHash": preview["inputHash"],
+                    },
                     input_snapshot_json=candidate_snapshot,
+                    status="pending",
+                    input_hash=input_hash,
                 )
-                session.add(step)
-                if candidate_index == 1:
-                    batch.workflow_step_id = step.id
-                final_prompt = (
-                    f"{base_prompt}\n\n候选 {candidate_index}/{payload.candidate_count}："
-                    "保持全部主体身份锚点，提供与其他候选不同的构图或机位。"
+            )
+        batch.workflow_step_id = steps[0].id
+        return _GenerationBatchPlan(payload, node, batch, tuple(steps), tuple(prompts)), None
+
+    def _compile_generation_batch_input(
+        self,
+        session: Session,
+        node: CanvasGraphNode,
+        payload: Any,
+    ) -> dict[str, Any]:
+        character_design = payload.input.get("characterDesign")
+        if isinstance(character_design, dict):
+            capability = self._resolve_provider_capability(
+                session,
+                provider=str(payload.provider),
+                model=str(payload.model),
+                media_kind="image",
+            )
+            if capability is None:
+                raise WorkflowConflictError("角色设计图片模型没有启用的 Provider 能力档案")
+            capabilities = dict(capability["capabilities"])
+            current_capability_revision = str(
+                capabilities.get("capabilityRevision")
+                or capability["updatedAt"]
+                or capability["id"]
+            )
+            expected_capability_revision = str(payload.input.get("capabilityRevision") or "")
+            if expected_capability_revision != current_capability_revision:
+                raise WorkflowConflictError(
+                    "角色设计模型能力 revision 已变化，请重新查看输入与费用"
                 )
-                session.add(
-                    PromptRecord(
-                        id=uuid.uuid4(),
-                        step_id=step.id,
-                        purpose=(
-                            PromptPurpose.IMAGE.value
-                            if payload.media_kind == "image"
-                            else PromptPurpose.VIDEO.value
-                        ),
-                        model=payload.model,
-                        prompt_text=final_prompt,
-                        sha256=hashlib.sha256(final_prompt.encode("utf-8")).hexdigest(),
-                        call_purpose=(
-                            f"{payload.media_kind}_generation_candidate_{candidate_index}"
-                        ),
-                        node_id=node.id,
-                        business_object_type="media_generation_batch",
-                        business_object_id=batch.id,
-                        template_name=f"media.{payload.media_kind}.candidate.v1",
-                        template_version="1.0.0",
-                        user_prompt=base_prompt,
-                        final_prompt=final_prompt,
-                        provider_request_json={
-                            "candidateIndex": candidate_index,
-                            "candidateCount": payload.candidate_count,
-                            "input": payload.input,
-                        },
-                        input_snapshot_json=candidate_snapshot,
-                        status="pending",
-                        input_hash=input_hash,
-                    )
-                )
-                candidate_step_ids.append(str(step.id))
-            node.status = "pending"
-            node.data_json = {
-                **node.data_json,
-                "batchId": str(batch.id),
-                "candidateCount": payload.candidate_count,
-                "candidateStepIds": candidate_step_ids,
-                "status": "pending",
+            references = list(payload.input.get("referenceManifest") or [])
+            if not references:
+                raise WorkflowConflictError("角色设计批次缺少服务端有序引用清单")
+            asset_ids = [uuid.UUID(str(item["assetId"])) for item in references]
+            assets = {
+                asset.id: asset
+                for asset in session.scalars(select(Asset).where(Asset.id.in_(asset_ids)))
             }
+            blockers: list[str] = []
+            compiled: list[dict[str, Any]] = []
+            seen_ids: set[uuid.UUID] = set()
+            seen_hashes: set[str] = set()
+            for item in references:
+                asset_id = uuid.UUID(str(item["assetId"]))
+                asset = assets.get(asset_id)
+                if asset is None:
+                    blockers.append(f"角色设计引用 {asset_id} 不存在")
+                    continue
+                path = _resolve_asset_path(asset.storage_key, self._asset_root)
+                if (
+                    asset.production_run_id not in {None, payload.project_id}
+                    or asset.media_type != "image"
+                    or asset.status not in {"approved", "ready"}
+                    or not path.is_file()
+                ):
+                    blockers.append(f"角色设计引用 {asset_id} 不可用或尚未批准")
+                    continue
+                if asset.id in seen_ids or asset.sha256 in seen_hashes:
+                    continue
+                seen_ids.add(asset.id)
+                seen_hashes.add(asset.sha256)
+                ordinal = len(compiled) + 1
+                compiled.append(
+                    {
+                        **item,
+                        "assetId": str(asset.id),
+                        "ordinal": ordinal,
+                        "sha256": asset.sha256,
+                        "providerIncluded": True,
+                        "providerSlot": f"reference_image_{ordinal}",
+                        "omissionReason": None,
+                        "evidenceLevel": "frozen",
+                    }
+                )
+            exact_input = character_design_generation_input(
+                provider=str(payload.provider),
+                model=str(payload.model),
+                candidate_count=payload.candidate_count,
+                prompt=str(payload.input.get("prompt") or ""),
+                references=compiled,
+                capability_revision=current_capability_revision,
+            )
+            input_image_cost = capabilities.get("inputImageCostMicros")
+            output_image_cost = capabilities.get("outputImageCostMicros")
+            if input_image_cost is None or output_image_cost is None:
+                estimated_cost_micros = None
+            else:
+                estimated_cost_micros = payload.candidate_count * (
+                    int(output_image_cost) + len(compiled) * int(input_image_cost)
+                )
+            return {
+                "provider": payload.provider,
+                "model": payload.model,
+                "mode": "all_reference",
+                "capabilityRevision": current_capability_revision,
+                "prompt": str(payload.input.get("prompt") or ""),
+                "references": compiled,
+                "warnings": [],
+                "blockers": blockers,
+                "estimatedCostMicros": estimated_cost_micros,
+                "inputHash": generation_input_hash(exact_input),
+            }
+
+        config_document = payload.input.get("generationConfig")
+        if not isinstance(config_document, dict):
+            raise WorkflowConflictError("通用生成批次缺少 generationConfig 输入快照")
+        normalized = {
+            **config_document,
+            "provider": payload.provider,
+            "model": payload.model,
+            "candidateCount": payload.candidate_count,
+            "draftPrompt": str(
+                payload.input.get("prompt") or config_document.get("draftPrompt") or ""
+            ),
+        }
+        config = NodeGenerationConfigDraft.model_validate(normalized)
+        return self._compile_node_generation_input(session, node, config)
+
+    def _persist_generation_batch_plans(
+        self,
+        session: Session,
+        plans: Sequence[_GenerationBatchPlan],
+    ) -> None:
+        # The ordering is a database invariant: referenced workflow rows must exist
+        # before media_generation_batches is flushed.
+        all_steps = [step for plan in plans for step in plan.steps]
+        session.add_all(all_steps)
+        session.flush()
+        session.add_all([plan.batch for plan in plans])
+        session.flush()
+        session.add_all([prompt for plan in plans for prompt in plan.prompts])
+        for plan in plans:
+            candidate_step_ids = [str(step.id) for step in plan.steps]
+            character_design = plan.payload.input.get("characterDesign")
+            validation_only = bool(
+                isinstance(character_design, dict)
+                and character_design.get("validationOnly") is True
+            )
+            if not validation_only:
+                plan.node.status = "pending"
+                plan.node.data_json = {
+                    **plan.node.data_json,
+                    "batchId": str(plan.batch.id),
+                    "candidateCount": plan.payload.candidate_count,
+                    "candidateStepIds": candidate_step_ids,
+                    "status": "pending",
+                }
             self._record_event(
                 session,
-                payload.project_id,
+                plan.payload.project_id,
                 "generation_batch_queued",
-                {"batchId": str(batch.id), "nodeId": str(node.id)},
+                {
+                    "batchId": str(plan.batch.id),
+                    "nodeId": str(plan.node.id),
+                    "validationOnly": validation_only,
+                },
             )
-            return _generation_batch_json(session, batch)
+
+    @staticmethod
+    def _generation_batch_steps(
+        session: Session,
+        batch: MediaGenerationBatch,
+    ) -> list[WorkflowStep]:
+        prefix = f"media:{batch.media_kind}:batch:{batch.id}:candidate:"
+        return list(
+            session.scalars(
+                select(WorkflowStep)
+                .where(WorkflowStep.operation_key.startswith(prefix))
+                .order_by(WorkflowStep.operation_key)
+            )
+        )
+
+    def _validate_existing_character_batch(
+        self,
+        session: Session,
+        batch: MediaGenerationBatch,
+        payload: Any,
+    ) -> None:
+        if (
+            batch.production_run_id != payload.project_id
+            or batch.canvas_node_id != payload.canvas_node_id
+            or batch.media_kind != payload.media_kind
+            or batch.candidate_count != payload.candidate_count
+            or batch.provider != payload.provider
+            or batch.model != payload.model
+            or (
+                payload.expected_input_hash
+                and batch.reference_manifest_hash
+                and batch.reference_manifest_hash != payload.expected_input_hash
+            )
+            or any(
+                batch.input_json.get(key) != value
+                for key, value in payload.input.items()
+                if key != "referenceManifest"
+            )
+        ):
+            raise WorkflowConflictError("已有角色设计批次与当前固定输入不一致")
+        steps = self._generation_batch_steps(session, batch)
+        if len(steps) != payload.candidate_count:
+            self._require_pristine_generation_batch(session, batch)
+            raise WorkflowConflictError(
+                "已有角色设计批次缺少完整候选子任务；未检测到 Provider 证据，"
+                "但该遗留状态不能被静默复用"
+            )
+
+    def _require_pristine_generation_batch(
+        self,
+        session: Session,
+        batch: MediaGenerationBatch,
+    ) -> None:
+        steps = self._generation_batch_steps(session, batch)
+        step_ids = [step.id for step in steps]
+        has_attempt = bool(
+            step_ids
+            and session.scalar(
+                select(GenerationAttempt.id)
+                .where(GenerationAttempt.workflow_step_id.in_(step_ids))
+                .limit(1)
+            )
+        )
+        has_provider_evidence = any(
+            step.provider_task_id or step.submitted_at is not None for step in steps
+        )
+        has_output_asset = bool(batch.output_asset_ids_json) or bool(
+            step_ids
+            and session.scalar(
+                select(Asset.id).where(Asset.producing_step_id.in_(step_ids)).limit(1)
+            )
+        )
+        if has_attempt or has_provider_evidence or has_output_asset:
+            raise WorkflowConflictError(
+                "角色设计批次已存在 Provider 提交、生成尝试或输出资产，不能自动补齐"
+            )
+
+    @staticmethod
+    def _link_generation_children(
+        session: Session,
+        parent: WorkflowStep,
+        children: Sequence[WorkflowStep],
+    ) -> None:
+        ordered_ids = list(dict.fromkeys(str(child.id) for child in children))
+        for child in children:
+            child.input_snapshot_json = {
+                **dict(child.input_snapshot_json or {}),
+                "parentStepId": str(parent.id),
+            }
+        parent.progress_json = {
+            **dict(parent.progress_json or {}),
+            "childStepIds": ordered_ids,
+            "message": (
+                "三个引用顺序验证批次已原子调度，等待子任务顺序执行"
+                if parent.operation_key == "recipe:character_design_validation"
+                else "三个角色设计图片批次已原子调度，等待子任务顺序执行"
+            ),
+        }
 
     def create_video_edit_recipe(self, payload: VideoEditRecipeDraft) -> dict[str, Any]:
         with self._sessions.begin() as session:
@@ -4157,16 +6600,29 @@ class SqlAlchemyAigcCanvasRepository:
                     ),
                     "semanticRole": reference.semantic_role,
                     "providerIncluded": True,
-                    "providerSlot": f"{reference_stage}_reference_{reference.ordinal}",
+                    "providerSlot": (
+                        f"reference_image_{reference.ordinal + 2}"
+                        if plan.mode == "direct"
+                        else f"{reference_stage}_reference_{reference.ordinal}"
+                    ),
                     "omissionReason": None,
                 }
                 for reference in references
             ]
+            compilation_input_hash = _json_hash(
+                {
+                    "recipe": draft.model_dump(mode="json", by_alias=True),
+                    "provider": capability.provider,
+                    "model": capability.model,
+                    "actualReferences": actual_references,
+                }
+            )
             recipe.compilation_json = {
                 **plan.model_dump(mode="json", by_alias=True),
                 "provider": capability.provider,
                 "model": capability.model,
                 "providerCapabilityId": str(capability_row.id),
+                "inputHash": compilation_input_hash,
                 "actualReferences": actual_references,
             }
             recipe.estimated_cost_micros = plan.estimated_cost_micros
@@ -4398,12 +6854,18 @@ class SqlAlchemyAigcCanvasRepository:
                 .order_by(StoryBriefRecord.revision.desc())
                 .limit(1)
             )
-            subjects = list(
-                session.scalars(
-                    select(Subject)
-                    .where(Subject.production_run_id == project_id, Subject.status != "archived")
-                    .order_by(Subject.created_at)
-                )
+            subjects = _preferred_subject_rows(
+                session,
+                list(
+                    session.scalars(
+                        select(Subject)
+                        .where(
+                            Subject.production_run_id == project_id,
+                            Subject.status != "archived",
+                        )
+                        .order_by(Subject.created_at)
+                    )
+                ),
             )
             stories = list(
                 session.scalars(
@@ -4444,12 +6906,61 @@ class SqlAlchemyAigcCanvasRepository:
                     .order_by(Scene.sort_order, ShotBeat.sort_order)
                 )
             )
+            approved_story = next(
+                (
+                    story
+                    for story in reversed(stories)
+                    if story.status == StoryRevisionStatus.APPROVED.value
+                ),
+                None,
+            )
+            active_storyboard_revision = (
+                None
+                if approved_story is None
+                else session.scalar(
+                    select(StoryboardRevision)
+                    .where(
+                        StoryboardRevision.production_run_id == project_id,
+                        StoryboardRevision.story_revision_id == approved_story.id,
+                        StoryboardRevision.status != StoryboardRevisionStatus.SUPERSEDED.value,
+                    )
+                    .order_by(StoryboardRevision.revision.desc())
+                    .limit(1)
+                )
+            )
+            has_active_storyboard = bool(
+                active_storyboard_revision is not None
+                and any(
+                    beat.storyboard_revision_id == active_storyboard_revision.id
+                    for beat in beats
+                )
+            )
             workflow_steps = list(
                 session.scalars(
                     select(WorkflowStep)
                     .where(WorkflowStep.production_run_id == project_id)
                     .order_by(WorkflowStep.created_at.desc(), WorkflowStep.id.desc())
                     .limit(300)
+                )
+            )
+            storyboard_prompt = (
+                None
+                if approved_story is None or has_active_storyboard
+                else session.scalar(
+                    select(PromptRecord)
+                    .join(WorkflowStep, WorkflowStep.id == PromptRecord.step_id)
+                    .where(
+                        WorkflowStep.production_run_id == project_id,
+                        PromptRecord.call_purpose == "storyboard_director",
+                        PromptRecord.business_object_type == "story_revision",
+                        PromptRecord.business_object_id == approved_story.id,
+                        PromptRecord.status == "succeeded",
+                    )
+                    .order_by(
+                        PromptRecord.completed_at.desc(),
+                        PromptRecord.created_at.desc(),
+                    )
+                    .limit(1)
                 )
             )
             result = _canvas_json(
@@ -4463,6 +6974,7 @@ class SqlAlchemyAigcCanvasRepository:
                 beats=beats,
                 session=session,
                 enabled=project.canvas_v2_enabled,
+                storyboard_prompt=storyboard_prompt,
                 include_narrative_projection=(
                     project.canvas_template_key != CanvasTemplateKey.PRODUCT_AD.value
                     or any((brief, stories, scenes, beats))
@@ -4478,6 +6990,20 @@ class SqlAlchemyAigcCanvasRepository:
                     .order_by(CanvasGraphNode.created_at, CanvasGraphNode.id)
                 )
             )
+            stable_brief_node_id = creative_brief_canvas_node_id(project_id)
+            preferred_subject_node_ids = {subject.id for subject in subjects}
+            graph_nodes = [
+                node
+                for node in graph_nodes
+                if (
+                    node.node_type != CanvasNodeType.BRIEF.value
+                    or node.id == stable_brief_node_id
+                )
+                and (
+                    node.node_type != CanvasNodeType.SUBJECT.value
+                    or node.id in preferred_subject_node_ids
+                )
+            ]
             graph_edges = list(
                 session.scalars(
                     select(CanvasGraphEdge)
@@ -4503,6 +7029,7 @@ class SqlAlchemyAigcCanvasRepository:
                 graph_edges=graph_edges,
                 legacy_assets=legacy_assets,
             )
+            _apply_shot_reference_edge_projection(result, beats)
             groups = list(
                 session.scalars(
                     select(CanvasGroup)
@@ -4565,6 +7092,312 @@ class SqlAlchemyAigcCanvasRepository:
                 "VIDEO_EDIT_V2": project.video_edit_v2_enabled,
             }
             return result
+
+    def get_workspace_shell(self, project_id: uuid.UUID) -> dict[str, Any]:
+        """Build the three product workspaces directly from persisted production facts."""
+
+        with self._sessions() as session:
+            project = self._require_project(session, project_id)
+            facts = _workspace_facts(session, project)
+            modules = _workspace_modules(facts)
+            latest_task = facts["tasks"][0] if facts["tasks"] else None
+            return {
+                "project": {
+                    "id": str(project.id),
+                    "title": project.title,
+                    "status": project.status,
+                    "updatedAt": project.updated_at.isoformat(),
+                },
+                "modules": modules,
+                "recommendedModuleId": _recommended_workspace_module(modules),
+                "activeTaskSummary": {
+                    "activeCount": sum(
+                        task.status in _DIRECTOR_ACTIVE_TASK_STATUSES
+                        for task in facts["tasks"]
+                    ),
+                    "attentionCount": sum(
+                        task.status in _DIRECTOR_ATTENTION_TASK_STATUSES
+                        for task in facts["tasks"]
+                    ),
+                    "latestTaskId": None if latest_task is None else str(latest_task.id),
+                    "latestStatus": None if latest_task is None else latest_task.status,
+                },
+            }
+
+    def get_script_workspace(self, project_id: uuid.UUID) -> dict[str, Any]:
+        """Read editable story documents without loading any graph projection."""
+
+        with self._sessions() as session:
+            self._require_project(session, project_id)
+            recipe_instance = session.scalar(
+                select(ProductionRecipeInstance)
+                .where(
+                    ProductionRecipeInstance.production_run_id == project_id,
+                    ProductionRecipeInstance.lifecycle_status == "active",
+                )
+                .order_by(ProductionRecipeInstance.revision.desc())
+                .limit(1)
+            )
+            brief = session.scalar(
+                select(StoryBriefRecord)
+                .where(StoryBriefRecord.production_run_id == project_id)
+                .order_by(StoryBriefRecord.revision.desc(), StoryBriefRecord.id.desc())
+                .limit(1)
+            )
+            rows = list(
+                session.scalars(
+                    select(StoryRevisionRecord)
+                    .where(StoryRevisionRecord.production_run_id == project_id)
+                    .order_by(StoryRevisionRecord.revision.desc(), StoryRevisionRecord.id.desc())
+                    .limit(5)
+                )
+            )
+            current = next(
+                (
+                    row
+                    for row in rows
+                    if row.status == StoryRevisionStatus.APPROVED.value
+                ),
+                None,
+            )
+            if current is None:
+                current = session.scalar(
+                    select(StoryRevisionRecord)
+                    .where(
+                        StoryRevisionRecord.production_run_id == project_id,
+                        StoryRevisionRecord.status == StoryRevisionStatus.APPROVED.value,
+                    )
+                    .order_by(StoryRevisionRecord.revision.desc())
+                    .limit(1)
+                )
+                if current is not None and all(row.id != current.id for row in rows):
+                    rows = [current, *rows[:4]]
+            prompt_ids = {
+                row.candidate_prompt_id for row in rows if row.candidate_prompt_id is not None
+            }
+            prompts = {
+                prompt.id: prompt
+                for prompt in (
+                    session.scalars(
+                        select(PromptRecord).where(PromptRecord.id.in_(prompt_ids))
+                    )
+                    if prompt_ids
+                    else ()
+                )
+            }
+            documents = []
+            for row in rows:
+                document = _story_json(row, None, prompts.get(row.candidate_prompt_id))
+                documents.append(
+                    {
+                        "id": document["id"],
+                        "title": document["title"],
+                        "body": document["body"],
+                        "summary": document["summary"],
+                        "revision": document["revision"],
+                        "status": document["status"],
+                        "source": document["source"],
+                        "warnings": document["warnings"],
+                    }
+                )
+            return {
+                "brief": None if brief is None else _brief_json(brief),
+                "documents": documents,
+                "currentStoryId": None if current is None else str(current.id),
+                "recipeInstanceId": (
+                    None if recipe_instance is None else str(recipe_instance.id)
+                ),
+            }
+
+    def get_production_flow(self, project_id: uuid.UUID) -> dict[str, Any]:
+        """Return the six stable creator artifacts used by the Toonflow-style canvas."""
+
+        with self._sessions() as session:
+            project = self._require_project(session, project_id)
+            facts = _workspace_facts(session, project)
+            layout = session.scalar(
+                select(CanvasLayout).where(CanvasLayout.production_run_id == project_id)
+            )
+            nodes = _production_flow_nodes(project_id, facts, layout)
+            node_ids = {node["kind"]: node["id"] for node in nodes}
+            edge_kinds = (
+                (ProductionFlowNodeKind.SCRIPT.value, ProductionFlowNodeKind.DIRECTOR_PLAN.value),
+                (ProductionFlowNodeKind.DIRECTOR_PLAN.value, ProductionFlowNodeKind.ASSETS.value),
+                (
+                    ProductionFlowNodeKind.ASSETS.value,
+                    ProductionFlowNodeKind.STORYBOARD_TABLE.value,
+                ),
+                (
+                    ProductionFlowNodeKind.STORYBOARD_TABLE.value,
+                    ProductionFlowNodeKind.STORYBOARD.value,
+                ),
+                (ProductionFlowNodeKind.STORYBOARD.value, ProductionFlowNodeKind.WORKBENCH.value),
+            )
+            active_storyboard = facts["storyboard"]
+            active_track = _active_track_id(facts["shot_cards"])
+            return {
+                "revision": 0 if layout is None else layout.version,
+                "nodes": nodes,
+                "edges": [
+                    {
+                        "id": f"{source}:{target}",
+                        "source": node_ids[source],
+                        "target": node_ids[target],
+                    }
+                    for source, target in edge_kinds
+                ],
+                "viewport": _production_flow_viewport(layout),
+                "activeStoryboardRevisionId": (
+                    None if active_storyboard is None else str(active_storyboard.id)
+                ),
+                "activeTrackId": active_track,
+                "shotOrder": [
+                    str(shot.id)
+                    for shot in (facts["beats"] or facts["shot_cards"])
+                ],
+            }
+
+    def save_production_flow_layout(
+        self,
+        project_id: uuid.UUID,
+        *,
+        expected_version: int,
+        payload: Any,
+    ) -> dict[str, Any]:
+        """Persist the six product positions without erasing historical Canvas audit layout."""
+
+        allowed_node_ids = {
+            str(uuid.uuid5(project_id, f"production-flow:{kind.value}"))
+            for kind in ProductionFlowNodeKind
+        }
+        document = payload.model_dump(mode="json", by_alias=True)
+        submitted_node_ids = {str(item.get("nodeId")) for item in document["nodes"]}
+        if submitted_node_ids - allowed_node_ids:
+            raise WorkflowConflictError("生产画布布局包含未知产物节点")
+        with self._sessions.begin() as session:
+            self._require_project(session, project_id)
+            row = session.scalar(
+                select(CanvasLayout)
+                .where(CanvasLayout.production_run_id == project_id)
+                .with_for_update()
+            )
+            current_version = 0 if row is None else row.version
+            rebased_from: int | None = None
+            if current_version != expected_version:
+                operation_types = {
+                    str(operation.get("type", ""))
+                    for operation in document["operations"]
+                }
+                replayable = bool(operation_types) and operation_types <= {
+                    "move_node",
+                    "auto_layout",
+                    "viewport",
+                }
+                if row is None or not replayable:
+                    raise WorkflowConflictError(
+                        "生产画布布局版本冲突："
+                        f"当前 {current_version}，提交 {expected_version}"
+                    )
+                rebased_from = expected_version
+
+            preserved_nodes = (
+                {} if row is None else {
+                    str(item.get("nodeId")): dict(item)
+                    for item in row.nodes_json
+                }
+            )
+            for item in document["nodes"]:
+                preserved_nodes[str(item.get("nodeId"))] = item
+
+            if row is None:
+                row = CanvasLayout(
+                    id=uuid.uuid4(),
+                    production_run_id=project_id,
+                    version=1,
+                    edges_json=[],
+                )
+                session.add(row)
+            else:
+                row.version += 1
+            row.nodes_json = list(preserved_nodes.values())
+            row.viewport_json = document["viewport"]
+            row.operations_json = [
+                *(row.operations_json or []),
+                *document["operations"],
+            ][-500:]
+            row.sync_status = "saved"
+            session.flush()
+            return {
+                "projectId": str(project_id),
+                "layoutVersion": row.version,
+                "viewport": row.viewport_json,
+                "syncStatus": row.sync_status,
+                "rebasedFromVersion": rebased_from,
+            }
+
+    def get_video_workbench(self, project_id: uuid.UUID) -> dict[str, Any]:
+        """Aggregate the exact first-screen video context without materializing Canvas."""
+
+        with self._sessions() as session:
+            project = self._require_project(session, project_id)
+            facts = _workspace_facts(session, project)
+            assets = list(
+                session.scalars(
+                    select(Asset)
+                    .where(Asset.production_run_id == project_id)
+                    .order_by(Asset.created_at, Asset.id)
+                )
+            )
+            assets_by_id = {asset.id: asset for asset in assets}
+            active_track_id = _active_track_id(facts["shot_cards"])
+            tracks = [
+                _video_workbench_track(
+                    session,
+                    project=project,
+                    shot=shot,
+                    assets=assets,
+                    assets_by_id=assets_by_id,
+                    tasks=facts["tasks"],
+                )
+                for shot in facts["shot_cards"]
+            ]
+            if active_track_id is not None:
+                tracks.sort(key=lambda track: track["id"] != active_track_id)
+            selected_sequence = facts["selected_sequence"]
+            rendered_asset = (
+                None
+                if selected_sequence is None or selected_sequence.rendered_asset_id is None
+                else assets_by_id.get(selected_sequence.rendered_asset_id)
+            )
+            approved_references = _approved_project_references(project, assets_by_id)
+            return {
+                "activeTrackId": active_track_id,
+                "tracks": tracks,
+                "approvedReferences": approved_references,
+                "timeline": None
+                if selected_sequence is None
+                else {
+                    "id": str(selected_sequence.id),
+                    "revision": selected_sequence.revision,
+                    "status": selected_sequence.status,
+                    "durationMs": selected_sequence.duration_ms,
+                    "clips": selected_sequence.clips_json,
+                },
+                "exportSummary": None
+                if selected_sequence is None
+                else {
+                    "sequenceId": str(selected_sequence.id),
+                    "status": selected_sequence.status,
+                    "renderedAssetId": (
+                        None if rendered_asset is None else str(rendered_asset.id)
+                    ),
+                    "contentUrl": (
+                        None
+                        if rendered_asset is None
+                        else f"/api/v1/assets/{rendered_asset.id}/content"
+                    ),
+                },
+            }
 
     def archive_canvas_node(
         self,
@@ -5221,6 +8054,103 @@ class SqlAlchemyAigcCanvasRepository:
                     target.status = "stale"
                     target.revision += 1
 
+    def _invalidate_visual_profile_dependents(
+        self,
+        session: Session,
+        project_id: uuid.UUID,
+    ) -> None:
+        """Preserve historical media while revoking selections built from an older Canon."""
+
+        character_asset_ids = select(CharacterDesignAsset.asset_id).join(
+            CharacterDesignRevision,
+            CharacterDesignRevision.id == CharacterDesignAsset.character_design_revision_id,
+        ).where(CharacterDesignRevision.production_run_id == project_id)
+        session.execute(
+            CharacterDesignRevision.__table__.update()
+            .where(
+                CharacterDesignRevision.production_run_id == project_id,
+                CharacterDesignRevision.status != "stale",
+            )
+            .values(status="stale")
+        )
+        session.execute(
+            Asset.__table__.update()
+            .where(
+                Asset.status != "stale",
+                or_(
+                    Asset.id.in_(character_asset_ids),
+                    (
+                        (Asset.production_run_id == project_id)
+                        & (Asset.scope != "canon")
+                        & (
+                            Asset.role.like("character_design_%")
+                            | Asset.role.in_(
+                                (
+                                    "scene_look",
+                                    "generated_reference",
+                                    "shot_anchor",
+                                    "shot_tail_frame",
+                                    "video_candidate",
+                                    "shot_video",
+                                    "shot_video_edit",
+                                    "project_sequence",
+                                )
+                            )
+                        )
+                    ),
+                ),
+            )
+            .values(status="stale")
+        )
+        scene_ids = select(Scene.id).where(Scene.production_run_id == project_id)
+        session.execute(
+            ShotCard.__table__.update()
+            .where(ShotCard.scene_id.in_(scene_ids))
+            .values(
+                prompt_id=None,
+                selected_anchor_asset_id=None,
+                selected_video_asset_id=None,
+                status="ready",
+            )
+        )
+        session.execute(
+            StoryboardRevision.__table__.update()
+            .where(
+                StoryboardRevision.production_run_id == project_id,
+                StoryboardRevision.status
+                == StoryboardRevisionStatus.PRODUCTION_APPROVED.value,
+            )
+            .values(
+                status=StoryboardRevisionStatus.STRUCTURE_APPROVED.value,
+                production_package_hash=None,
+                production_approved_at=None,
+            )
+        )
+        session.execute(
+            VideoSequence.__table__.update()
+            .where(
+                VideoSequence.production_run_id == project_id,
+                VideoSequence.status != "rejected",
+            )
+            .values(status="rejected")
+        )
+        project = session.get(ProductionRun, project_id)
+        if project is not None:
+            project.selected_sequence_id = None
+
+        sources = list(
+            session.scalars(
+                select(CanvasGraphNode).where(
+                    CanvasGraphNode.production_run_id == project_id,
+                    CanvasGraphNode.node_type.in_(
+                        (CanvasNodeType.SUBJECT.value, CanvasNodeType.STYLE_PRESET.value)
+                    ),
+                )
+            )
+        )
+        for source in sources:
+            self._mark_graph_downstream_stale(session, source.id)
+
 
 def _graph_edge(project_id: uuid.UUID, connection: CanvasConnection) -> CanvasGraphEdge:
     return CanvasGraphEdge(
@@ -5496,6 +8426,7 @@ def _canvas_node_contract(
             _canvas_action("toggle_children", "展开子节点"),
         ],
         "BriefNode": [
+            _canvas_action("review_creative", "批准当前创作要求"),
             _canvas_action("complete_creative", "AI 补全创意", execution="provider"),
             _canvas_action("edit_brief", "编辑创意简报"),
         ],
@@ -5512,6 +8443,13 @@ def _canvas_node_contract(
         ],
         "CharacterDesignNode": [
             _canvas_action(
+                "validate_character_design_references",
+                "验证引用顺序（3 张）",
+                enabled=bool(data.get("candidates")),
+                execution="provider",
+                disabled_reason="请先完成并批准三个角色设计槽位",
+            ),
+            _canvas_action(
                 "generate_character_design",
                 "生成角色设计" if not data.get("candidates") else "重新生成",
                 execution="provider",
@@ -5525,70 +8463,23 @@ def _canvas_node_contract(
         ],
         "StoryPlannerNode": [
             _canvas_action(
-                (
-                    "generate_event_candidates"
-                    if data.get("objectType") == "story_event_planner"
-                    else "generate_stories"
-                ),
-                (
-                    "生成三个事件方案"
-                    if data.get("objectType") == "story_event_planner"
-                    else "生成三案"
-                ),
-                execution="provider",
-            ),
-        ],
-        "StoryEventNode": [
-            _canvas_action(
-                "select_story_event",
-                "已选择" if status == StoryEventCandidateStatus.SELECTED.value else "选择这个事件",
-                enabled=(
-                    status != StoryEventCandidateStatus.SELECTED.value
-                    and not bool(data.get("isHistoryBranch"))
-                ),
-                disabled_reason=(
-                    "该事件已经选中"
-                    if status == StoryEventCandidateStatus.SELECTED.value
-                    else "该事件属于历史生成批次，需重新生成或选择当前批次事件"
-                    if data.get("isHistoryBranch")
-                    else None
-                ),
-            ),
-        ],
-        "StoryScriptNode": [
-            _canvas_action(
-                (
-                    "expand_story_script"
-                    if data.get("objectType") == "story_script_expander"
-                    else "review_story_script"
-                ),
-                (
-                    "扩写完整剧情脚本"
-                    if data.get("objectType") == "story_script_expander"
-                    else ("剧情脚本已批准" if status == "approved" else "编辑并审核剧情脚本")
-                ),
-                enabled=(
-                    bool(data.get("selectedEventId"))
-                    if data.get("objectType") == "story_script_expander"
-                    else status != "approved"
-                ),
+                "inspect_prompt"
+                if data.get("objectType") == "story_event_planner"
+                else "generate_stories",
+                "查看历史事件流程"
+                if data.get("objectType") == "story_event_planner"
+                else "生成完整故事候选",
                 execution=(
-                    "provider" if data.get("objectType") == "story_script_expander" else "client"
-                ),
-                disabled_reason=(
-                    "请先选择一个事件方案"
-                    if data.get("objectType") == "story_script_expander"
-                    and not data.get("selectedEventId")
-                    else "该剧情脚本已经人工批准"
-                    if status == "approved"
-                    else None
+                    "client" if data.get("objectType") == "story_event_planner" else "provider"
                 ),
             ),
         ],
+        "StoryEventNode": [],
+        "StoryScriptNode": [],
         "StoryCandidateNode": [
             _canvas_action(
                 "approve_story",
-                "批准定稿" if status != "approved" else "已批准",
+                "选择为当前剧情" if status != "approved" else "当前剧情",
                 enabled=status != "approved",
                 disabled_reason="该故事版本已经批准",
             ),
@@ -5597,7 +8488,7 @@ def _canvas_node_contract(
         "ApprovalGateNode": [
             _canvas_action(
                 (
-                    "select_story_event"
+                    "inspect_prompt"
                     if data.get("objectType") == "story_event_selection"
                     else (
                         "review_creative"
@@ -5610,7 +8501,7 @@ def _canvas_node_contract(
                     )
                 ),
                 (
-                    "在事件卡中选择一个方案"
+                    "查看历史事件流程"
                     if data.get("objectType") == "story_event_selection"
                     else (
                         "审核创意简报"
@@ -5622,37 +8513,50 @@ def _canvas_node_contract(
                         )
                     )
                 ),
-                enabled=data.get("objectType") != "story_event_selection",
-                disabled_reason=(
-                    "请直接打开一个事件方案卡并选择"
-                    if data.get("objectType") == "story_event_selection"
-                    else None
-                ),
+                enabled=True,
             )
         ],
         "StoryboardDirectorNode": [
-            _canvas_action("storyboard_from_story", "剧本生成分镜脚本", execution="provider"),
+            _canvas_action(
+                "storyboard_from_story",
+                "剧本生成分镜脚本",
+                enabled=not bool(data.get("shotCount")),
+                execution="provider",
+                disabled_reason="当前已有导演分镜，请在画布中编辑或明确建立新版本",
+            ),
             _canvas_action(
                 "storyboard_from_characters",
                 "基于固定角色补充分镜",
+                enabled=not bool(data.get("shotCount")),
                 execution="provider",
+                disabled_reason="当前已有导演分镜，请在画布中编辑或明确建立新版本",
             ),
-            _canvas_action("storyboard_manual", "自己编写分镜脚本"),
+            _canvas_action(
+                "storyboard_manual",
+                "在画布中编辑分镜",
+                enabled=bool(data.get("shotCount")),
+                disabled_reason="请先从已批准剧情生成首个导演分镜版本",
+            ),
             _canvas_action(
                 "review_storyboard",
-                "批准当前分镜" if not data.get("storyboardApproved") else "分镜已批准",
+                "继续分镜生产审核" if not data.get("storyboardApproved") else "生产分镜包已批准",
                 enabled=bool(data.get("shotCount")) and not bool(data.get("storyboardApproved")),
                 disabled_reason=(
-                    "分镜已经人工批准"
+                    "分镜结构、生成编排与生产分镜包均已批准"
                     if data.get("storyboardApproved")
-                    else ("请先生成并保存镜头表" if not data.get("shotCount") else None)
+                    else ("请先生成并保存导演分镜" if not data.get("shotCount") else None)
                 ),
             ),
         ],
         "SceneNode": [_canvas_action("open_scene", "查看场景与镜头")],
         "ShotBeatNode": [
             _canvas_action("edit_shot", "编辑镜头"),
-            _canvas_action("generate_anchor", "生成视觉锚点", execution="provider"),
+            _canvas_action("move_shot_up", "上移"),
+            _canvas_action("move_shot_down", "下移"),
+            _canvas_action("delete_shot", "删除分镜"),
+        ],
+        "GenerationPlanNode": [
+            _canvas_action("approve_generation_plan", "批准生成编排"),
         ],
         "ImageGenerationNode": [
             _canvas_action("open_generator", "打开图片生成器"),
@@ -5688,6 +8592,136 @@ def _canvas_node_contract(
         "PromptArtifactNode": [_canvas_action("inspect_prompt", "查看 Prompt 审计")],
     }
     actions = actions_by_type.get(node_type, [])
+    object_type = str(data.get("objectType") or "")
+    if (
+        node_type == "ApprovalGateNode"
+        and data.get("phase") == "character_design"
+        and object_type not in {"storyboard_structure", "storyboard_package"}
+    ):
+        actions = [
+            *actions,
+            _canvas_action(
+                "validate_character_design_references",
+                "验证引用顺序（3 张）",
+                enabled=status == "approved" or bool(data.get("approved")),
+                execution="provider",
+                disabled_reason="三个角色设计槽位尚未全部批准",
+            ),
+        ]
+    if node_type == "ApprovalGateNode" and object_type == "storyboard_structure":
+        actions = [
+            _canvas_action(
+                "approve_storyboard_structure",
+                "分镜结构已批准" if data.get("approved") else "批准分镜结构",
+                enabled=not bool(data.get("approved")),
+                disabled_reason="当前结构已锁定" if data.get("approved") else None,
+            )
+        ]
+    elif node_type == "ApprovalGateNode" and object_type == "storyboard_package":
+        prompts_ready = bool(data.get("requiredPromptCount")) and (
+            data.get("compiledPromptCount") == data.get("requiredPromptCount")
+        )
+        actions = [
+            _canvas_action(
+                "approve_storyboard_package",
+                "生产分镜包已批准" if data.get("approved") else "批准生产分镜包",
+                enabled=prompts_ready and not bool(data.get("approved")),
+                disabled_reason=(
+                    "生产分镜包已锁定"
+                    if data.get("approved")
+                    else None
+                    if prompts_ready
+                    else "请先完成全部生成片段 Prompt 编译"
+                ),
+            )
+        ]
+    elif node_type == "GenerationPlanNode":
+        blocked = bool(data.get("blockers"))
+        structure_approved = bool(data.get("structureApproved"))
+        actions = [
+            _canvas_action(
+                "approve_generation_plan",
+                "生成编排已批准" if data.get("approved") else "批准生成编排",
+                enabled=(structure_approved and not blocked and not bool(data.get("approved"))),
+                disabled_reason=(
+                    "当前编排已批准"
+                    if data.get("approved")
+                    else "请先批准分镜结构"
+                    if not structure_approved
+                    else "当前编排存在能力阻断"
+                    if blocked
+                    else None
+                ),
+            ),
+        ]
+    elif node_type == "VideoSegmentNode" and object_type == "generation_clip":
+        actions = [
+            _canvas_action("inspect_generation_clip", "查看片段编排"),
+            _canvas_action("split_generation_clip", "拆分片段"),
+            _canvas_action("merge_generation_clips", "合并相邻片段"),
+        ]
+    elif node_type == "PromptArtifactNode" and object_type == "generation_clip_prompt":
+        compiled = bool(data.get("compiled"))
+        prompt_ready = bool(data.get("generationPlanApproved")) and bool(
+            data.get("sceneAssetsReady")
+        )
+        scene_asset_blockers = data.get("sceneAssetBlockers")
+        first_scene_asset_blocker = (
+            str(scene_asset_blockers[0])
+            if isinstance(scene_asset_blockers, list) and scene_asset_blockers
+            else None
+        )
+        actions = [
+            _canvas_action(
+                "compile_generation_prompt",
+                "查看已编译 Prompt" if compiled else "编译生产 Prompt",
+                enabled=compiled or prompt_ready,
+                disabled_reason=(
+                    None
+                    if compiled or prompt_ready
+                    else "请先批准当前生成编排"
+                    if not data.get("generationPlanApproved")
+                    else first_scene_asset_blocker
+                    or "请先批准生成编排并完成当前启用的场景资产"
+                ),
+            )
+        ]
+    elif node_type == "ImageGenerationNode" and object_type == "visual_anchor_generation":
+        actions = [
+            _canvas_action(
+                "generate_anchor",
+                "生成视觉锚点",
+                execution="provider",
+                enabled=bool(data.get("packageApproved")) and not bool(data.get("selectedAssetId")),
+                disabled_reason=(
+                    "视觉锚点已批准"
+                    if data.get("selectedAssetId")
+                    else None
+                    if data.get("packageApproved")
+                    else "请先批准生产分镜包"
+                ),
+            )
+        ]
+    elif node_type == "VideoGenerationNode" and object_type == "video_generation_clip":
+        anchor_ready = not bool(data.get("anchorRequired")) or bool(
+            data.get("anchorApproved")
+        )
+        video_ready = bool(data.get("packageApproved")) and anchor_ready
+        actions = [
+            _canvas_action(
+                "generate_video",
+                "生成视频",
+                execution="provider",
+                enabled=video_ready,
+                disabled_reason=(
+                    None
+                    if video_ready
+                    else "请先批准生产分镜包"
+                    if not data.get("packageApproved")
+                    else "当前已选择精确开场模式，请先批准开场锚点"
+                ),
+            )
+        ]
     if node_type == "VideoAssetNode":
         actions = [dict(action) for action in _VIDEO_ASSET_ACTIONS]
     if data.get("promptId") and not any(action["key"] == "inspect_prompt" for action in actions):
@@ -5743,6 +8777,7 @@ _PROTECTED_RECIPE_SKELETON_NODE_TYPES = {
     "ReviewNode",
     "SceneNode",
     "ShotBeatNode",
+    "GenerationPlanNode",
     "StoryboardDirectorNode",
     "StoryPlannerNode",
     "StylePresetNode",
@@ -5827,6 +8862,75 @@ def _apply_canvas_node_archive_projection(
         ]
 
 
+def _apply_shot_reference_edge_projection(canvas: dict[str, Any], beats: list[ShotBeat]) -> None:
+    """Project persisted shot-level bindings as explicit, removable creative inputs."""
+
+    source_by_asset_id: dict[str, dict[str, Any]] = {}
+    for node in canvas.get("nodes", []):
+        data = node.get("data") or {}
+        candidate_documents: list[dict[str, Any]] = []
+        if isinstance(data.get("assets"), list):
+            candidate_documents.extend(item for item in data["assets"] if isinstance(item, dict))
+        if isinstance(data.get("candidates"), list):
+            candidate_documents.extend(
+                item for item in data["candidates"] if isinstance(item, dict)
+            )
+        if isinstance(data.get("references"), list):
+            candidate_documents.extend(
+                item for item in data["references"] if isinstance(item, dict)
+            )
+        direct_asset_id = data.get("assetId")
+        if direct_asset_id:
+            source_by_asset_id.setdefault(str(direct_asset_id), node)
+        if node.get("type") in {"ImageAssetNode", "ReferenceAssetNode"} and node.get("objectId"):
+            source_by_asset_id.setdefault(str(node["objectId"]), node)
+        for document in candidate_documents:
+            asset_id = document.get("assetId") or document.get("id")
+            if asset_id:
+                source_by_asset_id.setdefault(str(asset_id), node)
+
+    projected = canvas.setdefault("edges", [])
+    existing_ids = {str(edge.get("id")) for edge in projected}
+    for beat in beats:
+        for binding in beat.reference_bindings_json:
+            if not isinstance(binding, dict) or not binding.get("assetId"):
+                continue
+            asset_id = str(binding["assetId"])
+            source = source_by_asset_id.get(asset_id)
+            if source is None:
+                continue
+            edge_id = f"shot-reference:{beat.id}:{asset_id}"
+            if edge_id in existing_ids:
+                continue
+            existing_ids.add(edge_id)
+            projected.append(
+                {
+                    "id": edge_id,
+                    "sourceNodeId": str(source["id"]),
+                    "sourceNodeType": str(source["type"]),
+                    "sourcePort": "image_asset",
+                    "targetNodeId": str(beat.id),
+                    "targetNodeType": "ShotBeatNode",
+                    "targetPort": "image_reference[]",
+                    "relationType": "shot_reference",
+                    "revision": beat.reference_binding_revision,
+                    "systemManaged": False,
+                    "presentationKind": "user_reference",
+                    "defaultVisible": True,
+                    "authority": "user",
+                    "referenceBinding": binding,
+                    "availableActions": [
+                        {
+                            "key": "disconnect_edge",
+                            "label": "移除镜头引用",
+                            "enabled": True,
+                            "disabledReason": None,
+                        }
+                    ],
+                }
+            )
+
+
 def _graph_edge_json(
     row: CanvasGraphEdge,
     source: CanvasGraphNode,
@@ -5836,6 +8940,14 @@ def _graph_edge_json(
         source_port=row.source_port,
         target_port=row.target_port,
         relation_type=row.relation_type,
+    )
+    presentation_kind, default_visible, authority = _edge_presentation(
+        source_type=source.node_type,
+        target_type=target.node_type,
+        source_port=row.source_port,
+        target_port=row.target_port,
+        relation_type=row.relation_type,
+        user_managed=disconnect_enabled,
     )
     return {
         "id": str(row.id),
@@ -5848,6 +8960,9 @@ def _graph_edge_json(
         "relationType": row.relation_type,
         "revision": row.revision,
         "systemManaged": not disconnect_enabled,
+        "presentationKind": presentation_kind,
+        "defaultVisible": default_visible,
+        "authority": authority,
         "availableActions": [
             {
                 "key": "disconnect_edge",
@@ -5857,6 +8972,38 @@ def _graph_edge_json(
             }
         ],
     }
+
+
+def _edge_presentation(
+    *,
+    source_type: str,
+    target_type: str,
+    source_port: str,
+    target_port: str,
+    relation_type: str,
+    user_managed: bool,
+) -> tuple[str, bool, str]:
+    """Separate provider/user inputs from system lifecycle dependencies.
+
+    The graph remains authoritative for workflow gating, but the everyday canvas only
+    renders edges that represent an explicit creative input.  This prevents approval
+    gates and Canon inheritance from turning the canvas into a mandatory long chain.
+    """
+
+    reference_ports = {
+        CanvasPortType.IMAGE_REFERENCES.value,
+        CanvasPortType.MEDIA_REFERENCES.value,
+        CanvasPortType.IMAGE_ASSET.value,
+        CanvasPortType.IMAGE_ASSETS.value,
+    }
+    if user_managed and (source_port in reference_ports or target_port in reference_ports):
+        return "user_reference", True, "user"
+    if (
+        source_type in {"StoryScriptNode", "StoryCandidateNode"}
+        and target_type == "StoryboardDirectorNode"
+    ) or relation_type in {"storyboard_source", "generation_clip_shot"}:
+        return "artifact_flow", True, "business"
+    return "derived_dependency", False, "system"
 
 
 _SYSTEM_MANAGED_EDGE_RELATIONS = {
@@ -5927,6 +9074,8 @@ def _generation_batch_json(session: Session, row: MediaGenerationBatch) -> dict[
         "provider": row.provider,
         "model": row.model,
         "status": row.status,
+        "referenceManifest": row.reference_manifest_json,
+        "referenceManifestHash": row.reference_manifest_hash or None,
         "outputAssetIds": row.output_asset_ids_json,
         "candidateStepIds": [str(step.id) for step in candidate_steps],
         "candidateSteps": [
@@ -6217,6 +9366,699 @@ _CANVAS_LAYOUT_LANE_ORDER = {
 }
 
 
+_DIRECTOR_ACTIVE_TASK_STATUSES = {
+    StepStatus.PENDING.value,
+    StepStatus.SUBMITTING.value,
+    StepStatus.CANCELLING.value,
+    StepStatus.QUEUED.value,
+    StepStatus.RUNNING.value,
+}
+_DIRECTOR_ATTENTION_TASK_STATUSES = {
+    StepStatus.SUBMISSION_UNKNOWN.value,
+    StepStatus.CANCELLATION_UNKNOWN.value,
+    StepStatus.AWAITING_REVIEW.value,
+    StepStatus.FAILED.value,
+    StepStatus.EXPIRED.value,
+}
+
+_WORKSPACE_MODULE_ORDER = (
+    WorkspaceModuleId.SCRIPT,
+    WorkspaceModuleId.ASSETS,
+    WorkspaceModuleId.PRODUCTION,
+)
+
+
+def _workspace_facts(session: Session, project: ProductionRun) -> dict[str, Any]:
+    project_id = project.id
+    brief = session.scalar(
+        select(StoryBriefRecord)
+        .where(StoryBriefRecord.production_run_id == project_id)
+        .order_by(StoryBriefRecord.revision.desc(), StoryBriefRecord.id.desc())
+        .limit(1)
+    )
+    current_story = session.scalar(
+        select(StoryRevisionRecord)
+        .where(
+            StoryRevisionRecord.production_run_id == project_id,
+            StoryRevisionRecord.status == StoryRevisionStatus.APPROVED.value,
+        )
+        .order_by(StoryRevisionRecord.revision.desc(), StoryRevisionRecord.id.desc())
+        .limit(1)
+    )
+    latest_story = session.scalar(
+        select(StoryRevisionRecord)
+        .where(StoryRevisionRecord.production_run_id == project_id)
+        .order_by(StoryRevisionRecord.revision.desc(), StoryRevisionRecord.id.desc())
+        .limit(1)
+    )
+    subjects = _preferred_subject_rows(
+        session,
+        list(
+            session.scalars(
+                select(Subject)
+                .where(
+                    Subject.production_run_id == project_id,
+                    Subject.status != "archived",
+                )
+                .order_by(Subject.created_at, Subject.id)
+            )
+        ),
+    )
+    assets = list(
+        session.scalars(
+            select(Asset)
+            .where(Asset.production_run_id == project_id)
+            .order_by(Asset.created_at, Asset.id)
+        )
+    )
+    storyboard = session.scalar(
+        select(StoryboardRevision)
+        .where(StoryboardRevision.production_run_id == project_id)
+        .order_by(StoryboardRevision.revision.desc(), StoryboardRevision.id.desc())
+        .limit(1)
+    )
+    recipe = session.scalar(
+        select(ProductionRecipeInstance)
+        .where(ProductionRecipeInstance.production_run_id == project_id)
+        .order_by(ProductionRecipeInstance.created_at.desc(), ProductionRecipeInstance.id.desc())
+        .limit(1)
+    )
+    beats = list(
+        session.scalars(
+            select(ShotBeat)
+            .join(Scene, Scene.id == ShotBeat.scene_id)
+            .where(
+                Scene.production_run_id == project_id,
+                Scene.active.is_(True),
+                ShotBeat.status != "superseded",
+            )
+            .order_by(Scene.sort_order, ShotBeat.sort_order, ShotBeat.id)
+        )
+    )
+    scenes = list(
+        session.scalars(
+            select(Scene)
+            .where(
+                Scene.production_run_id == project_id,
+                Scene.active.is_(True),
+            )
+            .order_by(Scene.sort_order, Scene.id)
+        )
+    )
+    shot_cards = list(
+        session.scalars(
+            select(ShotCard)
+            .join(Scene, Scene.id == ShotCard.scene_id)
+            .where(
+                Scene.production_run_id == project_id,
+                Scene.active.is_(True),
+            )
+            .order_by(Scene.sort_order, ShotCard.sort_order, ShotCard.id)
+        )
+    )
+    tasks = list(
+        session.scalars(
+            select(WorkflowStep)
+            .where(WorkflowStep.production_run_id == project_id)
+            .order_by(WorkflowStep.updated_at.desc(), WorkflowStep.id.desc())
+            .limit(300)
+        )
+    )
+    selected_sequence = (
+        None
+        if project.selected_sequence_id is None
+        else session.get(VideoSequence, project.selected_sequence_id)
+    )
+    return {
+        "brief": brief,
+        "current_story": current_story,
+        "latest_story": latest_story,
+        "subjects": subjects,
+        "assets": assets,
+        "storyboard": storyboard,
+        "recipe": recipe,
+        "scenes": scenes,
+        "beats": beats,
+        "shot_cards": shot_cards,
+        "tasks": tasks,
+        "selected_sequence": selected_sequence,
+    }
+
+
+def _workspace_modules(facts: dict[str, Any]) -> list[dict[str, Any]]:
+    brief = facts["brief"]
+    current_story = facts["current_story"]
+    latest_story = facts["latest_story"]
+    subjects: list[Subject] = facts["subjects"]
+    assets: list[Asset] = facts["assets"]
+    storyboard = facts["storyboard"]
+    beats: list[ShotBeat] = facts["beats"]
+    shot_cards: list[ShotCard] = facts["shot_cards"]
+    tasks: list[WorkflowStep] = facts["tasks"]
+    selected_sequence = facts["selected_sequence"]
+
+    active_tasks = [task for task in tasks if task.status in _DIRECTOR_ACTIVE_TASK_STATUSES]
+    attention_tasks = [task for task in tasks if task.status in _DIRECTOR_ATTENTION_TASK_STATUSES]
+    identity_kinds = {
+        subject.kind
+        for subject in subjects
+        if subject.current_revision_id is not None and subject.kind in {"person", "animal"}
+    }
+    style_boards = [asset for asset in assets if _is_provider_style_board(asset)]
+    candidate_assets = [asset for asset in assets if asset.status == "candidate"]
+    stale_assets = [asset for asset in assets if asset.status == "stale"]
+    stale_beats = [beat for beat in beats if beat.status == "stale" or beat.stale_reason]
+    selected_video_ids = {
+        shot.selected_video_asset_id for shot in shot_cards if shot.selected_video_asset_id
+    }
+
+    if current_story is not None:
+        script_status = WorkspaceStatus.COMPLETE
+        script_progress = 100
+    elif latest_story is not None:
+        script_status = WorkspaceStatus.NEEDS_REVIEW
+        script_progress = 70
+    elif brief is not None:
+        script_status = WorkspaceStatus.ACTIVE
+        script_progress = 25
+    else:
+        script_status = WorkspaceStatus.READY
+        script_progress = 0
+
+    missing_identity = {"person", "animal"} - identity_kinds
+    if stale_assets:
+        asset_status = WorkspaceStatus.STALE
+        asset_progress = 70
+        asset_blocker = "人物、猫咪或画风参考已有失效版本"
+    elif candidate_assets:
+        asset_status = WorkspaceStatus.NEEDS_REVIEW
+        asset_progress = 75
+        asset_blocker = None
+    elif not missing_identity and style_boards:
+        asset_status = WorkspaceStatus.COMPLETE
+        asset_progress = 100
+        asset_blocker = None
+    elif subjects or assets:
+        asset_status = WorkspaceStatus.ACTIVE
+        asset_progress = 55
+        missing_labels = [
+            label
+            for key, label in (("person", "儿童身份"), ("animal", "猫咪身份"))
+            if key in missing_identity
+        ]
+        if not style_boards:
+            missing_labels.append("可提交 Provider 的净化画风板")
+        asset_blocker = None if not missing_labels else f"仍需完成：{'、'.join(missing_labels)}"
+    else:
+        asset_status = WorkspaceStatus.READY
+        asset_progress = 0
+        asset_blocker = None
+
+    if current_story is None:
+        production_status = WorkspaceStatus.BLOCKED
+        production_progress = 0
+        production_blocker = "请先设定当前剧情"
+    elif missing_identity:
+        production_status = WorkspaceStatus.BLOCKED
+        production_progress = 10
+        production_blocker = "请先完成儿童和猫咪身份 Canon"
+    elif stale_beats or stale_assets:
+        production_status = WorkspaceStatus.STALE
+        production_progress = 55
+        production_blocker = "分镜或参考素材已失效，需要重新确认制作输入"
+    elif attention_tasks:
+        production_status = WorkspaceStatus.NEEDS_REVIEW
+        production_progress = 75
+        production_blocker = None
+    elif active_tasks:
+        production_status = WorkspaceStatus.ACTIVE
+        production_progress = 80
+        production_blocker = None
+    elif selected_sequence is not None or selected_video_ids:
+        production_status = WorkspaceStatus.COMPLETE
+        production_progress = 100
+        production_blocker = None
+    elif storyboard is not None or beats or shot_cards:
+        production_status = WorkspaceStatus.ACTIVE
+        production_progress = 55
+        production_blocker = None
+    else:
+        production_status = WorkspaceStatus.READY
+        production_progress = 20
+        production_blocker = None
+
+    modules = [
+        {
+            "id": WorkspaceModuleId.SCRIPT.value,
+            "title": "剧本",
+            "order": 1,
+            "status": script_status.value,
+            "progress": script_progress,
+            "attentionCount": 1 if script_status == WorkspaceStatus.NEEDS_REVIEW else 0,
+            "primaryArtifactId": (
+                str((current_story or latest_story).id)
+                if current_story is not None or latest_story is not None
+                else (None if brief is None else str(brief.id))
+            ),
+            "blocker": None,
+            "nextAction": _workspace_next_action(WorkspaceModuleId.SCRIPT, script_status),
+        },
+        {
+            "id": WorkspaceModuleId.ASSETS.value,
+            "title": "角色资产",
+            "order": 2,
+            "status": asset_status.value,
+            "progress": asset_progress,
+            "attentionCount": len(candidate_assets) + len(stale_assets),
+            "primaryArtifactId": None if not assets else str(assets[-1].id),
+            "blocker": asset_blocker,
+            "nextAction": _workspace_next_action(WorkspaceModuleId.ASSETS, asset_status),
+        },
+        {
+            "id": WorkspaceModuleId.PRODUCTION.value,
+            "title": "生产画布",
+            "order": 3,
+            "status": production_status.value,
+            "progress": production_progress,
+            "attentionCount": len(attention_tasks) + len(stale_beats),
+            "primaryArtifactId": (
+                str(storyboard.id)
+                if storyboard is not None
+                else (None if not shot_cards else str(shot_cards[0].id))
+            ),
+            "blocker": production_blocker,
+            "nextAction": _workspace_next_action(
+                WorkspaceModuleId.PRODUCTION, production_status
+            ),
+        },
+    ]
+    return modules
+
+
+def _workspace_next_action(
+    module_id: WorkspaceModuleId,
+    status: WorkspaceStatus,
+) -> dict[str, str]:
+    labels = {
+        WorkspaceStatus.BLOCKED: "查看阻塞",
+        WorkspaceStatus.STALE: "更新失效内容",
+        WorkspaceStatus.NEEDS_REVIEW: "继续审核",
+        WorkspaceStatus.ACTIVE: "继续制作",
+        WorkspaceStatus.COMPLETE: "查看成果",
+        WorkspaceStatus.READY: "开始",
+    }
+    return {"label": labels[status], "moduleId": module_id.value}
+
+
+def _recommended_workspace_module(modules: Sequence[dict[str, Any]]) -> str:
+    precedence = (
+        WorkspaceStatus.NEEDS_REVIEW.value,
+        WorkspaceStatus.BLOCKED.value,
+        WorkspaceStatus.STALE.value,
+        WorkspaceStatus.ACTIVE.value,
+        WorkspaceStatus.READY.value,
+    )
+    for status in precedence:
+        candidate = next((module for module in modules if module["status"] == status), None)
+        if candidate is not None:
+            return str(candidate["id"])
+    return WorkspaceModuleId.PRODUCTION.value
+
+
+def _is_provider_style_board(asset: Asset) -> bool:
+    semantic_key = (asset.semantic_key or "").lower()
+    metadata = asset.metadata_json or {}
+    authority = metadata.get("referenceAuthority") or metadata.get("authority") or {}
+    role = str(authority.get("role") or metadata.get("purpose") or "").lower()
+    provider_eligible = authority.get("providerEligible", metadata.get("providerEligible", True))
+    return (
+        asset.status == "approved"
+        and bool(provider_eligible)
+        and (
+            role == "style_board"
+            or semantic_key.startswith("style:")
+            or "style_board" in semantic_key
+        )
+        and "style_source" not in semantic_key
+    )
+
+
+def _production_flow_nodes(
+    project_id: uuid.UUID,
+    facts: dict[str, Any],
+    layout: CanvasLayout | None,
+) -> list[dict[str, Any]]:
+    modules = {module["id"]: module for module in _workspace_modules(facts)}
+    current_story = facts["current_story"] or facts["latest_story"]
+    storyboard = facts["storyboard"]
+    recipe = facts["recipe"]
+    beats: list[ShotBeat] = facts["beats"]
+    scene_titles = {scene.id: scene.title for scene in facts["scenes"]}
+    shot_cards: list[ShotCard] = facts["shot_cards"]
+    assets: list[Asset] = facts["assets"]
+    tasks: list[WorkflowStep] = facts["tasks"]
+    selected_sequence = facts["selected_sequence"]
+    positions = _production_flow_positions(project_id, layout)
+    duration = sum(beat.duration_seconds for beat in beats) or sum(
+        shot.duration_seconds for shot in shot_cards
+    )
+    approved_assets = [asset for asset in assets if asset.status == "approved"]
+    storyboard_images = [
+        asset
+        for asset in assets
+        if asset.media_type == "image"
+        and asset.role in {"shot_anchor", "storyboard_frame", "scene_look"}
+    ]
+    selected_videos = [shot for shot in shot_cards if shot.selected_video_asset_id]
+    active_tasks = [task for task in tasks if task.status in _DIRECTOR_ACTIVE_TASK_STATUSES]
+
+    rows = (
+        (
+            ProductionFlowNodeKind.SCRIPT,
+            "剧本",
+            "尚未设定当前剧情"
+            if current_story is None
+            else f"R{current_story.revision} · {current_story.title}",
+            modules[WorkspaceModuleId.SCRIPT.value]["status"],
+            {
+                "revision": None if current_story is None else current_story.revision,
+                "storyId": None if current_story is None else str(current_story.id),
+                "summary": None if current_story is None else current_story.logline,
+                "action": "open_script",
+            },
+        ),
+        (
+            ProductionFlowNodeKind.DIRECTOR_PLAN,
+            "导演计划",
+            f"{len(beats) or len(shot_cards)} 镜 · {duration} 秒",
+            (
+                WorkspaceStatus.COMPLETE.value
+                if storyboard is not None and (beats or shot_cards)
+                else WorkspaceStatus.READY.value
+            ),
+            {
+                "recipeInstanceId": None if recipe is None else str(recipe.id),
+                "storyboardRevisionId": None if storyboard is None else str(storyboard.id),
+                "shotCount": len(beats) or len(shot_cards),
+                "durationSeconds": duration,
+                "shots": [
+                    _beat_json(beat, scene_title=scene_titles.get(beat.scene_id))
+                    for beat in beats
+                ],
+                "action": "open_storyboard_editor",
+            },
+        ),
+        (
+            ProductionFlowNodeKind.ASSETS,
+            "角色与素材",
+            f"{len(approved_assets)} 项已批准素材",
+            modules[WorkspaceModuleId.ASSETS.value]["status"],
+            {
+                "approvedCount": len(approved_assets),
+                "previewUrls": [
+                    f"/api/v1/assets/{asset.id}/content" for asset in approved_assets[-4:]
+                ],
+                "action": "open_assets",
+            },
+        ),
+        (
+            ProductionFlowNodeKind.STORYBOARD_TABLE,
+            "分镜表",
+            f"{len(beats)} 条分镜 · {duration} 秒",
+            (
+                WorkspaceStatus.COMPLETE.value
+                if beats
+                else WorkspaceStatus.BLOCKED.value
+            ),
+            {
+                "recipeInstanceId": None if recipe is None else str(recipe.id),
+                "storyboardRevisionId": None if storyboard is None else str(storyboard.id),
+                "storyboardRevision": None if storyboard is None else storyboard.revision,
+                "shotCount": len(beats),
+                "durationSeconds": duration,
+                "shots": [
+                    _beat_json(beat, scene_title=scene_titles.get(beat.scene_id))
+                    for beat in beats
+                ],
+                "action": "open_storyboard_editor",
+            },
+        ),
+        (
+            ProductionFlowNodeKind.STORYBOARD,
+            "分镜画面",
+            f"{len(storyboard_images)} 项画面参考",
+            (
+                WorkspaceStatus.NEEDS_REVIEW.value
+                if any(asset.status == "candidate" for asset in storyboard_images)
+                else (
+                    WorkspaceStatus.COMPLETE.value
+                    if storyboard_images
+                    else WorkspaceStatus.READY.value
+                )
+            ),
+            {
+                "assetCount": len(storyboard_images),
+                "previewUrls": [
+                    f"/api/v1/assets/{asset.id}/content" for asset in storyboard_images[-4:]
+                ],
+                "action": "open_preview",
+            },
+        ),
+        (
+            ProductionFlowNodeKind.WORKBENCH,
+            "视频工作台",
+            (
+                f"{len(selected_videos)} 个已选视频版本"
+                if selected_videos
+                else (
+                    f"{len(active_tasks)} 个任务进行中"
+                    if active_tasks
+                    else "生成、审核、剪辑与交付"
+                )
+            ),
+            modules[WorkspaceModuleId.PRODUCTION.value]["status"],
+            {
+                "selectedVideoCount": len(selected_videos),
+                "activeTaskCount": len(active_tasks),
+                "sequenceId": None if selected_sequence is None else str(selected_sequence.id),
+                "action": "open_video_workbench",
+            },
+        ),
+    )
+    return [
+        {
+            "id": str(uuid.uuid5(project_id, f"production-flow:{kind.value}")),
+            "kind": kind.value,
+            "title": title,
+            "subtitle": subtitle,
+            "status": status,
+            "position": positions[kind.value],
+            "data": data,
+        }
+        for kind, title, subtitle, status, data in rows
+    ]
+
+
+def _production_flow_positions(
+    project_id: uuid.UUID,
+    layout: CanvasLayout | None,
+) -> dict[str, dict[str, float]]:
+    defaults = {
+        ProductionFlowNodeKind.SCRIPT.value: {"x": 80.0, "y": 90.0},
+        ProductionFlowNodeKind.DIRECTOR_PLAN.value: {"x": 420.0, "y": 90.0},
+        ProductionFlowNodeKind.ASSETS.value: {"x": 760.0, "y": 90.0},
+        ProductionFlowNodeKind.STORYBOARD_TABLE.value: {"x": 760.0, "y": 390.0},
+        ProductionFlowNodeKind.STORYBOARD.value: {"x": 420.0, "y": 390.0},
+        ProductionFlowNodeKind.WORKBENCH.value: {"x": 80.0, "y": 390.0},
+    }
+    if layout is None:
+        return defaults
+    kind_by_id = {
+        str(uuid.uuid5(project_id, f"production-flow:{kind.value}")): kind.value
+        for kind in ProductionFlowNodeKind
+    }
+    for item in layout.nodes_json or []:
+        kind = kind_by_id.get(str(item.get("nodeId")))
+        if kind is None:
+            continue
+        x = item.get("x")
+        y = item.get("y")
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            defaults[kind] = {"x": float(x), "y": float(y)}
+    return defaults
+
+
+def _production_flow_viewport(layout: CanvasLayout | None) -> dict[str, float]:
+    if layout is None:
+        return {"x": 0.0, "y": 0.0, "zoom": 0.78}
+    viewport = layout.viewport_json or {}
+    return {
+        "x": float(viewport.get("x", 0)),
+        "y": float(viewport.get("y", 0)),
+        "zoom": float(viewport.get("zoom", 0.78)),
+    }
+
+
+def _active_track_id(shots: Sequence[ShotCard]) -> str | None:
+    selected = next((shot for shot in shots if shot.selected_video_asset_id is not None), None)
+    if selected is not None:
+        return str(selected.id)
+    return None if not shots else str(shots[0].id)
+
+
+def _reference_provider_eligible(binding: dict[str, Any], asset: Asset) -> bool:
+    authority = binding.get("authority") or asset.metadata_json.get("referenceAuthority") or {}
+    semantic_key = (asset.semantic_key or "").lower()
+    if str(authority.get("role") or "").lower() == "style_source":
+        return False
+    if "style_source" in semantic_key:
+        return False
+    return bool(authority.get("providerEligible", True))
+
+
+def _reference_title(binding: dict[str, Any], asset: Asset) -> str:
+    binding_title = binding.get("title")
+    metadata = {
+        **(asset.metadata_json or {}),
+        **(
+            {"title": binding_title}
+            if isinstance(binding_title, str) and binding_title.strip()
+            else {}
+        ),
+    }
+    return reference_display_name(
+        semantic_key=asset.semantic_key,
+        role=asset.role,
+        metadata=metadata,
+    )
+
+
+def _approved_project_references(
+    project: ProductionRun,
+    assets_by_id: dict[uuid.UUID, Asset],
+) -> list[dict[str, Any]]:
+    references: list[dict[str, Any]] = []
+    for ordinal, binding in enumerate(project.default_reference_bindings_json or [], start=1):
+        raw_asset_id = binding.get("assetId") or binding.get("asset_id")
+        try:
+            asset_id = uuid.UUID(str(raw_asset_id))
+        except (TypeError, ValueError):
+            continue
+        asset = assets_by_id.get(asset_id)
+        if asset is None or asset.status != "approved":
+            continue
+        provider_eligible = _reference_provider_eligible(binding, asset)
+        if not provider_eligible:
+            continue
+        references.append(
+            {
+                "assetId": str(asset.id),
+                "title": _reference_title(binding, asset),
+                "semanticRole": str(
+                    binding.get("semanticRole") or binding.get("role") or asset.role
+                ),
+                "ordinal": ordinal,
+                "providerEligible": True,
+                "contentUrl": f"/api/v1/assets/{asset.id}/content",
+                "sourceRevision": binding.get("revision"),
+            }
+        )
+    return references
+
+
+def _video_workbench_track(
+    session: Session,
+    *,
+    project: ProductionRun,
+    shot: ShotCard,
+    assets: Sequence[Asset],
+    assets_by_id: dict[uuid.UUID, Asset],
+    tasks: Sequence[WorkflowStep],
+) -> dict[str, Any]:
+    bindings = shot.reference_bindings_json or project.default_reference_bindings_json or []
+    ordered_references: list[dict[str, Any]] = []
+    for ordinal, binding in enumerate(bindings, start=1):
+        raw_asset_id = binding.get("assetId") or binding.get("asset_id")
+        try:
+            asset_id = uuid.UUID(str(raw_asset_id))
+        except (TypeError, ValueError):
+            continue
+        asset = assets_by_id.get(asset_id)
+        if asset is None or asset.status not in {"approved", "ready"}:
+            continue
+        if not _reference_provider_eligible(binding, asset):
+            continue
+        ordered_references.append(
+            {
+                "assetId": str(asset.id),
+                "title": _reference_title(binding, asset),
+                "semanticRole": str(
+                    binding.get("semanticRole") or binding.get("role") or asset.role
+                ),
+                "ordinal": ordinal,
+                "providerEligible": True,
+                "contentUrl": f"/api/v1/assets/{asset.id}/content",
+                "sourceRevision": binding.get("revision"),
+            }
+        )
+    prompt = None if shot.prompt_id is None else session.get(PromptRecord, shot.prompt_id)
+    shot_tasks = [task for task in tasks if task.shot_card_id == shot.id]
+    latest_task = shot_tasks[0] if shot_tasks else None
+    video_assets = [
+        asset
+        for asset in assets
+        if asset.shot_card_id == shot.id
+        and asset.media_type == "video"
+        and asset.role in {"shot_video", "shot_video_edit"}
+    ]
+    snapshot = {} if latest_task is None else latest_task.input_snapshot_json or {}
+    provider_config = {
+        "provider": None if latest_task is None else latest_task.provider,
+        "model": None if latest_task is None else latest_task.model,
+        "mode": snapshot.get("providerInputMode", "reference_media"),
+        "durationSeconds": shot.duration_seconds,
+        "aspectRatio": snapshot.get("aspectRatio", "9:16"),
+        "resolution": snapshot.get("resolution", "720p"),
+        "inputHash": None if latest_task is None else latest_task.input_hash,
+    }
+    task_json = (
+        None
+        if latest_task is None
+        else {
+            "id": str(latest_task.id),
+            "status": latest_task.status,
+            "provider": latest_task.provider,
+            "providerTaskId": latest_task.provider_task_id,
+            "submittedAt": latest_task.submitted_at,
+            "updatedAt": latest_task.updated_at,
+            "progress": latest_task.progress_json,
+            "error": latest_task.error_json,
+        }
+    )
+    return {
+        "id": str(shot.id),
+        "shotIds": [str(shot.id)],
+        "title": shot.title,
+        "durationSeconds": shot.duration_seconds,
+        "orderedReferences": ordered_references,
+        "prompt": "" if prompt is None else str(prompt.final_prompt or prompt.prompt_text),
+        "providerConfig": provider_config,
+        "task": task_json,
+        "versions": [
+            {
+                "assetId": str(asset.id),
+                "status": asset.status,
+                "contentUrl": f"/api/v1/assets/{asset.id}/content",
+                "createdAt": asset.created_at,
+                "selected": asset.id == shot.selected_video_asset_id,
+            }
+            for asset in video_assets
+        ],
+        "selectedVersionId": (
+            None if shot.selected_video_asset_id is None else str(shot.selected_video_asset_id)
+        ),
+    }
+
 def _canvas_node_layout_hint(
     node: dict[str, Any],
     *,
@@ -6277,9 +10119,7 @@ def _canvas_node_layout_hint(
             lane, item_order = "story", 90
     elif node_type == CanvasNodeType.CHARACTER_DESIGN.value:
         lane = "character_scene"
-        item_order = {"child": 0, "cat": 10, "pair_scale": 20}.get(
-            str(data.get("slot") or ""), 30
-        )
+        item_order = {"child": 0, "cat": 10, "pair_scale": 20}.get(str(data.get("slot") or ""), 30)
         stack_key = "character_design"
     elif node_type == CanvasNodeType.SCENE.value:
         lane = "character_scene"
@@ -6291,6 +10131,8 @@ def _canvas_node_layout_hint(
         lane = "storyboard"
         item_order = 10 + int(data.get("order") or 0)
         stack_key = "shot_beats"
+    elif node_type == CanvasNodeType.GENERATION_PLAN.value:
+        lane, item_order = "storyboard", 100
     elif node_type == CanvasNodeType.PROMPT_ARTIFACT.value:
         lane, item_order = "storyboard", 80
     elif node_type in {
@@ -6412,23 +10254,47 @@ def _recipe_canvas_group_state(
         .order_by(CharacterDesignRevision.revision.desc())
         .limit(1)
     )
-    beats = list(
-        session.scalars(
-            select(ShotBeat)
-            .join(Scene, Scene.id == ShotBeat.scene_id)
+    storyboard_revision = session.scalar(
+        select(StoryboardRevision)
+        .where(
+            StoryboardRevision.production_run_id == group.production_run_id,
+            StoryboardRevision.status != StoryboardRevisionStatus.SUPERSEDED.value,
+        )
+        .order_by(StoryboardRevision.revision.desc())
+        .limit(1)
+    )
+    generation_plan = (
+        None
+        if storyboard_revision is None
+        else session.scalar(
+            select(GenerationPlan)
             .where(
-                Scene.production_run_id == group.production_run_id,
-                Scene.active.is_(True),
-                ShotBeat.status != "superseded",
+                GenerationPlan.storyboard_revision_id == storyboard_revision.id,
+                GenerationPlan.status == GenerationPlanStatus.APPROVED.value,
+            )
+            .order_by(GenerationPlan.revision.desc())
+            .limit(1)
+        )
+    )
+    storyboard_approved = bool(
+        storyboard_revision is not None
+        and storyboard_revision.status == StoryboardRevisionStatus.PRODUCTION_APPROVED.value
+    )
+    shot_ids = (
+        []
+        if generation_plan is None
+        else list(
+            session.scalars(
+                select(ShotCard.id)
+                .where(ShotCard.generation_plan_id == generation_plan.id)
+                .order_by(ShotCard.plan_sort_order)
             )
         )
     )
-    storyboard_approved = bool(beats) and all(beat.status == "approved" for beat in beats)
-    shot_ids = [beat.shot_card_id for beat in beats if beat.shot_card_id is not None]
     shots = list(session.scalars(select(ShotCard).where(ShotCard.id.in_(shot_ids))))
     render_approved = (
         bool(shots)
-        and len(shots) == len(beats)
+        and len(shots) == len(shot_ids)
         and all(
             shot.selected_anchor_asset_id is not None and shot.selected_video_asset_id is not None
             for shot in shots
@@ -6518,6 +10384,51 @@ def _brief_json(row: StoryBriefRecord) -> dict[str, Any]:
         **_brief_document(row),
         "createdAt": None if row.created_at is None else row.created_at.isoformat(),
     }
+
+
+def _preferred_stored_subjects(
+    subjects: list[StoredCanvasSubject],
+) -> tuple[StoredCanvasSubject, ...]:
+    """Collapse legacy duplicate names at the creative-input compatibility boundary."""
+
+    winners: dict[str, tuple[tuple[int, int], int, StoredCanvasSubject]] = {}
+    for index, subject in enumerate(subjects):
+        key = subject.draft.name.strip().casefold()
+        rank = (
+            1 if subject.status in {"ready", "approved"} else 0,
+            subject.revision,
+        )
+        current = winners.get(key)
+        if current is None or rank > current[0]:
+            winners[key] = (rank, index, subject)
+    return tuple(item[2] for item in sorted(winners.values(), key=lambda item: item[1]))
+
+
+def _preferred_subject_rows(
+    session: Session,
+    subjects: list[Subject],
+) -> list[Subject]:
+    """Keep one visible subject per current name, preferring approved Canon evidence."""
+
+    winners: dict[str, tuple[tuple[int, int, int], int, Subject]] = {}
+    for index, subject in enumerate(subjects):
+        revision = (
+            None
+            if subject.current_revision_id is None
+            else session.get(SubjectRevision, subject.current_revision_id)
+        )
+        if revision is None:
+            continue
+        key = revision.name.strip().casefold()
+        rank = (
+            1 if revision.approval_status == "approved" else 0,
+            1 if subject.status in {"ready", "approved"} else 0,
+            revision.revision,
+        )
+        current = winners.get(key)
+        if current is None or rank > current[0]:
+            winners[key] = (rank, index, subject)
+    return [item[2] for item in sorted(winners.values(), key=lambda item: item[1])]
 
 
 def _subject_draft(
@@ -6636,39 +10547,191 @@ def _compiled_reference_binding(
     source: str,
 ) -> dict[str, Any]:
     metadata = asset.metadata_json or {}
+    provider_eligible = bool(metadata.get("providerEligible", True))
+    if asset.semantic_key and asset.semantic_key.startswith("style_source:"):
+        authority_role = "style_source"
+        provider_eligible = False
+        priority = 10
+        locked_traits: list[str] = []
+        mutable_traits: list[str] = []
+        forbidden_transfer = list(CANON_V4_STYLE_SOURCE_EXCLUSIONS)
+    elif asset.semantic_key and asset.semantic_key.startswith("style:"):
+        authority_role = "style_board"
+        priority = 50
+        locked_traits = ["轮廓线", "材质", "色阶", "光影"]
+        mutable_traits = ["与剧情一致的场景颜色和物体"]
+        forbidden_transfer = ["具体人物或动物身份", "具体物体与构图"]
+    elif source == "character_design" and purpose == "pair_scale":
+        authority_role = "pair_scale"
+        priority = 80
+        locked_traits = ["一人一猫相对比例", "自然接触尺度"]
+        mutable_traits = ["姿态", "镜头朝向"]
+        forbidden_transfer = ["重新设计人物或猫咪身份", "背景"]
+    elif source == "character_design":
+        authority_role = "episode_appearance"
+        priority = 100
+        locked_traits = ["当前本集身份与造型", "本集服装或配件"]
+        mutable_traits = ["表情", "动作", "朝向"]
+        forbidden_transfer = ["参考图背景", "另一主体身份"]
+    elif source == "scene":
+        authority_role = "environment"
+        priority = 70
+        locked_traits = ["当前空间陈设", "布局", "环境光"]
+        mutable_traits = ["镜头构图", "与动作一致的局部状态"]
+        forbidden_transfer = ["人物或猫咪身份"]
+    else:
+        authority_role = "identity"
+        priority = 100
+        locked_traits = ["长期角色身份与基础结构"]
+        mutable_traits = ["本集造型", "表情", "动作", "朝向"]
+        forbidden_transfer = ["参考图背景", "未批准服装或配件"]
     return {
         "assetId": str(asset.id),
         "role": role,
         "purpose": purpose,
         "source": source,
         "semanticKey": asset.semantic_key,
-        "title": str(
-            metadata.get("displayName")
-            or metadata.get("title")
-            or asset.semantic_key
-            or asset.role
+        "title": reference_display_name(
+            semantic_key=asset.semantic_key,
+            role=asset.role,
+            metadata=metadata,
         ),
         "sha256": asset.sha256,
+        "authority": {
+            "role": authority_role,
+            "providerEligible": provider_eligible,
+            "priority": priority,
+            "lockedTraits": locked_traits,
+            "mutableTraits": mutable_traits,
+            "forbiddenTransfer": forbidden_transfer,
+        },
     }
+
+
+def _compile_provider_reference_manifest(
+    references: list[dict[str, Any]],
+    *,
+    maximum: int,
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """Compile stable provider slots while never silently dropping required evidence."""
+
+    compiled: list[dict[str, Any]] = []
+    blockers: list[str] = []
+    warnings: list[str] = []
+    seen_ids: set[str] = set()
+    seen_hashes: set[str] = set()
+    provider_count = 0
+    episode_authorities: dict[str, list[str]] = {}
+    for reference in references:
+        asset_id = str(reference.get("assetId") or "")
+        sha256 = str(reference.get("sha256") or "")
+        if not asset_id or not sha256:
+            blockers.append("生产引用缺少素材 ID 或 SHA，不能冻结供应商输入")
+            continue
+        if asset_id in seen_ids or sha256 in seen_hashes:
+            continue
+        seen_ids.add(asset_id)
+        seen_hashes.add(sha256)
+        ordinal = len(compiled) + 1
+        authority = reference.get("authority") or {}
+        provider_eligible = bool(authority.get("providerEligible", True))
+        if authority.get("role") == "episode_appearance":
+            purpose = str(reference.get("purpose") or "")
+            subject_key = "cat" if "cat" in purpose else "child" if "child" in purpose else purpose
+            episode_authorities.setdefault(subject_key, []).append(asset_id)
+        optional = bool(
+            reference.get("source") == "scene"
+            and reference.get("purpose") in {"prop", "decoration", "optional_prop"}
+        )
+        provider_included = provider_eligible and provider_count < maximum
+        omission_reason = None
+        if not provider_eligible:
+            omission_reason = "该素材仅用于画风提炼或审计血缘，不允许提交给日常 Provider"
+        elif not provider_included:
+            omission_reason = f"Seedream 最多接受 {maximum} 张参考图"
+            if optional:
+                warnings.append(
+                    f"可选场景参考“{reference.get('title') or asset_id}”因模型上限未提交"
+                )
+            else:
+                blockers.append(
+                    f"必需引用“{reference.get('title') or asset_id}”超出模型上限，不能静默省略"
+                )
+        if provider_included:
+            provider_count += 1
+        compiled.append(
+            {
+                **reference,
+                "sourceNodeId": reference.get("sourceNodeId"),
+                "sourceType": reference.get("source") or "production_package",
+                "semanticRole": reference.get("role") or "reference",
+                "instruction": reference.get("instruction") or "",
+                "ordinal": ordinal,
+                "locked": not optional,
+                "providerIncluded": provider_included,
+                "providerSlot": (
+                    f"reference_image_{provider_count}" if provider_included else None
+                ),
+                "omissionReason": omission_reason,
+                "origin": reference.get("source") or "production_package",
+                "contentUrl": f"/api/v1/assets/{asset_id}/content",
+                "evidenceLevel": "frozen",
+            }
+        )
+    for subject_key, asset_ids in episode_authorities.items():
+        if len(set(asset_ids)) > 1:
+            blockers.append(
+                f"{subject_key} 同时存在多个本集身份权威参考；请在费用确认前只保留一个"
+            )
+    return compiled, blockers, warnings
 
 
 def _scene_prompt_bindings(
     session: Session,
     scene: Scene,
     profile: VisualProfileRevision,
+    *,
+    storyboard_revision: StoryboardRevision | None = None,
+    generation_plan: GenerationPlan | None = None,
+    scene_look_usage: str = "off",
 ) -> tuple[list[dict[str, Any]], list[str], list[str]]:
     blockers: list[str] = []
     warnings: list[str] = []
-    accepted_plan_step = session.scalar(
-        select(WorkflowStep)
-        .where(
-            WorkflowStep.production_run_id == scene.production_run_id,
-            WorkflowStep.scene_id == scene.id,
-            WorkflowStep.operation_key == "director:visual-asset-plan",
-            WorkflowStep.status == StepStatus.SUCCEEDED.value,
+    plan_steps = list(
+        session.scalars(
+            select(WorkflowStep)
+            .where(
+                WorkflowStep.production_run_id == scene.production_run_id,
+                WorkflowStep.scene_id == scene.id,
+                WorkflowStep.operation_key == "director:visual-asset-plan",
+                WorkflowStep.status == StepStatus.SUCCEEDED.value,
+            )
+            .order_by(
+                WorkflowStep.completed_at.desc().nullslast(),
+                WorkflowStep.created_at.desc(),
+            )
         )
-        .order_by(WorkflowStep.completed_at.desc().nullslast(), WorkflowStep.created_at.desc())
-        .limit(1)
+    )
+    accepted_plan_step = next(
+        (
+            step
+            for step in plan_steps
+            if isinstance(step.input_snapshot_json.get("acceptedOutput"), dict)
+            and (
+                storyboard_revision is None
+                or generation_plan is None
+                or (
+                    step.input_snapshot_json.get("storyboardRevisionId")
+                    == str(storyboard_revision.id)
+                    and step.input_snapshot_json.get("structureHash")
+                    == storyboard_revision.structure_hash
+                    and step.input_snapshot_json.get("generationPlanId") == str(generation_plan.id)
+                    and step.input_snapshot_json.get("generationPlanHash")
+                    == generation_plan.input_hash
+                )
+            )
+        ),
+        None,
     )
     accepted_plan = (
         None
@@ -6676,7 +10739,13 @@ def _scene_prompt_bindings(
         else accepted_plan_step.input_snapshot_json.get("acceptedOutput")
     )
     if not isinstance(accepted_plan, dict):
-        blockers.append("尚未人工接受当前场景的视觉资产规划")
+        blockers.append("尚未人工接受当前分镜结构与生成编排对应的视觉资产规划")
+    selections = (
+        accepted_plan.get("selections", [])
+        if isinstance(accepted_plan, dict)
+        else []
+    )
+    explicit_selections = isinstance(selections, list) and bool(selections)
 
     look_draft = scene.look_draft_json or {}
     if not look_draft:
@@ -6701,8 +10770,7 @@ def _scene_prompt_bindings(
         bound_ids.append(asset_id)
         binding_by_id[asset_id] = document
     assets_by_id = {
-        asset.id: asset
-        for asset in session.scalars(select(Asset).where(Asset.id.in_(bound_ids)))
+        asset.id: asset for asset in session.scalars(select(Asset).where(Asset.id.in_(bound_ids)))
     }
     result: list[dict[str, Any]] = []
     ready_purposes: set[str] = set()
@@ -6738,10 +10806,20 @@ def _scene_prompt_bindings(
         if purpose == "prop":
             ready_prop_titles.append(str(binding["title"]))
 
-    if "wardrobe" not in ready_purposes:
-        blockers.append("缺少已批准并绑定的本集服饰/配件素材")
-    if "environment" not in ready_purposes:
-        blockers.append("缺少已批准并绑定的当前场景环境素材")
+    if explicit_selections:
+        for selection in selections:
+            if not isinstance(selection, dict) or selection.get("action") == "skip":
+                continue
+            purpose = str(selection.get("purpose") or "")
+            if purpose and purpose not in ready_purposes:
+                blockers.append(
+                    f"缺少已批准并绑定的场景素材：{selection.get('displayName') or purpose}"
+                )
+    else:
+        if "wardrobe" not in ready_purposes:
+            blockers.append("缺少已批准并绑定的本集服饰/配件素材")
+        if "environment" not in ready_purposes:
+            blockers.append("缺少已批准并绑定的当前场景环境素材")
 
     continuity: dict[str, Any] = {}
     if scene.context_note:
@@ -6761,7 +10839,7 @@ def _scene_prompt_bindings(
             if label and label not in required_objects:
                 required_objects.append(label)
     normalized_prop_titles = ["".join(item.lower().split()) for item in ready_prop_titles]
-    for label in required_objects:
+    for label in required_objects if not explicit_selections else []:
         normalized_label = "".join(label.lower().split())
         if not any(
             normalized_label in title or title in normalized_label
@@ -6769,7 +10847,7 @@ def _scene_prompt_bindings(
             if title
         ):
             blockers.append(f"缺少已批准并绑定的场景道具/装饰：{label}")
-    if not required_objects:
+    if not required_objects and not explicit_selections:
         warnings.append("剧情未声明必需装饰或道具，本镜头仅使用场景环境与文本约束")
 
     selected_look = (
@@ -6777,14 +10855,14 @@ def _scene_prompt_bindings(
         if scene.selected_look_asset_id is None
         else session.get(Asset, scene.selected_look_asset_id)
     )
-    if selected_look is None:
-        blockers.append("尚未选择已批准的场景视觉基准（Scene Look）")
-    else:
+    if scene_look_usage != "off" and selected_look is None:
+        blockers.append("已启用 Scene Look，但尚未选择已批准的场景视觉基准")
+    elif scene_look_usage != "off" and selected_look is not None:
         look_revision = (selected_look.metadata_json or {}).get("lookDraftRevision")
         if (
             selected_look.production_run_id not in {None, scene.production_run_id}
             or selected_look.media_type != "image"
-            or selected_look.status not in {"approved", "ready"}
+            or selected_look.status != "approved"
             or look_revision not in {None, scene.look_draft_revision}
         ):
             blockers.append("已选择的场景视觉基准不可用或已过期")
@@ -6820,74 +10898,140 @@ def _compile_storyboard_prompt_text(
         if isinstance(context, dict) and isinstance(context.get("continuity"), dict):
             continuity = context["continuity"]
     temporal_beats = shot.get("temporalBeats") or []
-    if healing_recipe and not temporal_beats:
-        temporal_beats = [
-            item.model_dump(mode="json", by_alias=True)
-            for item in build_temporal_beats(
-                int(shot["durationSeconds"]),
-                actions=(
-                    (
-                        str(shot["action"]),
-                        "猫咪以已批准行为模式自然参与",
-                        str(shot.get("camera") or "固定机位"),
-                    ),
-                    (
-                        "发生一个微小可见变化",
-                        "猫咪对变化做出自然反应",
-                        str(shot.get("camera") or "固定机位"),
-                    ),
-                    (
-                        "儿童与猫咪在温暖状态中收尾",
-                        "猫咪保持猫科身体结构",
-                        str(shot.get("camera") or "固定机位"),
-                    ),
-                ),
-            )
-        ]
-    reference_manifest = [
-        {
-            "index": index,
-            "role": item["role"],
-            "purpose": item["purpose"],
-            "semanticKey": item.get("semanticKey"),
-            "title": item["title"],
-        }
-        for index, item in enumerate(reference_bindings, 1)
+    director_shots = shot.get("directorShots") or []
+    direction = str(shot.get("direction") or shot.get("action") or "").strip()
+    camera = str(shot.get("camera") or "").strip()
+    lighting = str(shot.get("lighting") or "").strip()
+    shot_size = str(shot.get("shotSize") or "").strip()
+    sound_effect = str(shot.get("soundEffect") or "").strip()
+    dialogue = str(shot.get("dialogue") or "").strip()
+    optional_visual_parameters = "；".join(
+        item
+        for item in (
+            f"景别：{shot_size}" if shot_size else "",
+            f"光影：{lighting}" if lighting else "",
+            f"运镜：{camera}" if camera else "",
+        )
+        if item
+    )
+    optional_sound_parameters = "；".join(
+        item
+        for item in (
+            f"声音：{sound_effect}" if sound_effect else "",
+            f"对白：{dialogue}" if dialogue else "",
+        )
+        if item
+    )
+    provider_references = [
+        item for item in reference_bindings if item.get("providerIncluded", True)
     ]
+    reference_lines: list[str] = []
+    for index, item in enumerate(provider_references, 1):
+        authority = item.get("authority") or {}
+        authority_role = str(authority.get("role") or item.get("role") or "reference")
+        purpose = str(item.get("purpose") or "")
+        display_title = {
+            "child": "本集儿童设计",
+            "cat": "本集猫咪设计",
+            "pair_scale": "一人一猫同框比例",
+        }.get(purpose, str(item.get("title") or purpose or "参考"))
+        responsibility = {
+            "episode_appearance": "当前唯一身份与本集造型来源",
+            "pair_scale": "只锁定一人一猫相对比例与自然接触尺度",
+            "environment": "只锁定当前空间陈设、布局与环境光，不改变角色",
+            "style_board": "只锁定轮廓线、材质、色阶与渲染语言，不添加具体内容",
+            "identity": "只锁定长期身份与基础身体结构",
+        }.get(authority_role, str(item.get("instruction") or "只承担已声明的参考职责"))
+        reference_lines.append(
+            f"- @图片{index}「{display_title}」："
+            f"{responsibility}。"
+        )
+
+    time_beat_lines: list[str] = []
+    for index, beat in enumerate(director_shots or temporal_beats, 1):
+        if not isinstance(beat, dict):
+            continue
+        start = beat.get("startSecond", beat.get("startSeconds"))
+        end = beat.get("endSecond", beat.get("endSeconds"))
+        label = f"{start}–{end} 秒" if start is not None and end is not None else f"节拍 {index}"
+        beat_title = str(beat.get("title") or "").strip()
+        beat_direction = str(beat.get("direction") or "").strip()
+        if beat_direction:
+            # A saved director direction is the complete editable creative
+            # document for this window. Advanced fields are legacy/optional
+            # projections and must not repeat or contradict that document.
+            details = [value for value in (beat_title, beat_direction) if value]
+        else:
+            details = [
+                str(value).strip()
+                for key in (
+                    "title",
+                    "visualDescription",
+                    "childAction",
+                    "catAction",
+                    "spatialRelation",
+                    "camera",
+                )
+                if (value := beat.get(key)) and str(value).strip()
+            ]
+        if details:
+            time_beat_lines.append(f"- {label}：{'；'.join(dict.fromkeys(details))}。")
+
+    continuity_values = [
+        str(value).strip()
+        for value in continuity.values()
+        if isinstance(value, (str, int, float)) and str(value).strip()
+    ]
+    person_wardrobe = str(
+        episode_rules.get("personWardrobe") or "沿用已批准的本集儿童设计"
+    )
+    time_weather = str(episode_rules.get("timeWeather") or "沿用当前场景")
+    main_scene = str(episode_rules.get("mainScene") or scene.title)
+    core_props = [str(item) for item in episode_rules.get("coreProps") or [] if str(item)]
     sections = [
-        "【全局 Canon：身份与画风不变量】\n"
-        f"儿童身份：{profile.person_identity}；发型：{profile.person_hair}；体型比例：{profile.person_body}。\n"
-        f"猫咪身份：{profile.cat_identity}。\n"
-        f"画风正向：{'、'.join(profile.style_positive_json)}。",
-        "【本集造型与规则】\n"
-        f"{json.dumps(episode_rules, ensure_ascii=False, sort_keys=True)}\n"
-        "已批准的儿童造型、猫咪造型与同框比例图只负责 "
-        "appearance/pose/scale/composition，不替换 Canon 身份。",
-        "【所属场景】\n"
-        f"场景：{scene.title}。剧情语义：{scene.source_text}。\n"
-        f"连续性：{json.dumps(continuity, ensure_ascii=False, sort_keys=True)}。\n"
-        "只能使用本场景 environment/prop 绑定，禁止串用其他场景素材。",
-        "【镜头画面】\n"
-        f"镜头 {shot['order']}《{shot['title']}》，时长 {shot['durationSeconds']} 秒，"
-        f"景别 {shot.get('shotSize') or '中景'}，动作：{shot['action']}，"
-        f"光影：{shot.get('lighting') or '遵循 Scene Look'}，构图与表情遵循已绑定镜头参考。\n"
-        f"三个时间节拍：{json.dumps(temporal_beats, ensure_ascii=False, sort_keys=True)}。",
-        "【视频运动与声音】\n"
-        f"运镜：{shot.get('camera') or '固定机位'}。"
-        f"关键动作声与环境声：{shot.get('soundEffect') or '保留当前环境的自然原生声'}。"
-        "无对白，不做口型；微表情和动作变化必须遵循时间节拍。",
-        "【引用职责审计】\n"
-        f"{json.dumps(reference_manifest, ensure_ascii=False, sort_keys=True)}",
-        "【排除项】\n"
+        f"任务：生成一个 9:16、{shot['durationSeconds']} 秒的原创二维治愈生活短片。",
+        "参考职责：\n"
+        + ("\n".join(reference_lines) if reference_lines else "当前没有可提交的视觉参考。"),
+        "身份连续性：\n"
+        f"- 儿童始终是同一个 8–9 岁儿童。{profile.person_identity}；"
+        f"{profile.person_hair}；{profile.person_body}。"
+        "本片段保持已批准本集儿童设计中的服装。\n"
+        f"- 猫咪始终是同一只灰白虎斑猫。{profile.cat_identity}。始终保持真实四足猫科结构。\n"
+        "参考冲突时的优先级：儿童/猫咪本集身份 > 人猫同框比例 > 当前环境空间 > "
+        "画风板渲染语言 > 镜头可变动作。",
+        "画风：\n"
+        f"{'；'.join(profile.style_positive_json)}。画风板只控制渲染语言，不自动添加其中不存在的物体、颜色或构图。",
+        "本集与场景：\n"
+        f"本集造型：{person_wardrobe}。时间与天气：{time_weather}。主要空间：{main_scene}。\n"
+        f"当前场景《{scene.title}》：{scene.source_text}。"
+        + (f"核心道具：{'、'.join(core_props)}。" if core_props else "")
+        + (
+            f"连续性要求：{'；'.join(dict.fromkeys(continuity_values))}。"
+            if continuity_values
+            else ""
+        ),
+        "镜头正文：\n"
+        f"镜头 {shot['order']}《{shot['title']}》。\n"
+        + (
+            f"完整镜头方向：{direction}。\n"
+            if direction and not time_beat_lines
+            else ""
+        )
+        + (f"可选导演参数：{optional_visual_parameters}。\n" if optional_visual_parameters else "")
+        + ("时间节拍：\n" + "\n".join(time_beat_lines) if time_beat_lines else ""),
+        "运动与声音：\n"
+        + (optional_sound_parameters or "未提供额外声音或对白要求。")
+        + ("\n保持短时、低对白、日常陪伴的原创治愈叙事节奏。" if healing_recipe else ""),
+        "连续性与排除项：\n"
         + "、".join(
             [
                 *profile.style_negative_json,
                 "儿童身份漂移或年龄变化",
                 "猫咪毛色、脸型或身体结构变化",
                 "猫咪出现人手、人形肢体或未批准的直立劳动",
-                "画风污染或复制风格参考中的具体物体与构图",
+                "从画风板无理由复制具体物体、颜色或构图",
                 "跨场景环境与道具串用",
-                "额外人物、额外猫咪、文字、水印、对白与口型",
+                "额外人物、额外猫咪、文字、水印",
             ]
         ),
     ]
@@ -6898,11 +11042,131 @@ def _shot_matches_persisted_beat(shot: dict[str, Any], beat: ShotBeat) -> bool:
     return bool(
         int(shot["order"]) == beat.sort_order
         and str(shot["title"]).strip() == beat.title.strip()
-        and str(shot["action"]).strip() == beat.action.strip()
+        and str(shot.get("direction") or shot.get("action") or "").strip()
+        == beat.action.strip()
         and str(shot.get("camera") or "").strip() == (beat.camera or "").strip()
         and str(shot.get("dialogue") or "").strip() == (beat.dialogue or "").strip()
         and int(shot["durationSeconds"]) == beat.duration_seconds
     )
+
+
+def _create_generation_plan_for_beats(
+    session: Session,
+    *,
+    storyboard: StoryboardRevision,
+    beats: list[ShotBeat],
+) -> GenerationPlan:
+    capability = SEEDANCE_2_0_CAPABILITY
+    blockers: list[str] = []
+    try:
+        proposals = plan_generation_clips(
+            tuple(
+                EditorialShotDescriptor(
+                    shot_beat_id=beat.id,
+                    scene_id=beat.scene_id,
+                    duration_seconds=beat.duration_seconds,
+                    cut_intent=EditorialCutIntent(beat.cut_intent),
+                    wardrobe_state=beat.wardrobe_state,
+                    prop_state=beat.prop_state,
+                )
+                for beat in beats
+            ),
+            capability=capability,
+        )
+    except ValueError as exc:
+        proposals = ()
+        blockers.append(str(exc))
+    clip_documents = [
+            {
+                "durationSeconds": proposal.duration_seconds,
+                "shotBeatIds": [str(item) for item in proposal.shot_beat_ids],
+            }
+            for proposal in proposals
+        ]
+    plan = GenerationPlan(
+        id=uuid.uuid4(),
+        storyboard_revision_id=storyboard.id,
+        revision=1,
+        status=GenerationPlanStatus.PROPOSED.value,
+        provider=capability.provider,
+        model=capability.model,
+        capability_revision=capability.capability_revision,
+        input_hash=generation_plan_input_hash(
+            structure_hash=storyboard.structure_hash,
+            provider=capability.provider,
+            model=capability.model,
+            capability_revision=capability.capability_revision,
+            clips=clip_documents,
+        ),
+        estimated_image_call_count=len(proposals),
+        estimated_video_call_count=len(proposals),
+        estimated_cost_micros=None,
+        warnings_json=[f"Agent 将 {len(beats)} 个导演分镜编排为 {len(proposals)} 个生成片段"],
+        blockers_json=blockers,
+    )
+    session.add(plan)
+    session.flush()
+    beats_by_id = {beat.id: beat for beat in beats}
+    clip_order_by_scene: dict[uuid.UUID, int] = {}
+    for plan_order, proposal in enumerate(proposals, 1):
+        clip_beats = [beats_by_id[beat_id] for beat_id in proposal.shot_beat_ids]
+        scene_id = clip_beats[0].scene_id
+        clip_order_by_scene[scene_id] = clip_order_by_scene.get(scene_id, 0) + 1
+        direction_lines: list[str] = []
+        for index, beat in enumerate(clip_beats, 1):
+            parts = [f"分镜{index}：{beat.visual_description or beat.action}"]
+            parts.extend(
+                f"{label} {value}"
+                for label, value in (
+                    ("儿童", beat.child_action),
+                    ("猫咪", beat.cat_action),
+                    ("空间关系", beat.spatial_relation),
+                    ("运镜", beat.camera),
+                )
+                if value
+            )
+            direction_lines.append("；".join(parts))
+        direction = "\n".join(direction_lines)
+        clip = ShotCard(
+            id=uuid.uuid4(),
+            scene_id=scene_id,
+            sort_order=clip_order_by_scene[scene_id],
+            plan_sort_order=plan_order,
+            title=(
+                clip_beats[0].title
+                if len(clip_beats) == 1
+                else f"{clip_beats[0].title}—{clip_beats[-1].title}"
+            )[:100],
+            direction=direction,
+            duration_seconds=proposal.duration_seconds,
+            generation_plan_id=plan.id,
+            anchor_mode="text_only",
+            reference_bindings_json=[],
+            inherit_project_references=True,
+            use_scene_look=False,
+            scene_look_usage="off",
+            draft_revision=1,
+            status="ready",
+        )
+        session.add(clip)
+        session.flush()
+        cursor = 0
+        for ordinal, beat in enumerate(clip_beats, 1):
+            beat.shot_card_id = clip.id
+            session.add(
+                GenerationClipShot(
+                    id=uuid.uuid4(),
+                    generation_plan_id=plan.id,
+                    shot_card_id=clip.id,
+                    shot_beat_id=beat.id,
+                    ordinal=ordinal,
+                    start_second=cursor,
+                    end_second=cursor + beat.duration_seconds,
+                    transition_in=beat.cut_intent,
+                )
+            )
+            cursor += beat.duration_seconds
+    return plan
 
 
 def _scorecard(row: StoryScore) -> StoryScorecard:
@@ -6920,16 +11184,50 @@ def _scorecard(row: StoryScore) -> StoryScorecard:
     )
 
 
-def _story_json(row: StoryRevisionRecord, score: StoryScore | None) -> dict[str, Any]:
+def _story_json(
+    row: StoryRevisionRecord,
+    score: StoryScore | None,
+    candidate_prompt: PromptRecord | None = None,
+) -> dict[str, Any]:
     is_approved = row.status == StoryRevisionStatus.APPROVED.value
+    scenes = _normalized_story_scenes(row)
+    scorecard = (
+        None
+        if score is None
+        else {
+            **_scorecard(score).model_dump(mode="json", by_alias=True),
+            "average": _scorecard(score).average,
+        }
+    )
+    diagnostics: list[dict[str, Any]] = []
+    if candidate_prompt is not None:
+        structured_response = candidate_prompt.structured_response_json or {}
+        stored_diagnostics = structured_response.get("diagnostics")
+        if isinstance(stored_diagnostics, list):
+            diagnostics = [dict(item) for item in stored_diagnostics if isinstance(item, dict)]
+    source = (
+        "ai"
+        if candidate_prompt is not None
+        else "manual"
+        if row.parent_revision_id is not None or row.strategy == StoryStrategy.LEGACY_IMPORT.value
+        else "unknown"
+    )
+    contract_kind = story_revision_contract_kind(
+        row,
+        legacy_score_present=scorecard is not None,
+    )
+    legacy_details = (
+        None if not scenes and scorecard is None else {"scenes": scenes, "scorecard": scorecard}
+    )
     return {
         "id": str(row.id),
         "projectId": str(row.production_run_id),
         "briefId": None if row.brief_id is None else str(row.brief_id),
+        "parentRevisionId": (
+            None if row.parent_revision_id is None else str(row.parent_revision_id)
+        ),
         "sourceEventCandidateId": (
-            None
-            if row.source_event_candidate_id is None
-            else str(row.source_event_candidate_id)
+            None if row.source_event_candidate_id is None else str(row.source_event_candidate_id)
         ),
         "revision": row.revision,
         "strategy": row.strategy,
@@ -6937,23 +11235,22 @@ def _story_json(row: StoryRevisionRecord, score: StoryScore | None) -> dict[str,
         "artifactLabel": "剧情脚本定稿" if is_approved else "剧情候选",
         "isCanonicalStory": is_approved,
         "title": row.title,
+        "body": row.synopsis,
+        "summary": row.logline,
+        "source": source,
+        "contractKind": contract_kind,
+        "warnings": diagnostics,
+        "legacyDetails": legacy_details,
         "logline": row.logline,
         "synopsis": row.synopsis,
         "subjectIds": row.subject_ids_json,
-        "scenes": _normalized_story_scenes(row),
+        "scenes": scenes,
         "episodeRules": row.episode_rules_json or None,
         "candidatePromptId": (
             None if row.candidate_prompt_id is None else str(row.candidate_prompt_id)
         ),
         "criticPromptId": (None if row.critic_prompt_id is None else str(row.critic_prompt_id)),
-        "scorecard": (
-            None
-            if score is None
-            else {
-                **_scorecard(score).model_dump(mode="json", by_alias=True),
-                "average": _scorecard(score).average,
-            }
-        ),
+        "scorecard": scorecard,
         "approvedAt": None if row.approved_at is None else row.approved_at.isoformat(),
     }
 
@@ -7006,22 +11303,65 @@ def _attempt_json(row: GenerationAttempt) -> dict[str, Any]:
     }
 
 
-def _beat_json(row: ShotBeat, prompt: PromptRecord | None = None) -> dict[str, Any]:
+def _beat_json(
+    row: ShotBeat,
+    prompt: PromptRecord | None = None,
+    *,
+    generation_clip_id: uuid.UUID | None = None,
+    thumbnail_asset: Asset | None = None,
+    scene_title: str | None = None,
+) -> dict[str, Any]:
     document = {
         "id": str(row.id),
         "sceneId": str(row.scene_id),
+        "sceneTitle": scene_title,
         "storyRevisionId": (None if row.story_revision_id is None else str(row.story_revision_id)),
+        "storyboardRevisionId": (
+            None if row.storyboard_revision_id is None else str(row.storyboard_revision_id)
+        ),
+        "generationClipId": (
+            None
+            if generation_clip_id is None and row.shot_card_id is None
+            else str(generation_clip_id or row.shot_card_id)
+        ),
         "promptId": None if row.prompt_id is None else str(row.prompt_id),
         "order": row.sort_order,
         "revision": row.revision,
+        "referenceBindings": row.reference_bindings_json,
+        "referenceBindingRevision": row.reference_binding_revision,
         "title": row.title,
+        "direction": row.action,
         "action": row.action,
+        "visualDescription": row.visual_description,
+        "childAction": row.child_action,
+        "catAction": row.cat_action,
+        "spatialRelation": row.spatial_relation,
+        "contactOcclusion": row.contact_occlusion,
+        "shotSize": row.shot_size,
         "camera": row.camera,
+        "lighting": row.lighting,
         "dialogue": row.dialogue,
+        "soundEffect": row.sound_effect,
+        "musicIntent": row.music_intent,
+        "wardrobeState": row.wardrobe_state,
+        "propState": row.prop_state,
+        "continuityIn": row.continuity_in,
+        "continuityOut": row.continuity_out,
+        "cutIntent": row.cut_intent,
         "durationSeconds": row.duration_seconds,
         "temporalBeats": row.temporal_beats_json,
         "status": row.status,
         "staleReason": row.stale_reason,
+        "thumbnailUrl": (
+            None if thumbnail_asset is None else f"/api/v1/assets/{thumbnail_asset.id}/content"
+        ),
+        "thumbnailSource": (
+            None
+            if thumbnail_asset is None
+            else "video_frame"
+            if thumbnail_asset.role == "editorial_thumbnail"
+            else "approved_anchor"
+        ),
     }
     if prompt is not None:
         structured = prompt.structured_response_json or {}
@@ -7049,6 +11389,44 @@ def _storyboard_json(
         "targetDurationSeconds": sum(item.duration_seconds for item in beats),
         "beats": [_beat_json(item) for item in beats],
     }
+
+
+def _storyboard_prompt_projection(prompt: PromptRecord | None) -> dict[str, Any]:
+    """Restore tolerant storyboard output from the durable Prompt audit boundary."""
+
+    if prompt is None or not isinstance(prompt.structured_response_json, dict):
+        return {}
+    structured = prompt.structured_response_json
+    status = structured.get("status")
+    if status not in {"ready", "needs_structuring"}:
+        return {}
+    diagnostics: list[dict[str, Any]] = []
+    for item in structured.get("diagnostics", []):
+        try:
+            diagnostic = CanvasDiagnostic.model_validate(item)
+        except (TypeError, ValueError):
+            continue
+        diagnostics.append(diagnostic.model_dump(mode="json", by_alias=True))
+    projection: dict[str, Any] = {
+        "storyboardDraftStatus": status,
+        "storyboardPromptId": str(prompt.id),
+        "diagnostics": diagnostics,
+    }
+    if status == "needs_structuring":
+        raw_text = structured.get("rawText")
+        if not isinstance(raw_text, str) or not raw_text.strip():
+            raw_response = prompt.raw_response_json or {}
+            raw_text = raw_response.get("text") if isinstance(raw_response, dict) else None
+        projection["rawStoryboardText"] = raw_text or ""
+        projection["blocker"] = next(
+            (
+                item["message"]
+                for item in diagnostics
+                if item["severity"] == "blocker"
+            ),
+            "分镜原文需要整理为可执行镜头",
+        )
+    return projection
 
 
 def _prompt_json(prompt: PromptRecord, step: WorkflowStep) -> dict[str, Any]:
@@ -7103,22 +11481,186 @@ def _canvas_json(
     session: Session,
     enabled: bool,
     include_narrative_projection: bool = True,
+    storyboard_prompt: PromptRecord | None = None,
 ) -> dict[str, Any]:
+    brief_node_id = creative_brief_canvas_node_id(project_id)
     planner_id = uuid.uuid5(project_id, "story-planner")
     event_selection_id = uuid.uuid5(project_id, "story-event-selection")
     script_expander_id = uuid.uuid5(project_id, "story-script-expander")
     approval_id = uuid.uuid5(project_id, "story-approval")
     storyboard_id = uuid.uuid5(project_id, "storyboard-director")
+    approved_story = next(
+        (
+            story
+            for story in reversed(stories)
+            if story.status == StoryRevisionStatus.APPROVED.value
+        ),
+        None,
+    )
     recipe_instance = session.scalar(
         select(ProductionRecipeInstance).where(
             ProductionRecipeInstance.production_run_id == project_id,
             ProductionRecipeInstance.lifecycle_status == "active",
         )
     )
+    storyboard_revision = session.scalar(
+        select(StoryboardRevision)
+        .where(
+            StoryboardRevision.production_run_id == project_id,
+            StoryboardRevision.status != "superseded",
+            *(
+                ()
+                if approved_story is None
+                else (StoryboardRevision.story_revision_id == approved_story.id,)
+            ),
+        )
+        .order_by(StoryboardRevision.revision.desc())
+        .limit(1)
+    )
+    if storyboard_revision is not None:
+        beats = [beat for beat in beats if beat.storyboard_revision_id == storyboard_revision.id]
+    generation_plan = (
+        None
+        if storyboard_revision is None
+        else session.scalar(
+            select(GenerationPlan)
+            .where(GenerationPlan.storyboard_revision_id == storyboard_revision.id)
+            .order_by(GenerationPlan.revision.desc())
+            .limit(1)
+        )
+    )
+    clip_mappings = (
+        []
+        if generation_plan is None
+        else list(
+            session.scalars(
+                select(GenerationClipShot)
+                .join(ShotCard, ShotCard.id == GenerationClipShot.shot_card_id)
+                .where(GenerationClipShot.generation_plan_id == generation_plan.id)
+                .order_by(
+                    ShotCard.plan_sort_order,
+                    GenerationClipShot.ordinal,
+                )
+            )
+        )
+    )
+    clip_ids = list(dict.fromkeys(item.shot_card_id for item in clip_mappings))
+    generation_clips = list(
+        session.scalars(
+            select(ShotCard).where(ShotCard.id.in_(clip_ids)).order_by(ShotCard.plan_sort_order)
+        )
+    )
+    clips_by_id = {clip.id: clip for clip in generation_clips}
+    clip_assets = list(
+        session.scalars(
+            select(Asset).where(Asset.shot_card_id.in_(clip_ids)).order_by(Asset.created_at)
+        )
+    )
+    assets_by_clip: dict[uuid.UUID, list[Asset]] = {}
+    for asset in clip_assets:
+        if asset.shot_card_id is not None:
+            assets_by_clip.setdefault(asset.shot_card_id, []).append(asset)
+    selected_anchor_by_clip = {
+        clip.id: next(
+            (
+                asset
+                for asset in assets_by_clip.get(clip.id, [])
+                if asset.id == clip.selected_anchor_asset_id
+                and asset.status in {"approved", "ready"}
+            ),
+            None,
+        )
+        for clip in generation_clips
+    }
+    editorial_thumbnail_by_beat: dict[uuid.UUID, Asset] = {}
+    for asset in clip_assets:
+        if asset.role != "editorial_thumbnail" or asset.status not in {"approved", "ready"}:
+            continue
+        raw_beat_id = (asset.metadata_json or {}).get("shotBeatId")
+        try:
+            beat_id = uuid.UUID(str(raw_beat_id))
+        except (TypeError, ValueError):
+            continue
+        editorial_thumbnail_by_beat[beat_id] = asset
+    clip_steps = list(
+        session.scalars(
+            select(WorkflowStep)
+            .where(WorkflowStep.shot_card_id.in_(clip_ids))
+            .order_by(WorkflowStep.created_at)
+        )
+    )
+    steps_by_clip: dict[uuid.UUID, list[WorkflowStep]] = {}
+    for step in clip_steps:
+        if step.shot_card_id is not None:
+            steps_by_clip.setdefault(step.shot_card_id, []).append(step)
+    beat_ids_by_clip: dict[uuid.UUID, list[uuid.UUID]] = {}
+    clip_id_by_beat: dict[uuid.UUID, uuid.UUID] = {}
+    for mapping in clip_mappings:
+        beat_ids_by_clip.setdefault(mapping.shot_card_id, []).append(mapping.shot_beat_id)
+        clip_id_by_beat[mapping.shot_beat_id] = mapping.shot_card_id
+    structure_approved = bool(
+        storyboard_revision is not None
+        and storyboard_revision.status in {"structure_approved", "production_approved"}
+    )
+    generation_plan_approved = bool(
+        generation_plan is not None and generation_plan.status == "approved"
+    )
+    package_approved = bool(
+        storyboard_revision is not None
+        and storyboard_revision.status == "production_approved"
+        and storyboard_revision.production_package_hash
+    )
+    project_row = session.get(ProductionRun, project_id)
+    current_profile = (
+        None
+        if project_row is None or project_row.current_visual_profile_revision_id is None
+        else session.get(
+            VisualProfileRevision,
+            project_row.current_visual_profile_revision_id,
+        )
+    )
+    scene_prompt_ready: dict[uuid.UUID, bool] = {}
+    scene_prompt_blockers: dict[uuid.UUID, list[str]] = {}
+    if (
+        storyboard_revision is not None
+        and generation_plan is not None
+        and generation_plan_approved
+        and current_profile is not None
+    ):
+        for scene in scenes:
+            _bindings, blockers, _warnings = _scene_prompt_bindings(
+                session,
+                scene,
+                current_profile,
+                storyboard_revision=storyboard_revision,
+                generation_plan=generation_plan,
+                scene_look_usage=next(
+                    (
+                        str(clip.scene_look_usage)
+                        for clip in generation_clips
+                        if clip.scene_id == scene.id and clip.scene_look_usage != "off"
+                    ),
+                    "off",
+                ),
+            )
+            scene_prompt_ready[scene.id] = not blockers
+            scene_prompt_blockers[scene.id] = blockers
     recipe_instance_id = None if recipe_instance is None else str(recipe_instance.id)
-    uses_event_story_flow = bool(
+    shows_legacy_event_history = bool(
         recipe_instance is not None
         and recipe_instance.recipe_key == ProductionRecipeKey.HEALING_CHILD_CAT_V1.value
+        and story_events
+    )
+    has_approved_story = any(
+        story.status == StoryRevisionStatus.APPROVED.value for story in stories
+    )
+    has_full_text_story_candidate = any(
+        story.source_event_candidate_id is None for story in stories
+    )
+    uses_event_story_flow = bool(
+        shows_legacy_event_history
+        and not has_approved_story
+        and not has_full_text_story_candidate
     )
     latest_event_batch_id = story_events[-1].batch_id if story_events else None
     current_story_events = [
@@ -7155,7 +11697,7 @@ def _canvas_json(
     if brief is not None:
         nodes.append(
             {
-                "id": str(brief.id),
+                "id": str(brief_node_id),
                 "type": "BriefNode",
                 "objectType": "story_brief",
                 "objectId": str(brief.id),
@@ -7173,20 +11715,22 @@ def _canvas_json(
                     ),
                     "objectId": str(project_id),
                     "data": {
-                        "title": (
-                            "生成三个事件方案" if uses_event_story_flow else "三案故事策划"
-                        ),
+                        "title": ("历史事件方案" if uses_event_story_flow else "生成完整故事候选"),
                         "phase": "story",
                         "recipeInstanceId": recipe_instance_id,
                         "briefSummary": None if brief is None else brief.theme,
                         "canonDependencies": planner_canon_dependencies,
                         "candidateCount": 3,
-                        "storyWorkflowStep": 1 if not current_story_events else 2,
-                        "storyWorkflowTotalSteps": 4,
+                        "storyWorkflowStep": (1 if not stories else 2)
+                        if not uses_event_story_flow
+                        else 1
+                        if not current_story_events
+                        else 2,
+                        "storyWorkflowTotalSteps": 4 if uses_event_story_flow else 2,
                         "candidateRules": [
-                            "儿童主动参与一个低压力日常事件",
-                            "猫咪以锁定的行为模式参与",
-                            "包含小变化并以温暖画面收尾",
+                            "一次返回 1–5 个可编辑的完整长文本候选",
+                            "候选在事件、人物行动和情绪落点上保持差异",
+                            "固定一人一猫身份关系，不复制独特角色或画风",
                         ],
                     },
                 },
@@ -7239,11 +11783,11 @@ def _canvas_json(
                     "objectType": "story_approval",
                     "objectId": str(project_id),
                     "data": {
-                        "title": "人工剧情脚本定稿",
+                        "title": "选择为当前剧情",
                         "phase": "story",
                         "recipeInstanceId": recipe_instance_id,
-                        "storyWorkflowStep": 4,
-                        "storyWorkflowTotalSteps": 4,
+                        "storyWorkflowStep": 4 if uses_event_story_flow else 2,
+                        "storyWorkflowTotalSteps": 4 if uses_event_story_flow else 2,
                     },
                 },
                 {
@@ -7256,17 +11800,38 @@ def _canvas_json(
                         "phase": "storyboard",
                         "recipeInstanceId": recipe_instance_id,
                         "shotCount": len(beats),
-                        "storyboardApproved": bool(beats)
-                        and all(
-                            beat.status == "approved" and beat.prompt_id is not None
-                            for beat in beats
+                        "generationClipCount": len(generation_clips),
+                        "storyboardRevisionId": (
+                            None if storyboard_revision is None else str(storyboard_revision.id)
                         ),
+                        "storyboardRevision": (
+                            0 if storyboard_revision is None else storyboard_revision.revision
+                        ),
+                        "structureHash": (
+                            None
+                            if storyboard_revision is None
+                            else storyboard_revision.structure_hash
+                        ),
+                        "storyboardStructureApproved": structure_approved,
+                        "generationPlanApproved": generation_plan_approved,
+                        "storyboardPackageApproved": package_approved,
+                        "storyboardApproved": package_approved,
+                        **_storyboard_prompt_projection(storyboard_prompt),
                     },
                 },
             )
         )
     if brief is not None:
-        edges.append(_edge(brief.id, "BriefNode", "brief", planner_id, "StoryPlannerNode", "brief"))
+        edges.append(
+            _edge(
+                brief_node_id,
+                "BriefNode",
+                "brief",
+                planner_id,
+                "StoryPlannerNode",
+                "brief",
+            )
+        )
     for subject in subjects:
         revision = subject_revisions.get(subject.id)
         if revision is None:
@@ -7296,7 +11861,7 @@ def _canvas_json(
                     "subject[]",
                 )
             )
-    if uses_event_story_flow:
+    if shows_legacy_event_history:
         for event in story_events:
             event_data = {
                 **_story_event_json(event),
@@ -7325,7 +11890,7 @@ def _canvas_json(
                     "story_event",
                 )
             )
-            if event.batch_id == latest_event_batch_id:
+            if uses_event_story_flow and event.batch_id == latest_event_batch_id:
                 edges.append(
                     _edge(
                         event.id,
@@ -7336,7 +11901,7 @@ def _canvas_json(
                         "story_event",
                     )
                 )
-        if selected_story_event is not None:
+        if uses_event_story_flow and selected_story_event is not None:
             edges.append(
                 _edge(
                     event_selection_id,
@@ -7347,12 +11912,36 @@ def _canvas_json(
                     "story_event",
                 )
             )
+    story_ids = [story.id for story in stories]
+    scores_by_story_id = {
+        score.story_revision_id: score
+        for score in (
+            session.scalars(select(StoryScore).where(StoryScore.story_revision_id.in_(story_ids)))
+            if story_ids
+            else ()
+        )
+    }
+    candidate_prompt_ids = [
+        story.candidate_prompt_id for story in stories if story.candidate_prompt_id is not None
+    ]
+    candidate_prompts_by_id = {
+        prompt.id: prompt
+        for prompt in (
+            session.scalars(select(PromptRecord).where(PromptRecord.id.in_(candidate_prompt_ids)))
+            if candidate_prompt_ids
+            else ()
+        )
+    }
     for story in stories:
-        score = session.scalar(select(StoryScore).where(StoryScore.story_revision_id == story.id))
+        score = scores_by_story_id.get(story.id)
+        candidate_prompt = candidate_prompts_by_id.get(story.candidate_prompt_id)
         is_event_script = story.source_event_candidate_id is not None
         story_node_type = "StoryScriptNode" if is_event_script else "StoryCandidateNode"
+        story_document = _story_json(story, score, candidate_prompt)
+        story_document.pop("scenes", None)
+        story_document.pop("scorecard", None)
         story_data = {
-            **_story_json(story, score),
+            **story_document,
             "phase": "story",
             "recipeInstanceId": recipe_instance_id,
             "legacyCompatibility": uses_event_story_flow and not is_event_script,
@@ -7382,7 +11971,8 @@ def _canvas_json(
                     )
                 )
             if (
-                selected_story_event is not None
+                uses_event_story_flow
+                and selected_story_event is not None
                 and story.source_event_candidate_id == selected_story_event.id
             ):
                 edges.extend(
@@ -7429,24 +12019,17 @@ def _canvas_json(
         if story.status == StoryRevisionStatus.APPROVED.value:
             edges.append(
                 _edge(
-                    approval_id,
-                    "ApprovalGateNode",
+                    story.id,
+                    story_node_type,
                     "story_revision",
                     storyboard_id,
                     "StoryboardDirectorNode",
                     "story_revision",
                 )
             )
-    approved_story = next(
-        (
-            story
-            for story in stories
-            if story.status == StoryRevisionStatus.APPROVED.value
-        ),
-        None,
-    )
     scene_by_id = {scene.id: scene for scene in scenes}
     for scene in scenes:
+        scene_beats = [beat for beat in beats if beat.scene_id == scene.id]
         scene_data: dict[str, Any] = {
             "title": scene.title,
             "order": scene.sort_order,
@@ -7456,6 +12039,17 @@ def _canvas_json(
             "sceneKey": scene.scene_key,
             "active": scene.active,
             "staleReason": scene.stale_reason,
+            "storyboardShotCount": len(scene_beats),
+            "totalDurationSeconds": sum(beat.duration_seconds for beat in scene_beats),
+            "collapsedStoryboardShots": [
+                {
+                    "id": str(beat.id),
+                    "order": beat.sort_order,
+                    "title": beat.title,
+                    "durationSeconds": beat.duration_seconds,
+                }
+                for beat in scene_beats
+            ],
         }
         if scene.context_note:
             try:
@@ -7496,6 +12090,11 @@ def _canvas_json(
                 )
             )
     for beat in beats:
+        generation_clip_id = clip_id_by_beat.get(beat.id)
+        first_clip_beat = bool(
+            generation_clip_id is not None
+            and beat_ids_by_clip.get(generation_clip_id, [None])[0] == beat.id
+        )
         nodes.append(
             {
                 "id": str(beat.id),
@@ -7505,6 +12104,12 @@ def _canvas_json(
                 "data": _beat_json(
                     beat,
                     None if beat.prompt_id is None else session.get(PromptRecord, beat.prompt_id),
+                    generation_clip_id=generation_clip_id,
+                    thumbnail_asset=(
+                        selected_anchor_by_clip.get(generation_clip_id)
+                        if first_clip_beat and generation_clip_id is not None
+                        else editorial_thumbnail_by_beat.get(beat.id)
+                    ),
                 ),
             }
         )
@@ -7513,13 +12118,402 @@ def _canvas_json(
                 _edge(
                     beat.scene_id,
                     "SceneNode",
-                    "shot_beat[]",
+                    "storyboard_shot[]",
                     beat.id,
                     "ShotBeatNode",
-                    "shot_beat[]",
+                    "storyboard_shot[]",
                 )
             )
+    if storyboard_revision is not None:
+        structure_gate_id = uuid.uuid5(storyboard_revision.id, "storyboard-structure-approval")
+        package_gate_id = uuid.uuid5(storyboard_revision.id, "storyboard-package-approval")
+        nodes.append(
+            {
+                "id": str(structure_gate_id),
+                "type": "ApprovalGateNode",
+                "objectType": "storyboard_structure",
+                "objectId": str(storyboard_revision.id),
+                "status": storyboard_revision.status,
+                "data": {
+                    "title": "批准分镜结构并建立生产版本",
+                    "phase": "storyboard",
+                    "recipeInstanceId": recipe_instance_id,
+                    "storyboardRevisionId": str(storyboard_revision.id),
+                    "revision": storyboard_revision.revision,
+                    "shotCount": len(beats),
+                    "totalDurationSeconds": sum(beat.duration_seconds for beat in beats),
+                    "structureHash": storyboard_revision.structure_hash,
+                    "approved": structure_approved,
+                },
+            }
+        )
+        for beat in beats:
+            edges.append(
+                _edge(
+                    beat.id,
+                    "ShotBeatNode",
+                    "storyboard_shot[]",
+                    structure_gate_id,
+                    "ApprovalGateNode",
+                    "shot_sequence",
+                )
+            )
+        if generation_plan is not None:
+            nodes.append(
+                {
+                    "id": str(generation_plan.id),
+                    "type": "GenerationPlanNode",
+                    "objectType": "generation_plan",
+                    "objectId": str(generation_plan.id),
+                    "status": generation_plan.status,
+                    "data": {
+                        "title": "Agent 生成编排",
+                        "phase": "storyboard",
+                        "recipeInstanceId": recipe_instance_id,
+                        "storyboardRevisionId": str(storyboard_revision.id),
+                        "revision": generation_plan.revision,
+                        "status": generation_plan.status,
+                        "provider": generation_plan.provider,
+                        "model": generation_plan.model,
+                        "capabilityRevision": generation_plan.capability_revision,
+                        "inputHash": generation_plan.input_hash,
+                        "editorialShotCount": len(beats),
+                        "generationClipCount": len(generation_clips),
+                        "estimatedImageCallCount": generation_plan.estimated_image_call_count,
+                        "estimatedVideoCallCount": generation_plan.estimated_video_call_count,
+                        "estimatedCostMicros": generation_plan.estimated_cost_micros,
+                        "warnings": generation_plan.warnings_json,
+                        "blockers": generation_plan.blockers_json,
+                        "structureApproved": structure_approved,
+                        "approved": generation_plan_approved,
+                        "clips": [
+                            {
+                                "id": str(clip.id),
+                                "title": clip.title,
+                                "durationSeconds": clip.duration_seconds,
+                                "editorialShotIds": [
+                                    str(item) for item in beat_ids_by_clip.get(clip.id, [])
+                                ],
+                                "mode": (
+                                    "multi_shot"
+                                    if len(beat_ids_by_clip.get(clip.id, [])) > 1
+                                    else "single_shot"
+                                ),
+                            }
+                            for clip in generation_clips
+                        ],
+                    },
+                }
+            )
+            edges.append(
+                _edge(
+                    structure_gate_id,
+                    "ApprovalGateNode",
+                    "shot_sequence",
+                    generation_plan.id,
+                    "GenerationPlanNode",
+                    "shot_sequence",
+                )
+            )
+            for clip_id in clip_ids:
+                clip = clips_by_id.get(clip_id)
+                if clip is None:
+                    continue
+                anchor_required = clip.anchor_mode != "text_only"
+                prompt_node_id = uuid.uuid5(clip.id, "compiled-prompt")
+                anchor_node_id = uuid.uuid5(clip.id, "anchor-generation")
+                review_node_id = uuid.uuid5(clip.id, "anchor-review")
+                video_node_id = uuid.uuid5(clip.id, "video-generation")
+                anchor_assets = [
+                    asset
+                    for asset in assets_by_clip.get(clip.id, [])
+                    if asset.role == "shot_anchor"
+                ]
+                video_assets = [
+                    asset
+                    for asset in assets_by_clip.get(clip.id, [])
+                    if asset.role in {"shot_video", "shot_video_edit"}
+                ]
+                provider_steps = [
+                    step for step in steps_by_clip.get(clip.id, []) if step.provider_task_id
+                ]
+                anchor_provider_task_id = next(
+                    (
+                        step.provider_task_id
+                        for step in reversed(provider_steps)
+                        if "anchor" in step.operation_key
+                    ),
+                    None,
+                )
+                video_provider_task_id = next(
+                    (
+                        step.provider_task_id
+                        for step in reversed(provider_steps)
+                        if "video" in step.operation_key
+                    ),
+                    None,
+                )
+                nodes.extend(
+                    (
+                        {
+                            "id": str(clip.id),
+                            "type": "VideoSegmentNode",
+                            "objectType": "generation_clip",
+                            "objectId": str(clip.id),
+                            "status": clip.status,
+                            "data": {
+                                "title": clip.title,
+                                "phase": "storyboard",
+                                "recipeInstanceId": recipe_instance_id,
+                                "shotId": str(clip.id),
+                                "generationPlanId": str(generation_plan.id),
+                                "order": clip.plan_sort_order or clip.sort_order,
+                                "durationSeconds": clip.duration_seconds,
+                                "mode": (
+                                    "multi_shot"
+                                    if len(beat_ids_by_clip.get(clip.id, [])) > 1
+                                    else "single_shot"
+                                ),
+                                "editorialShotIds": [
+                                    str(item) for item in beat_ids_by_clip.get(clip.id, [])
+                                ],
+                                "thumbnailUrl": (
+                                    None
+                                    if selected_anchor_by_clip.get(clip.id) is None
+                                    else (
+                                        "/api/v1/assets/"
+                                        f"{selected_anchor_by_clip[clip.id].id}/content"
+                                    )
+                                ),
+                                "thumbnailSource": (
+                                    None
+                                    if selected_anchor_by_clip.get(clip.id) is None
+                                    else "approved_anchor"
+                                ),
+                            },
+                        },
+                        {
+                            "id": str(prompt_node_id),
+                            "type": "PromptArtifactNode",
+                            "objectType": "generation_clip_prompt",
+                            "objectId": str(clip.id),
+                            "status": (
+                                "compiled"
+                                if clip.prompt_id
+                                else "ready"
+                                if scene_prompt_ready.get(clip.scene_id, False)
+                                else "blocked"
+                            ),
+                            "data": {
+                                "title": f"{clip.title} · 生产 Prompt",
+                                "phase": "storyboard",
+                                "recipeInstanceId": recipe_instance_id,
+                                "shotId": str(clip.id),
+                                "sceneId": str(clip.scene_id),
+                                "generationPlanApproved": generation_plan_approved,
+                                "sceneAssetsReady": scene_prompt_ready.get(clip.scene_id, False),
+                                "sceneAssetBlockers": scene_prompt_blockers.get(
+                                    clip.scene_id,
+                                    [],
+                                ),
+                                "promptId": (
+                                    None if clip.prompt_id is None else str(clip.prompt_id)
+                                ),
+                                "compiled": clip.prompt_id is not None,
+                            },
+                        },
+                        {
+                            "id": str(anchor_node_id),
+                            "type": "ImageGenerationNode",
+                            "objectType": "visual_anchor_generation",
+                            "objectId": str(clip.id),
+                            "status": (
+                                "approved"
+                                if clip.selected_anchor_asset_id is not None
+                                else "ready"
+                                if package_approved
+                                else "blocked"
+                            ),
+                            "data": {
+                                "title": f"{clip.title} · 可选开场视觉锚点",
+                                "phase": "render",
+                                "recipeInstanceId": recipe_instance_id,
+                                "shotId": str(clip.id),
+                                "packageApproved": package_approved,
+                                "optional": not anchor_required,
+                                "selectedAssetId": (
+                                    None
+                                    if clip.selected_anchor_asset_id is None
+                                    else str(clip.selected_anchor_asset_id)
+                                ),
+                                "candidateCount": len(anchor_assets),
+                                "providerTaskId": anchor_provider_task_id,
+                            },
+                        },
+                        {
+                            "id": str(review_node_id),
+                            "type": "ReviewNode",
+                            "objectType": "visual_anchor_review",
+                            "objectId": str(clip.id),
+                            "status": (
+                                "approved"
+                                if clip.selected_anchor_asset_id is not None
+                                else "awaiting_asset"
+                            ),
+                            "data": {
+                                "title": f"{clip.title} · 锚点审核",
+                                "phase": "render",
+                                "recipeInstanceId": recipe_instance_id,
+                                "shotId": str(clip.id),
+                                "approved": clip.selected_anchor_asset_id is not None,
+                                "candidateCount": len(anchor_assets),
+                            },
+                        },
+                        {
+                            "id": str(video_node_id),
+                            "type": "VideoGenerationNode",
+                            "objectType": "video_generation_clip",
+                            "objectId": str(clip.id),
+                            "status": (
+                                "approved"
+                                if clip.selected_video_asset_id is not None
+                                else "ready"
+                                if package_approved
+                                and (
+                                    not anchor_required
+                                    or clip.selected_anchor_asset_id is not None
+                                )
+                                else "blocked"
+                            ),
+                            "data": {
+                                "title": f"{clip.title} · 生成视频",
+                                "phase": "render",
+                                "recipeInstanceId": recipe_instance_id,
+                                "shotId": str(clip.id),
+                                "packageApproved": package_approved,
+                                "anchorRequired": anchor_required,
+                                "anchorApproved": clip.selected_anchor_asset_id is not None,
+                                "selectedAssetId": (
+                                    None
+                                    if clip.selected_video_asset_id is None
+                                    else str(clip.selected_video_asset_id)
+                                ),
+                                "providerInputMode": (
+                                    "first_frame"
+                                    if clip.selected_anchor_asset_id is not None
+                                    else "reference_media"
+                                ),
+                                "videoCandidateCount": len(video_assets),
+                                "providerTaskId": video_provider_task_id,
+                            },
+                        },
+                    )
+                )
+                edges.extend(
+                    (
+                        _edge(
+                            generation_plan.id,
+                            "GenerationPlanNode",
+                            "generation_plan",
+                            clip.id,
+                            "VideoSegmentNode",
+                            "generation_plan",
+                        ),
+                        _edge(
+                            clip.id,
+                            "VideoSegmentNode",
+                            "video_segment[]",
+                            prompt_node_id,
+                            "PromptArtifactNode",
+                            "video_segment[]",
+                        ),
+                        _edge(
+                            prompt_node_id,
+                            "PromptArtifactNode",
+                            "compiled_prompt",
+                            package_gate_id,
+                            "ApprovalGateNode",
+                            "compiled_prompt",
+                        ),
+                        _edge(
+                            package_gate_id,
+                            "ApprovalGateNode",
+                            "compiled_prompt",
+                            anchor_node_id,
+                            "ImageGenerationNode",
+                            "compiled_prompt",
+                        ),
+                        _edge(
+                            anchor_node_id,
+                            "ImageGenerationNode",
+                            "approved_anchor",
+                            review_node_id,
+                            "ReviewNode",
+                            "approved_anchor",
+                        ),
+                        _edge(
+                            review_node_id,
+                            "ReviewNode",
+                            "approved_anchor",
+                            video_node_id,
+                            "VideoGenerationNode",
+                            "approved_anchor",
+                        ),
+                    )
+                )
+                for beat_id in beat_ids_by_clip.get(clip.id, []):
+                    edges.append(
+                        _edge(
+                            beat_id,
+                            "ShotBeatNode",
+                            "storyboard_shot[]",
+                            clip.id,
+                            "VideoSegmentNode",
+                            "video_segment[]",
+                            relation_type="generation_clip_shot",
+                        )
+                    )
+            nodes.append(
+                {
+                    "id": str(package_gate_id),
+                    "type": "ApprovalGateNode",
+                    "objectType": "storyboard_package",
+                    "objectId": str(storyboard_revision.id),
+                    "status": storyboard_revision.status,
+                    "data": {
+                        "title": "批准生产分镜包",
+                        "phase": "storyboard",
+                        "recipeInstanceId": recipe_instance_id,
+                        "storyboardRevisionId": str(storyboard_revision.id),
+                        "revision": storyboard_revision.revision,
+                        "productionPackageHash": storyboard_revision.production_package_hash,
+                        "compiledPromptCount": sum(
+                            clip.prompt_id is not None for clip in generation_clips
+                        ),
+                        "requiredPromptCount": len(generation_clips),
+                        "approved": package_approved,
+                    },
+                }
+            )
     positions = {str(item.get("nodeId")): item for item in (layout.nodes_json if layout else [])}
+    if brief is not None and str(brief_node_id) not in positions:
+        brief_version_ids = list(
+            session.scalars(
+                select(StoryBriefRecord.id)
+                .where(StoryBriefRecord.production_run_id == project_id)
+                .order_by(StoryBriefRecord.revision.desc())
+            )
+        )
+        inherited_position = next(
+            (
+                positions[str(version_id)]
+                for version_id in brief_version_ids
+                if str(version_id) in positions
+            ),
+            None,
+        )
+        if inherited_position is not None:
+            positions[str(brief_node_id)] = inherited_position
     stage_by_type = {
         "BriefNode": 0,
         "SubjectNode": 0,
@@ -7531,11 +12525,24 @@ def _canvas_json(
         "StoryboardDirectorNode": 5,
         "SceneNode": 6,
         "ShotBeatNode": 7,
+        "GenerationPlanNode": 9,
+        "VideoSegmentNode": 10,
+        "PromptArtifactNode": 11,
+        "ImageGenerationNode": 13,
+        "ReviewNode": 14,
+        "VideoGenerationNode": 15,
     }
     row_by_stage: dict[int, int] = {}
     for node in nodes:
         stored = positions.get(node["id"])
-        stage = stage_by_type.get(node["type"], 7)
+        stage = (
+            8
+            if node["type"] == "ApprovalGateNode"
+            and node.get("objectType") == "storyboard_structure"
+            else 12
+            if node["type"] == "ApprovalGateNode" and node.get("objectType") == "storyboard_package"
+            else stage_by_type.get(node["type"], 7)
+        )
         row = row_by_stage.get(stage, 0)
         row_by_stage[stage] = row + 1
         node["position"] = (
@@ -7572,16 +12579,6 @@ def _canvas_json(
                     execution="unavailable",
                     disabledReason=reason,
                 )
-        if node["type"] == "ShotBeatNode" and not node["data"].get("promptId"):
-            reason = "请先在分镜三步工作流中完成服务端分层 Prompt 编译并批准分镜"
-            node["blocker"] = reason
-            for action in node["availableActions"]:
-                if action["key"] == "generate_anchor":
-                    action.update(
-                        enabled=False,
-                        execution="unavailable",
-                        disabledReason=reason,
-                    )
     return {
         "projectId": str(project_id),
         "canvasV2Enabled": enabled,
@@ -7631,17 +12628,13 @@ def _apply_canvas_workflow_step_projection(
                 operation_matches = step.operation_key in operation_keys
                 phase_matches = not phases or task_phase in phases
                 recipe_matches = bool(
-                    recipe_instance_id
-                    and snapshot.get("recipeInstanceId") == recipe_instance_id
+                    recipe_instance_id and snapshot.get("recipeInstanceId") == recipe_instance_id
                 )
                 group_matches = bool(
-                    canvas_group_id
-                    and snapshot.get("canvasGroupId") == canvas_group_id
+                    canvas_group_id and snapshot.get("canvasGroupId") == canvas_group_id
                 )
                 step_matches = bool(
-                    operation_matches
-                    and phase_matches
-                    and (recipe_matches or group_matches)
+                    operation_matches and phase_matches and (recipe_matches or group_matches)
                 )
 
             if step_matches:
@@ -7675,10 +12668,11 @@ def _apply_canvas_workflow_step_projection(
 
 def _canvas_workflow_operation_label(operation_key: str) -> str:
     return {
-        "recipe:story_events": "生成三个事件方案",
+        "recipe:story_events": "生成完整故事候选（兼容入口）",
         "recipe:story_script": "扩写剧情脚本",
         "recipe:creative_brief": "补全创意简报",
         "recipe:character_design": "生成本集角色造型",
+        "recipe:character_design_validation": "验证三槽位引用顺序",
         "recipe:storyboard": "生成文本分镜",
         "recipe:anchor": "生成视觉锚点",
         "recipe:video": "生成逐镜视频",
@@ -7693,18 +12687,38 @@ def _edge(
     target_id: uuid.UUID,
     target_type: str,
     target_port: str,
+    *,
+    relation_type: str = "derived_flow",
 ) -> dict[str, Any]:
+    presentation_kind, default_visible, authority = _edge_presentation(
+        source_type=source_type,
+        target_type=target_type,
+        source_port=source_port,
+        target_port=target_port,
+        relation_type=relation_type,
+        user_managed=False,
+    )
     return {
-        "id": str(uuid.uuid5(source_id, f"{source_port}:{target_id}:{target_port}")),
+        "id": str(
+            uuid.uuid5(
+                source_id,
+                f"{source_port}:{target_id}:{target_port}"
+                if relation_type == "derived_flow"
+                else f"{source_port}:{target_id}:{target_port}:{relation_type}",
+            )
+        ),
         "sourceNodeId": str(source_id),
         "sourceNodeType": source_type,
         "sourcePort": source_port,
         "targetNodeId": str(target_id),
         "targetNodeType": target_type,
         "targetPort": target_port,
-        "relationType": "derived_flow",
+        "relationType": relation_type,
         "revision": 1,
         "systemManaged": True,
+        "presentationKind": presentation_kind,
+        "defaultVisible": default_visible,
+        "authority": authority,
         "availableActions": [
             {
                 "key": "disconnect_edge",

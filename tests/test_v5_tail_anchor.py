@@ -43,6 +43,12 @@ class _TailStore:
         destination.write_bytes(payload)
         return LandedAsset(destination, digest, len(payload))
 
+    def download(self, url: str, *, suffix: str) -> LandedAsset:
+        assert url == "https://provider.example/tail.png"
+        source = self.root / f"provider-tail{suffix}"
+        Image.new("RGB", (90, 160), color=(60, 90, 120)).save(source)
+        return self.import_local(source)
+
 
 class _TailProbe:
     def inspect_image(self, path: Path) -> dict[str, object]:
@@ -196,6 +202,37 @@ def test_adopt_previous_tail_extracts_once_and_replaces_unique_anchor(tmp_path: 
     assert tail.metadata["timestampMs"] == 11_850
     assert second.draft.reference_bindings == first.draft.reference_bindings
     assert extractor.calls == 1
+
+
+def test_provider_returned_tail_frame_is_saved_without_local_extraction(
+    tmp_path: Path,
+) -> None:
+    repository = _TailRepository(tmp_path)
+    extractor = _TailExtractor(tmp_path)
+    service = ShotProductionService(
+        repository=repository,  # type: ignore[arg-type]
+        gateway=None,
+        asset_store=_TailStore(tmp_path),  # type: ignore[arg-type]
+        media_probe=_TailProbe(),  # type: ignore[arg-type]
+        frame_extractor=extractor,  # type: ignore[arg-type]
+        provider_name="ark",
+        resolution="720p",
+    )
+    step_id = uuid.uuid4()
+
+    tail = service._land_provider_tail_frame(
+        source_video=repository.video,
+        shot_id=repository.shots[0].id,
+        step_id=step_id,
+        last_frame_url="https://provider.example/tail.png",
+    )
+
+    assert tail.role == "shot_tail_frame"
+    assert tail.status == "approved"
+    assert tail.step_id == step_id
+    assert tail.metadata["providerReturned"] is True
+    assert tail.metadata["sourceVideoAssetId"] == str(repository.video.id)
+    assert extractor.calls == 0
 
 
 def test_tail_anchor_becomes_stale_when_previous_selected_video_changes(

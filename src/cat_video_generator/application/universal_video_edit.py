@@ -56,7 +56,7 @@ class UniversalVideoEditRepository(Protocol):
         step_id: uuid.UUID,
         *,
         input_plan: dict[str, Any],
-        input_assets: tuple[StoredAsset, StoredAsset, StoredAsset],
+        input_assets: tuple[StoredAsset, ...],
     ) -> None: ...
 
     def complete_video_edit(
@@ -160,6 +160,13 @@ class UniversalVideoEditExecutor:
         end_ms = int(work["endMs"])
         provider_duration = min(13, max(4, math.ceil((end_ms - start_ms) / 1000)))
         anchors = tuple(_stored_asset(item) for item in work["anchors"])  # type: ignore[union-attr]
+        compilation = work.get("compilation")
+        direct_mode = isinstance(compilation, dict) and compilation.get("mode") == "direct"
+        references = (
+            tuple(_stored_asset(item) for item in work.get("references", ()))
+            if direct_mode
+            else ()
+        )
         temporary_paths: tuple[Path, ...] = ()
         if anchors:
             if len(anchors) != 2:
@@ -198,11 +205,12 @@ class UniversalVideoEditExecutor:
             source_video=_media_source(source),
             before_frame=_media_source(before_frame),
             after_frame=_media_source(after_frame),
+            references=tuple(_media_source(item) for item in references),
         )
         self._repository.record_video_edit_inputs(
             step_id,
             input_plan=input_plan.model_dump(mode="json", by_alias=True),
-            input_assets=(source, before_frame, after_frame),
+            input_assets=(source, before_frame, after_frame, *references),
         )
         task_id = work.get("providerTaskId")
         if isinstance(task_id, str) and task_id:
@@ -215,6 +223,7 @@ class UniversalVideoEditExecutor:
                     work["sourceInput"],  # type: ignore[arg-type]
                     before_frame.require_path(),
                     after_frame.require_path(),
+                    *(item.require_path() for item in references),
                 ),
             )
             self._repository.record_video_edit_submission(

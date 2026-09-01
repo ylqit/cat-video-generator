@@ -2,13 +2,37 @@
 
 from __future__ import annotations
 
-from sqlalchemy import Engine, create_engine, text
+import time
+from typing import Any
+
+from psycopg.errors import ConnectionTimeout
+from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from ...config import DatabaseOperation, DatabaseSettings
 from .models import SCHEMA_NAME
 
-ALEMBIC_HEAD = "0028_story_event_candidates"
+ALEMBIC_HEAD = "0031_workflow_task_cancellation"
+_CONNECTION_TIMEOUT_RETRY_DELAYS = (0.5, 1.5)
+
+
+def _connect_with_timeout_retry(
+    dialect: Any,
+    _connection_record: Any,
+    connection_args: list[Any],
+    connection_params: dict[str, Any],
+) -> Any:
+    """Retry transient PostgreSQL connection timeouts before a session exists."""
+
+    for attempt in range(len(_CONNECTION_TIMEOUT_RETRY_DELAYS) + 1):
+        try:
+            return dialect.connect(*connection_args, **connection_params)
+        except ConnectionTimeout:
+            if attempt == len(_CONNECTION_TIMEOUT_RETRY_DELAYS):
+                raise
+            time.sleep(_CONNECTION_TIMEOUT_RETRY_DELAYS[attempt])
+
+    raise RuntimeError("database connection retry loop exhausted unexpectedly")
 
 
 def create_database_engine(
@@ -36,7 +60,11 @@ def create_database_engine(
         pool_pre_ping=True,
         pool_recycle=900,
     )
-    return engine.execution_options(schema_translate_map={SCHEMA_NAME: settings.schema})
+    configured_engine = engine.execution_options(
+        schema_translate_map={SCHEMA_NAME: settings.schema}
+    )
+    event.listen(configured_engine, "do_connect", _connect_with_timeout_retry, retval=True)
+    return configured_engine
 
 
 def create_session_factory(engine: Engine) -> sessionmaker[Session]:

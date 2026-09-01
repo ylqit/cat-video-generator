@@ -104,7 +104,7 @@ npm --prefix web run dev -- --host 0.0.0.0
 浏览器访问：
 
 ```text
-http://<本机局域网地址>:5173/studio
+http://<本机局域网地址>:5173/projects
 ```
 
 日常已经安装依赖时，可跳过 `npm --prefix web install`。

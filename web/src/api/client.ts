@@ -1,25 +1,25 @@
 import type {
   AssetDto,
   AcceptedVisualAssetPlan,
-  CanvasDto,
-  CanvasLayoutSaveResult,
+  ProductionFlowLayoutSaveResult,
   CanvasAssetHistoryDto,
-  CanvasEdgeCreateRequest,
-  CanvasEdgeDto,
-  CanvasNodeType,
-  CanvasNodeAssetBindingDto,
-  CanvasNodeArchiveResult,
-  CanvasTemplateDto,
-  CanvasTemplateKey,
+  AssetGenerationLineageDto,
   CapabilityCompilationPlan,
   CreativeStepRecord,
+  CreativeDocumentDto,
   CreativeWorkflowDto,
+  CreateChildCatProjectInput,
+  CreateChildCatProjectResult,
   HealthDto,
   JobDto,
+  GenerationInputPreviewDto,
+  CharacterDesignInputPreviewDto,
+  CharacterDesignValidationPreviewDto,
   PersistentTaskDto,
   TaskCenterDto,
   PreviousTailStatus,
   ProductionBoardDto,
+  ProductionFlowDto,
   ProductionRecipeDefinitionDto,
   ProductionRecipeInstanceDto,
   EpisodeRulesDto,
@@ -28,14 +28,17 @@ import type {
   PromptRunDto,
   ProviderCapabilityDto,
   VideoFilmstripDto,
+  VideoWorkbenchDto,
   ProjectGraph,
   ProjectSummary,
+  ProjectWorkspaceShellDto,
   ReferenceBinding,
   ReferenceImageDraft,
   ReferenceRole,
   ReferenceUsage,
   RuntimeProductionConfig,
   RuntimeSettingsDto,
+  ScriptWorkspaceDto,
   SceneLookDraftDto,
   SceneLookDraftEnvelope,
   SceneDto,
@@ -54,6 +57,7 @@ import type {
   ShotSuggestion,
   ShotSuggestionOutput,
   StoryDiagnosisOutput,
+  StoryDocumentEditRequest,
   StoryboardPromptCompilationDto,
   StoryBriefInput,
   StoryExpansionOutput,
@@ -79,8 +83,44 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit, base = BASE): Promise<T> {
-  const response = await fetch(`${base}${path}`, init);
+export class ApiTimeoutError extends Error {
+  readonly timeoutMs: number;
+
+  constructor(timeoutMs: number) {
+    super(`请求在 ${Math.round(timeoutMs / 1000)} 秒内没有响应，请检查服务状态后重试`);
+    this.name = "ApiTimeoutError";
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+
+export async function request<T>(
+  path: string,
+  init?: RequestInit,
+  base = BASE,
+  timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+): Promise<T> {
+  const controller = new AbortController();
+  const externalSignal = init?.signal;
+  let timedOut = false;
+  const forwardExternalAbort = () => controller.abort(externalSignal?.reason);
+  if (externalSignal?.aborted) forwardExternalAbort();
+  else externalSignal?.addEventListener("abort", forwardExternalAbort, { once: true });
+  const timeoutId = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort(new ApiTimeoutError(timeoutMs));
+  }, timeoutMs);
+  let response: Response;
+  try {
+    response = await fetch(`${base}${path}`, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (timedOut) throw new ApiTimeoutError(timeoutMs);
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+    externalSignal?.removeEventListener("abort", forwardExternalAbort);
+  }
   if (!response.ok) {
     let detail: unknown = response.statusText;
     try {
@@ -224,14 +264,37 @@ export const api = {
     applyMode,
     sourceShotRevisions,
   }),
-  planVisualAssets: (sceneId: string, runtimeRevision?: number) =>
+  planVisualAssets: (
+    sceneId: string,
+    runtimeRevision: number | undefined,
+    lineage: {
+      storyboardRevisionId: string;
+      structureHash: string;
+      generationPlanId: string;
+      generationPlanHash: string;
+    },
+  ) =>
     paidJson<{ jobId: string }>(`/scenes/${sceneId}/visual-asset-plans`, {
       allowPaidGeneration: true,
+      ...lineage,
     }, runtimeRevision),
   acceptVisualAssetPlan: (stepId: string, plan: AcceptedVisualAssetPlan) =>
     json<CreativeStepRecord>(`/steps/${stepId}/accept-visual-asset-plan`, "POST", {
       plan,
     }),
+  reviseVisualAssetPlan: (
+    stepId: string,
+    revision: number,
+    plan: AcceptedVisualAssetPlan,
+    note = "",
+  ) => request<CreativeStepRecord>(`/steps/${stepId}/visual-asset-plan-revisions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "If-Match": String(revision),
+    },
+    body: JSON.stringify({ selections: plan.selections, note }),
+  }),
   sceneVisualAssets: (sceneId: string) =>
     request<SceneVisualAssetsDto>(`/scenes/${sceneId}/visual-assets`),
   addShot: (sceneId: string, body: Record<string, unknown>) =>
@@ -356,6 +419,7 @@ export const api = {
     draftRevision: number,
     regenerate = false,
     reason?: string,
+    expectedInputHash?: string,
     runtimeRevision?: number,
   ) =>
     paidJson<{ jobId: string }>(`/scenes/${sceneId}/look-images`, {
@@ -363,12 +427,14 @@ export const api = {
       draftRevision,
       regenerate,
       reason,
+      expectedInputHash,
     }, runtimeRevision),
   generateReferenceImage: (
     target: { projectId: string; sceneId?: string | null },
     draft: ReferenceImageDraft,
     regenerate = false,
     reason?: string,
+    expectedInputHash?: string,
     runtimeRevision?: number,
   ) => paidJson<{ jobId: string; operationKey: string }>(
     target.sceneId
@@ -379,8 +445,21 @@ export const api = {
       regenerate,
       reason,
       draft,
+      expectedInputHash,
     },
     runtimeRevision,
+  ),
+  previewReferenceImage: (
+    target: { projectId: string; sceneId?: string | null },
+    draft: ReferenceImageDraft,
+    regenerate = false,
+    reason?: string,
+  ) => json<GenerationInputPreviewDto & { operationKey: string }>(
+    target.sceneId
+      ? `/scenes/${target.sceneId}/reference-images/preview`
+      : `/projects/${target.projectId}/reference-images/preview`,
+    "POST",
+    { draft, regenerate, reason },
   ),
   generateVideo: (
     shotId: string,
@@ -412,8 +491,12 @@ export const api = {
   ) => paidJson<{ jobId: string }>(`/shots/${shotId}/range-edits`, body, runtimeRevision),
   buildSequence: (
     projectId: string,
-    transitions: Array<{ afterShotId: string; transition: SequenceTransitionDto }>,
-  ) => json<{ jobId: string }>(`/projects/${projectId}/sequences`, "POST", { transitions }),
+    draft: {
+      transitions: Array<{ afterShotId: string; transition: SequenceTransitionDto }>;
+      introTransition?: SequenceTransitionDto | null;
+      outroTransition?: SequenceTransitionDto | null;
+    },
+  ) => json<{ jobId: string }>(`/projects/${projectId}/sequences`, "POST", draft),
   sequences: (projectId: string) => request<SequenceDto[]>(`/projects/${projectId}/sequences`),
   selectSequence: (projectId: string, sequenceId: string, approve: boolean) =>
     json<SequenceDto>(`/projects/${projectId}/sequences/${sequenceId}/select`, "POST", {
@@ -427,6 +510,16 @@ export const api = {
   jobs: () => request<JobDto[]>("/jobs"),
   job: (jobId: string) => request<JobDto>(`/jobs/${jobId}`),
   taskCenter: () => request<TaskCenterDto>("/task-center"),
+  recoverPersistentTask: (stepId: string) =>
+    json<PersistentTaskDto>(`/task-center/tasks/${stepId}/recover`, "POST"),
+  cancelPersistentTask: (
+    stepId: string,
+    payload: {
+      expectedStatus: string;
+      expectedProviderTaskId?: string | null;
+      reason?: string | null;
+    },
+  ) => json<PersistentTaskDto>(`/steps/${stepId}/cancellation`, "POST", payload),
   taskCenterEventsUrl: (afterEventId = 0) =>
     `${BASE}/task-center/events?afterEventId=${Math.max(0, afterEventId)}`,
   projectTasks: (projectId: string) =>
@@ -463,11 +556,32 @@ export const canvasApi = {
     payload,
     { "If-Match": String(revision) },
   ),
-  runRecipeStory: (instanceId: string, acceptEstimatedCostMicros = 0) =>
+  reviseGenerationPlan: (
+    recipeInstanceId: string,
+    planId: string,
+    revision: number,
+    payload: {
+      provider: string;
+      model: string;
+      capabilityRevision: string;
+      clips: Array<{ shotBeatIds: string[] }>;
+      reason?: string;
+    },
+  ) => canvasJson<ProductionRecipeInstanceDto>(
+    `/recipe-instances/${recipeInstanceId}/generation-plans/${planId}`,
+    "PUT",
+    payload,
+    { "If-Match": String(revision) },
+  ),
+  runRecipeStory: (
+    instanceId: string,
+    acceptEstimatedCostMicros: number,
+    idempotencyKey: string,
+  ) =>
     canvasJson<JobDto>(
       `/recipe-instances/${instanceId}/story-runs`,
       "POST",
-      { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros },
+      { idempotencyKey, acceptEstimatedCostMicros },
     ),
   runRecipeStoryEvents: (instanceId: string, acceptEstimatedCostMicros = 0) =>
     canvasJson<JobDto>(
@@ -487,20 +601,55 @@ export const canvasApi = {
       "POST",
       { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros: 0 },
     ),
-  runRecipeCharacterDesign: (instanceId: string, acceptEstimatedCostMicros = 0) =>
+  previewRecipeCharacterDesign: (
+    instanceId: string,
+    idempotencyKey: string,
+    acceptEstimatedCostMicros = 0,
+    characterDesignStage: "all" | "identity" | "pair_scale" = "all",
+  ) => canvasJson<CharacterDesignInputPreviewDto>(
+    `/recipe-instances/${instanceId}/character-design-input-preview`,
+    "POST",
+    { idempotencyKey, acceptEstimatedCostMicros, characterDesignStage },
+  ),
+  runRecipeCharacterDesign: (
+    instanceId: string,
+    acceptEstimatedCostMicros = 0,
+    idempotencyKey: string = crypto.randomUUID(),
+    expectedInputHash?: string,
+    characterDesignStage: "all" | "identity" | "pair_scale" = "all",
+  ) =>
     canvasJson<JobDto>(
       `/recipe-instances/${instanceId}/character-design-runs`,
       "POST",
-      { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros },
+      { idempotencyKey, acceptEstimatedCostMicros, expectedInputHash, characterDesignStage },
     ),
+  previewRecipeCharacterDesignValidation: (
+    instanceId: string,
+    idempotencyKey: string,
+  ) => canvasJson<CharacterDesignValidationPreviewDto>(
+    `/recipe-instances/${instanceId}/character-design-validation-input-preview`,
+    "POST",
+    { idempotencyKey, acceptEstimatedCostMicros: 0 },
+  ),
+  runRecipeCharacterDesignValidation: (
+    instanceId: string,
+    acceptEstimatedCostMicros: number,
+    idempotencyKey: string,
+    expectedInputHash: string,
+  ) => canvasJson<JobDto>(
+    `/recipe-instances/${instanceId}/character-design-validation-runs`,
+    "POST",
+    { idempotencyKey, acceptEstimatedCostMicros, expectedInputHash },
+  ),
   runRecipeStoryboard: (
     instanceId: string,
     acceptEstimatedCostMicros = 0,
     options: {
       creationMode?: "from_story" | "from_characters";
+      sourceStoryRevisionId: string;
       referenceAssetIds?: string[];
       instruction?: string;
-    } = {},
+    },
   ) =>
     canvasJson<JobDto>(
       `/recipe-instances/${instanceId}/storyboard-runs`,
@@ -512,36 +661,42 @@ export const canvasApi = {
     shotId: string,
     acceptEstimatedCostMicros = 0,
     reason?: string,
+    expectedInputHash?: string,
   ) =>
     canvasJson<JobDto>(
       `/recipe-instances/${instanceId}/shots/${shotId}/anchor-runs`,
       "POST",
-      { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros, reason },
+      { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros, reason, expectedInputHash },
     ),
   runRecipeVideo: (
     instanceId: string,
     shotId: string,
     acceptEstimatedCostMicros = 0,
     reason?: string,
+    expectedInputHash?: string,
   ) =>
     canvasJson<JobDto>(
       `/recipe-instances/${instanceId}/shots/${shotId}/video-runs`,
       "POST",
-      { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros, reason },
+      { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros, reason, expectedInputHash },
     ),
   runRecipeSequence: (
     instanceId: string,
     acceptEstimatedCostMicros = 0,
-    transitions: Array<{ afterShotId: string; transition: SequenceTransitionDto }> = [],
+    sequence: {
+      transitions: Array<{ afterShotId: string; transition: SequenceTransitionDto }>;
+      introTransition?: SequenceTransitionDto | null;
+      outroTransition?: SequenceTransitionDto | null;
+    } = { transitions: [] },
   ) =>
     canvasJson<JobDto>(
       `/recipe-instances/${instanceId}/sequence-runs`,
       "POST",
-      { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros, transitions },
+      { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros, ...sequence },
     ),
   reviewRecipeTarget: (payload: {
     recipeInstanceId: string;
-    targetType: "creative_brief" | "story_event" | "story_revision" | "episode_rules" | "character_design" | "storyboard_revision" | "shot_beat" | "anchor_asset" | "video_asset" | "final_sequence";
+    targetType: "creative_brief" | "story_event" | "story_revision" | "episode_rules" | "character_design" | "storyboard_structure" | "generation_plan" | "storyboard_package" | "storyboard_revision" | "shot_beat" | "anchor_asset" | "video_asset" | "final_sequence";
     targetId: string;
     targetRevision?: number;
     targetHash?: string;
@@ -551,97 +706,65 @@ export const canvasApi = {
     reason?: string;
     episodeRules?: EpisodeRulesDto;
   }) => canvasJson<Record<string, unknown>>("/review-decisions", "POST", payload),
-  compileCanvasGroup: (groupId: string) =>
-    canvasJson<Record<string, unknown>>(`/canvas-groups/${groupId}/compile-run`, "POST"),
-  runCanvasGroup: (groupId: string, acceptEstimatedCostMicros = 0) =>
-    canvasJson<JobDto>(
-      `/canvas-groups/${groupId}/runs`,
-      "POST",
-      { idempotencyKey: crypto.randomUUID(), acceptEstimatedCostMicros },
-    ),
-  saveCanvasGroupTemplate: (groupId: string) =>
-    canvasJson<Record<string, unknown>>(
-      `/canvas-groups/${groupId}/toolbox-templates`,
-      "POST",
-    ),
-  convertCanvasGroupToShots: (groupId: string) =>
-    canvasJson<Record<string, unknown>>(`/canvas-groups/${groupId}/shot-groups`, "POST"),
-  ungroupCanvasGroup: (groupId: string, revision: number) =>
-    canvasJson<Record<string, unknown>>(
-      `/canvas-groups/${groupId}/ungroup`,
-      "POST",
-      undefined,
-      { "If-Match": String(revision) },
-    ),
-  canvasGroupDownloadManifest: (groupId: string) =>
-    request<Record<string, unknown>>(
-      `/canvas-groups/${groupId}/download-manifest`,
-      undefined,
-      CANVAS_BASE,
-    ),
-  canvasGroupDownloadUrl: (groupId: string) => `${CANVAS_BASE}/canvas-groups/${groupId}/download`,
-  templates: () => request<CanvasTemplateDto[]>("/canvas-templates", undefined, CANVAS_BASE),
-  instantiateTemplate: (projectId: string, templateKey: CanvasTemplateKey) =>
-    canvasJson<Record<string, unknown>>(
-      `/projects/${projectId}/template-instances`,
-      "POST",
-      { templateKey },
-    ),
-  canvas: (projectId: string) =>
-    request<CanvasDto>(`/projects/${projectId}/canvas`, undefined, CANVAS_BASE),
-  createNode: (
-    projectId: string,
+  confirmStoryboardProductionPlan: (
+    instanceId: string,
     payload: {
-      nodeType: CanvasNodeType;
-      objectType: string;
-      objectId?: string | null;
-      data?: Record<string, unknown>;
+      idempotencyKey: string;
+      storyboardRevisionId: string;
+      storyboardRevision: number;
+      structureHash: string;
+      generationPlanId: string;
+      generationPlanRevision: number;
+      generationPlanHash: string;
+      reason?: string;
     },
   ) => canvasJson<Record<string, unknown>>(
-    `/projects/${projectId}/canvas/nodes`, "POST", payload,
-  ),
-  createEdge: (projectId: string, edge: CanvasEdgeCreateRequest) =>
-    canvasJson<CanvasEdgeDto>(`/projects/${projectId}/canvas/edges`, "POST", edge),
-  deleteEdge: (edgeId: string) =>
-    canvasJson<Record<string, unknown>>(`/canvas/edges/${edgeId}`, "DELETE"),
-  archiveNode: (
-    projectId: string,
-    nodeId: string,
-    layoutVersion: number,
-    reason?: string,
-  ) => canvasJson<CanvasNodeArchiveResult>(
-    `/projects/${projectId}/canvas/nodes/${nodeId}/archive`,
+    `/recipe-instances/${instanceId}/storyboard-production-confirmations`,
     "POST",
-    { reason },
-    { "If-Match": String(layoutVersion) },
+    payload,
   ),
-  restoreNode: (
+  workspaceShell: (projectId: string, signal?: AbortSignal) => request<ProjectWorkspaceShellDto>(
+    `/projects/${projectId}/workspace-shell`,
+    signal ? { signal } : undefined,
+    CANVAS_BASE,
+  ),
+  scriptWorkspace: (projectId: string, signal?: AbortSignal) => request<ScriptWorkspaceDto>(
+    `/projects/${projectId}/script-workspace`,
+    signal ? { signal } : undefined,
+    CANVAS_BASE,
+  ),
+  productionFlow: (projectId: string, signal?: AbortSignal) => request<ProductionFlowDto>(
+    `/projects/${projectId}/production-flow`,
+    signal ? { signal } : undefined,
+    CANVAS_BASE,
+  ),
+  saveProductionFlowLayout: (
     projectId: string,
-    nodeId: string,
-    layoutVersion: number,
-  ) => canvasJson<CanvasNodeArchiveResult>(
-    `/projects/${projectId}/canvas/nodes/${nodeId}/restore`,
-    "POST",
-    {},
-    { "If-Match": String(layoutVersion) },
+    revision: number,
+    payload: {
+      nodes: Array<{ nodeId: string; x: number; y: number }>;
+      viewport: { x: number; y: number; zoom: number };
+      operations?: Array<Record<string, unknown>>;
+    },
+  ) => canvasJson<ProductionFlowLayoutSaveResult>(
+    `/projects/${projectId}/production-flow/layout`,
+    "PATCH",
+    payload,
+    { "If-Match": String(revision) },
   ),
+  videoWorkbench: (projectId: string, signal?: AbortSignal) => request<VideoWorkbenchDto>(
+    `/projects/${projectId}/video-workbench`,
+    signal ? { signal } : undefined,
+    CANVAS_BASE,
+  ),
+  createChildCatProject: (payload: CreateChildCatProjectInput) =>
+    canvasJson<CreateChildCatProjectResult>("/projects", "POST", payload),
   saveBrief: (projectId: string, brief: StoryBriefInput) =>
     canvasJson<Record<string, unknown>>(`/projects/${projectId}/brief`, "PUT", brief),
   createSubject: (projectId: string, subject: SubjectInput) =>
     canvasJson<Record<string, unknown>>(`/projects/${projectId}/subjects`, "POST", subject),
   subjects: (projectId: string) =>
     request<SubjectDto[]>(`/projects/${projectId}/subjects`, undefined, CANVAS_BASE),
-  bindNodeAssets: (
-    nodeId: string,
-    revision: number,
-    bindings: CanvasNodeAssetBindingDto[],
-    allowMove: boolean,
-  ) => canvasJson<Record<string, unknown>>(
-    `/canvas/nodes/${nodeId}/asset-bindings`,
-    "PUT",
-    { bindings, allowMove },
-    { "If-Match": String(revision) },
-  ),
   createSubjectCompletionRun: (
     projectId: string,
     subjectId: string,
@@ -666,15 +789,15 @@ export const canvasApi = {
     "POST",
     { acceptedFields, finalDraft },
   ),
-  assets: (projectId: string, kind?: "image" | "video" | "audio") =>
+  assets: (projectId: string, kind?: "image" | "video" | "audio", signal?: AbortSignal) =>
     request<CanvasAssetHistoryDto[]>(
       `/projects/${projectId}/assets${kind ? `?kind=${kind}` : ""}`,
-      undefined,
+      signal ? { signal } : undefined,
       CANVAS_BASE,
     ),
-  visualPresets: () => request<VisualPresetProfileDto[]>(
+  visualPresets: (signal?: AbortSignal) => request<VisualPresetProfileDto[]>(
     "/visual-presets",
-    undefined,
+    signal ? { signal } : undefined,
     CANVAS_BASE,
   ),
   applyVisualPreset: (projectId: string, presetKey: string) =>
@@ -685,9 +808,9 @@ export const canvasApi = {
       canvasNodeIds: string[];
       reusedAssetIds: string[];
     }>(`/projects/${projectId}/visual-presets/${presetKey}/apply`, "POST", {}),
-  episodeVisualProfile: (projectId: string) => request<EpisodeVisualProfileDto>(
+  episodeVisualProfile: (projectId: string, signal?: AbortSignal) => request<EpisodeVisualProfileDto>(
     `/projects/${projectId}/visual-profile`,
-    undefined,
+    signal ? { signal } : undefined,
     CANVAS_BASE,
   ),
   updateEpisodeVisualProfile: (
@@ -717,16 +840,6 @@ export const canvasApi = {
       undefined,
       CANVAS_BASE,
     ),
-  saveNodeGenerationConfig: (
-    nodeId: string,
-    revision: number,
-    payload: Record<string, unknown>,
-  ) => canvasJson<Record<string, unknown>>(
-    `/canvas/nodes/${nodeId}/generation-config`,
-    "PUT",
-    payload,
-    { "If-Match": String(revision) },
-  ),
   runStoryStrategies: (projectId: string, rewriteInstruction?: string) =>
     canvasJson<JobDto>(
       `/projects/${projectId}/story-strategy-runs`,
@@ -738,13 +851,16 @@ export const canvasApi = {
     ),
   approveStory: (revisionId: string) =>
     canvasJson<Record<string, unknown>>(`/story-revisions/${revisionId}/approve`, "POST", {}),
+  editStoryRevision: (revisionId: string, payload: StoryDocumentEditRequest) =>
+    canvasJson<CreativeDocumentDto>(`/story-revisions/${revisionId}/edits`, "POST", payload),
   createStoryboard: (
     projectId: string,
     options: {
       creationMode?: "from_story" | "from_characters";
+      sourceStoryRevisionId: string;
       referenceAssetIds?: string[];
       instruction?: string;
-    } = {},
+    },
   ) => canvasJson<JobDto>(
     `/projects/${projectId}/storyboard-runs`,
     "POST",
@@ -757,6 +873,21 @@ export const canvasApi = {
       patch,
       { "If-Match": String(revision) },
     ),
+  replaceBeatReferences: (
+    beatId: string,
+    referenceRevision: number,
+    bindings: Array<{
+      assetId: string;
+      semanticRole: "composition" | "pose" | "wardrobe" | "prop" | "environment_detail";
+      instruction: string;
+      ordinal: number;
+    }>,
+  ) => canvasJson<Record<string, unknown>>(
+    `/shot-beats/${beatId}/reference-bindings`,
+    "PUT",
+    { bindings },
+    { "If-Match": String(referenceRevision) },
+  ),
   saveManualStoryboard: (
     projectId: string,
     revision: number,
@@ -772,6 +903,10 @@ export const canvasApi = {
     projectId: string,
     payload: {
       storyRevisionId: string;
+      storyboardRevisionId?: string;
+      structureHash?: string;
+      generationPlanId?: string;
+      generationPlanHash?: string;
       visualProfileRevisionId: string;
       healingRecipe: boolean;
       shots: Array<Record<string, unknown>>;
@@ -789,8 +924,15 @@ export const canvasApi = {
     provider?: string;
     model?: string;
     idempotencyKey: string;
+    expectedInputHash: string;
     input: Record<string, unknown>;
   }) => canvasJson<Record<string, unknown>>("/generation-batches", "POST", payload),
+  assetGenerationLineage: (assetId: string) =>
+    request<AssetGenerationLineageDto>(
+      `/assets/${assetId}/generation-lineage`,
+      undefined,
+      CANVAS_BASE,
+    ),
   createVideoEditRecipe: (payload: {
     projectId: string;
     sourceAssetId: string;
@@ -836,21 +978,6 @@ export const canvasApi = {
   ),
   promptRun: (promptId: string) =>
     request<PromptRunDto>(`/prompt-runs/${promptId}`, undefined, CANVAS_BASE),
-  saveLayout: (
-    projectId: string,
-    version: number,
-    payload: {
-      nodes: Array<{ nodeId: string; x: number; y: number }>;
-      viewport: { x: number; y: number; zoom: number };
-      operations: Array<Record<string, unknown>>;
-    },
-  ) => canvasJson<CanvasLayoutSaveResult>(
-    `/projects/${projectId}/canvas/layout`,
-    "PATCH",
-    payload,
-    { "If-Match": String(version) },
-  ),
-  eventsUrl: (projectId: string) => `${CANVAS_BASE}/projects/${projectId}/events`,
 };
 
 export type SuggestionJobResult = { stepId: string; output: ShotSuggestionOutput };

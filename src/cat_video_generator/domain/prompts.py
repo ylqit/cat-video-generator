@@ -99,7 +99,7 @@ def compile_story_diagnosis_prompt(
 【上一场景摘要】{previous}
 【下一场景摘要】{following}
 【目标视频片段数量】{scene.target_shot_count}
-【每片段允许时长】8至15秒
+【每片段允许时长】4至15秒
 【长期人物约束】{visual_profile.person_identity}；{visual_profile.person_hair}；{visual_profile.person_body}
 【长期猫咪约束】{visual_profile.cat_identity}
 【系列画风】{'、'.join(visual_profile.style_positive)}
@@ -176,7 +176,7 @@ def compile_shot_suggestion_prompt(
    剧情没有明确要求时，不给猫咪添加帽子、背包，不让猫咪操作复杂工具。
 4. 人与猫必须发生可见的因果互动，不能只是在同一画面共存；节奏温和、低冲突、日常治愈。
 5. 不虚构用户原文没有的第二个事件，不输出数据库或生命周期术语。
-6. 每个片段建议8至15秒；suggestedDurationSeconds填写整数，但不得在direction中编造精确秒点。
+6. 每个片段建议4至15秒；suggestedDurationSeconds填写整数，但不得在direction中编造精确秒点。
 7. 同时给出lookPlan：personWardrobe、personAccessories、catAppearance、keyProps、
    environmentStyle、personPose、catPose、composition、additionalInstructions、
    imageRecommended、recommendationReason。只有服饰、配件、关键道具或双主体关系需要视觉确认时才建议场景视觉基准图。
@@ -354,6 +354,7 @@ def compile_shot_video_prompt(
     style_profile: StyleProfile = DEFAULT_STYLE_PROFILE,
     visual_profile: VisualProfileDraft | None = None,
     semantic_aliases: dict[str, str] | None = None,
+    precompiled_creative_body: bool = False,
 ) -> CompiledPrompt:
     return compile_shot_video_prompt_parts(
         context,
@@ -364,6 +365,7 @@ def compile_shot_video_prompt(
         style_profile=style_profile,
         visual_profile=visual_profile,
         semantic_aliases=semantic_aliases,
+        precompiled_creative_body=precompiled_creative_body,
     ).final
 
 
@@ -378,6 +380,7 @@ def compile_shot_video_prompt_parts(
     visual_profile: VisualProfileDraft | None = None,
     semantic_aliases: dict[str, str] | None = None,
     strict_semantic_links: bool = True,
+    precompiled_creative_body: bool = False,
 ) -> CompiledShotVideoPrompt:
     profile = visual_profile or VisualProfileDraft(
         personIdentity=series_profile.person_identity,
@@ -410,6 +413,9 @@ def compile_shot_video_prompt_parts(
         binding.provider_role is ProviderMediaRole.FIRST_FRAME
         for binding in input_plan.bindings
     )
+    material_aliases = "、".join(
+        binding.prompt_alias for binding in input_plan.bindings
+    ) or "无图片输入"
     if first_frame_mode:
         prefix = (
             f"【首帧职责】输出{input_plan.resolution}、9:16竖屏、"
@@ -418,6 +424,12 @@ def compile_shot_video_prompt_parts(
             "只延续首帧并执行下方动作、微表情、运镜与声音变化，"
             "不得重写、重构或补充人物、猫咪与画风特征。"
             f"素材：{binding_text}"
+        )
+    elif precompiled_creative_body:
+        prefix = (
+            f"【执行规格】输出{input_plan.resolution}、9:16竖屏、"
+            f"{context.duration_seconds}秒的一个完整视频片段，使用原生环境声和动作声。"
+            f"实际图片输入：{material_aliases}，按创作正文中已确认的参考职责与冻结顺序使用。"
         )
     else:
         prefix = (
@@ -439,17 +451,26 @@ def compile_shot_video_prompt_parts(
     system_shell = _compiled(
         f"""{prefix}
 
-【片段内子镜头、动作路径和结果】项目“{context.project_title}”，场景“{context.scene_title}”，视频片段“{context.shot_title}”。正文由片段已确认正文注入，此技术外壳不改写创作内容。
+正文由片段已确认正文注入，此技术外壳不改写创作内容。
 
 {suffix}"""
     )
-    final = _compiled(
-        f"""{prefix}
+    if precompiled_creative_body and not first_frame_mode:
+        final = _compiled(
+            f"""{creative_body}
+
+{prefix}
+
+{suffix}"""
+        )
+    else:
+        final = _compiled(
+            f"""{prefix}
 
 【片段内子镜头、动作路径和结果】项目“{context.project_title}”，场景“{context.scene_title}”，视频片段“{context.shot_title}”。严格按下列编号子镜头的顺序、空间连续性和因果关系执行：{creative_body}
 
 {suffix}"""
-    )
+        )
     return CompiledShotVideoPrompt(
         creative_body=creative_body,
         system_shell=system_shell,
@@ -549,7 +570,7 @@ def compile_anchor_review_prompt(context: ShotPromptContext) -> str:
 镜头：{context.shot_title}
 预期：{context.direction}
 请指出儿童身份与年龄、猫咪脸部毛色和体型、猫科身体结构、固定服装、关键道具初始位置、
-构图以及统一水彩画风的问题。不要把普通水彩晕染或轻微背景差异误报为身份漂移。""".strip()
+构图以及项目锁定画风的问题。不要把锁定画风允许的轻微背景差异误报为身份漂移。""".strip()
 
 
 def compile_range_edit_prompt(

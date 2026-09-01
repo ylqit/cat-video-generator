@@ -19,12 +19,15 @@ from cat_video_generator.application.shot_queue import (
     RevisionConflictError,
 )
 from cat_video_generator.domain.contracts import (
+    AcceptedVisualAssetPlan,
     SceneDraft,
     ShotAssistAnalysis,
     ShotCardDraft,
     ShotPromptContext,
     StoryDiagnosisOutput,
     StoryRewriteOutput,
+    VisualAssetAction,
+    VisualAssetPlanSelection,
     VisualProfileDraft,
 )
 from cat_video_generator.domain.creative_workflow import story_source_hash
@@ -34,9 +37,9 @@ from cat_video_generator.domain.prompts import (
     compile_story_diagnosis_prompt,
     compile_story_rewrite_prompt,
 )
-from cat_video_generator.domain.rendering import build_shot_input_plan
+from cat_video_generator.domain.rendering import MediaSource, build_shot_input_plan
 from cat_video_generator.domain.shot_assistance import analyze_shot_draft
-from cat_video_generator.domain.workflow import RunStatus, SceneStatus, StepStatus
+from cat_video_generator.domain.workflow import RunStatus, SceneStatus, StepKind, StepStatus
 
 
 def _diagnosis_payload() -> dict[str, object]:
@@ -382,6 +385,131 @@ def test_story_diagnosis_requires_payment_and_keeps_provider_and_accepted_drafts
     assert repository.scene.draft.source_text == "孩子和猫咪整理装备后出门。"
 
 
+def test_manual_visual_asset_plan_revision_is_versioned_without_provider_call() -> None:
+    class RevisionRepository(_Repository):
+        def __init__(self) -> None:
+            super().__init__()
+            self.storyboard_revision_id = uuid.uuid4()
+            self.generation_plan_id = uuid.uuid4()
+            self.revision_call: dict[str, object] | None = None
+
+        def storyboard_production_context(self, scene_id: uuid.UUID) -> dict[str, object]:
+            assert scene_id == self.scene.id
+            return {
+                "structureApproved": True,
+                "generationPlanApproved": True,
+                "storyboardRevisionId": str(self.storyboard_revision_id),
+                "structureHash": "structure-hash",
+                "generationPlanId": str(self.generation_plan_id),
+                "generationPlanHash": "generation-plan-hash",
+            }
+
+        def list_assets(self, **_values: object) -> tuple[object, ...]:
+            return ()
+
+        def revise_visual_asset_plan(self, **values: object) -> StoredStep:
+            self.revision_call = values
+            source = self.get_step(values["step_id"])  # type: ignore[arg-type]
+            revised = replace(
+                source,
+                id=uuid.uuid4(),
+                attempt=source.attempt + 1,
+                provider="manual",
+                model="human-editor",
+                input_snapshot={
+                    **source.input_snapshot,
+                    "source": "manual",
+                    "manualRevisionOfStepId": str(source.id),
+                    "manualRevisionNote": values["note"],
+                    "acceptedOutput": values["accepted_output"].model_dump(  # type: ignore[union-attr]
+                        mode="json", by_alias=True
+                    ),
+                },
+            )
+            self.steps.append(revised)
+            return revised
+
+    repository = RevisionRepository()
+    unavailable_planning_reference_id = uuid.uuid4()
+    provider_output = {
+        "overallAssessment": "只保留真正需要的场景参考。",
+        "suggestions": [
+            {
+                "suggestionKey": "rainy-yard",
+                "displayName": "雨后小院",
+                "purpose": "environment",
+                "targetScope": "scene",
+                "rationale": "建立环境",
+                "prompt": "雨后小院空镜",
+                "referenceAssetIds": [str(unavailable_planning_reference_id)],
+            }
+        ],
+        "textOnlyItems": [],
+    }
+    accepted = AcceptedVisualAssetPlan(
+        selections=[
+            VisualAssetPlanSelection(
+                suggestionKey="rainy-yard",
+                action="generate",
+                displayName="雨后小院",
+                purpose="environment",
+                targetScope="scene",
+                prompt="雨后小院空镜",
+                referenceAssetIds=[unavailable_planning_reference_id],
+            )
+        ]
+    )
+    step = StoredStep(
+        id=uuid.uuid4(),
+        project_id=repository.project.id,
+        scene_id=repository.scene.id,
+        shot_card_id=None,
+        kind=StepKind.DIRECTOR,
+        status=StepStatus.SUCCEEDED,
+        attempt=1,
+        operation_key="director:visual-asset-plan",
+        input_snapshot={
+            **repository.storyboard_production_context(repository.scene.id),
+            "providerOutput": provider_output,
+            "acceptedOutput": accepted.model_dump(mode="json", by_alias=True),
+            "acceptedAt": datetime.now(UTC).isoformat(),
+        },
+    )
+    repository.steps.append(step)
+    gateway = _Gateway()
+    service = ProjectEditingService(
+        repository=repository,  # type: ignore[arg-type]
+        director=gateway,
+        provider_name="fake",
+    )
+    revised_plan = AcceptedVisualAssetPlan(
+        selections=[
+            accepted.selections[0].model_copy(update={"action": VisualAssetAction.SKIP})
+        ]
+    )
+
+    revised = service.revise_visual_asset_plan(
+        step.id,
+        expected_revision=1,
+        plan=revised_plan,
+        note="已有环境参考足够，跳过重复生成",
+    )
+
+    assert revised.attempt == 2
+    assert revised.provider == "manual"
+    assert revised.input_snapshot["acceptedOutput"]["selections"][0]["action"] == "skip"
+    assert repository.revision_call is not None
+    assert gateway.calls == []
+
+    with pytest.raises(RevisionConflictError, match="最新规划版本"):
+        service.revise_visual_asset_plan(
+            step.id,
+            expected_revision=0,
+            plan=revised_plan,
+            note="过期页面提交",
+        )
+
+
 def test_story_rewrite_requires_accepted_diagnosis_and_updates_existing_source_text() -> None:
     repository = _Repository()
     gateway = _Gateway()
@@ -646,6 +774,62 @@ def test_video_prompt_preview_parts_separate_creative_body_from_system_shell() -
     assert "由片段已确认正文注入" in parts.system_shell.text
     assert context.direction in parts.final.text
     assert "480p" in parts.system_shell.text
+
+
+def test_precompiled_video_prompt_is_not_wrapped_in_a_duplicate_reference_contract() -> None:
+    creative_body = """任务：生成一个 9:16、8秒的原创二维治愈生活短片。
+
+参考职责：
+@图片1 是儿童当前唯一身份与本集造型来源。
+@图片2 是猫咪当前唯一身份与本集造型来源。
+
+身份连续性：儿童保持齐下颌短发；猫咪保持灰白虎斑和四足结构。
+
+镜头正文：孩子在窗边发现纸星星，猫咪用鼻尖推回，最后一起贴到玻璃上。"""
+    context = ShotPromptContext(
+        project_title="纸星星",
+        scene_title="清晨窗边",
+        scene_text="孩子和猫咪在窗边迎接阳光。",
+        shot_title="晨风吹落的星",
+        direction=creative_body,
+        duration_seconds=8,
+    )
+    plan = build_shot_input_plan(
+        resolution="720p",
+        duration_seconds=8,
+        anchor=None,
+        references=tuple(
+            MediaSource(
+                asset_id=uuid.UUID(int=index),
+                semantic_key=f"reference:{index}",
+                media_type="image",
+                sha256=f"{index:064x}",
+                metadata={},
+            )
+            for index in (1, 2)
+        ),
+    )
+
+    parts = compile_shot_video_prompt_parts(
+        context,
+        plan,
+        binding_descriptions=(
+            "@图片1=本集儿童设计；职责=儿童身份与本集造型",
+            "@图片2=本集猫咪设计；职责=猫咪身份、花纹与四足结构",
+        ),
+        precompiled_creative_body=True,
+    )
+
+    assert parts.creative_body == creative_body
+    assert creative_body in parts.final.text
+    assert creative_body not in parts.system_shell.text
+    assert parts.final.text.count("参考职责：") == 1
+    assert parts.final.text.count("身份连续性：") == 1
+    assert "【主体、画风和素材职责】" not in parts.final.text
+    assert "【片段内子镜头、动作路径和结果】" not in parts.final.text
+    assert "【执行规格】" in parts.final.text
+    assert "@图片1、@图片2" in parts.final.text
+    assert "720p" in parts.final.text
 
 
 def test_project_canon_repair_preserves_profile_text_and_cleans_misbound_scene_looks() -> None:

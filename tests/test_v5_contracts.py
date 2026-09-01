@@ -18,7 +18,10 @@ from cat_video_generator.domain.rendering import (
     SequenceTransition,
     build_shot_input_plan,
 )
-from cat_video_generator.interfaces.api_schemas import AcceptSuggestionsRequest
+from cat_video_generator.interfaces.api_schemas import (
+    AcceptSuggestionsRequest,
+    BuildSequenceRequest,
+)
 
 
 def test_v5_contract_defaults_are_backward_compatible() -> None:
@@ -30,8 +33,8 @@ def test_v5_contract_defaults_are_backward_compatible() -> None:
     assert scene.target_shot_count == 1
     assert scene.look_plan is None
     assert shot.inherit_project_references is True
-    assert shot.scene_look_usage is contracts.SceneLookUsage.APPEARANCE_ONLY
-    assert shot.use_scene_look is True
+    assert shot.scene_look_usage is contracts.SceneLookUsage.OFF
+    assert shot.use_scene_look is False
 
 
 def test_accept_suggestions_contract_defaults_and_parses_shot_revisions() -> None:
@@ -55,7 +58,7 @@ def test_accept_suggestions_contract_defaults_and_parses_shot_revisions() -> Non
     assert request.shots[0].anchor_mode is contracts.AnchorMode.TEXT_ONLY
     assert (
         request.shots[0].scene_look_usage
-        is contracts.SceneLookUsage.APPEARANCE_ONLY
+        is contracts.SceneLookUsage.OFF
     )
 
 
@@ -266,6 +269,25 @@ def test_v5_first_frame_video_prompt_does_not_rewrite_identity_or_style() -> Non
     assert "NEGATIVE_SENTINEL" not in prompt
 
 
+def test_legacy_web_sequence_request_accepts_intro_and_outro_fades() -> None:
+    request = BuildSequenceRequest.model_validate(
+        {
+            "transitions": [],
+            "introTransition": {"type": "fade_black", "durationMs": 400},
+            "outroTransition": {"type": "fade_black", "durationMs": 400},
+        }
+    )
+
+    assert request.intro_transition == SequenceTransition(
+        type="fade_black",
+        durationMs=400,
+    )
+    assert request.outro_transition == SequenceTransition(
+        type="fade_black",
+        durationMs=400,
+    )
+
+
 def test_v5_video_input_contract_rejects_reference_media_with_first_frame() -> None:
     with pytest.raises(ValueError, match="首帧模式不能同时提交普通参考图片"):
         build_shot_input_plan(
@@ -274,6 +296,20 @@ def test_v5_video_input_contract_rejects_reference_media_with_first_frame() -> N
             anchor=_image_source(1),
             references=(_image_source(2),),
         )
+
+
+def test_v5_video_input_contract_preserves_explicit_first_and_last_frames() -> None:
+    plan = build_shot_input_plan(
+        resolution="720p",
+        duration_seconds=10,
+        anchor=_image_source(1),
+        last_frame=_image_source(2),
+    )
+
+    assert [item.provider_role for item in plan.bindings] == [
+        ProviderMediaRole.FIRST_FRAME,
+        ProviderMediaRole.LAST_FRAME,
+    ]
 
 
 def test_v5_video_reference_mode_rejects_tenth_image() -> None:
@@ -386,14 +422,46 @@ def test_sequence_timeline_supports_cut_fade_and_cross_dissolve() -> None:
         ),
     ]
 
-    plan = ProjectSequencePlan(duration_ms=29_700, clips=clips)
+    plan = ProjectSequencePlan(
+        duration_ms=29_700,
+        clips=clips,
+        introTransition={"type": "fade_black", "durationMs": 500},
+        outroTransition={"type": "fade_black", "durationMs": 500},
+    )
 
     assert plan.clips[0].transition_from_previous is None
+    assert plan.intro_transition == SequenceTransition(
+        type="fade_black",
+        durationMs=500,
+    )
+    assert plan.outro_transition == SequenceTransition(
+        type="fade_black",
+        durationMs=500,
+    )
     assert plan.clips[1].transition_from_previous == SequenceTransition(
         type="fade_black",
         durationMs=300,
     )
     assert plan.clips[2].timeline_start_ms == 19_700
+
+
+def test_sequence_boundary_transitions_reject_cross_dissolve() -> None:
+    clip = SequenceClip(
+        order=1,
+        shot_card_id=uuid.uuid4(),
+        source_asset_id=uuid.uuid4(),
+        source_start_ms=0,
+        source_end_ms=8_000,
+        timeline_start_ms=0,
+        timeline_end_ms=8_000,
+    )
+
+    with pytest.raises(ValidationError):
+        ProjectSequencePlan(
+            duration_ms=8_000,
+            clips=[clip],
+            introTransition={"type": "cross_dissolve", "durationMs": 500},
+        )
 
 
 def test_sequence_rejects_timeline_that_ignores_dissolve_overlap() -> None:

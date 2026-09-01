@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from cat_video_generator.application.ports import (
     DirectorResult,
@@ -21,6 +22,7 @@ from cat_video_generator.application.universal_media_worker import (
     VideoFilmstripExecutor,
 )
 from cat_video_generator.application.universal_video_edit import UniversalVideoEditExecutor
+from cat_video_generator.domain.production_recipes import PaidRecipeRunRequest, RecipeDispatchError
 from cat_video_generator.domain.rendering import RenderOperation, VideoInputPlan
 from cat_video_generator.domain.workflow import StepStatus
 
@@ -55,6 +57,9 @@ def test_worker_claims_only_media_canvas_jobs_and_lands_one_audited_candidate(
 
         def update_progress(self, *_args: object, **_values: object) -> object:
             return lease
+
+        def assert_provider_submission_allowed(self, *_args: object, **_values: object) -> None:
+            events.append("submission_allowed")
 
     class Repository:
         def image_candidate_work(self, _step_id: uuid.UUID) -> dict[str, object]:
@@ -93,6 +98,7 @@ def test_worker_claims_only_media_canvas_jobs_and_lands_one_audited_candidate(
     assert result == {"stepId": str(lease.step_id), "assetId": "asset-1"}
     assert events == [
         "claimed",
+        "submission_allowed",
         "loaded_persisted_prompt",
         "provider_called",
         "downloaded",
@@ -120,6 +126,9 @@ def test_worker_dispatches_durable_recipe_task_and_stops_at_review_gate() -> Non
 
         def update_progress(self, *_args: object, **_values: object) -> object:
             return lease
+
+        def assert_provider_submission_allowed(self, *_args: object, **_values: object) -> None:
+            return None
 
         def finish(self, _step_id: uuid.UUID, **values: object) -> None:
             finished.append(values)
@@ -149,6 +158,139 @@ def test_worker_dispatches_durable_recipe_task_and_stops_at_review_gate() -> Non
     assert finished[0]["result_summary"] == {"message": "三个故事候选已生成"}
 
 
+def test_worker_persists_pre_provider_recipe_dispatch_failure_as_recoverable() -> None:
+    step_id = uuid.uuid4()
+    recipe_id = uuid.uuid4()
+    revision_id = uuid.uuid4()
+    lease = SimpleNamespace(
+        step_id=step_id,
+        operation_key="recipe:character_design",
+        input_snapshot={"recipeInstanceId": str(recipe_id)},
+        attempt=1,
+        progress={},
+    )
+    finished: list[dict[str, object]] = []
+
+    class Queue:
+        def claim_next(self, **_values: object) -> object:
+            return lease
+
+        def heartbeat(self, *_args: object, **_values: object) -> object:
+            return lease
+
+        def update_progress(self, *_args: object, **_values: object) -> object:
+            return lease
+
+        def assert_provider_submission_allowed(self, *_args: object, **_values: object) -> None:
+            return None
+
+        def finish(self, _step_id: uuid.UUID, **values: object) -> None:
+            finished.append(values)
+
+    class Executor:
+        def execute_queued_task(self, *_args: object, **_values: object) -> MediaExecutionResult:
+            raise RecipeDispatchError(
+                "三个角色设计图片批次未能原子落库",
+                context={
+                    "recipeInstanceId": str(recipe_id),
+                    "characterDesignRevisionId": str(revision_id),
+                },
+            )
+
+    worker = UniversalMediaWorker(
+        queue=Queue(),  # type: ignore[arg-type]
+        repository=SimpleNamespace(),  # type: ignore[arg-type]
+        gateway=SimpleNamespace(),  # type: ignore[arg-type]
+        asset_store=SimpleNamespace(),  # type: ignore[arg-type]
+        worker_id="dispatch-failure-worker-test",
+        recipe_task_executor=Executor(),
+    )
+
+    with pytest.raises(RecipeDispatchError, match="未能原子落库"):
+        worker.run_once()
+
+    assert finished == [
+        {
+            "worker_id": "dispatch-failure-worker-test",
+            "status": StepStatus.FAILED,
+            "error": {
+                "code": "recipe_dispatch_failed",
+                "failedStep": "create_generation_batches",
+                "recoverable": True,
+                "providerSubmitted": False,
+                "message": "三个角色设计图片批次未能原子落库",
+                "context": {
+                    "recipeInstanceId": str(recipe_id),
+                    "characterDesignRevisionId": str(revision_id),
+                },
+            },
+            "progress_update": {
+                "currentStep": 2,
+                "totalSteps": 3,
+                "percent": 35,
+                "message": "角色设计调度失败；供应商尚未提交，可从失败步骤继续",
+                "providerStatus": "not_submitted",
+            },
+        }
+    ]
+
+
+def test_worker_marks_character_recipe_input_validation_as_pre_provider_recoverable() -> None:
+    step_id = uuid.uuid4()
+    lease = SimpleNamespace(
+        step_id=step_id,
+        operation_key="recipe:character_design",
+        input_snapshot={"recipeInstanceId": str(uuid.uuid4())},
+        attempt=1,
+        progress={},
+    )
+    finished: list[dict[str, object]] = []
+
+    class Queue:
+        def claim_next(self, **_values: object) -> object:
+            return lease
+
+        def heartbeat(self, *_args: object, **_values: object) -> object:
+            return lease
+
+        def update_progress(self, *_args: object, **_values: object) -> object:
+            return lease
+
+        def assert_provider_submission_allowed(self, *_args: object, **_values: object) -> None:
+            return None
+
+        def finish(self, _step_id: uuid.UUID, **values: object) -> None:
+            finished.append(values)
+
+    class Executor:
+        def execute_queued_task(self, *_args: object, **_values: object) -> MediaExecutionResult:
+            PaidRecipeRunRequest.model_validate(
+                {
+                    "idempotencyKey": "character-design-identity",
+                    "acceptEstimatedCostMicros": 720_000,
+                    "characterDesignStage": "identity",
+                }
+            )
+            raise AssertionError("strict request parsing should have failed")
+
+    worker = UniversalMediaWorker(
+        queue=Queue(),  # type: ignore[arg-type]
+        repository=SimpleNamespace(),  # type: ignore[arg-type]
+        gateway=SimpleNamespace(),  # type: ignore[arg-type]
+        asset_store=SimpleNamespace(),  # type: ignore[arg-type]
+        worker_id="input-validation-worker-test",
+        recipe_task_executor=Executor(),
+    )
+
+    with pytest.raises(ValidationError, match="characterDesignStage"):
+        worker.run_once()
+
+    assert finished[0]["status"] is StepStatus.FAILED
+    assert finished[0]["error"]["code"] == "recipe_input_validation_failed"  # type: ignore[index]
+    assert finished[0]["error"]["providerSubmitted"] is False  # type: ignore[index]
+    assert finished[0]["progress_update"]["providerStatus"] == "not_submitted"  # type: ignore[index]
+
+
 def test_worker_persists_network_retry_count_without_changing_business_attempt() -> None:
     step_id = uuid.uuid4()
     lease = SimpleNamespace(
@@ -169,6 +311,9 @@ def test_worker_persists_network_retry_count_without_changing_business_attempt()
 
         def update_progress(self, *_args: object, **_values: object) -> object:
             return lease
+
+        def assert_provider_submission_allowed(self, *_args: object, **_values: object) -> None:
+            return None
 
         def finish(self, _step_id: uuid.UUID, **values: object) -> None:
             finished.append(values)
@@ -218,6 +363,9 @@ def test_worker_never_resubmits_submission_unknown() -> None:
 
         def update_progress(self, *_args: object, **_values: object) -> object:
             return lease
+
+        def assert_provider_submission_allowed(self, *_args: object, **_values: object) -> None:
+            return None
 
         def finish(self, _step_id: uuid.UUID, **values: object) -> None:
             finished.append(values)
@@ -274,6 +422,9 @@ def test_worker_submits_and_lands_audited_video_batch_candidate(tmp_path: Path) 
         def update_progress(self, *_args: object, **_values: object) -> object:
             return lease
 
+        def assert_provider_submission_allowed(self, *_args: object, **_values: object) -> None:
+            events.append("submission_allowed")
+
     class Repository:
         def video_candidate_work(self, _step_id: uuid.UUID) -> dict[str, object]:
             events.append("loaded_persisted_prompt")
@@ -292,6 +443,10 @@ def test_worker_submits_and_lands_audited_video_batch_candidate(tmp_path: Path) 
 
         def complete_video_candidate(self, _step_id: uuid.UUID, **values: object) -> str:
             assert values["provider_url"] == "https://provider.test/candidate.mp4"
+            assert values["last_frame_provider_url"] == "https://provider.test/tail.png"
+            tail = values["last_frame_landed"]
+            assert isinstance(tail, LandedAsset)
+            assert tail.sha256 == "f" * 64
             events.append("candidate_persisted")
             return "video-asset-1"
 
@@ -303,6 +458,7 @@ def test_worker_submits_and_lands_audited_video_batch_candidate(tmp_path: Path) 
                 task_id="video-task-1",
                 status="succeeded",
                 video_url="https://provider.test/candidate.mp4",
+                last_frame_url="https://provider.test/tail.png",
                 model="seedance",
             )
 
@@ -310,12 +466,19 @@ def test_worker_submits_and_lands_audited_video_batch_candidate(tmp_path: Path) 
             raise AssertionError("new task must be submitted, not polled")
 
     class Store:
-        def download(self, _url: str, *, suffix: str) -> LandedAsset:
-            assert suffix == ".mp4"
-            events.append("downloaded")
-            path = tmp_path / "candidate.mp4"
-            path.write_bytes(b"video")
-            return LandedAsset(path, "e" * 64, 5)
+        def download(self, url: str, *, suffix: str) -> LandedAsset:
+            if url.endswith("candidate.mp4"):
+                assert suffix == ".mp4"
+                events.append("downloaded")
+                path = tmp_path / "candidate.mp4"
+                path.write_bytes(b"video")
+                return LandedAsset(path, "e" * 64, 5)
+            assert url == "https://provider.test/tail.png"
+            assert suffix == ".png"
+            events.append("tail_downloaded")
+            path = tmp_path / "tail.png"
+            path.write_bytes(b"tail")
+            return LandedAsset(path, "f" * 64, 4)
 
     worker = UniversalMediaWorker(
         queue=Queue(),  # type: ignore[arg-type]
@@ -329,13 +492,68 @@ def test_worker_submits_and_lands_audited_video_batch_candidate(tmp_path: Path) 
 
     assert result == {"stepId": str(lease.step_id), "assetId": "video-asset-1"}
     assert events == [
+        "submission_allowed",
         "loaded_persisted_prompt",
         "provider_called",
         "submission_persisted",
         "downloaded",
+        "tail_downloaded",
         "candidate_persisted",
         f"finished:{StepStatus.AWAITING_REVIEW}",
     ]
+
+
+def test_worker_persists_the_observed_provider_status_while_polling() -> None:
+    step_id = uuid.uuid4()
+    lease = SimpleNamespace(
+        step_id=step_id,
+        operation_key=f"media:video:batch:{uuid.uuid4()}:candidate:1",
+    )
+    finished: list[dict[str, object]] = []
+
+    class Queue:
+        def claim_next(self, **_values: object) -> object:
+            return lease
+
+        def update_progress(self, *_args: object, **_values: object) -> object:
+            return lease
+
+        def assert_provider_submission_allowed(self, *_args: object, **_values: object) -> None:
+            return None
+
+        def finish(self, _step_id: uuid.UUID, **values: object) -> None:
+            finished.append(values)
+
+    class Repository:
+        def video_candidate_work(self, _step_id: uuid.UUID) -> dict[str, object]:
+            return {
+                "prompt": "保持身份并缓慢抬头",
+                "inputPlan": VideoInputPlan(
+                    operation=RenderOperation.SHOT,
+                    resolution="480p",
+                    duration_seconds=8,
+                    bindings=[],
+                ),
+                "inputSources": (),
+                "providerTaskId": "provider-video-running",
+            }
+
+    class Gateway:
+        def get_video_task(self, task_id: str) -> VideoTaskResult:
+            return VideoTaskResult(task_id=task_id, status="running")
+
+    worker = UniversalMediaWorker(
+        queue=Queue(),  # type: ignore[arg-type]
+        repository=Repository(),  # type: ignore[arg-type]
+        gateway=Gateway(),  # type: ignore[arg-type]
+        asset_store=SimpleNamespace(),  # type: ignore[arg-type]
+        worker_id="provider-status-worker-test",
+    )
+
+    worker.run_once()
+
+    assert finished[0]["status"] is StepStatus.QUEUED
+    assert finished[0]["progress_update"]["providerStatus"] == "running"  # type: ignore[index]
 
 
 def test_worker_resumes_submitted_shot_video_without_resubmitting() -> None:
@@ -354,6 +572,9 @@ def test_worker_resumes_submitted_shot_video_without_resubmitting() -> None:
 
         def update_progress(self, *_args: object, **_values: object) -> object:
             return lease
+
+        def assert_provider_submission_allowed(self, *_args: object, **_values: object) -> None:
+            return None
 
         def finish(self, _step_id: uuid.UUID, **values: object) -> None:
             finished.append(values)
@@ -415,6 +636,9 @@ def test_worker_executes_persisted_subject_completion_and_waits_for_human_review
         def update_progress(self, *_args: object, **_values: object) -> object:
             return lease
 
+        def assert_provider_submission_allowed(self, *_args: object, **_values: object) -> None:
+            events.append("submission_allowed")
+
     class Repository:
         def subject_completion_work(self, _step_id: uuid.UUID) -> dict[str, object]:
             events.append("loaded_persisted_prompt")
@@ -459,6 +683,7 @@ def test_worker_executes_persisted_subject_completion_and_waits_for_human_review
 
     assert result == {"stepId": str(lease.step_id), "subjectCompletionRunId": "completion-run-1"}
     assert events == [
+        "submission_allowed",
         "loaded_persisted_prompt",
         "provider_called",
         "proposal_persisted",
@@ -514,6 +739,23 @@ def test_direct_video_edit_freezes_inputs_and_preserves_full_version(
     tmp_path: Path,
 ) -> None:
     source = _video_asset(tmp_path)
+    reference_path = tmp_path / "identity-reference.png"
+    reference_path.write_bytes(b"identity reference")
+    reference = StoredAsset(
+        id=uuid.uuid4(),
+        project_id=source.project_id,
+        scene_id=None,
+        shot_card_id=None,
+        step_id=None,
+        role="person_reference",
+        media_type="image",
+        scope="project",
+        status="approved",
+        path=reference_path,
+        sha256="e" * 64,
+        metadata={},
+        semantic_key="person:identity",
+    )
     events: list[str] = []
 
     class Repository:
@@ -524,6 +766,8 @@ def test_direct_video_edit_freezes_inputs_and_preserves_full_version(
                 "source": source,
                 "sourceInput": source.path,
                 "anchors": (),
+                "references": (reference,),
+                "compilation": {"mode": "direct"},
                 "startMs": 1_000,
                 "endMs": 4_000,
                 "providerTaskId": None,
@@ -531,7 +775,8 @@ def test_direct_video_edit_freezes_inputs_and_preserves_full_version(
 
         def record_video_edit_inputs(self, _step_id: uuid.UUID, **values: object) -> None:
             assets = values["input_assets"]
-            assert len(assets) == 3  # type: ignore[arg-type]
+            assert len(assets) == 4  # type: ignore[arg-type]
+            assert assets[-1] == reference  # type: ignore[index]
             events.append("inputs_persisted")
 
         def record_video_edit_submission(self, _step_id: uuid.UUID, **_values: object) -> None:
@@ -544,7 +789,9 @@ def test_direct_video_edit_freezes_inputs_and_preserves_full_version(
     class Gateway:
         video_model = "video-model"
 
-        def submit_video(self, **_values: object) -> VideoTaskResult:
+        def submit_video(self, **values: object) -> VideoTaskResult:
+            assert len(values["input_plan"].bindings) == 4
+            assert values["input_sources"][-1] == reference.path
             events.append("provider_called")
             return VideoTaskResult(
                 task_id="task-1",

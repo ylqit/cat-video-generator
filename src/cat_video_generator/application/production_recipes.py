@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import uuid
@@ -9,17 +10,27 @@ import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence
 
 from ..domain.production_recipes import (
+    CANON_V2_PROFILE_ID,
+    CANON_V2_STYLE_NEGATIVE,
+    CANON_V2_STYLE_POSITIVE,
     CANON_V3_PROFILE_ID,
     CANON_V3_STYLE_NEGATIVE,
     CANON_V3_STYLE_POSITIVE,
+    CANON_V4_PROFILE_ID,
+    CANON_V4_STYLE_NEGATIVE,
+    CANON_V4_STYLE_POSITIVE,
     HEALING_CHILD_CAT_RECIPE,
     CanvasGroupRunRequest,
     CatBehaviorMode,
     CharacterDesignBatchDraft,
+    CharacterDesignRecipeRunRequest,
+    CharacterDesignRunStage,
+    DirectorWorkflowAdoptionRequest,
     EpisodeRules,
+    GenerationPlanRevisionDraft,
     HumanReviewDraft,
     PaidRecipeRunRequest,
     ProductionRecipeInstanceDraft,
@@ -29,8 +40,10 @@ from ..domain.production_recipes import (
     RecipeStage,
     SoundPlan,
     StoryboardCreationMode,
+    StoryboardProductionPlanConfirmation,
     StoryboardRecipeRunRequest,
     recipe_task_source_hash,
+    split_editorial_shot_durations,
     split_shot_durations,
 )
 from ..domain.workflow import StepKind, StepStatus
@@ -38,6 +51,19 @@ from .universal_media_worker import MediaExecutionResult
 
 
 class ProductionRecipeRepository(Protocol):
+    def preview_director_workflow_adoption(
+        self,
+        project_id: uuid.UUID,
+    ) -> dict[str, Any]: ...
+
+    def adopt_director_workflow(
+        self,
+        project_id: uuid.UUID,
+        payload: DirectorWorkflowAdoptionRequest,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]: ...
+
     def create_instance(
         self,
         project_id: uuid.UUID,
@@ -78,6 +104,21 @@ class ProductionRecipeRepository(Protocol):
         episode_rules: EpisodeRules | None = None,
     ) -> dict[str, Any]: ...
 
+    def confirm_storyboard_production_plan(
+        self,
+        instance_id: uuid.UUID,
+        payload: StoryboardProductionPlanConfirmation,
+    ) -> dict[str, Any]: ...
+
+    def revise_generation_plan(
+        self,
+        instance_id: uuid.UUID,
+        plan_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        payload: GenerationPlanRevisionDraft,
+    ) -> dict[str, Any]: ...
+
     def materialize_storyboard(
         self,
         instance_id: uuid.UUID,
@@ -97,6 +138,30 @@ class ProductionRecipeRepository(Protocol):
         *,
         idempotency_key: str,
         candidate_count: int,
+        stage: CharacterDesignRunStage = CharacterDesignRunStage.ALL,
+    ) -> dict[str, Any]: ...
+
+    def preview_character_design(
+        self,
+        instance_id: uuid.UUID,
+        *,
+        idempotency_key: str,
+        candidate_count: int,
+        stage: CharacterDesignRunStage = CharacterDesignRunStage.ALL,
+    ) -> dict[str, Any]: ...
+
+    def prepare_character_design_validation(
+        self,
+        instance_id: uuid.UUID,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]: ...
+
+    def preview_character_design_validation(
+        self,
+        instance_id: uuid.UUID,
+        *,
+        idempotency_key: str,
     ) -> dict[str, Any]: ...
 
     def validate_storyboard_character_references(
@@ -166,6 +231,7 @@ class StoryRecipeWorkflow(Protocol):
         self,
         project_id: uuid.UUID,
         *,
+        source_story_revision_id: uuid.UUID | None = None,
         exact_durations: tuple[int, ...] | None = None,
         healing_recipe: bool = False,
         idempotency_key: str | None = None,
@@ -175,6 +241,18 @@ class StoryRecipeWorkflow(Protocol):
     ) -> dict[str, Any]: ...
 
     def create_generation_batch(self, payload: Any) -> dict[str, Any]: ...
+
+    def create_generation_batches(
+        self,
+        payloads: Sequence[Any],
+        *,
+        parent_step_id: uuid.UUID,
+    ) -> tuple[dict[str, Any], ...]: ...
+
+    def preview_generation_batches(
+        self,
+        payloads: Sequence[Any],
+    ) -> tuple[dict[str, Any], ...]: ...
 
 
 class ShotRecipeWorkflow(Protocol):
@@ -220,6 +298,27 @@ class ProductionRecipeService:
     def list_recipes(self) -> list[dict[str, Any]]:
         return [HEALING_CHILD_CAT_RECIPE.model_dump(mode="json", by_alias=True)]
 
+    def preview_director_workflow_adoption(
+        self,
+        project_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        return self._repository.preview_director_workflow_adoption(project_id)
+
+    def adopt_director_workflow(
+        self,
+        project_id: uuid.UUID,
+        payload: DirectorWorkflowAdoptionRequest,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        if payload.recipe_key != HEALING_CHILD_CAT_RECIPE.key:
+            raise ValueError("当前版本只支持一人一猫治愈短片配方")
+        return self._repository.adopt_director_workflow(
+            project_id,
+            payload,
+            idempotency_key=idempotency_key,
+        )
+
     def create_instance(
         self,
         project_id: uuid.UUID,
@@ -260,6 +359,30 @@ class ProductionRecipeService:
             episode_rules=episode_rules,
         )
 
+    def confirm_storyboard_production_plan(
+        self,
+        instance_id: uuid.UUID,
+        payload: StoryboardProductionPlanConfirmation,
+    ) -> dict[str, Any]:
+        return self._repository.confirm_storyboard_production_plan(instance_id, payload)
+
+    def revise_generation_plan(
+        self,
+        instance_id: uuid.UUID,
+        plan_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        payload: GenerationPlanRevisionDraft,
+    ) -> dict[str, Any]:
+        return self._project_instance(
+            self._repository.revise_generation_plan(
+                instance_id,
+                plan_id,
+                expected_revision=expected_revision,
+                payload=payload,
+            )
+        )
+
     def enqueue_recipe_task(
         self,
         instance_id: uuid.UUID,
@@ -273,6 +396,7 @@ class ProductionRecipeService:
         instance = self.get_instance(instance_id)
         self._validate_enqueued_operation(
             instance,
+            instance_id=instance_id,
             operation_key=operation_key,
             payload=payload,
             shot_id=shot_id,
@@ -339,7 +463,14 @@ class ProductionRecipeService:
         elif operation_key == "canvas-group:run":
             group_id = uuid.UUID(str(input_snapshot["canvasGroupId"]))
             group_payload = CanvasGroupRunRequest.model_validate(payload_document)
-            result = self.run_group(group_id, group_payload)
+            result = self.run_group(group_id, group_payload, parent_step_id=step_id)
+        elif operation_key == "recipe:character_design":
+            character_payload = CharacterDesignRecipeRunRequest.model_validate(payload_document)
+            result = self.run_character_design(
+                instance_id,
+                character_payload,
+                parent_step_id=step_id,
+            )
         else:
             payload = PaidRecipeRunRequest.model_validate(payload_document)
             shot_value = input_snapshot.get("shotId")
@@ -351,8 +482,12 @@ class ProductionRecipeService:
                 result = self.run_story_script(instance_id, payload)
             elif operation_key == "recipe:story":
                 result = self.run_story(instance_id, payload)
-            elif operation_key == "recipe:character_design":
-                result = self.run_character_design(instance_id, payload)
+            elif operation_key == "recipe:character_design_validation":
+                result = self.run_character_design_validation(
+                    instance_id,
+                    payload,
+                    parent_step_id=step_id,
+                )
             elif operation_key == "recipe:anchor" and shot_value is not None:
                 result = self.run_anchor(instance_id, uuid.UUID(str(shot_value)), payload)
             elif operation_key == "recipe:video" and shot_value is not None:
@@ -372,9 +507,14 @@ class ProductionRecipeService:
         summary["parentStepId"] = str(step_id)
         summary["childStepIds"] = [str(item["stepId"]) for item in child_steps]
         summary["childStatuses"] = [
-            {"stepId": str(item["stepId"]), "status": str(item["status"])}
+            {
+                "stepId": str(item["stepId"]),
+                "status": str(item["status"]),
+                "resultSummary": item.get("resultSummary"),
+            }
             for item in child_steps
         ]
+        summary["reviewTargets"] = _child_review_targets(operation_key, child_steps)
         failed_steps = [item for item in child_steps if item["status"] == StepStatus.FAILED.value]
         if failed_steps:
             failed_ids = ", ".join(str(item["stepId"]) for item in failed_steps)
@@ -428,15 +568,16 @@ class ProductionRecipeService:
         if not instance.get("progress", {}).get("creativeApproved", True):
             raise ValueError("创意简报尚未人工批准")
         self._accept_cost(payload, self._director_call_cost_micros)
-        rules = _suggest_episode_rules(str(instance["theme"]))
+        rules = _suggest_episode_rules(str(instance["theme"]), instance)
         command = RecipeStoryCommand(
             idempotency_key=payload.idempotency_key,
             rewrite_instruction=(
-                "生成三个原创、低压力的日常小事件。每个候选必须包含儿童行动、"
-                "猫咪参与、一个小变化和温暖收尾；固定儿童与固定猫咪、原创柔和水彩画风、"
-                "无对白。8至15秒只能设计一个场景；16至60秒仅在叙事必要时换场，"
-                "场景数不得超过总时长除以15秒向上取整，每次换场必须说明叙事目的。"
-                "自然猫不得直立劳动、持工具或产生人形肢体。"
+                "一次生成 1–5 个原创、低压力的完整故事候选，以可直接编辑的长正文为主；"
+                "候选应在事件冲突、人物行动和情绪落点上有明显差异。"
+                "保持固定儿童、固定猫咪及二者稳定关系，猫咪行为以自然可信为宜；"
+                "对白、场景数量、情绪节奏和结尾方式属于创作建议，不要输出质量评分，"
+                "也不要模仿或复制任何参考账号的独特角色造型、画风或品牌元素。"
+                f"{_narrative_visual_instruction(instance)}"
             ),
         )
         result = workflow.run_story_strategies(
@@ -464,34 +605,14 @@ class ProductionRecipeService:
         instance_id: uuid.UUID,
         payload: PaidRecipeRunRequest,
     ) -> dict[str, Any]:
-        workflow = self._require_story_workflow()
-        instance = _recipe_projection(self._repository.get_instance(instance_id))
-        if instance["phase"] != RecipePhaseKey.STORY.value:
-            raise ValueError("创意简报人工批准后才能生成事件方案")
-        if not instance.get("progress", {}).get("creativeApproved", True):
-            raise ValueError("创意简报尚未人工批准")
-        self._accept_cost(
-            payload,
-            _multiply_cost(self._director_call_cost_micros, 6),
-        )
-        command = RecipeStoryCommand(
-            idempotency_key=payload.idempotency_key,
-            rewrite_instruction=(
-                "生成三个原创、低压力、可在目标时长内完成的一人一猫事件方案。"
-                "只输出儿童行动、猫咪参与、小变化、温暖收尾和换场必要性，"
-                "不要提前扩写成长篇剧情脚本；固定儿童、固定猫咪、固定线条材质画风，"
-                "无对白，自然猫不得直立劳动、持工具或产生人形肢体。"
-            ),
-        )
-        result = workflow.run_story_event_strategies(
-            uuid.UUID(str(instance["projectId"])),
-            instance_id,
-            command,
-        )
+        # HTTP compatibility boundary: old clients may still post to
+        # ``story-event-runs``.  New work must nevertheless execute the same
+        # single creative-text batch as ``story-runs``; no event rows, Critic,
+        # or second expansion call are created.
+        result = self.run_story(instance_id, payload)
         return {
             **result,
-            "recipeInstanceId": str(instance_id),
-            "status": "awaiting_review",
+            "legacyCompatibilityOperation": "story-event-runs",
         }
 
     def run_story_script(
@@ -516,6 +637,7 @@ class ProductionRecipeService:
                 "把已选择事件扩写为完整、可拍摄的剧情脚本，明确因果链、稳定 sceneKey、"
                 "场景目的、换场原因、声音计划、角色造型与场景资产需求；保持无对白和"
                 "固定儿童、猫咪及画风约束。"
+                f"{_narrative_visual_instruction(instance)}"
             ),
         )
         result = workflow.expand_selected_story_event(
@@ -527,7 +649,7 @@ class ProductionRecipeService:
         story_id_value = story.get("id")
         if story_id_value is None:
             raise RuntimeError("剧情脚本扩写没有返回版本标识")
-        rules = _suggest_episode_rules(str(instance["theme"]))
+        rules = _suggest_episode_rules(str(instance["theme"]), instance)
         self._repository.store_suggested_episode_rules(
             instance_id,
             (uuid.UUID(str(story_id_value)),),
@@ -544,7 +666,9 @@ class ProductionRecipeService:
     def run_character_design(
         self,
         instance_id: uuid.UUID,
-        payload: PaidRecipeRunRequest,
+        payload: CharacterDesignRecipeRunRequest,
+        *,
+        parent_step_id: uuid.UUID,
     ) -> dict[str, Any]:
         workflow = self._require_story_workflow()
         instance = _recipe_projection(self._repository.get_instance(instance_id))
@@ -552,23 +676,146 @@ class ProductionRecipeService:
             raise ValueError("故事与 EpisodeRules 人工批准后才能生成角色设计")
         tier = HEALING_CHILD_CAT_RECIPE.quality_tiers[instance["qualityTier"]]
         candidate_count = tier.character_design_candidate_count
-        self._accept_cost(
-            payload,
-            _multiply_cost(self._image_call_cost_micros, candidate_count * 3),
-        )
+        preview = self.preview_character_design(instance_id, payload)
+        if payload.expected_input_hash is None:
+            raise ValueError("付费角色设计必须先查看三个槽位的服务端输入预览")
+        if payload.expected_input_hash != preview["inputHash"]:
+            raise ValueError("角色设计引用、Prompt 或模型已变化，请重新查看费用与输入")
+        self._accept_cost(payload, preview["estimatedCostMicros"])
         prepared = self._repository.prepare_character_design(
             instance_id,
             idempotency_key=payload.idempotency_key,
             candidate_count=candidate_count,
+            stage=payload.character_design_stage,
         )
-        batches = [
-            workflow.create_generation_batch(CharacterDesignBatchDraft.model_validate(batch))
-            for batch in prepared["batches"]
-        ]
+        drafts = tuple(
+            CharacterDesignBatchDraft.model_validate(batch) for batch in prepared["batches"]
+        )
+        batches = workflow.create_generation_batches(
+            drafts,
+            parent_step_id=parent_step_id,
+        )
         return {
             **prepared,
             "status": "generating",
             "generationBatches": batches,
+        }
+
+    def preview_character_design(
+        self,
+        instance_id: uuid.UUID,
+        payload: CharacterDesignRecipeRunRequest,
+    ) -> dict[str, Any]:
+        workflow = self._require_story_workflow()
+        instance = _recipe_projection(self._repository.get_instance(instance_id))
+        if instance["phase"] != RecipePhaseKey.CHARACTER_DESIGN.value:
+            raise ValueError("故事与 EpisodeRules 人工批准后才能预览角色设计")
+        tier = HEALING_CHILD_CAT_RECIPE.quality_tiers[instance["qualityTier"]]
+        candidate_count = tier.character_design_candidate_count
+        prepared = self._repository.preview_character_design(
+            instance_id,
+            idempotency_key=payload.idempotency_key,
+            candidate_count=candidate_count,
+            stage=payload.character_design_stage,
+        )
+        drafts = tuple(
+            CharacterDesignBatchDraft.model_validate(batch) for batch in prepared["batches"]
+        )
+        slots = workflow.preview_generation_batches(drafts)
+        aggregate = hashlib.sha256(
+            json.dumps(
+                [item["inputHash"] for item in slots],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        estimated_cost = _sum_preview_costs(slots)
+        return {
+            "recipeInstanceId": str(instance_id),
+            "characterDesignRevisionId": prepared["id"],
+            "candidateCountPerSlot": candidate_count,
+            "stage": payload.character_design_stage.value,
+            "slots": slots,
+            "estimatedCostMicros": estimated_cost,
+            "inputHash": aggregate,
+        }
+
+    def run_character_design_validation(
+        self,
+        instance_id: uuid.UUID,
+        payload: PaidRecipeRunRequest,
+        *,
+        parent_step_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        workflow = self._require_story_workflow()
+        preview = self.preview_character_design_validation(instance_id, payload)
+        if payload.expected_input_hash is None:
+            raise ValueError("付费引用顺序验证必须先查看三个槽位的服务端输入预览")
+        if payload.expected_input_hash != preview["inputHash"]:
+            raise ValueError("验证引用、Prompt 或模型已变化，请重新查看费用与输入")
+        self._accept_cost(payload, preview["estimatedCostMicros"])
+        prepared = self._repository.prepare_character_design_validation(
+            instance_id,
+            idempotency_key=payload.idempotency_key,
+        )
+        drafts = tuple(
+            CharacterDesignBatchDraft.model_validate(batch) for batch in prepared["batches"]
+        )
+        frozen_slots = workflow.preview_generation_batches(drafts)
+        frozen_aggregate = hashlib.sha256(
+            json.dumps(
+                [item["inputHash"] for item in frozen_slots],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if frozen_aggregate != payload.expected_input_hash:
+            raise ValueError("验证引用在任务冻结前发生变化，未创建任何图片批次，请重新预览")
+        batches = workflow.create_generation_batches(
+            drafts,
+            parent_step_id=parent_step_id,
+        )
+        return {
+            **prepared,
+            "mode": "validation_only",
+            "preservesApprovedSelection": True,
+            "providerCallCount": 3,
+            "status": "generating",
+            "generationBatches": batches,
+        }
+
+    def preview_character_design_validation(
+        self,
+        instance_id: uuid.UUID,
+        payload: PaidRecipeRunRequest,
+    ) -> dict[str, Any]:
+        workflow = self._require_story_workflow()
+        prepared = self._repository.preview_character_design_validation(
+            instance_id,
+            idempotency_key=payload.idempotency_key,
+        )
+        drafts = tuple(
+            CharacterDesignBatchDraft.model_validate(batch) for batch in prepared["batches"]
+        )
+        slots = workflow.preview_generation_batches(drafts)
+        aggregate = hashlib.sha256(
+            json.dumps(
+                [item["inputHash"] for item in slots],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return {
+            "mode": "validation_only",
+            "recipeInstanceId": str(instance_id),
+            "baseCharacterDesignRevisionId": prepared["id"],
+            "characterDesignRevisionId": prepared["id"],
+            "candidateCountPerSlot": 1,
+            "preservesApprovedSelection": True,
+            "providerCallCount": 3,
+            "slots": slots,
+            "estimatedCostMicros": _sum_preview_costs(slots),
+            "inputHash": aggregate,
         }
 
     def run_storyboard(
@@ -581,8 +828,6 @@ class ProductionRecipeService:
         if instance["phase"] != RecipePhaseKey.STORYBOARD.value:
             raise ValueError("角色设计全部人工批准后才能生成分镜")
         progress = dict(instance.get("progress") or {})
-        if not progress.get("episodeRulesLocked"):
-            raise ValueError("EpisodeRules 尚未随故事审核锁定")
         if not progress.get("characterDesignApproved", True):
             raise ValueError("三个角色设计槽位尚未全部人工批准")
         if int(progress.get("shotCount") or 0) > 0:
@@ -594,9 +839,10 @@ class ProductionRecipeService:
                 reference_asset_ids,
             )
         self._accept_cost(payload, self._director_call_cost_micros)
-        durations = split_shot_durations(int(instance["targetDurationSeconds"]))
+        durations = split_editorial_shot_durations(int(instance["targetDurationSeconds"]))
         storyboard = workflow.create_storyboard(
             uuid.UUID(str(instance["projectId"])),
+            source_story_revision_id=payload.source_story_revision_id,
             exact_durations=durations,
             healing_recipe=True,
             idempotency_key=payload.idempotency_key,
@@ -630,7 +876,8 @@ class ProductionRecipeService:
                 shot_id,
                 allow_paid_generation=True,
                 regenerate=index > 0 or payload.reason is not None,
-                reason=(payload.reason if index == 0 else f"配方锚点候选 {index + 1}"),
+                reason=payload.reason,
+                expected_input_hash=payload.expected_input_hash,
                 request_idempotency_key=f"{payload.idempotency_key}:anchor:{index + 1}",
             )
             for index in range(tier.anchor_candidate_count)
@@ -658,7 +905,8 @@ class ProductionRecipeService:
                 shot_id,
                 allow_paid_generation=True,
                 regenerate=index > 0 or payload.reason is not None,
-                reason=(payload.reason if index == 0 else f"配方视频候选 {index + 1}"),
+                reason=payload.reason,
+                expected_input_hash=payload.expected_input_hash,
                 request_idempotency_key=f"{payload.idempotency_key}:video:{index + 1}",
             )
             for index in range(tier.video_candidate_count)
@@ -679,6 +927,8 @@ class ProductionRecipeService:
         sequence = self._sequence_workflow.build_project_sequence(
             uuid.UUID(str(instance["projectId"])),
             transitions={item.after_shot_id: item.transition for item in payload.transitions},
+            intro_transition=payload.intro_transition,
+            outro_transition=payload.outro_transition,
             request_idempotency_key=payload.idempotency_key,
         )
         return {
@@ -716,6 +966,8 @@ class ProductionRecipeService:
         self,
         group_id: uuid.UUID,
         payload: CanvasGroupRunRequest,
+        *,
+        parent_step_id: uuid.UUID,
     ) -> dict[str, Any]:
         group = self._repository.get_group(group_id)
         if group.get("lifecycleStatus") != "active":
@@ -737,21 +989,25 @@ class ProductionRecipeService:
             result = self.run_creative_brief(instance_id, payload)
         elif phase is RecipePhaseKey.STORY:
             story_workflow = dict(instance.get("storyWorkflow") or {})
-            story_status = str(story_workflow.get("status") or "generate_events")
-            if story_status in {"select_event", "approve_script"}:
+            story_status = str(story_workflow.get("status") or "generate_candidates")
+            if story_status in {"select_story", "complete"}:
                 return self._group_stop(group_id, instance, "awaiting_review")
-            if story_status == "expand_script":
-                result = self.run_story_script(instance_id, payload)
-            else:
-                result = self.run_story_events(instance_id, payload)
+            if story_status in {"select_event", "expand_script", "approve_script"}:
+                return self._group_stop(group_id, instance, "awaiting_review")
+            result = self.run_story(instance_id, payload)
         elif phase is RecipePhaseKey.CHARACTER_DESIGN:
             character_design = instance.get("characterDesign") or {}
             if character_design.get("status") in {"generating", "awaiting_review"}:
                 return self._group_stop(group_id, instance, "awaiting_review")
-            result = self.run_character_design(instance_id, payload)
+            result = self.run_character_design(
+                instance_id,
+                payload,
+                parent_step_id=parent_step_id,
+            )
         elif phase is RecipePhaseKey.STORYBOARD:
             if int(instance.get("progress", {}).get("shotCount") or 0) > 0:
                 return self._group_stop(group_id, instance, "awaiting_review")
+            source_story_revision_id = _approved_story_revision_id(instance)
             result = self.run_storyboard(
                 instance_id,
                 StoryboardRecipeRunRequest(
@@ -759,6 +1015,7 @@ class ProductionRecipeService:
                     acceptEstimatedCostMicros=payload.accept_estimated_cost_micros,
                     reason=payload.reason,
                     creationMode=StoryboardCreationMode.FROM_STORY,
+                    sourceStoryRevisionId=source_story_revision_id,
                 ),
             )
         elif phase is RecipePhaseKey.RENDER:
@@ -924,14 +1181,15 @@ class ProductionRecipeService:
         tier = HEALING_CHILD_CAT_RECIPE.quality_tiers[document["qualityTier"]]
         if document["phase"] == RecipePhaseKey.STORY.value:
             story_status = str(
-                (document.get("storyWorkflow") or {}).get("status") or "generate_events"
+                (document.get("storyWorkflow") or {}).get("status") or "generate_candidates"
             )
-            estimate = _multiply_cost(
-                self._director_call_cost_micros,
-                2 if story_status == "expand_script" else 6,
+            estimate = (
+                self._director_call_cost_micros
+                if story_status in {"generate_candidates", "generate_events"}
+                else _multiply_cost(self._director_call_cost_micros, 2)
+                if story_status == "expand_script"
+                else 0
             )
-            if story_status in {"select_event", "approve_script"}:
-                estimate = 0
         elif document["phase"] in {
             RecipePhaseKey.CREATIVE.value,
             RecipePhaseKey.STORYBOARD.value,
@@ -958,11 +1216,10 @@ class ProductionRecipeService:
         return {
             **document,
             "estimatedCostMicros": estimate,
+            "storyGenerationEstimatedCostMicros": self._director_call_cost_micros,
             "costEstimateStatus": estimate_status,
             "costEstimateLabel": (
-                "付费调用·暂未计量"
-                if estimate is None
-                else f"预计费用 ¥{estimate / 1_000_000:.3f}"
+                "付费调用·暂未计量" if estimate is None else f"预计费用 ¥{estimate / 1_000_000:.3f}"
             ),
         }
 
@@ -970,6 +1227,7 @@ class ProductionRecipeService:
         self,
         instance: dict[str, Any],
         *,
+        instance_id: uuid.UUID,
         operation_key: str,
         payload: PaidRecipeRunRequest,
         shot_id: uuid.UUID | None,
@@ -1001,12 +1259,24 @@ class ProductionRecipeService:
         ):
             raise ValueError("已完成的分组没有可执行阶段")
         estimated_cost = instance["estimatedCostMicros"]
-        if operation_key in {"recipe:creative", "recipe:story"}:
+        if operation_key in {
+            "recipe:creative",
+            "recipe:story",
+            "recipe:story_events",
+        }:
             estimated_cost = self._director_call_cost_micros
-        elif operation_key == "recipe:story_events":
-            estimated_cost = _multiply_cost(self._director_call_cost_micros, 6)
         elif operation_key == "recipe:story_script":
             estimated_cost = _multiply_cost(self._director_call_cost_micros, 2)
+        elif operation_key == "recipe:character_design":
+            estimated_cost = self.preview_character_design(
+                instance_id,
+                payload,
+            )["estimatedCostMicros"]
+        elif operation_key == "recipe:character_design_validation":
+            estimated_cost = self.preview_character_design_validation(
+                instance_id,
+                payload,
+            )["estimatedCostMicros"]
         self._accept_cost(payload, estimated_cost)
 
     @staticmethod
@@ -1032,24 +1302,64 @@ def _multiply_cost(unit_cost_micros: int | None, count: int) -> int | None:
     return None if unit_cost_micros is None else unit_cost_micros * count
 
 
+def _sum_preview_costs(previews: Sequence[dict[str, Any]]) -> int | None:
+    costs = [item.get("estimatedCostMicros") for item in previews]
+    if any(cost is None for cost in costs):
+        return None
+    return sum(int(cost) for cost in costs)
+
+
 def _recipe_projection(source: dict[str, Any]) -> dict[str, Any]:
     document = dict(source)
     progress = dict(document.get("progress") or {})
     shot_count = int(progress.get("shotCount") or 0)
     approved_anchors = int(progress.get("approvedAnchorCount") or 0)
+    required_anchors = int(progress.get("requiredAnchorCount", shot_count) or 0)
     approved_videos = int(progress.get("approvedVideoCount") or 0)
     creative_approved = bool(progress.get("creativeApproved", True))
     creative_completed = bool(progress.get("creativeCompleted", True))
     story_approved = bool(progress.get("storyApproved"))
     character_design_approved = bool(progress.get("characterDesignApproved", True))
     storyboard_approved = bool(progress.get("storyboardApproved", shot_count > 0))
-    story_candidates_exist = bool(document.get("storyCandidates"))
-    story_workflow = dict(document.get("storyWorkflow") or {})
-    story_workflow_status = str(story_workflow.get("status") or "generate_events")
-    legacy_story_candidates = any(
-        not candidate.get("sourceEventCandidateId")
-        for candidate in document.get("storyCandidates") or []
+    storyboard_structure_approved = bool(progress.get("storyboardStructureApproved"))
+    generation_plan_approved = bool(progress.get("generationPlanApproved"))
+    story_candidates = list(document.get("storyCandidates") or [])
+    full_text_story_candidates_exist = any(
+        candidate.get("sourceEventCandidateId") is None
+        or candidate.get("contractKind") == "creative_text"
+        for candidate in story_candidates
+        if isinstance(candidate, dict)
     )
+    story_events_exist = bool(document.get("storyEvents"))
+    source_story_workflow = dict(document.get("storyWorkflow") or {})
+    source_story_status = str(source_story_workflow.get("status") or "")
+    if story_approved:
+        story_workflow = {
+            "currentStep": 2,
+            "totalSteps": 2,
+            "status": "complete",
+        }
+    elif full_text_story_candidates_exist:
+        story_workflow = {
+            "currentStep": 2,
+            "totalSteps": 2,
+            "status": "select_story",
+        }
+    elif story_events_exist and source_story_status in {
+        "generate_events",
+        "select_event",
+        "expand_script",
+        "approve_script",
+    }:
+        story_workflow = source_story_workflow
+    else:
+        story_workflow = {
+            "currentStep": 1,
+            "totalSteps": 2,
+            "status": "generate_candidates",
+        }
+    story_workflow_status = str(story_workflow["status"])
+    document["storyWorkflow"] = story_workflow
     sequence_ready = bool(progress.get("sequenceReady"))
     final_approved = bool(progress.get("finalApproved"))
 
@@ -1063,7 +1373,7 @@ def _recipe_projection(source: dict[str, Any]) -> dict[str, Any]:
         phase = RecipePhaseKey.EXPORT
         blocker = "最终音画尚未人工批准"
         primary_action = "审核最终成片" if sequence_ready else "合成最终成片"
-    elif storyboard_approved and shot_count > 0 and approved_anchors >= shot_count:
+    elif storyboard_approved and shot_count > 0 and approved_anchors >= required_anchors:
         stage = RecipeStage.VIDEO
         phase = RecipePhaseKey.RENDER
         blocker = "有视频镜头待生成或审核"
@@ -1076,8 +1386,21 @@ def _recipe_projection(source: dict[str, Any]) -> dict[str, Any]:
     elif story_approved and character_design_approved:
         stage = RecipeStage.STORYBOARD
         phase = RecipePhaseKey.STORYBOARD
-        blocker = "分镜尚未生成并确认" if shot_count == 0 else "分镜等待人工审核"
-        primary_action = "生成分镜" if shot_count == 0 else "审核分镜"
+        if not document.get("editorialShots"):
+            blocker = "导演分镜尚未生成"
+            primary_action = "生成导演分镜"
+        elif not storyboard_structure_approved:
+            blocker = "导演分镜结构等待人工批准"
+            primary_action = "批准分镜结构"
+        elif not generation_plan_approved:
+            blocker = "Agent 生成编排等待人工批准"
+            primary_action = "审核生成编排"
+        elif not storyboard_approved:
+            blocker = "场景资产、Scene Look 或 Prompt 尚未锁定"
+            primary_action = "完成生产分镜包"
+        else:
+            blocker = None
+            primary_action = "生成视觉锚点"
     elif story_approved:
         stage = RecipeStage.CONCEPT
         phase = RecipePhaseKey.CHARACTER_DESIGN
@@ -1086,21 +1409,15 @@ def _recipe_projection(source: dict[str, Any]) -> dict[str, Any]:
     elif creative_approved:
         stage = RecipeStage.CONCEPT
         phase = RecipePhaseKey.STORY
-        if legacy_story_candidates and not document.get("storyEvents"):
-            blocker = "旧版剧情候选等待人工选择与规则确认"
-            primary_action = "选择并批准故事"
-        elif story_workflow_status == "select_event":
-            blocker = "三个事件方案等待人工选择"
-            primary_action = "选择一个事件方案"
-        elif story_workflow_status == "expand_script":
-            blocker = "所选事件尚未扩写为完整剧情脚本"
-            primary_action = "扩写剧情脚本"
-        elif story_workflow_status == "approve_script" or story_candidates_exist:
-            blocker = "完整剧情脚本等待编辑、批准并锁定 EpisodeRules"
-            primary_action = "审核剧情脚本"
+        if story_workflow_status == "select_story":
+            blocker = "完整故事候选等待人工选择"
+            primary_action = "选择为当前剧情"
+        elif story_events_exist:
+            blocker = "历史事件流程仅供查看；请选择已有完整剧情或重新生成候选"
+            primary_action = "查看历史剧情数据"
         else:
-            blocker = "事件方案尚未生成"
-            primary_action = "生成三个事件方案"
+            blocker = "完整故事候选尚未生成"
+            primary_action = "生成完整故事候选"
     else:
         stage = RecipeStage.CONCEPT
         phase = RecipePhaseKey.CREATIVE
@@ -1124,7 +1441,7 @@ def _recipe_projection(source: dict[str, Any]) -> dict[str, Any]:
                     "key": "render",
                     "complete": (
                         shot_count > 0
-                        and approved_anchors >= shot_count
+                        and approved_anchors >= required_anchors
                         and approved_videos >= shot_count
                     ),
                 },
@@ -1135,11 +1452,88 @@ def _recipe_projection(source: dict[str, Any]) -> dict[str, Any]:
     return document
 
 
-def _suggest_episode_rules(theme: str) -> EpisodeRules:
+def _approved_story_revision_id(instance: dict[str, Any]) -> uuid.UUID:
+    approved = [
+        candidate
+        for candidate in instance.get("storyCandidates") or []
+        if isinstance(candidate, dict) and candidate.get("status") == "approved"
+    ]
+    if len(approved) != 1 or not approved[0].get("id"):
+        raise ValueError("生成分镜必须明确选择唯一的当前批准剧情脚本")
+    return uuid.UUID(str(approved[0]["id"]))
+
+
+@dataclass(frozen=True)
+class EpisodeVisualConstraints:
+    canon_profile_id: str
+    positive: tuple[str, ...]
+    negative: tuple[str, ...]
+
+
+def _episode_visual_constraints(instance: dict[str, Any]) -> EpisodeVisualConstraints:
+    canon_profile_id = str(instance.get("canonProfileId") or "")
+    profile = instance.get("visualProfile")
+    if isinstance(profile, dict) and profile:
+        source_profile_id = str(profile.get("sourceProfileId") or "")
+        if source_profile_id != canon_profile_id:
+            raise ValueError(
+                "本集视觉档案与配方 Canon 不一致："
+                f"{source_profile_id or 'missing'} != {canon_profile_id or 'missing'}"
+            )
+        positive = tuple(
+            str(value).strip() for value in profile.get("stylePositive") or () if str(value).strip()
+        )
+        negative = tuple(
+            str(value).strip() for value in profile.get("styleNegative") or () if str(value).strip()
+        )
+        if not positive:
+            raise ValueError("本集视觉档案缺少正向画风约束")
+        if canon_profile_id == CANON_V4_PROFILE_ID:
+            positive = tuple(dict.fromkeys((*positive, *CANON_V4_STYLE_POSITIVE)))
+            negative = tuple(dict.fromkeys((*negative, *CANON_V4_STYLE_NEGATIVE)))
+        elif canon_profile_id == CANON_V3_PROFILE_ID:
+            positive = tuple(dict.fromkeys((*positive, *CANON_V3_STYLE_POSITIVE)))
+            negative = tuple(dict.fromkeys((*negative, *CANON_V3_STYLE_NEGATIVE)))
+        return EpisodeVisualConstraints(canon_profile_id, positive, negative)
+    if canon_profile_id == CANON_V4_PROFILE_ID:
+        return EpisodeVisualConstraints(
+            canon_profile_id,
+            CANON_V4_STYLE_POSITIVE,
+            CANON_V4_STYLE_NEGATIVE,
+        )
+    if canon_profile_id == CANON_V3_PROFILE_ID:
+        return EpisodeVisualConstraints(
+            canon_profile_id,
+            CANON_V3_STYLE_POSITIVE,
+            CANON_V3_STYLE_NEGATIVE,
+        )
+    if canon_profile_id == CANON_V2_PROFILE_ID:
+        return EpisodeVisualConstraints(
+            canon_profile_id,
+            CANON_V2_STYLE_POSITIVE,
+            CANON_V2_STYLE_NEGATIVE,
+        )
+    raise ValueError(f"不支持的 Canon 配置：{canon_profile_id or 'missing'}")
+
+
+def _narrative_visual_instruction(instance: dict[str, Any]) -> str:
+    constraints = _episode_visual_constraints(instance)
+    return (
+        "叙事阶段只把项目锁定画风作为情绪与可视化约束，不提交或改写视觉参考图；"
+        f"画风正向约束：{'、'.join(constraints.positive)}；"
+        f"排除：{'、'.join(constraints.negative)}。"
+    )
+
+
+def _suggest_episode_rules(theme: str, instance: dict[str, Any]) -> EpisodeRules:
     indoor_markers = ("室内", "屋", "厨房", "窗", "睡前", "床", "餐桌")
     environment = "indoor" if any(marker in theme for marker in indoor_markers) else "outdoor"
+    visual = _episode_visual_constraints(instance)
     return EpisodeRules(
-        personWardrobe="沿用儿童 Canon 身份，本集固定米白上衣与棕色背带裤",
+        personWardrobe=(
+            "服装由当前故事与本集儿童设计确定；不得改变脸型、五官、8–9 岁年龄感、"
+            "深棕黑色齐下颌短发、发际线或儿童身体比例；造型一经批准须在本集连续镜头保持一致"
+        ),
         timeWeather="依据主题确定整集时间推进与天气基调，逐场细节由场景连续性规则锁定",
         mainScene="以批准故事的 scenes 为准；只有叙事必要时换场",
         environment=environment,
@@ -1151,14 +1545,18 @@ def _suggest_episode_rules(theme: str) -> EpisodeRules:
             musicMood="轻柔、留白、不抢动作的治愈配乐",
             dialoguePolicy="none",
         ),
-        stylePositive=list(CANON_V3_STYLE_POSITIVE),
-        styleExcluded=list(CANON_V3_STYLE_NEGATIVE),
-        canonProfileId=CANON_V3_PROFILE_ID,
+        stylePositive=list(visual.positive),
+        styleExcluded=list(visual.negative),
+        canonProfileId=visual.canon_profile_id,
     )
 
 
 def _task_kind(operation_key: str, instance: dict[str, Any]) -> StepKind:
-    if operation_key in {"recipe:character_design", "recipe:anchor"}:
+    if operation_key in {
+        "recipe:character_design",
+        "recipe:character_design_validation",
+        "recipe:anchor",
+    }:
         return StepKind.IMAGE
     if operation_key in {"recipe:video", "recipe:sequence"}:
         return StepKind.VIDEO
@@ -1178,6 +1576,7 @@ def _task_canvas_node_id(project_id: uuid.UUID, operation_key: str) -> uuid.UUID
         "recipe:story_events": "story-planner",
         "recipe:story_script": "story-script-expander",
         "recipe:character_design": "character-design-approval",
+        "recipe:character_design_validation": "character-design-approval",
         "recipe:storyboard": "storyboard-director",
         "recipe:anchor": "recipe-anchor-stage",
         "recipe:video": "recipe-video-stage",
@@ -1189,7 +1588,7 @@ def _task_canvas_node_id(project_id: uuid.UUID, operation_key: str) -> uuid.UUID
 
 def _task_result_summary(operation_key: str, result: dict[str, Any]) -> dict[str, object]:
     candidates = result.get("candidates") or result.get("generationBatches") or []
-    return {
+    summary: dict[str, object] = {
         "operationKey": operation_key,
         "status": str(result.get("status") or "awaiting_review"),
         "message": "任务已完成，等待人工审核",
@@ -1197,9 +1596,113 @@ def _task_result_summary(operation_key: str, result: dict[str, Any]) -> dict[str
         "outputCount": len(candidates) if isinstance(candidates, list) else 1,
         "recipeInstanceId": result.get("recipeInstanceId"),
         "shotId": result.get("shotId"),
-        "assetId": result.get("renderedAssetId") or result.get("id"),
-        "revisionId": result.get("revisionId"),
+        "assetId": result.get("renderedAssetId"),
+        "revisionId": result.get("revisionId")
+        or (
+            result.get("id")
+            if operation_key in {"recipe:character_design", "recipe:character_design_validation"}
+            else None
+        ),
     }
+    summary["reviewTargets"] = _direct_review_targets(operation_key, result)
+    return summary
+
+
+def _review_target(
+    target_type: str,
+    value: object,
+    *,
+    revision: object = None,
+    target_hash: object = None,
+) -> dict[str, object] | None:
+    if value is None or value == "":
+        return None
+    target: dict[str, object] = {
+        "targetType": target_type,
+        "targetId": str(value),
+    }
+    if revision is not None and revision != "":
+        target["targetRevision"] = int(str(revision))
+    if target_hash is not None and target_hash != "":
+        target["targetHash"] = str(target_hash)
+    return target
+
+
+def _direct_review_targets(
+    operation_key: str,
+    result: dict[str, Any],
+) -> list[dict[str, object]]:
+    if operation_key == "recipe:creative":
+        target = _review_target(
+            "creative_brief",
+            result.get("id"),
+            revision=result.get("revision"),
+        )
+        return [] if target is None else [target]
+    if operation_key in {"recipe:story", "recipe:story_events", "recipe:story_script"}:
+        candidates = result.get("candidates") or []
+        if operation_key == "recipe:story_script":
+            story = result.get("story")
+            candidates = [story] if isinstance(story, dict) else []
+        return [
+            target
+            for candidate in candidates
+            if isinstance(candidate, dict)
+            and (
+                target := _review_target(
+                    "story_revision",
+                    candidate.get("id"),
+                    revision=candidate.get("revision"),
+                )
+            )
+            is not None
+        ]
+    if operation_key == "recipe:storyboard":
+        target = _review_target(
+            "storyboard_structure",
+            result.get("storyboardRevisionId"),
+            revision=result.get("storyboardRevision"),
+            target_hash=result.get("structureHash"),
+        )
+        return [] if target is None else [target]
+    if operation_key == "recipe:sequence":
+        target = _review_target(
+            "final_sequence",
+            result.get("id"),
+            revision=result.get("revision"),
+        )
+        return [] if target is None else [target]
+    return []
+
+
+def _child_review_targets(
+    operation_key: str,
+    child_steps: tuple[dict[str, Any], ...],
+) -> list[dict[str, object]]:
+    target_type = {
+        "recipe:character_design": "character_design",
+        "recipe:anchor": "anchor_asset",
+        "recipe:video": "video_asset",
+    }.get(operation_key)
+    if target_type is None:
+        return []
+    targets: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for child in child_steps:
+        result_summary = child.get("resultSummary")
+        if not isinstance(result_summary, dict):
+            continue
+        asset_id = result_summary.get("assetId")
+        target = _review_target(
+            target_type,
+            asset_id,
+            target_hash=result_summary.get("sha256"),
+        )
+        if target is None or str(target["targetId"]) in seen:
+            continue
+        seen.add(str(target["targetId"]))
+        targets.append(target)
+    return targets
 
 
 def _result_child_step_ids(result: dict[str, Any]) -> tuple[uuid.UUID, ...]:

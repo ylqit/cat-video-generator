@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from ...application.ports import (
+    CreativeDirectorResult,
     DirectorResult,
     ImageDiagnosticResult,
     ImageResult,
@@ -38,12 +39,86 @@ class FakeArkGateway:
     video_model = "fake-seedance"
     review_model = "fake-video-review"
 
+    def generate_creative_text(
+        self,
+        *,
+        prompt: str,
+        output_name: str,
+    ) -> CreativeDirectorResult:
+        if output_name != "StoryCandidateBatch":
+            raise ValueError(
+                f"fake provider has no creative fixture for {output_name}"
+            )
+        payload = {
+            "candidates": [
+                {
+                    "title": "雨前收画",
+                    "body": "孩子和猫发现雨云，一起把晾晒的画纸安全收回屋内。",
+                }
+            ]
+        }
+        input_text = f"生成一个{output_name}。"
+        request_hash = _request_hash(
+            {
+                "input": input_text,
+                "instructions": prompt,
+                "mode": "creative_text",
+                "model": self.model,
+                "outputName": output_name,
+            }
+        )
+        return CreativeDirectorResult(
+            payload=payload,
+            response_id=f"fake-creative-{request_hash[:10]}",
+            model=self.model,
+            request_hash=request_hash,
+        )
+
+    def generate_storyboard_text(
+        self,
+        *,
+        prompt: str,
+        output_name: str,
+        image_paths: tuple[Path, ...] = (),
+    ) -> CreativeDirectorResult:
+        if output_name != "CanvasStoryboardPlanOutput":
+            raise ValueError(
+                f"fake provider has no storyboard fixture for {output_name}"
+            )
+        payload = {
+            "shots": [
+                {
+                    "order": index,
+                    "title": f"生活镜头 {index}",
+                    "direction": "人物与猫咪围绕同一生活事件完成一个连续、可见的动作。",
+                    "durationSeconds": 12,
+                }
+                for index in range(1, 6)
+            ]
+        }
+        request_hash = _request_hash(
+            {
+                "images": [str(path) for path in image_paths],
+                "mode": "storyboard_text",
+                "model": self.model,
+                "outputName": output_name,
+                "prompt": prompt,
+            }
+        )
+        return CreativeDirectorResult(
+            payload=payload,
+            response_id=f"fake-storyboard-{request_hash[:10]}",
+            model=self.model,
+            request_hash=request_hash,
+        )
+
     def generate_structured(
         self,
         *,
         prompt: str,
         schema: dict[str, Any],
         output_name: str,
+        image_paths: tuple[Path, ...] = (),
     ) -> DirectorResult:
         del schema
         payload = self._structured_payload(output_name, prompt)
@@ -52,7 +127,12 @@ class FakeArkGateway:
             response_id=f"fake-{output_name.lower()}-{uuid.uuid4().hex[:10]}",
             model=self.model,
             request_hash=_request_hash(
-                {"outputName": output_name, "prompt": prompt, "payload": payload}
+                {
+                    "outputName": output_name,
+                    "prompt": prompt,
+                    "payload": payload,
+                    "images": [str(path) for path in image_paths],
+                }
             ),
         )
 
@@ -189,6 +269,9 @@ class FakeArkGateway:
             generate_audio=True,
         )
 
+    def cancel_video_task(self, task_id: str) -> VideoTaskResult:
+        return VideoTaskResult(task_id=task_id, status="cancelled")
+
     def list_video_tasks(
         self,
         *,
@@ -203,9 +286,12 @@ class FakeArkGateway:
         *,
         prompt: str,
         frame_paths: tuple[Path, ...],
+        reference_paths: tuple[Path, ...] = (),
+        reference_labels: tuple[str, ...] = (),
     ) -> VideoDiagnosticResult:
         return VideoDiagnosticResult(
             identity_ok=True,
+            identity_assessment="consistent",
             style_ok=True,
             constraints_ok=True,
             narrative_order_ok=True,
@@ -224,7 +310,12 @@ class FakeArkGateway:
             response_id=f"fake-video-review-{uuid.uuid4().hex[:10]}",
             model=self.review_model,
             request_hash=_request_hash(
-                {"prompt": prompt, "frames": [str(path) for path in frame_paths]}
+                {
+                    "prompt": prompt,
+                    "references": [str(path) for path in reference_paths],
+                    "referenceLabels": list(reference_labels),
+                    "frames": [str(path) for path in frame_paths],
+                }
             ),
         )
 

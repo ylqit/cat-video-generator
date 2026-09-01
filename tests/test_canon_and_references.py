@@ -18,6 +18,7 @@ from cat_video_generator.application.ports import (
 )
 from cat_video_generator.application.shot_queue import (
     ShotProductionService,
+    _creator_prompt_preview,
     _merge_generation_references,
     _video_reference_description,
 )
@@ -137,6 +138,58 @@ def test_scene_look_descriptions_explain_the_selected_visual_responsibility() ->
     assert "派生本片段开场状态" in derived
 
 
+@pytest.mark.parametrize(
+    ("slot", "label", "responsibility"),
+    [
+        ("child", "本集儿童设计", "当前唯一儿童身份与本集造型来源"),
+        ("cat", "本集猫咪设计", "当前唯一猫咪身份与本集造型来源"),
+        ("pair_scale", "一人一猫同框比例", "只锁定一人一猫相对比例"),
+    ],
+)
+def test_episode_design_video_references_use_professional_labels(
+    tmp_path: Path,
+    slot: str,
+    label: str,
+    responsibility: str,
+) -> None:
+    asset = _image_asset(tmp_path, f"design-{slot}", "d" * 64, uuid.uuid4(), uuid.uuid4())
+    asset = StoredAsset(
+        **{
+            field: getattr(asset, field)
+            for field in asset.__dataclass_fields__
+            if field not in {"role", "semantic_key", "metadata"}
+        },
+        role=f"character_design_{slot}",
+        semantic_key=f"character-design:{uuid.uuid4()}:{slot}:candidate:1",
+        metadata={"characterDesign": {"slot": slot}},
+    )
+    text = _video_reference_description(
+        1,
+        _binding(asset.id, role="composition" if slot == "pair_scale" else "identity"),
+        asset=asset,
+    )
+
+    assert label in text
+    assert responsibility in text
+    assert "character-design:" not in text
+
+
+def test_historical_prompt_preview_hides_internal_character_design_keys() -> None:
+    revision_id = uuid.uuid4()
+    prompt = (
+        f"@图片1「character-design:{revision_id}:child:candidate:1」\n"
+        f"@图片2「character-design:{revision_id}:cat:candidate:2」\n"
+        f"@图片3「character-design:{revision_id}:pair_scale:candidate:1」"
+    )
+
+    preview = _creator_prompt_preview(prompt)
+
+    assert "本集儿童设计" in preview
+    assert "本集猫咪设计" in preview
+    assert "一人一猫同框比例" in preview
+    assert "character-design:" not in preview
+
+
 def test_resolved_video_references_keep_precedence_and_deduplicate_sha(
     tmp_path: Path,
 ) -> None:
@@ -162,6 +215,7 @@ def test_resolved_video_references_keep_precedence_and_deduplicate_sha(
             title="片段",
             direction="1. 中景固定，人和猫准备出门，稳定收尾。\n2. 近景跟随猫咪。",
             referenceBindings=[_binding(custom.id)],
+            sceneLookUsage="appearance_only",
         ),
         status=ShotStatus.READY,
     )

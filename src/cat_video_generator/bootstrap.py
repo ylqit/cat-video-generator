@@ -99,7 +99,7 @@ def build_runtime_container() -> RuntimeContainer:
         if runtime.ffmpeg_path is None
         else FfmpegFrameExtractor(ffmpeg_path=runtime.ffmpeg_path, work_root=runtime.work_root)
     )
-    workflow_queue = DurableWorkflowQueue(sessions)
+    workflow_queue = DurableWorkflowQueue(sessions, gateway=gateway)
     editing = ProjectEditingService(
         repository=repository,
         director=gateway,

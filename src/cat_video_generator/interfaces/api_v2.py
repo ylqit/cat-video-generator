@@ -9,33 +9,33 @@ from __future__ import annotations
 
 import inspect
 import uuid
+from datetime import date
 from typing import Any, Literal, Protocol
 
-from fastapi import APIRouter, FastAPI, Header, Query, Request, Response, status
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, FastAPI, Header, Query, Response, status
 from pydantic import Field, model_validator
 
 from ..domain.aigc_canvas import (
-    CanvasConnection,
-    CanvasNodeType,
-    NodeGenerationConfigDraft,
+    CanvasDiagnostic,
+    ProductionFlowDto,
+    ProjectWorkspaceShellDto,
+    ScriptWorkspaceDto,
     StoryBrief,
     SubjectCompletionField,
     SubjectDraft,
+    VideoWorkbenchDto,
+    storyboard_quality_diagnostics,
 )
 from ..domain.contract_base import StrictModel
 from ..domain.contracts import VisualProfileDraft
-from ..domain.universal_canvas import (
-    CanvasTemplateKey,
-    VideoEditAnnotation,
-    VideoEditRecipeDraft,
-)
+from ..domain.universal_canvas import VideoEditAnnotation, VideoEditRecipeDraft
 from .http_headers import parse_version_header
 from .jobs import JobConflictError, JobRegistry
-from .sse import parse_event_cursor, stream_events
 
 
 class CanvasV2Service(Protocol):
+    def create_child_cat_project(self, payload: CreateChildCatProjectRequest) -> dict[str, Any]: ...
+
     def save_brief(self, project_id: uuid.UUID, payload: StoryBrief) -> dict[str, Any]: ...
 
     def create_subject(self, project_id: uuid.UUID, payload: SubjectDraft) -> dict[str, Any]: ...
@@ -78,14 +78,6 @@ class CanvasV2Service(Protocol):
 
     def get_video_filmstrip(self, asset_id: uuid.UUID, *, frame_count: int) -> dict[str, Any]: ...
 
-    def save_node_generation_config(
-        self,
-        node_id: uuid.UUID,
-        *,
-        expected_revision: int,
-        payload: NodeGenerationConfigDraft,
-    ) -> dict[str, Any]: ...
-
     def list_provider_capabilities(
         self, *, media_kind: str | None = None
     ) -> list[dict[str, Any]]: ...
@@ -96,10 +88,13 @@ class CanvasV2Service(Protocol):
 
     def approve_story_revision(self, revision_id: uuid.UUID) -> dict[str, Any]: ...
 
+    def edit_story_revision(self, revision_id: uuid.UUID, payload: Any) -> dict[str, Any]: ...
+
     def create_storyboard(
         self,
         project_id: uuid.UUID,
         *,
+        source_story_revision_id: uuid.UUID | None = None,
         idempotency_key: str | None = None,
         creation_mode: str = "from_story",
         reference_asset_ids: tuple[uuid.UUID, ...] = (),
@@ -138,50 +133,31 @@ class CanvasV2Service(Protocol):
 
     def get_prompt_run(self, prompt_id: uuid.UUID) -> dict[str, Any]: ...
 
-    def get_canvas(self, project_id: uuid.UUID) -> dict[str, Any]: ...
+    def get_workspace_shell(self, project_id: uuid.UUID) -> dict[str, Any]: ...
 
-    def save_canvas_layout(
+    def get_script_workspace(self, project_id: uuid.UUID) -> dict[str, Any]: ...
+
+    def get_production_flow(self, project_id: uuid.UUID) -> dict[str, Any]: ...
+
+    def save_production_flow_layout(
         self,
         project_id: uuid.UUID,
         *,
         expected_version: int,
-        payload: CanvasLayoutPatch,
+        payload: ProductionFlowLayoutPatch,
     ) -> dict[str, Any]: ...
 
-    def archive_canvas_node(
+    def get_video_workbench(self, project_id: uuid.UUID) -> dict[str, Any]: ...
+
+    def replace_shot_beat_references(
         self,
-        project_id: uuid.UUID,
-        node_id: uuid.UUID,
+        beat_id: uuid.UUID,
         *,
-        expected_version: int,
-        reason: str | None,
+        expected_revision: int,
+        payload: ShotBeatReferenceBindingsRequest,
     ) -> dict[str, Any]: ...
 
-    def restore_canvas_node(
-        self,
-        project_id: uuid.UUID,
-        node_id: uuid.UUID,
-        *,
-        expected_version: int,
-    ) -> dict[str, Any]: ...
-
-    def list_canvas_templates(self) -> list[dict[str, Any]]: ...
-
-    def instantiate_template(
-        self, project_id: uuid.UUID, payload: TemplateInstanceRequest
-    ) -> dict[str, Any]: ...
-
-    def create_canvas_node(
-        self, project_id: uuid.UUID, payload: CanvasNodeCreateRequest
-    ) -> dict[str, Any]: ...
-
-    def create_canvas_edge(
-        self, project_id: uuid.UUID, payload: CanvasConnection
-    ) -> dict[str, Any]: ...
-
-    def delete_canvas_edge(self, edge_id: uuid.UUID) -> dict[str, Any]: ...
-
-    def create_generation_batch(self, payload: GenerationBatchRequest) -> dict[str, Any]: ...
+    def get_asset_generation_lineage(self, asset_id: uuid.UUID) -> dict[str, Any]: ...
 
     def create_video_edit_recipe(self, payload: VideoEditRecipeDraft) -> dict[str, Any]: ...
 
@@ -212,9 +188,21 @@ class StoryStrategyRunRequest(StrictModel):
     idempotency_key: str | None = Field(
         alias="idempotencyKey", default=None, min_length=8, max_length=96
     )
+    rewrite_instruction: str | None = Field(
+        alias="rewriteInstruction", default=None, max_length=4_000
+    )
+
+
+class StoryDocumentEditRequest(StrictModel):
+    title: str = Field(min_length=1, max_length=200)
+    body: str = Field(min_length=1, max_length=200_000)
+    summary: str | None = Field(default=None, min_length=1, max_length=4_000)
+    expected_revision: int = Field(alias="expectedRevision", ge=1)
+    idempotency_key: str = Field(alias="idempotencyKey", min_length=8, max_length=96)
 
 
 class StoryboardRunRequest(StrictModel):
+    source_story_revision_id: uuid.UUID = Field(alias="sourceStoryRevisionId")
     creation_mode: Literal["from_story", "from_characters"] = Field(
         alias="creationMode",
         default="from_story",
@@ -251,13 +239,47 @@ class SubjectAssistantApplyRequest(StrictModel):
 
 class ShotBeatPatch(StrictModel):
     title: str | None = Field(default=None, min_length=1, max_length=160)
+    direction: str | None = Field(default=None, min_length=1, max_length=6_000)
     action: str | None = Field(default=None, min_length=1, max_length=6_000)
     camera: str | None = Field(default=None, max_length=2_000)
     dialogue: str | None = Field(default=None, max_length=4_000)
+    visual_description: str | None = Field(
+        alias="visualDescription",
+        default=None,
+        max_length=6_000,
+    )
+    child_action: str | None = Field(alias="childAction", default=None, max_length=4_000)
+    cat_action: str | None = Field(alias="catAction", default=None, max_length=4_000)
+    spatial_relation: str | None = Field(alias="spatialRelation", default=None, max_length=4_000)
+    contact_occlusion: str | None = Field(alias="contactOcclusion", default=None, max_length=4_000)
+    shot_size: str | None = Field(alias="shotSize", default=None, max_length=200)
+    lighting: str | None = Field(default=None, max_length=1_000)
+    sound_effect: str | None = Field(alias="soundEffect", default=None, max_length=1_000)
+    music_intent: str | None = Field(alias="musicIntent", default=None, max_length=1_000)
+    wardrobe_state: str | None = Field(alias="wardrobeState", default=None, max_length=1_000)
+    prop_state: str | None = Field(alias="propState", default=None, max_length=1_000)
+    continuity_in: str | None = Field(alias="continuityIn", default=None, max_length=2_000)
+    continuity_out: str | None = Field(alias="continuityOut", default=None, max_length=2_000)
+    cut_intent: Literal["continuous", "soft_cut", "hard_cut"] | None = Field(
+        alias="cutIntent", default=None
+    )
     duration_seconds: int | None = Field(alias="durationSeconds", default=None, ge=1, le=60)
     subject_states: list[dict[str, Any]] | None = Field(
         alias="subjectStates", default=None, max_length=20
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_direction(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        direction = normalized.get("direction")
+        if isinstance(direction, str) and direction.strip():
+            normalized["action"] = direction
+        elif isinstance(normalized.get("action"), str):
+            normalized["direction"] = normalized["action"]
+        return normalized
 
 
 class ManualStoryboardShot(StrictModel):
@@ -267,11 +289,25 @@ class ManualStoryboardShot(StrictModel):
     order: int = Field(ge=1, le=200)
     duration_seconds: int = Field(alias="durationSeconds", ge=1, le=60)
     title: str = Field(min_length=1, max_length=160)
+    direction: str = Field(min_length=1, max_length=6_000)
     action: str = Field(min_length=1, max_length=6_000)
+    visual_description: str = Field(alias="visualDescription", default="", max_length=6_000)
+    child_action: str = Field(alias="childAction", default="", max_length=4_000)
+    cat_action: str = Field(alias="catAction", default="", max_length=4_000)
+    spatial_relation: str = Field(alias="spatialRelation", default="", max_length=4_000)
+    contact_occlusion: str = Field(alias="contactOcclusion", default="", max_length=4_000)
     shot_size: str = Field(alias="shotSize", default="中景", max_length=200)
     lighting: str = Field(default="", max_length=500)
     dialogue: str = Field(default="", max_length=4_000)
     sound_effect: str = Field(alias="soundEffect", default="", max_length=1_000)
+    music_intent: str = Field(alias="musicIntent", default="", max_length=1_000)
+    wardrobe_state: str = Field(alias="wardrobeState", default="", max_length=1_000)
+    prop_state: str = Field(alias="propState", default="", max_length=1_000)
+    continuity_in: str = Field(alias="continuityIn", default="", max_length=2_000)
+    continuity_out: str = Field(alias="continuityOut", default="", max_length=2_000)
+    cut_intent: Literal["continuous", "soft_cut", "hard_cut"] = Field(
+        alias="cutIntent", default="continuous"
+    )
     camera: str = Field(default="", max_length=2_000)
     prompt: str = Field(default="", max_length=8_000)
     prompt_id: uuid.UUID | None = Field(alias="promptId", default=None)
@@ -280,6 +316,19 @@ class ManualStoryboardShot(StrictModel):
         default=None,
         pattern=r"^[0-9a-f]{64}$",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_direction(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        direction = normalized.get("direction")
+        if isinstance(direction, str) and direction.strip():
+            normalized["action"] = direction
+        elif isinstance(normalized.get("action"), str):
+            normalized["direction"] = normalized["action"]
+        return normalized
 
 
 class ManualStoryboardDraftRequest(StrictModel):
@@ -291,21 +340,29 @@ class ManualStoryboardDraftRequest(StrictModel):
         orders = [shot.order for shot in self.shots]
         if sorted(orders) != list(range(1, len(self.shots) + 1)):
             raise ValueError("镜头顺序必须从1开始且连续")
-        if self.healing_recipe:
-            if any(not 8 <= shot.duration_seconds <= 15 for shot in self.shots):
-                raise ValueError("治愈组合包每镜必须为8至15秒")
-            if any(shot.dialogue.strip() for shot in self.shots):
-                raise ValueError("治愈组合包禁止对白")
+        if self.healing_recipe and any(
+            not 2 <= shot.duration_seconds <= 15 for shot in self.shots
+        ):
+            raise ValueError("治愈组合包每个导演分镜必须为2至15秒")
         return self
+
+    @property
+    def diagnostics(self) -> list[CanvasDiagnostic]:
+        return storyboard_quality_diagnostics(self.shots)
 
 
 class StoryboardPromptCompilationShot(StrictModel):
     beat_id: uuid.UUID | None = Field(alias="beatId", default=None)
+    shot_card_id: uuid.UUID | None = Field(alias="shotCardId", default=None)
+    editorial_shot_ids: list[uuid.UUID] = Field(
+        alias="editorialShotIds", default_factory=list, max_length=20
+    )
     expected_revision: int = Field(alias="expectedRevision", default=0, ge=0)
     order: int = Field(ge=1, le=200)
     scene_id: uuid.UUID = Field(alias="sceneId")
     duration_seconds: int = Field(alias="durationSeconds", ge=1, le=60)
     title: str = Field(min_length=1, max_length=160)
+    direction: str = Field(min_length=1, max_length=6_000)
     action: str = Field(min_length=1, max_length=6_000)
     shot_size: str = Field(alias="shotSize", default="中景", max_length=200)
     lighting: str = Field(default="", max_length=500)
@@ -315,7 +372,7 @@ class StoryboardPromptCompilationShot(StrictModel):
     temporal_beats: list[dict[str, Any]] = Field(
         alias="temporalBeats",
         default_factory=list,
-        max_length=3,
+        max_length=20,
     )
     composition_asset_ids: list[uuid.UUID] = Field(
         alias="compositionAssetIds",
@@ -323,9 +380,32 @@ class StoryboardPromptCompilationShot(StrictModel):
         max_length=6,
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_direction(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        direction = normalized.get("direction")
+        if isinstance(direction, str) and direction.strip():
+            normalized["action"] = direction
+        elif isinstance(normalized.get("action"), str):
+            normalized["direction"] = normalized["action"]
+        return normalized
+
 
 class StoryboardPromptCompilationRequest(StrictModel):
     story_revision_id: uuid.UUID = Field(alias="storyRevisionId")
+    storyboard_revision_id: uuid.UUID | None = Field(
+        alias="storyboardRevisionId", default=None
+    )
+    structure_hash: str | None = Field(
+        alias="structureHash", default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    generation_plan_id: uuid.UUID | None = Field(alias="generationPlanId", default=None)
+    generation_plan_hash: str | None = Field(
+        alias="generationPlanHash", default=None, pattern=r"^[0-9a-f]{64}$"
+    )
     visual_profile_revision_id: uuid.UUID = Field(alias="visualProfileRevisionId")
     shots: list[StoryboardPromptCompilationShot] = Field(min_length=1, max_length=200)
     healing_recipe: bool = Field(alias="healingRecipe", default=False)
@@ -335,12 +415,27 @@ class StoryboardPromptCompilationRequest(StrictModel):
         orders = [shot.order for shot in self.shots]
         if sorted(orders) != list(range(1, len(self.shots) + 1)):
             raise ValueError("镜头顺序必须从1开始且连续")
-        if self.healing_recipe:
-            if any(not 8 <= shot.duration_seconds <= 15 for shot in self.shots):
-                raise ValueError("治愈组合包每镜必须为8至15秒")
-            if any(shot.dialogue.strip() for shot in self.shots):
-                raise ValueError("治愈组合包禁止对白")
+        if self.healing_recipe and any(
+            not 4 <= shot.duration_seconds <= 15 for shot in self.shots
+        ):
+            raise ValueError("治愈组合包每个真实生成片段必须为4至15秒")
+        lineage_fields = (
+            self.storyboard_revision_id,
+            self.structure_hash,
+            self.generation_plan_id,
+            self.generation_plan_hash,
+        )
+        if any(item is not None for item in lineage_fields) and any(
+            item is None for item in lineage_fields
+        ):
+            raise ValueError("新分镜 Prompt 编译必须同时固定分镜版本、结构哈希和生成编排")
+        if self.healing_recipe and any(item is None for item in lineage_fields):
+            raise ValueError("治愈组合包不能用临时镜头数组绕过分镜版本与生成编排")
         return self
+
+    @property
+    def diagnostics(self) -> list[CanvasDiagnostic]:
+        return storyboard_quality_diagnostics(self.shots)
 
 
 class GenerationAttemptRequest(StrictModel):
@@ -363,7 +458,7 @@ class AssetReviewRequest(StrictModel):
     reason: str | None = Field(default=None, max_length=2_000)
 
 
-class CanvasLayoutPatch(StrictModel):
+class ProductionFlowLayoutPatch(StrictModel):
     nodes: list[dict[str, Any]] = Field(max_length=2_000)
     legacy_edges: list[dict[str, Any]] | None = Field(
         alias="edges",
@@ -375,40 +470,47 @@ class CanvasLayoutPatch(StrictModel):
     operations: list[dict[str, Any]] = Field(default_factory=list, max_length=2_000)
 
 
-class CanvasNodeArchiveRequest(StrictModel):
-    reason: str | None = Field(default=None, max_length=1_000)
+class CreateChildCatBriefRequest(StrictModel):
+    body: str = Field(min_length=1, max_length=20_000)
+    duration_seconds: int = Field(alias="durationSeconds", ge=8, le=60)
+    aspect_ratio: Literal["9:16", "16:9", "1:1"] = Field(alias="aspectRatio")
+    quality_tier: Literal["quick", "balanced", "premium"] = Field(alias="qualityTier")
 
 
-class TemplateInstanceRequest(StrictModel):
-    template_key: CanvasTemplateKey = Field(alias="templateKey")
+class CreateChildCatProjectRequest(StrictModel):
+    title: str = Field(min_length=1, max_length=160)
+    content_date: date | None = Field(alias="contentDate", default=None)
+    brief: CreateChildCatBriefRequest
+    child_canon_profile_id: str = Field(alias="childCanonProfileId", min_length=1, max_length=80)
+    cat_canon_profile_id: str = Field(alias="catCanonProfileId", min_length=1, max_length=80)
+    style_board_asset_id: uuid.UUID = Field(alias="styleBoardAssetId")
 
 
-class CanvasNodeCreateRequest(StrictModel):
-    node_type: CanvasNodeType = Field(alias="nodeType")
-    object_type: str = Field(alias="objectType", min_length=1, max_length=80)
-    object_id: uuid.UUID | None = Field(alias="objectId", default=None)
-    data: dict[str, Any] = Field(default_factory=dict)
-
-
-class CanvasNodeAssetBinding(StrictModel):
+class ShotBeatReferenceBindingRequest(StrictModel):
     asset_id: uuid.UUID = Field(alias="assetId")
-    semantic_role: str = Field(alias="semanticRole", min_length=1, max_length=80)
+    semantic_role: Literal[
+        "composition",
+        "pose",
+        "wardrobe",
+        "prop",
+        "environment_detail",
+    ] = Field(alias="semanticRole")
+    instruction: str = Field(default="", max_length=2_000)
+    ordinal: int = Field(ge=1, le=30)
 
 
-class CanvasNodeAssetBindingsRequest(StrictModel):
-    bindings: list[CanvasNodeAssetBinding] = Field(max_length=30)
-    allow_move: bool = Field(alias="allowMove", default=False)
+class ShotBeatReferenceBindingsRequest(StrictModel):
+    bindings: list[ShotBeatReferenceBindingRequest] = Field(default_factory=list, max_length=14)
 
-
-class GenerationBatchRequest(StrictModel):
-    project_id: uuid.UUID = Field(alias="projectId")
-    canvas_node_id: uuid.UUID = Field(alias="canvasNodeId")
-    media_kind: str = Field(alias="mediaKind", pattern="^(image|video)$")
-    candidate_count: int = Field(alias="candidateCount", default=4, ge=1, le=8)
-    provider: str | None = Field(default=None, min_length=1, max_length=80)
-    model: str | None = Field(default=None, min_length=1, max_length=200)
-    idempotency_key: str = Field(alias="idempotencyKey", min_length=8, max_length=96)
-    input: dict[str, Any]
+    @model_validator(mode="after")
+    def validate_order(self) -> ShotBeatReferenceBindingsRequest:
+        ordinals = [item.ordinal for item in self.bindings]
+        if ordinals != list(range(1, len(ordinals) + 1)):
+            raise ValueError("镜头引用顺序必须从1开始且连续")
+        asset_ids = [item.asset_id for item in self.bindings]
+        if len(asset_ids) != len(set(asset_ids)):
+            raise ValueError("同一素材不能在一个导演分镜中重复绑定")
+        return self
 
 
 class VideoEditRecipePatch(StrictModel):
@@ -436,10 +538,6 @@ def install_canvas_v2_routes(
 ) -> None:
     router = APIRouter(prefix="/api/v2")
 
-    @router.get("/canvas-templates")
-    def list_canvas_templates() -> list[dict[str, Any]]:
-        return service.list_canvas_templates()
-
     @router.get("/provider-capabilities")
     def list_provider_capabilities(
         media_kind: str | None = Query(
@@ -447,44 +545,6 @@ def install_canvas_v2_routes(
         ),
     ) -> list[dict[str, Any]]:
         return service.list_provider_capabilities(media_kind=media_kind)
-
-    @router.post(
-        "/projects/{project_id}/template-instances",
-        status_code=status.HTTP_201_CREATED,
-    )
-    def instantiate_template(
-        project_id: uuid.UUID, payload: TemplateInstanceRequest
-    ) -> dict[str, Any]:
-        return service.instantiate_template(project_id, payload)
-
-    @router.post("/projects/{project_id}/canvas/nodes", status_code=status.HTTP_201_CREATED)
-    def create_canvas_node(
-        project_id: uuid.UUID, payload: CanvasNodeCreateRequest
-    ) -> dict[str, Any]:
-        return service.create_canvas_node(project_id, payload)
-
-    @router.post("/projects/{project_id}/canvas/edges", status_code=status.HTTP_201_CREATED)
-    def create_canvas_edge(project_id: uuid.UUID, payload: CanvasConnection) -> dict[str, Any]:
-        return service.create_canvas_edge(project_id, payload)
-
-    @router.delete("/canvas/edges/{edge_id}")
-    def delete_canvas_edge(edge_id: uuid.UUID) -> dict[str, Any]:
-        return service.delete_canvas_edge(edge_id)
-
-    @router.put(
-        "/canvas/nodes/{node_id}/generation-config",
-        status_code=status.HTTP_201_CREATED,
-    )
-    def save_node_generation_config(
-        node_id: uuid.UUID,
-        payload: NodeGenerationConfigDraft,
-        if_match: str = Header(alias="If-Match"),
-    ) -> dict[str, Any]:
-        return service.save_node_generation_config(
-            node_id,
-            expected_revision=parse_version_header(if_match),
-            payload=payload,
-        )
 
     @router.put("/projects/{project_id}/brief")
     def save_brief(project_id: uuid.UUID, payload: StoryBrief) -> dict[str, Any]:
@@ -580,18 +640,6 @@ def install_canvas_v2_routes(
     ) -> dict[str, Any]:
         return service.get_video_filmstrip(asset_id, frame_count=frame_count)
 
-    @router.put("/canvas/nodes/{node_id}/asset-bindings")
-    def bind_canvas_node_assets(
-        node_id: uuid.UUID,
-        payload: CanvasNodeAssetBindingsRequest,
-        if_match: str = Header(alias="If-Match"),
-    ) -> dict[str, Any]:
-        return service.bind_canvas_node_assets(
-            node_id,
-            expected_revision=parse_version_header(if_match),
-            payload=payload,
-        )
-
     @router.post(
         "/projects/{project_id}/story-strategy-runs",
         status_code=status.HTTP_202_ACCEPTED,
@@ -624,6 +672,16 @@ def install_canvas_v2_routes(
         return service.approve_story_revision(revision_id)
 
     @router.post(
+        "/story-revisions/{revision_id}/edits",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def edit_story_revision(
+        revision_id: uuid.UUID,
+        payload: StoryDocumentEditRequest,
+    ) -> dict[str, Any]:
+        return service.edit_story_revision(revision_id, payload)
+
+    @router.post(
         "/projects/{project_id}/storyboard-runs",
         status_code=status.HTTP_202_ACCEPTED,
     )
@@ -647,6 +705,7 @@ def install_canvas_v2_routes(
             def run() -> dict[str, Any]:
                 return service.create_storyboard(
                     project_id,
+                    source_story_revision_id=payload.source_story_revision_id,
                     idempotency_key=payload.idempotency_key,
                     creation_mode=payload.creation_mode,
                     reference_asset_ids=tuple(payload.reference_asset_ids),
@@ -682,6 +741,18 @@ def install_canvas_v2_routes(
             payload=payload,
         )
 
+    @router.put("/shot-beats/{beat_id}/reference-bindings")
+    def replace_shot_beat_references(
+        beat_id: uuid.UUID,
+        payload: ShotBeatReferenceBindingsRequest,
+        if_match: str = Header(alias="If-Match"),
+    ) -> dict[str, Any]:
+        return service.replace_shot_beat_references(
+            beat_id,
+            expected_revision=parse_version_header(if_match),
+            payload=payload,
+        )
+
     @router.put("/projects/{project_id}/storyboard-drafts")
     def save_manual_storyboard(
         project_id: uuid.UUID,
@@ -705,9 +776,9 @@ def install_canvas_v2_routes(
     def create_generation_attempt(payload: GenerationAttemptRequest) -> dict[str, Any]:
         return service.create_generation_attempt(payload)
 
-    @router.post("/generation-batches", status_code=status.HTTP_202_ACCEPTED)
-    def create_generation_batch(payload: GenerationBatchRequest) -> dict[str, Any]:
-        return service.create_generation_batch(payload)
+    @router.get("/assets/{asset_id}/generation-lineage")
+    def get_asset_generation_lineage(asset_id: uuid.UUID) -> dict[str, Any]:
+        return service.get_asset_generation_lineage(asset_id)
 
     @router.post("/video-edit-recipes", status_code=status.HTTP_201_CREATED)
     def create_video_edit_recipe(payload: VideoEditRecipeDraft) -> dict[str, Any]:
@@ -768,76 +839,57 @@ def install_canvas_v2_routes(
     def get_prompt_run(prompt_id: uuid.UUID) -> dict[str, Any]:
         return service.get_prompt_run(prompt_id)
 
-    @router.get("/projects/{project_id}/canvas")
-    def get_canvas(project_id: uuid.UUID) -> dict[str, Any]:
-        return service.get_canvas(project_id)
+    @router.post("/projects", status_code=status.HTTP_201_CREATED)
+    def create_child_cat_project(payload: CreateChildCatProjectRequest) -> dict[str, Any]:
+        return service.create_child_cat_project(payload)
 
-    @router.patch("/projects/{project_id}/canvas/layout")
-    def save_canvas_layout(
+    @router.get(
+        "/projects/{project_id}/workspace-shell",
+        response_model=ProjectWorkspaceShellDto,
+        response_model_by_alias=True,
+        response_model_exclude_none=True,
+    )
+    def get_workspace_shell(project_id: uuid.UUID) -> ProjectWorkspaceShellDto:
+        return ProjectWorkspaceShellDto.model_validate(service.get_workspace_shell(project_id))
+
+    @router.get(
+        "/projects/{project_id}/script-workspace",
+        response_model=ScriptWorkspaceDto,
+        response_model_by_alias=True,
+        response_model_exclude_none=True,
+    )
+    def get_script_workspace(project_id: uuid.UUID) -> ScriptWorkspaceDto:
+        return ScriptWorkspaceDto.model_validate(service.get_script_workspace(project_id))
+
+    @router.get(
+        "/projects/{project_id}/production-flow",
+        response_model=ProductionFlowDto,
+        response_model_by_alias=True,
+        response_model_exclude_none=True,
+    )
+    def get_production_flow(project_id: uuid.UUID) -> ProductionFlowDto:
+        return ProductionFlowDto.model_validate(service.get_production_flow(project_id))
+
+    @router.patch("/projects/{project_id}/production-flow/layout")
+    def save_production_flow_layout(
         project_id: uuid.UUID,
-        payload: CanvasLayoutPatch,
+        payload: ProductionFlowLayoutPatch,
         if_match: str = Header(alias="If-Match"),
     ) -> dict[str, Any]:
-        return service.save_canvas_layout(
+        return service.save_production_flow_layout(
             project_id,
             expected_version=parse_version_header(if_match),
             payload=payload,
         )
 
-    @router.post("/projects/{project_id}/canvas/nodes/{node_id}/archive")
-    def archive_canvas_node(
-        project_id: uuid.UUID,
-        node_id: uuid.UUID,
-        payload: CanvasNodeArchiveRequest,
-        if_match: str = Header(alias="If-Match"),
-    ) -> dict[str, Any]:
-        return service.archive_canvas_node(
-            project_id,
-            node_id,
-            expected_version=parse_version_header(if_match),
-            reason=payload.reason,
-        )
-
-    @router.post("/projects/{project_id}/canvas/nodes/{node_id}/restore")
-    def restore_canvas_node(
-        project_id: uuid.UUID,
-        node_id: uuid.UUID,
-        if_match: str = Header(alias="If-Match"),
-    ) -> dict[str, Any]:
-        return service.restore_canvas_node(
-            project_id,
-            node_id,
-            expected_version=parse_version_header(if_match),
-        )
-
-    @router.get("/projects/{project_id}/events")
-    async def project_events(
-        project_id: uuid.UUID,
-        request: Request,
-        last_event_id: str | None = Header(alias="Last-Event-ID", default=None),
-        after_event_id: int | None = Query(alias="afterEventId", default=None, ge=0),
-    ) -> StreamingResponse:
-        event_loader = getattr(service, "events", None)
-        cursor = parse_event_cursor(last_event_id, after_event_id)
-
-        def load(after_sequence: int) -> tuple[dict[str, Any], ...]:
-            if callable(event_loader):
-                return event_loader(project_id, after_sequence=after_sequence)
-            if after_sequence > 0:
-                return ()
-            return (
-                {
-                    "sequence": 1,
-                    "type": "canvas_snapshot",
-                    "data": service.get_canvas(project_id),
-                },
-            )
-
-        return StreamingResponse(
-            stream_events(request, loader=load, after_sequence=cursor),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+    @router.get(
+        "/projects/{project_id}/video-workbench",
+        response_model=VideoWorkbenchDto,
+        response_model_by_alias=True,
+        response_model_exclude_none=True,
+    )
+    def get_video_workbench(project_id: uuid.UUID) -> VideoWorkbenchDto:
+        return VideoWorkbenchDto.model_validate(service.get_video_workbench(project_id))
 
     @router.options("/{path:path}", include_in_schema=False)
     def v2_options(_path: str) -> Response:

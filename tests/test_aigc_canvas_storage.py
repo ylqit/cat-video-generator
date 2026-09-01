@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from cat_video_generator.domain.aigc_canvas import CanvasNodeType
 from cat_video_generator.infrastructure.db.aigc_canvas_repository import (
+    _active_track_id,
     _apply_canvas_layout_hints,
     _apply_canvas_node_archive_projection,
     _apply_canvas_workflow_step_projection,
@@ -14,6 +15,20 @@ from cat_video_generator.infrastructure.db.aigc_canvas_repository import (
 )
 from cat_video_generator.infrastructure.db.models import SCHEMA_NAME, Base, CanvasGraphNode
 from cat_video_generator.infrastructure.db.session import ALEMBIC_HEAD
+
+
+def test_video_workbench_active_track_is_always_a_real_shot_track() -> None:
+    waiting_id = uuid.uuid4()
+    selected_id = uuid.uuid4()
+
+    active_track_id = _active_track_id(
+        [
+            SimpleNamespace(id=waiting_id, selected_video_asset_id=None),
+            SimpleNamespace(id=selected_id, selected_video_asset_id=uuid.uuid4()),
+        ]
+    )
+
+    assert active_track_id == str(selected_id)
 
 
 def test_canvas_v2_schema_contains_domain_truth_tables() -> None:
@@ -108,7 +123,7 @@ def test_prompt_records_have_full_audit_columns() -> None:
 
 
 def test_canvas_v2_migration_is_current_head() -> None:
-    assert ALEMBIC_HEAD == "0028_story_event_candidates"
+    assert ALEMBIC_HEAD == "0031_workflow_task_cancellation"
 
 
 def test_storyboard_prompt_compiler_keeps_reference_layers_and_exclusions_separate() -> None:
@@ -174,18 +189,21 @@ def test_storyboard_prompt_compiler_keeps_reference_layers_and_exclusions_separa
         healing_recipe=True,
     )
 
-    assert "【全局 Canon：身份与画风不变量】" in prompt
-    assert "【本集造型与规则】" in prompt
-    assert "【所属场景】" in prompt
-    assert "【镜头画面】" in prompt
-    assert "【视频运动与声音】" in prompt
-    assert "【引用职责审计】" in prompt
-    assert "【排除项】" in prompt
-    assert '"role": "identity"' in prompt
-    assert '"role": "environment"' in prompt
-    assert "禁止串用其他场景素材" in prompt
+    assert "身份连续性" in prompt
+    assert "本集与场景" in prompt
+    assert "镜头正文" in prompt
+    assert "运动与声音" in prompt
+    assert "参考职责" in prompt
+    assert "连续性与排除项" in prompt
+    assert "@图片1「儿童面部身份」" in prompt
+    assert "@图片2「雨后小院 Scene Look」" in prompt
+    assert '"role": "identity"' not in prompt
+    assert '"role": "environment"' not in prompt
+    assert "跨场景环境与道具串用" in prompt
     assert "猫咪出现人手、人形肢体" in prompt
-    assert "无对白，不做口型" in prompt
+    assert "未提供额外声音或对白要求" not in prompt
+    assert "声音：雨滴与猫咪脚步声" in prompt
+    assert "无对白，不做口型" not in prompt
 
 
 def test_approved_story_scenes_and_compiled_prompts_have_version_pins() -> None:
@@ -198,6 +216,46 @@ def test_approved_story_scenes_and_compiled_prompts_have_version_pins() -> None:
     assert {"story_revision_id", "prompt_id", "temporal_beats_json"} <= set(
         beat_columns.keys()
     )
+
+
+def test_storyboard_prompt_uses_direction_without_inventing_advanced_facts() -> None:
+    profile = SimpleNamespace(
+        person_identity="固定人物身份",
+        person_hair="固定发型",
+        person_body="固定比例",
+        cat_identity="固定猫咪身份",
+        style_positive_json=["原创柔和线条"],
+        style_negative_json=["身份漂移"],
+    )
+    story = SimpleNamespace(episode_rules_json={})
+    scene = SimpleNamespace(
+        title="雨前小院",
+        source_text="孩子和猫收起画纸",
+        context_note=None,
+    )
+
+    prompt = _compile_storyboard_prompt_text(
+        profile=profile,
+        story=story,
+        scene=scene,
+        shot={
+            "order": 1,
+            "title": "收画",
+            "direction": "孩子将画纸收进文件夹，猫咪停在一旁观察。",
+            "action": "旧动作字段不应胜出。",
+            "durationSeconds": 10,
+            "dialogue": "要下雨了。",
+        },
+        reference_bindings=[],
+        healing_recipe=True,
+    )
+
+    assert "孩子将画纸收进文件夹，猫咪停在一旁观察。" in prompt
+    assert "旧动作字段不应胜出" not in prompt
+    assert "对白：要下雨了。" in prompt
+    assert "猫咪以已批准行为模式自然参与" not in prompt
+    assert "固定机位" not in prompt
+    assert "发生一个微小可见变化" not in prompt
 
 
 def test_assets_can_belong_to_a_universal_canvas_node() -> None:

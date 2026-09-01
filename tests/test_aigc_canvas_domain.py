@@ -13,7 +13,6 @@ from cat_video_generator.domain.aigc_canvas import (
     StoryBrief,
     StoryEventCandidateOutput,
     StoryRevisionStatus,
-    StoryScorecard,
     SubjectDraft,
     allocate_bounded_durations,
     allocate_durations,
@@ -214,25 +213,14 @@ def test_canvas_connection_validates_typed_node_ports() -> None:
         )
 
 
-def test_story_approval_requires_scorecard_and_both_subjects() -> None:
+def test_story_approval_without_scorecard_still_requires_all_subjects() -> None:
     child_id = uuid.uuid4()
     cat_id = uuid.uuid4()
-    scorecard = StoryScorecard(
-        openingHook=8,
-        causalCompleteness=8,
-        subjectNecessity=9,
-        emotionalArc=8,
-        visualizability=9,
-        durationFit=8,
-        continuityRisk=7,
-        safety=10,
-        rationale="两个主体共同推动回收画作的行动链。",
-    )
-
     assert (
         approve_story_revision(
             StoryRevisionStatus.CANDIDATE,
-            scorecard=scorecard,
+            scorecard=None,
+            requires_scorecard=False,
             revision_subject_ids=(child_id, cat_id),
             required_subject_ids=(child_id, cat_id),
         )
@@ -242,8 +230,18 @@ def test_story_approval_requires_scorecard_and_both_subjects() -> None:
     with pytest.raises(ValueError, match="缺少主体"):
         approve_story_revision(
             StoryRevisionStatus.CANDIDATE,
-            scorecard=scorecard,
+            scorecard=None,
+            requires_scorecard=False,
             revision_subject_ids=(child_id,),
+            required_subject_ids=(child_id, cat_id),
+        )
+
+    with pytest.raises(ValueError, match="评审评分"):
+        approve_story_revision(
+            StoryRevisionStatus.CANDIDATE,
+            scorecard=None,
+            requires_scorecard=True,
+            revision_subject_ids=(child_id, cat_id),
             required_subject_ids=(child_id, cat_id),
         )
 

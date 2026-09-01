@@ -177,22 +177,7 @@ def compile_video_edit_plan(
             videoCallCount=1,
             estimatedCostMicros=capability.video_call_cost_micros,
         )
-    if not capability.supports_control_anchors:
-        raise ValueError("当前供应商无法表达所选标注和主体参考，请更换模型")
-
-    stages = [
-        VideoEditStage(kind="control_anchor", boundary="start"),
-        VideoEditStage(kind="control_anchor", boundary="end"),
-        VideoEditStage(kind="video_edit"),
-    ]
-    return CapabilityCompilationPlan(
-        mode="two_stage",
-        stages=stages,
-        imageCallCount=2,
-        videoCallCount=1,
-        estimatedCostMicros=(
-            capability.image_call_cost_micros * 2
-            + capability.video_call_cost_micros
-        ),
-        warnings=["当前模型将先生成两个干净控制锚点，再执行区间视频重编"],
+    raise ValueError(
+        "当前供应商无法直接接收当前标注和参考素材，请精简输入或更换兼容模型；"
+        "系统不会自动增加图片调用"
     )

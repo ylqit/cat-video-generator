@@ -29,6 +29,7 @@ class MediaModality(StrEnum):
 
 class ProviderMediaRole(StrEnum):
     FIRST_FRAME = "first_frame"
+    LAST_FRAME = "last_frame"
     REFERENCE_VIDEO = "reference_video"
     REFERENCE_IMAGE = "reference_image"
 
@@ -91,31 +92,52 @@ class VideoInputPlan(StrictModel):
         if len({item.asset_id for item in self.bindings}) != len(self.bindings):
             raise ValueError("同一资产不能重复进入一个视频任务")
         if self.operation is RenderOperation.SHOT:
-            if self.duration_seconds < 8:
-                raise ValueError("镜头视频时长必须在8至15秒")
             first_frames = [
                 item
                 for item in self.bindings
                 if item.provider_role is ProviderMediaRole.FIRST_FRAME
             ]
-            if len(first_frames) > 1:
+            last_frames = [
+                item
+                for item in self.bindings
+                if item.provider_role is ProviderMediaRole.LAST_FRAME
+            ]
+            if len(first_frames) > 1 or len(last_frames) > 1:
                 raise ValueError("一次镜头生成最多使用一张first_frame")
             if first_frames and self.bindings[0] is not first_frames[0]:
                 raise ValueError("first_frame必须是第一项素材")
-            if first_frames and len(self.bindings) != 1:
+            if last_frames and not first_frames:
+                raise ValueError("last_frame必须与first_frame一起使用")
+            controlled_roles = [
+                item.provider_role
+                for item in self.bindings
+                if item.provider_role in {
+                    ProviderMediaRole.FIRST_FRAME,
+                    ProviderMediaRole.LAST_FRAME,
+                }
+            ]
+            if controlled_roles not in (
+                [],
+                [ProviderMediaRole.FIRST_FRAME],
+                [ProviderMediaRole.FIRST_FRAME, ProviderMediaRole.LAST_FRAME],
+            ):
+                raise ValueError("首尾帧必须按first_frame、last_frame顺序提交")
+            if first_frames and len(self.bindings) != len(controlled_roles):
                 raise ValueError(
-                    "Seedance首帧模式不能同时提交普通参考图片或参考视频"
+                    "Seedance首帧或首尾帧模式不能同时提交普通参考图片或参考视频"
                 )
             if any(item.modality is MediaModality.VIDEO for item in self.bindings):
                 raise ValueError("初始镜头生成不接收前序完整视频")
         else:
             roles = [item.provider_role for item in self.bindings]
-            if roles != [
-                ProviderMediaRole.REFERENCE_VIDEO,
-                ProviderMediaRole.REFERENCE_IMAGE,
-                ProviderMediaRole.REFERENCE_IMAGE,
-            ]:
-                raise ValueError("区间编辑必须按@视频1、@图片1、@图片2绑定")
+            if (
+                len(roles) < 3
+                or roles[0] is not ProviderMediaRole.REFERENCE_VIDEO
+                or any(role is not ProviderMediaRole.REFERENCE_IMAGE for role in roles[1:])
+            ):
+                raise ValueError(
+                    "区间编辑必须先绑定@视频1和两张真实边界帧，随后才能附加参考图"
+                )
         return self
 
 
@@ -148,9 +170,17 @@ class SequenceClip(StrictModel):
 class ProjectSequencePlan(StrictModel):
     duration_ms: Annotated[int, Field(gt=0)]
     clips: list[SequenceClip] = Field(min_length=1)
+    intro_transition: SequenceTransition | None = Field(default=None, alias="introTransition")
+    outro_transition: SequenceTransition | None = Field(default=None, alias="outroTransition")
 
     @model_validator(mode="after")
     def validate_timeline(self) -> ProjectSequencePlan:
+        for label, transition in (
+            ("开场", self.intro_transition),
+            ("结尾", self.outro_transition),
+        ):
+            if transition is not None and transition.type is SequenceTransitionType.CROSS_DISSOLVE:
+                raise ValueError(f"{label}边界不支持叠化，只能使用淡黑或直接切换")
         if [clip.order for clip in self.clips] != list(range(1, len(self.clips) + 1)):
             raise ValueError("时间轴片段order必须连续")
         previous: SequenceClip | None = None
@@ -193,6 +223,7 @@ def build_shot_input_plan(
     resolution: str,
     duration_seconds: int,
     anchor: MediaSource | None,
+    last_frame: MediaSource | None = None,
     references: tuple[MediaSource, ...] = (),
 ) -> VideoInputPlan:
     if resolution not in {"480p", "720p"}:
@@ -201,11 +232,17 @@ def build_shot_input_plan(
     # mutually exclusive request modes.  Identity, wardrobe, environment and
     # style references must be resolved while producing the approved anchor;
     # once it is used as FIRST_FRAME, it is the only provider media input.
+    if last_frame is not None and anchor is None:
+        raise ValueError("尾帧控制必须同时提供首帧")
     if anchor is not None and references:
         raise ValueError("Seedance首帧模式不能同时提交普通参考图片")
     if len(references) > 9:
         raise ValueError("当前模型输入档案最多允许9项参考素材")
-    sources = (() if anchor is None else (anchor,)) + references
+    sources = (
+        (() if anchor is None else (anchor,))
+        + (() if last_frame is None else (last_frame,))
+        + references
+    )
     if any(source.media_type != "image" for source in sources):
         raise ValueError("镜头生成的锚点与参考素材必须是图片")
     bindings: list[MediaBinding] = []
@@ -218,6 +255,8 @@ def build_shot_input_plan(
                 provider_role=(
                     ProviderMediaRole.FIRST_FRAME
                     if anchor is not None and index == 1
+                    else ProviderMediaRole.LAST_FRAME
+                    if last_frame is not None and index == 2
                     else ProviderMediaRole.REFERENCE_IMAGE
                 ),
                 ordinal=index,
@@ -239,17 +278,20 @@ def build_edit_input_plan(
     source_video: MediaSource,
     before_frame: MediaSource,
     after_frame: MediaSource,
+    references: tuple[MediaSource, ...] = (),
 ) -> VideoInputPlan:
-    sources = (source_video, before_frame, after_frame)
-    if [item.media_type for item in sources] != ["video", "image", "image"]:
+    sources = (source_video, before_frame, after_frame, *references)
+    if [item.media_type for item in sources[:3]] != ["video", "image", "image"]:
         raise ValueError("区间编辑需要一个视频和两张边界图")
-    roles = (
-        ProviderMediaRole.REFERENCE_VIDEO,
-        ProviderMediaRole.REFERENCE_IMAGE,
-        ProviderMediaRole.REFERENCE_IMAGE,
+    if any(item.media_type != "image" for item in references):
+        raise ValueError("视频局部编辑的额外参考素材必须是图片")
+    if len(sources) > 9:
+        raise ValueError("视频局部编辑最多允许六张额外参考图")
+    roles = (ProviderMediaRole.REFERENCE_VIDEO,) + (
+        (ProviderMediaRole.REFERENCE_IMAGE,) * (len(sources) - 1)
     )
-    modalities = (MediaModality.VIDEO, MediaModality.IMAGE, MediaModality.IMAGE)
-    ordinals = (1, 1, 2)
+    modalities = (MediaModality.VIDEO,) + ((MediaModality.IMAGE,) * (len(sources) - 1))
+    ordinals = (1, *range(1, len(sources)))
     return VideoInputPlan(
         operation=RenderOperation.EDIT,
         resolution=resolution,

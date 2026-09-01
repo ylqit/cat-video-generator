@@ -23,6 +23,7 @@ from volcenginesdkarkruntime._exceptions import (
 )
 
 from ...application.ports import (
+    CreativeDirectorResult,
     DirectorResult,
     GatewayError,
     ImageDiagnosticResult,
@@ -96,13 +97,102 @@ class ArkGateway:
     def review_model(self) -> str:
         return self._settings.ark_review_model
 
+    def generate_creative_text(
+        self,
+        *,
+        prompt: str,
+        output_name: str,
+    ) -> CreativeDirectorResult:
+        return self._generate_flexible_text(
+            prompt=prompt,
+            output_name=output_name,
+            mode="creative_text",
+        )
+
+    def generate_storyboard_text(
+        self,
+        *,
+        prompt: str,
+        output_name: str,
+        image_paths: tuple[Path, ...] = (),
+    ) -> CreativeDirectorResult:
+        return self._generate_flexible_text(
+            prompt=prompt,
+            output_name=output_name,
+            mode="storyboard_text",
+            image_paths=image_paths,
+        )
+
+    def _generate_flexible_text(
+        self,
+        *,
+        prompt: str,
+        output_name: str,
+        mode: str,
+        image_paths: tuple[Path, ...] = (),
+    ) -> CreativeDirectorResult:
+        """Own tolerant creative output and ordered multimodal reference transport."""
+
+        input_text = f"生成一个{output_name}。"
+        ordered_image_hashes: list[str] = []
+        input_content: Any = input_text
+        if image_paths:
+            content: list[dict[str, str]] = [{"type": "input_text", "text": input_text}]
+            for index, path in enumerate(image_paths, 1):
+                _validate_reference_file(path)
+                ordered_image_hashes.append(hashlib.sha256(path.read_bytes()).hexdigest())
+                content.append({"type": "input_text", "text": f"按顺序查看@图片{index}"})
+                content.append(
+                    {
+                        "type": "input_image",
+                        "image_url": _analysis_preview_data_url(path),
+                    }
+                )
+            input_content = [{"role": "user", "content": content}]
+        request_document: dict[str, Any] = {
+            "input": input_text,
+            "instructions": prompt,
+            "mode": mode,
+            "model": self.model,
+            "outputName": output_name,
+        }
+        if ordered_image_hashes:
+            request_document["orderedImageSha256"] = ordered_image_hashes
+        request_hash = _json_hash(request_document)
+        response = self._run_planning_response(
+            instructions=prompt,
+            input_text=input_content,
+            text_format={"type": "text"},
+        )
+        response_text = _response_text(response, reject_blank=True)
+        try:
+            decoded = json.loads(response_text)
+        except json.JSONDecodeError:
+            payload: dict[str, Any] | str = response_text
+        else:
+            payload = decoded if isinstance(decoded, dict) else response_text
+        return CreativeDirectorResult(
+            payload=payload,
+            response_id=response.id,
+            model=response.model,
+            request_hash=request_hash,
+        )
+
     def generate_structured(
         self,
         *,
         prompt: str,
         schema: dict[str, Any],
         output_name: str,
+        image_paths: tuple[Path, ...] = (),
     ) -> DirectorResult:
+        if image_paths:
+            return self.analyze_structured(
+                prompt=prompt,
+                schema=schema,
+                output_name=output_name,
+                image_paths=image_paths,
+            )
         instructions, text_format = self._structured_output(
             prompt,
             schema,
@@ -116,16 +206,49 @@ class ArkGateway:
                 "outputName": output_name,
             }
         )
+        response = self._run_planning_response(
+            instructions=instructions,
+            input_text=f"生成一个{output_name}对象。",
+            text_format=text_format,
+        )
+        try:
+            payload = json.loads(_response_text(response))
+        except json.JSONDecodeError as exc:
+            raise ArkGatewayError(
+                "Ark导演没有返回合法JSON对象。",
+                code="invalid_director_output",
+                retryable=False,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ArkGatewayError(
+                "Ark导演返回的JSON顶层必须是对象。",
+                code="invalid_director_output",
+                retryable=False,
+            )
+        return DirectorResult(
+            payload=payload,
+            response_id=response.id,
+            model=response.model,
+            request_hash=request_hash,
+        )
+
+    def _run_planning_response(
+        self,
+        *,
+        instructions: str,
+        input_text: Any,
+        text_format: dict[str, Any],
+    ) -> Any:
+        """Own the planning request lifecycle and its recoverable error policy."""
+
         try:
             response = self._client.responses.create(
                 model=self.model,
                 instructions=instructions,
-                input=f"生成一个{output_name}对象。",
+                input=input_text,
                 text={"format": text_format},
                 temperature=0.35,
                 max_output_tokens=8000,
-                # 导演结果必须是短小、可校验的JSON。关闭隐藏思考，避免推理内容
-                # 消耗输出预算后只返回incomplete，创意约束仍由分层Prompt承担。
                 thinking={"type": "disabled"},
                 store=False,
                 timeout=self._settings.ark_director_request_timeout_seconds,
@@ -148,26 +271,7 @@ class ArkGateway:
                 ),
                 retryable=incomplete_reason == "max_output_tokens",
             )
-        try:
-            payload = json.loads(_response_text(response))
-        except json.JSONDecodeError as exc:
-            raise ArkGatewayError(
-                "Ark导演没有返回合法JSON对象。",
-                code="invalid_director_output",
-                retryable=False,
-            ) from exc
-        if not isinstance(payload, dict):
-            raise ArkGatewayError(
-                "Ark导演返回的JSON顶层必须是对象。",
-                code="invalid_director_output",
-                retryable=False,
-            )
-        return DirectorResult(
-            payload=payload,
-            response_id=response.id,
-            model=response.model,
-            request_hash=request_hash,
-        )
+        return response
 
     def analyze_structured(
         self,
@@ -338,6 +442,8 @@ class ArkGateway:
         *,
         prompt: str,
         frame_paths: tuple[Path, ...],
+        reference_paths: tuple[Path, ...] = (),
+        reference_labels: tuple[str, ...] = (),
     ) -> VideoDiagnosticResult:
         """按时间顺序审核抽帧序列；诊断结果不直接批准最终视频。"""
 
@@ -347,6 +453,12 @@ class ArkGateway:
                 code="invalid_video_review_frame_count",
                 retryable=False,
             )
+        if len(reference_paths) != len(reference_labels):
+            raise ArkGatewayError(
+                "视频身份诊断的参考图与职责标签数量不一致",
+                code="invalid_video_review_reference_manifest",
+                retryable=False,
+            )
         schema = VIDEO_DIAGNOSTIC_SCHEMA
         instructions, text_format = self._structured_output(
             prompt,
@@ -354,20 +466,36 @@ class ArkGateway:
             "VideoSemanticDiagnostic",
         )
         frame_hashes = [hashlib.sha256(path.read_bytes()).hexdigest() for path in frame_paths]
+        reference_hashes = [
+            hashlib.sha256(path.read_bytes()).hexdigest() for path in reference_paths
+        ]
         request_hash = _json_hash(
             {
                 "model": self.review_model,
                 "instructions": instructions,
                 "schema": schema,
                 "orderedFrameSha256": frame_hashes,
+                "referenceSha256": reference_hashes,
+                "referenceLabels": list(reference_labels),
             }
         )
         content: list[dict[str, str]] = [
             {
                 "type": "input_text",
-                "text": "以下图片按视频时间顺序排列，请只返回结构化诊断。",
+                "text": (
+                    "先给出身份 Canon、已批准本集设计与画风参考，再给出按视频时间排序的抽帧。"
+                    "必须逐项比较固定特征；不能只根据文字猜测身份。请只返回结构化诊断。"
+                ),
             }
         ]
+        for label, path in zip(reference_labels, reference_paths, strict=True):
+            content.append({"type": "input_text", "text": f"参考职责：{label}"})
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": _asset_data_url(path),
+                }
+            )
         for index, path in enumerate(frame_paths, 1):
             content.append({"type": "input_text", "text": f"有序抽帧{index}"})
             content.append(
@@ -400,6 +528,7 @@ class ArkGateway:
             payload = json.loads(_response_text(response))
             return VideoDiagnosticResult(
                 identity_ok=bool(payload["identityOk"]),
+                identity_assessment=str(payload["identityAssessment"]),
                 style_ok=bool(payload["styleOk"]),
                 constraints_ok=bool(payload["constraintsOk"]),
                 narrative_order_ok=bool(payload["narrativeOrderOk"]),
@@ -491,7 +620,7 @@ class ArkGateway:
             response = self._client.content_generation.tasks.create(
                 model=self.video_model,
                 content=content,
-                return_last_frame=False,
+                return_last_frame=True,
                 generate_audio=input_plan.audio_policy is AudioPolicy.NATIVE_REQUIRED,
                 watermark=False,
                 resolution=input_plan.resolution,
@@ -518,6 +647,21 @@ class ArkGateway:
         except ArkAPIError as exc:
             raise _provider_error(exc, submission=False) from exc
         return _video_task_result(task)
+
+    def cancel_video_task(self, task_id: str) -> VideoTaskResult:
+        """Delete one Ark video task that the Provider still reports as queued."""
+
+        normalized_task_id = task_id.strip()
+        if not normalized_task_id:
+            raise ValueError("Ark视频任务ID不能为空")
+        try:
+            self._client.content_generation.tasks.delete(
+                task_id=normalized_task_id,
+                timeout=self._settings.ark_video_api_timeout_seconds,
+            )
+        except ArkAPIError as exc:
+            raise _provider_error(exc, submission=False) from exc
+        return VideoTaskResult(task_id=normalized_task_id, status="cancelled")
 
     def list_video_tasks(
         self,
@@ -579,7 +723,7 @@ class ArkGateway:
         )
 
 
-def _response_text(response: Any) -> str:
+def _response_text(response: Any, *, reject_blank: bool = False) -> str:
     parts: list[str] = []
     for output in response.output:
         if getattr(output, "type", None) != "message":
@@ -587,13 +731,14 @@ def _response_text(response: Any) -> str:
         for part in getattr(output, "content", ()):
             if getattr(part, "type", None) == "output_text":
                 parts.append(part.text)
-    if not parts:
+    text = _repair_utf8_mojibake("".join(parts))
+    if not parts or (reject_blank and not text.strip()):
         raise ArkGatewayError(
-            "Ark Responses没有返回JSON文本。",
+            "Ark Responses没有返回文本。",
             code="empty_director_result",
             retryable=False,
         )
-    return _repair_utf8_mojibake("".join(parts))
+    return text
 
 
 def _repair_utf8_mojibake(value: str) -> str:
@@ -738,6 +883,9 @@ def _video_task_result(task: Any) -> VideoTaskResult:
         task_id=str(task.id),
         status=str(task.status),
         video_url=(None if content is None else getattr(content, "video_url", None)),
+        last_frame_url=(
+            None if content is None else getattr(content, "last_frame_url", None)
+        ),
         error_code=None if error is None else getattr(error, "code", None),
         error_message=None if error is None else getattr(error, "message", None),
         model=getattr(task, "model", None),

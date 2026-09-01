@@ -2,29 +2,57 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any, Protocol
 from urllib.parse import quote
 
-from fastapi import APIRouter, FastAPI, Header, Response, status
+from fastapi import (
+    APIRouter,
+    FastAPI,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+    status,
+)
 from pydantic import Field
 
 from ..domain.contract_base import StrictModel
 from ..domain.production_recipes import (
     CanvasGroupRunRequest,
+    CharacterDesignRecipeRunRequest,
+    DirectorWorkflowAdoptionRequest,
     EpisodeRules,
+    GenerationPlanRevisionDraft,
     HumanReviewDecision,
     HumanReviewDraft,
     PaidRecipeRunRequest,
     ProductionRecipeInstanceDraft,
     ProductionRecipeInstancePatch,
     RecipeSequenceRunRequest,
+    StoryboardProductionPlanConfirmation,
     StoryboardRecipeRunRequest,
 )
 from .http_headers import parse_version_header
 
+logger = logging.getLogger(__name__)
+
 
 class ProductionRecipeApiService(Protocol):
+    def preview_director_workflow_adoption(
+        self,
+        project_id: uuid.UUID,
+    ) -> dict[str, Any]: ...
+
+    def adopt_director_workflow(
+        self,
+        project_id: uuid.UUID,
+        payload: DirectorWorkflowAdoptionRequest,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]: ...
+
     def list_recipes(self) -> list[dict[str, Any]]: ...
 
     def create_instance(
@@ -51,6 +79,21 @@ class ProductionRecipeApiService(Protocol):
         episode_rules: EpisodeRules | None = None,
     ) -> dict[str, Any]: ...
 
+    def confirm_storyboard_production_plan(
+        self,
+        instance_id: uuid.UUID,
+        payload: StoryboardProductionPlanConfirmation,
+    ) -> dict[str, Any]: ...
+
+    def revise_generation_plan(
+        self,
+        instance_id: uuid.UUID,
+        plan_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        payload: GenerationPlanRevisionDraft,
+    ) -> dict[str, Any]: ...
+
     def run_story(
         self, instance_id: uuid.UUID, payload: PaidRecipeRunRequest
     ) -> dict[str, Any]: ...
@@ -68,6 +111,14 @@ class ProductionRecipeApiService(Protocol):
     ) -> dict[str, Any]: ...
 
     def run_character_design(
+        self, instance_id: uuid.UUID, payload: CharacterDesignRecipeRunRequest
+    ) -> dict[str, Any]: ...
+
+    def preview_character_design(
+        self, instance_id: uuid.UUID, payload: CharacterDesignRecipeRunRequest
+    ) -> dict[str, Any]: ...
+
+    def preview_character_design_validation(
         self, instance_id: uuid.UUID, payload: PaidRecipeRunRequest
     ) -> dict[str, Any]: ...
 
@@ -162,6 +213,27 @@ def install_production_recipe_routes(
     def list_recipes() -> list[dict[str, Any]]:
         return service.list_recipes()
 
+    @router.get("/projects/{project_id}/director-workflow-adoption-preview")
+    def preview_director_workflow_adoption(
+        project_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        return service.preview_director_workflow_adoption(project_id)
+
+    @router.post(
+        "/projects/{project_id}/director-workflow-adoptions",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def adopt_director_workflow(
+        project_id: uuid.UUID,
+        payload: DirectorWorkflowAdoptionRequest,
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=8, max_length=96),
+    ) -> dict[str, Any]:
+        return service.adopt_director_workflow(
+            project_id,
+            payload,
+            idempotency_key=idempotency_key,
+        )
+
     @router.post(
         "/projects/{project_id}/recipe-instances",
         status_code=status.HTTP_201_CREATED,
@@ -250,13 +322,43 @@ def install_production_recipe_routes(
     )
     def run_character_design(
         instance_id: uuid.UUID,
-        payload: PaidRecipeRunRequest,
+        payload: CharacterDesignRecipeRunRequest,
     ) -> dict[str, Any]:
         return service.enqueue_recipe_task(
             instance_id,
             operation_key="recipe:character_design",
             payload=payload,
         )
+
+    @router.post("/recipe-instances/{instance_id}/character-design-input-preview")
+    def preview_character_design(
+        instance_id: uuid.UUID,
+        payload: CharacterDesignRecipeRunRequest,
+    ) -> dict[str, Any]:
+        return service.preview_character_design(instance_id, payload)
+
+    @router.post(
+        "/recipe-instances/{instance_id}/character-design-validation-runs",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def run_character_design_validation(
+        instance_id: uuid.UUID,
+        payload: PaidRecipeRunRequest,
+    ) -> dict[str, Any]:
+        return service.enqueue_recipe_task(
+            instance_id,
+            operation_key="recipe:character_design_validation",
+            payload=payload,
+        )
+
+    @router.post(
+        "/recipe-instances/{instance_id}/character-design-validation-input-preview"
+    )
+    def preview_character_design_validation(
+        instance_id: uuid.UUID,
+        payload: PaidRecipeRunRequest,
+    ) -> dict[str, Any]:
+        return service.preview_character_design_validation(instance_id, payload)
 
     @router.post(
         "/recipe-instances/{instance_id}/storyboard-runs",
@@ -277,6 +379,32 @@ def install_production_recipe_routes(
             payload=payload,
             creation_mode=payload.creation_mode.value,
         )
+
+    @router.put(
+        "/recipe-instances/{instance_id}/generation-plans/{plan_id}"
+    )
+    def revise_generation_plan(
+        instance_id: uuid.UUID,
+        plan_id: uuid.UUID,
+        payload: GenerationPlanRevisionDraft,
+        if_match: str = Header(alias="If-Match"),
+    ) -> dict[str, Any]:
+        return service.revise_generation_plan(
+            instance_id,
+            plan_id,
+            expected_revision=parse_version_header(if_match),
+            payload=payload,
+        )
+
+    @router.post(
+        "/recipe-instances/{instance_id}/storyboard-production-confirmations",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def confirm_storyboard_production_plan(
+        instance_id: uuid.UUID,
+        payload: StoryboardProductionPlanConfirmation,
+    ) -> dict[str, Any]:
+        return service.confirm_storyboard_production_plan(instance_id, payload)
 
     @router.post(
         "/recipe-instances/{instance_id}/shots/{shot_id}/anchor-runs",
@@ -375,18 +503,42 @@ def install_production_recipe_routes(
         )
 
     @router.post("/review-decisions", status_code=status.HTTP_201_CREATED)
-    def record_review(payload: ReviewDecisionRequest) -> dict[str, Any]:
+    def record_review(payload: ReviewDecisionRequest, request: Request) -> dict[str, Any]:
         review_document = payload.model_dump(mode="json", by_alias=True)
         instance_id = uuid.UUID(review_document.pop("recipeInstanceId"))
         episode_rules_document = review_document.pop("episodeRules")
-        return service.record_review(
-            instance_id,
-            HumanReviewDraft.model_validate(review_document),
-            episode_rules=(
-                None
-                if episode_rules_document is None
-                else EpisodeRules.model_validate(episode_rules_document)
-            ),
-        )
+        correlation_id = request.headers.get("X-Correlation-ID") or uuid.uuid4().hex
+        try:
+            return service.record_review(
+                instance_id,
+                HumanReviewDraft.model_validate(review_document),
+                episode_rules=(
+                    None
+                    if episode_rules_document is None
+                    else EpisodeRules.model_validate(episode_rules_document)
+                ),
+            )
+        except (LookupError, ValueError):
+            raise
+        except Exception as exc:
+            logger.exception(
+                "unexpected production recipe review transaction failure",
+                extra={
+                    "correlation_id": correlation_id,
+                    "recipe_instance_id": str(instance_id),
+                    "review_target_type": review_document.get("targetType"),
+                    "review_target_id": review_document.get("targetId"),
+                    "review_target_revision": review_document.get("targetRevision"),
+                    "request_path": request.url.path,
+                },
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "message": "剧情审核事务未完成，剧情仍未批准且任务仍等待审核",
+                    "errorType": "review_transaction_failed",
+                    "correlationId": correlation_id,
+                },
+            ) from exc
 
     app.include_router(router)

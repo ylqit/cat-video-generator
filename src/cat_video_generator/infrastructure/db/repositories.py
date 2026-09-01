@@ -9,7 +9,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -63,11 +63,18 @@ from ..ark.runtime import current_execution_snapshot
 from .models import (
     Asset,
     CanvasEvent,
+    CharacterDesignAsset,
+    CharacterDesignRevision,
+    GenerationClipShot,
+    GenerationPlan,
+    ProductionRecipeInstance,
     ProductionRun,
     PromptRecord,
     Review,
     Scene,
+    ShotBeat,
     ShotCard,
+    StoryboardRevision,
     VideoSequence,
     VisualProfileRevision,
     WorkflowStep,
@@ -164,9 +171,21 @@ class SqlAlchemyWorkflowRepository:
                 project_id=project_id,
                 bindings=bindings,
             )
-            row.default_reference_bindings_json = [
+            serialized = [
                 item.model_dump(mode="json", by_alias=True) for item in bindings
             ]
+            if row.default_reference_bindings_json != serialized:
+                row.default_reference_bindings_json = serialized
+                scenes = list(
+                    session.scalars(
+                        select(Scene).where(
+                            Scene.production_run_id == project_id,
+                            Scene.active.is_(True),
+                        )
+                    )
+                )
+                for scene in scenes:
+                    self._invalidate_scene_outputs(session, scene)
             return _project(row)
 
     def get_visual_profile(self, project_id: uuid.UUID) -> StoredVisualProfileRevision:
@@ -200,6 +219,7 @@ class SqlAlchemyWorkflowRepository:
     ) -> StoredVisualProfileRevision:
         with self._sessions.begin() as session:
             project = self._require_project(session, project_id)
+            previous_profile_id = project.current_visual_profile_revision_id
             normalized_bindings = self._normalize_look_reference_bindings(
                 session,
                 project_id=project_id,
@@ -227,6 +247,17 @@ class SqlAlchemyWorkflowRepository:
             )
             project.current_visual_profile_revision_id = row.id
             project.default_reference_bindings_json = _project_reference_bindings(draft)
+            if previous_profile_id != row.id:
+                scenes = list(
+                    session.scalars(
+                        select(Scene).where(
+                            Scene.production_run_id == project_id,
+                            Scene.active.is_(True),
+                        )
+                    )
+                )
+                for scene in scenes:
+                    self._invalidate_scene_outputs(session, scene)
             return _visual_profile(row)
 
     def restore_project_canon_references(
@@ -236,6 +267,7 @@ class SqlAlchemyWorkflowRepository:
     ) -> tuple[StoredVisualProfileRevision, int]:
         with self._sessions.begin() as session:
             project = self._require_project(session, project_id)
+            previous_profile_id = project.current_visual_profile_revision_id
             normalized_bindings = self._normalize_look_reference_bindings(
                 session,
                 project_id=project_id,
@@ -303,6 +335,17 @@ class SqlAlchemyWorkflowRepository:
                 cleaned_shot_count += 1
             if cleaned_shot_count:
                 self._invalidate_project_sequence(session, project_id)
+            if previous_profile_id != profile.id or cleaned_shot_count:
+                scenes = list(
+                    session.scalars(
+                        select(Scene).where(
+                            Scene.production_run_id == project_id,
+                            Scene.active.is_(True),
+                        )
+                    )
+                )
+                for scene in scenes:
+                    self._invalidate_scene_outputs(session, scene)
             return _visual_profile(profile), cleaned_shot_count
 
     def get_project(self, project_id: uuid.UUID) -> StoredProject:
@@ -558,14 +601,7 @@ class SqlAlchemyWorkflowRepository:
                 row.look_draft_json = look_draft.model_dump(mode="json", by_alias=True)
                 row.look_draft_revision += 1
             if changed:
-                shots = session.execute(
-                    select(ShotCard).where(ShotCard.scene_id == scene_id)
-                ).scalars()
-                for shot in shots:
-                    shot.selected_anchor_asset_id = None
-                    shot.selected_video_asset_id = None
-                    shot.status = ShotStatus.READY.value
-                self._invalidate_project_sequence(session, row.production_run_id)
+                self._invalidate_scene_outputs(session, row)
             return _scene(row)
 
     def select_scene_look_asset(
@@ -580,8 +616,8 @@ class SqlAlchemyWorkflowRepository:
                 asset = _required(session, Asset, asset_id)
                 if asset.scope != "canon" and asset.production_run_id != scene.production_run_id:
                     raise ValueError("scene look must be Canon or belong to the current project")
-                if asset.media_type != "image" or asset.status not in {"ready", "approved"}:
-                    raise ValueError("scene look must be an available image")
+                if asset.media_type != "image" or asset.status != "approved":
+                    raise ValueError("scene look must be an approved image")
                 if not _asset(asset, self._asset_root).content_ready:
                     raise ValueError("scene look content is missing; repair or upload it first")
             if scene.selected_look_asset_id == asset_id:
@@ -688,6 +724,278 @@ class SqlAlchemyWorkflowRepository:
             row = _required(session, Scene, scene_id)
             self._require_project(session, row.production_run_id)
             return _scene(row)
+
+    def storyboard_production_context(self, scene_id: uuid.UUID) -> dict[str, Any]:
+        """Return the approved version lineage used by scene asset planning."""
+
+        with self._sessions() as session:
+            scene = _required(session, Scene, scene_id)
+            storyboard = session.scalar(
+                select(StoryboardRevision)
+                .where(
+                    StoryboardRevision.production_run_id == scene.production_run_id,
+                    StoryboardRevision.status.in_(
+                        ("structure_approved", "production_approved")
+                    ),
+                )
+                .order_by(StoryboardRevision.revision.desc())
+                .limit(1)
+            )
+            if storyboard is None:
+                return {
+                    "structureApproved": False,
+                    "generationPlanApproved": False,
+                }
+            plan = session.scalar(
+                select(GenerationPlan)
+                .where(
+                    GenerationPlan.storyboard_revision_id == storyboard.id,
+                )
+                .order_by(GenerationPlan.revision.desc())
+                .limit(1)
+            )
+            if plan is None:
+                return {
+                    "storyboardRevisionId": str(storyboard.id),
+                    "structureHash": storyboard.structure_hash,
+                    "structureApproved": True,
+                    "generationPlanApproved": False,
+                }
+            scene_mapping_count = int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(GenerationClipShot)
+                    .join(
+                        ShotCard,
+                        ShotCard.id == GenerationClipShot.shot_card_id,
+                    )
+                    .where(
+                        GenerationClipShot.generation_plan_id == plan.id,
+                        ShotCard.scene_id == scene.id,
+                    )
+                )
+                or 0
+            )
+            editorial_rows = list(
+                session.execute(
+                    select(ShotBeat)
+                    .where(
+                        ShotBeat.storyboard_revision_id == storyboard.id,
+                        ShotBeat.scene_id == scene.id,
+                    )
+                    .order_by(ShotBeat.sort_order)
+                ).scalars()
+            )
+            return {
+                "storyboardRevisionId": str(storyboard.id),
+                "structureHash": storyboard.structure_hash,
+                "structureApproved": True,
+                "generationPlanId": str(plan.id),
+                "generationPlanHash": plan.input_hash,
+                "generationPlanApproved": plan.status == "approved",
+                "sceneGenerationClipCount": scene_mapping_count,
+                "editorialShots": [
+                    {
+                        "id": str(row.id),
+                        "order": row.sort_order,
+                        "title": row.title,
+                        "durationSeconds": row.duration_seconds,
+                        "visualDescription": row.visual_description,
+                        "childAction": row.child_action,
+                        "catAction": row.cat_action,
+                        "spatialRelation": row.spatial_relation,
+                        "camera": row.camera,
+                    }
+                    for row in editorial_rows
+                ],
+            }
+
+    def generation_clip_production_context(
+        self,
+        shot_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        """Return the immutable production-package lineage for a real clip."""
+
+        with self._sessions() as session:
+            shot = _required(session, ShotCard, shot_id)
+            scene = _required(session, Scene, shot.scene_id)
+            if shot.generation_plan_id is None:
+                return {"managedByStoryboard": False}
+            plan = _required(session, GenerationPlan, shot.generation_plan_id)
+            storyboard = _required(
+                session,
+                StoryboardRevision,
+                plan.storyboard_revision_id,
+            )
+            latest_storyboard = session.scalar(
+                select(StoryboardRevision)
+                .where(
+                    StoryboardRevision.production_run_id == scene.production_run_id,
+                    StoryboardRevision.status != "superseded",
+                )
+                .order_by(StoryboardRevision.revision.desc())
+                .limit(1)
+            )
+            latest_plan = session.scalar(
+                select(GenerationPlan)
+                .where(GenerationPlan.storyboard_revision_id == storyboard.id)
+                .order_by(GenerationPlan.revision.desc())
+                .limit(1)
+            )
+            prompt = (
+                None
+                if shot.prompt_id is None
+                else session.get(PromptRecord, shot.prompt_id)
+            )
+            prompt_snapshot = (
+                {} if prompt is None else dict(prompt.input_snapshot_json or {})
+            )
+            legacy_plan = plan.capability_revision.startswith("legacy-")
+            legacy_prompt_lineage = bool(
+                legacy_plan
+                and prompt is not None
+                and prompt.business_object_type != "generation_clip"
+            )
+            project = session.get(ProductionRun, scene.production_run_id)
+            reference_bindings = prompt_snapshot.get("referenceBindings")
+            reference_lineage_current = isinstance(reference_bindings, list)
+            if reference_lineage_current:
+                for reference in reference_bindings:
+                    if not isinstance(reference, dict) or not reference.get("assetId"):
+                        reference_lineage_current = False
+                        break
+                    try:
+                        reference_asset_id = uuid.UUID(str(reference["assetId"]))
+                    except ValueError:
+                        reference_lineage_current = False
+                        break
+                    reference_asset = session.get(Asset, reference_asset_id)
+                    if (
+                        reference_asset is None
+                        or reference_asset.status not in {"approved", "ready"}
+                        or reference_asset.sha256 != reference.get("sha256")
+                    ):
+                        reference_lineage_current = False
+                        break
+            package_inputs_current = bool(
+                legacy_prompt_lineage
+                or (
+                    project is not None
+                    and prompt_snapshot.get("storyRevisionId")
+                    == str(storyboard.story_revision_id)
+                    and prompt_snapshot.get("visualProfileRevisionId")
+                    == (
+                        None
+                        if project.current_visual_profile_revision_id is None
+                        else str(project.current_visual_profile_revision_id)
+                    )
+                    and prompt_snapshot.get("sceneId") == str(scene.id)
+                    and prompt_snapshot.get("sceneLookDraftRevision")
+                    == scene.look_draft_revision
+                    and reference_lineage_current
+                )
+            )
+            lineage_current = bool(
+                latest_storyboard is not None
+                and latest_storyboard.id == storyboard.id
+                and latest_plan is not None
+                and latest_plan.id == plan.id
+                and plan.status == "approved"
+                and storyboard.status == "production_approved"
+                and storyboard.production_package_hash
+                and prompt is not None
+                and prompt.status == "succeeded"
+                and (
+                    legacy_prompt_lineage
+                    or (
+                        prompt.business_object_type == "generation_clip"
+                        and prompt.business_object_id == shot.id
+                        and prompt_snapshot.get("storyboardRevisionId")
+                        == str(storyboard.id)
+                        and prompt_snapshot.get("structureHash")
+                        == storyboard.structure_hash
+                        and prompt_snapshot.get("generationPlanId") == str(plan.id)
+                        and prompt_snapshot.get("generationPlanHash")
+                        == plan.input_hash
+                        and package_inputs_current
+                    )
+                )
+            )
+            return {
+                "managedByStoryboard": True,
+                "lineageCurrent": lineage_current,
+                "storyboardRevisionId": str(storyboard.id),
+                "structureHash": storyboard.structure_hash,
+                "generationPlanId": str(plan.id),
+                "generationPlanHash": plan.input_hash,
+                "generationPlanApproved": plan.status == "approved",
+                "legacyPlan": legacy_plan,
+                "productionPackageApproved": bool(
+                    storyboard.status == "production_approved"
+                    and storyboard.production_package_hash
+                    and package_inputs_current
+                ),
+                "productionPackageHash": storyboard.production_package_hash,
+                "compiledPromptId": None if prompt is None else str(prompt.id),
+                "compiledPromptInputHash": None if prompt is None else prompt.input_hash,
+                "compiledPromptHash": None if prompt is None else prompt.sha256,
+                "compiledPrompt": None if prompt is None else prompt.prompt_text,
+                "compiledShot": prompt_snapshot.get("shot"),
+                "referenceBindings": (
+                    [] if not isinstance(reference_bindings, list) else reference_bindings
+                ),
+            }
+
+    def approved_character_design_assets(
+        self,
+        project_id: uuid.UUID,
+    ) -> tuple[StoredAsset, ...]:
+        with self._sessions() as session:
+            revision = session.scalar(
+                select(CharacterDesignRevision)
+                .where(
+                    CharacterDesignRevision.production_run_id == project_id,
+                    CharacterDesignRevision.status == "approved",
+                )
+                .order_by(CharacterDesignRevision.revision.desc())
+                .limit(1)
+            )
+            if revision is None:
+                return ()
+            rows = list(
+                session.scalars(
+                    select(CharacterDesignAsset).where(
+                        CharacterDesignAsset.character_design_revision_id == revision.id,
+                        CharacterDesignAsset.selected.is_(True),
+                    )
+                )
+            )
+            slot_order = {"child": 0, "cat": 1, "pair_scale": 2}
+            rows.sort(key=lambda row: slot_order.get(row.slot, 99))
+            assets = {
+                asset.id: asset
+                for asset in session.scalars(
+                    select(Asset).where(Asset.id.in_([row.asset_id for row in rows]))
+                )
+            }
+            return tuple(
+                _asset(assets[row.asset_id], self._asset_root)
+                for row in rows
+                if row.asset_id in assets
+            )
+
+    def requires_character_design_assets(self, project_id: uuid.UUID) -> bool:
+        with self._sessions() as session:
+            return bool(
+                session.scalar(
+                    select(ProductionRecipeInstance.id)
+                    .where(
+                        ProductionRecipeInstance.production_run_id == project_id,
+                        ProductionRecipeInstance.lifecycle_status == "active",
+                    )
+                    .limit(1)
+                )
+            )
 
     def add_shot(self, scene_id: uuid.UUID, draft: ShotCardDraft) -> StoredShot:
         with self._sessions.begin() as session:
@@ -850,7 +1158,10 @@ class SqlAlchemyWorkflowRepository:
         self,
         *,
         step_id: uuid.UUID,
-        expected_shot_snapshot_hash: str,
+        expected_storyboard_revision_id: uuid.UUID,
+        expected_structure_hash: str,
+        expected_generation_plan_id: uuid.UUID,
+        expected_generation_plan_hash: str,
         accepted_output: AcceptedVisualAssetPlan,
     ) -> StoredStep:
         with self._sessions.begin() as session:
@@ -867,26 +1178,231 @@ class SqlAlchemyWorkflowRepository:
             if "acceptedAt" in snapshot:
                 raise WorkflowConflictError("该视觉资产规划已经接受过")
             scene = _required(session, Scene, step.scene_id)
-            rows = session.execute(
-                select(ShotCard)
-                .where(ShotCard.scene_id == scene.id)
-                .order_by(ShotCard.sort_order)
-            ).scalars()
-            current_hash = shot_snapshot_hash(
-                (row.id, row.draft_revision, _shot(row, scene.production_run_id).draft)
-                for row in rows
+            storyboard = session.scalar(
+                select(StoryboardRevision)
+                .where(
+                    StoryboardRevision.id == expected_storyboard_revision_id,
+                    StoryboardRevision.production_run_id == scene.production_run_id,
+                    StoryboardRevision.status.in_(
+                        ("structure_approved", "production_approved")
+                    ),
+                )
             )
             if (
-                snapshot.get("shotSnapshotHash") != expected_shot_snapshot_hash
-                or current_hash != expected_shot_snapshot_hash
+                storyboard is None
+                or storyboard.structure_hash != expected_structure_hash
+                or snapshot.get("storyboardRevisionId")
+                != str(expected_storyboard_revision_id)
+                or snapshot.get("structureHash") != expected_structure_hash
             ):
-                raise WorkflowConflictError("视频片段已经变化，旧视觉资产规划不能再接受")
+                raise WorkflowConflictError("分镜结构已经变化，旧视觉资产规划不能再接受")
+            plan = session.scalar(
+                select(GenerationPlan).where(
+                    GenerationPlan.id == expected_generation_plan_id,
+                    GenerationPlan.storyboard_revision_id == storyboard.id,
+                    GenerationPlan.status == "approved",
+                )
+            )
+            if (
+                plan is None
+                or plan.input_hash != expected_generation_plan_hash
+                or snapshot.get("generationPlanId") != str(expected_generation_plan_id)
+                or snapshot.get("generationPlanHash") != expected_generation_plan_hash
+            ):
+                raise WorkflowConflictError("生成编排已经变化，旧视觉资产规划不能再接受")
             snapshot["acceptedOutput"] = accepted_output.model_dump(
                 mode="json", by_alias=True
             )
             snapshot["acceptedAt"] = datetime.now(timezone.utc).isoformat()
             step.input_snapshot_json = snapshot
+            if self._apply_visual_asset_plan_bindings(
+                session,
+                scene=scene,
+                accepted_output=accepted_output,
+            ):
+                self._invalidate_scene_outputs(session, scene)
             return _step(step)
+
+    def revise_visual_asset_plan(
+        self,
+        *,
+        step_id: uuid.UUID,
+        expected_revision: int,
+        accepted_output: AcceptedVisualAssetPlan,
+        note: str,
+    ) -> StoredStep:
+        with self._sessions.begin() as session:
+            source = _required(session, WorkflowStep, step_id)
+            if (
+                StepKind(source.kind) is not StepKind.DIRECTOR
+                or StepStatus(source.status) is not StepStatus.SUCCEEDED
+                or source.operation_key != "director:visual-asset-plan"
+                or source.scene_id is None
+                or source.shot_card_id is not None
+                or not isinstance(source.input_snapshot_json.get("acceptedOutput"), dict)
+            ):
+                raise ValueError("step is not an accepted visual asset plan")
+            latest = session.scalar(
+                select(WorkflowStep)
+                .where(
+                    WorkflowStep.scene_id == source.scene_id,
+                    WorkflowStep.shot_card_id.is_(None),
+                    WorkflowStep.operation_key == "director:visual-asset-plan",
+                    WorkflowStep.status == StepStatus.SUCCEEDED.value,
+                )
+                .order_by(WorkflowStep.attempt.desc())
+                .with_for_update()
+                .limit(1)
+            )
+            if (
+                source.attempt != expected_revision
+                or latest is None
+                or latest.id != source.id
+            ):
+                raise WorkflowConflictError(
+                    "视觉资产规划已更新，请基于最新规划版本重新应用修改"
+                )
+            previous_output = AcceptedVisualAssetPlan.model_validate(
+                source.input_snapshot_json["acceptedOutput"]
+            )
+            previous_json = previous_output.model_dump(mode="json", by_alias=True)
+            accepted_json = accepted_output.model_dump(mode="json", by_alias=True)
+            if previous_json == accepted_json:
+                return _step(source)
+
+            scene = _required(session, Scene, source.scene_id)
+            now = datetime.now(timezone.utc)
+            attempt = source.attempt + 1
+            input_hash = hashlib.sha256(
+                json.dumps(
+                    accepted_json,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            idempotency_key = hashlib.sha256(
+                "|".join(
+                    (
+                        str(source.production_run_id),
+                        str(source.scene_id),
+                        source.operation_key,
+                        str(attempt),
+                        input_hash,
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            snapshot = {
+                **source.input_snapshot_json,
+                "source": "manual",
+                "manualRevisionOfStepId": str(source.id),
+                "manualRevisionNote": note,
+                "acceptedOutput": accepted_json,
+                "acceptedAt": now.isoformat(),
+            }
+            revised = WorkflowStep(
+                id=uuid.uuid4(),
+                production_run_id=source.production_run_id,
+                scene_id=source.scene_id,
+                shot_card_id=None,
+                kind=StepKind.DIRECTOR.value,
+                status=StepStatus.SUCCEEDED.value,
+                attempt=attempt,
+                operation_key=source.operation_key,
+                idempotency_key=idempotency_key,
+                provider="manual",
+                model="human-editor",
+                input_hash=input_hash,
+                input_snapshot_json=snapshot,
+                completed_at=now,
+            )
+            session.add(revised)
+            session.flush()
+            self._apply_visual_asset_plan_bindings(
+                session,
+                scene=scene,
+                accepted_output=accepted_output,
+                previous_output=previous_output,
+            )
+            self._invalidate_scene_outputs(session, scene)
+            return _step(revised)
+
+    def _apply_visual_asset_plan_bindings(
+        self,
+        session: Session,
+        *,
+        scene: Scene,
+        accepted_output: AcceptedVisualAssetPlan,
+        previous_output: AcceptedVisualAssetPlan | None = None,
+    ) -> bool:
+        existing_selections = [
+            selection
+            for selection in accepted_output.selections
+            if selection.action.value == "existing"
+        ]
+        previous_existing_ids = {
+            selection.existing_asset_id
+            for selection in (() if previous_output is None else previous_output.selections)
+            if selection.action.value == "existing" and selection.existing_asset_id is not None
+        }
+        project = self._require_project(session, scene.production_run_id)
+        if project.current_visual_profile_revision_id is None:
+            raise ValueError("项目尚未建立视觉档案")
+        look_draft = (
+            SceneLookDraft.model_validate(scene.look_draft_json)
+            if scene.look_draft_json
+            else SceneLookDraft(
+                visualProfileRevisionId=project.current_visual_profile_revision_id,
+                lookPlan=SceneLookPlan.model_validate(scene.look_plan_json or {}),
+            )
+        )
+        bindings = [
+            binding
+            for binding in look_draft.reference_bindings
+            if not (
+                binding.asset_id in previous_existing_ids
+                and (binding.instruction or "").startswith("复用资产规划“")
+            )
+        ]
+        bound_ids = {binding.asset_id for binding in bindings}
+        for selection in existing_selections:
+            asset_id = selection.existing_asset_id
+            if asset_id is None or asset_id in bound_ids:
+                continue
+            bindings.append(
+                LookReferenceBinding(
+                    assetId=asset_id,
+                    purpose=LookReferencePurpose(selection.purpose.value),
+                    instruction=(
+                        f"复用资产规划“{selection.display_name}”，只承担"
+                        f"{selection.purpose.value}职责，不改写长期身份"
+                    ),
+                )
+            )
+            bound_ids.add(asset_id)
+        normalized_bindings = self._normalize_look_reference_bindings(
+            session,
+            project_id=scene.production_run_id,
+            bindings=bindings,
+            profile_only=False,
+        )
+        updated_draft = look_draft.model_copy(
+            update={
+                "visual_profile_revision_id": project.current_visual_profile_revision_id,
+                "reference_bindings": normalized_bindings,
+            }
+        )
+        if updated_draft == look_draft:
+            return False
+        scene.look_plan_json = updated_draft.look_plan.model_dump(
+            mode="json", by_alias=True
+        )
+        scene.look_draft_json = updated_draft.model_dump(
+            mode="json", by_alias=True
+        )
+        scene.look_draft_revision += 1
+        scene.selected_look_asset_id = None
+        return True
 
     def accept_scene_suggestions(
         self,
@@ -1603,6 +2119,63 @@ class SqlAlchemyWorkflowRepository:
                 row.byte_size = landed.byte_size
             return tuple(_asset(row, self._asset_root) for row, _landed in rows)
 
+    def install_canon_asset(
+        self,
+        *,
+        landed: LandedAsset,
+        semantic_key: str,
+        role: str,
+        display_name: str,
+        group: str | None,
+        recommended_default: bool,
+    ) -> StoredAsset:
+        """Create one global immutable Canon asset, idempotently by semantic key and hash."""
+
+        with self._sessions.begin() as session:
+            rows = list(
+                session.scalars(
+                    select(Asset).where(
+                        Asset.scope == "canon",
+                        Asset.semantic_key == semantic_key,
+                    )
+                )
+            )
+            if len(rows) > 1:
+                raise ValueError(f"duplicate Canon semantic key: {semantic_key}")
+            if rows:
+                row = rows[0]
+                if row.status != "approved" or row.sha256 != landed.sha256:
+                    raise ValueError(
+                        f"Canon semantic key already exists with different content: {semantic_key}"
+                    )
+                row.storage_key = _storage_key_for(landed.path, self._asset_root)
+                row.byte_size = landed.byte_size
+                return _asset(row, self._asset_root)
+
+            row = Asset(
+                production_run_id=None,
+                scene_id=None,
+                shot_card_id=None,
+                producing_step_id=None,
+                role=role,
+                semantic_key=semantic_key,
+                scope="canon",
+                status="approved",
+                media_type="image",
+                storage_key=_storage_key_for(landed.path, self._asset_root),
+                sha256=landed.sha256,
+                byte_size=landed.byte_size,
+                metadata_json={
+                    "displayName": display_name,
+                    "group": group,
+                    "recommendedDefault": recommended_default,
+                    "providerEligible": not semantic_key.startswith("style_source:"),
+                },
+            )
+            session.add(row)
+            session.flush()
+            return _asset(row, self._asset_root)
+
     def list_assets(
         self,
         *,
@@ -1965,13 +2538,58 @@ class SqlAlchemyWorkflowRepository:
 
     @staticmethod
     def _invalidate_scene_outputs(session: Session, scene: Scene) -> None:
-        shots = session.execute(
-            select(ShotCard).where(ShotCard.scene_id == scene.id)
-        ).scalars()
-        for shot in shots:
+        storyboard = session.scalar(
+            select(StoryboardRevision)
+            .where(
+                StoryboardRevision.production_run_id == scene.production_run_id,
+                StoryboardRevision.status.in_(
+                    ("draft", "structure_approved", "production_approved")
+                ),
+            )
+            .order_by(StoryboardRevision.revision.desc())
+            .limit(1)
+        )
+        plan = (
+            None
+            if storyboard is None
+            else session.scalar(
+                select(GenerationPlan)
+                .where(
+                    GenerationPlan.storyboard_revision_id == storyboard.id,
+                    GenerationPlan.status.in_(("proposed", "approved")),
+                )
+                .order_by(GenerationPlan.revision.desc())
+                .limit(1)
+            )
+        )
+        if storyboard is not None and plan is None:
+            shots = ()
+        else:
+            shot_query = select(ShotCard).where(ShotCard.scene_id == scene.id)
+            if plan is not None:
+                shot_query = shot_query.where(ShotCard.generation_plan_id == plan.id)
+            shots = session.execute(shot_query).scalars()
+        current_shots = list(shots)
+        current_shot_ids = [shot.id for shot in current_shots]
+        for shot in current_shots:
+            shot.prompt_id = None
             shot.selected_anchor_asset_id = None
             shot.selected_video_asset_id = None
             shot.status = ShotStatus.READY.value
+        if current_shot_ids:
+            session.execute(
+                update(Asset)
+                .where(
+                    Asset.shot_card_id.in_(current_shot_ids),
+                    Asset.role.in_(("shot_anchor", "shot_video", "shot_video_edit")),
+                    Asset.status != "stale",
+                )
+                .values(status="stale")
+            )
+        if storyboard is not None and storyboard.status == "production_approved":
+            storyboard.status = "structure_approved"
+            storyboard.production_package_hash = None
+            storyboard.production_approved_at = None
         project = _required(session, ProductionRun, scene.production_run_id)
         project.selected_sequence_id = None
 

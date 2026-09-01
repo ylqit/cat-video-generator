@@ -41,16 +41,12 @@ describe("VideoEditWorkspace", () => {
     });
     calls.compileVideoEditRecipe.mockResolvedValue({
       recipeId: "recipe-1",
-      mode: "two_stage",
-      stages: [
-        { kind: "control_anchor", boundary: "start" },
-        { kind: "control_anchor", boundary: "end" },
-        { kind: "video_edit" },
-      ],
-      imageCallCount: 2,
+      mode: "direct",
+      stages: [{ kind: "video_edit" }],
+      imageCallCount: 0,
       videoCallCount: 1,
-      estimatedCostMicros: 11_000,
-      warnings: ["先生成两个控制锚点"],
+      estimatedCostMicros: 8_000,
+      warnings: [],
       provider: "ark",
       model: "seedance",
     });
@@ -70,6 +66,7 @@ describe("VideoEditWorkspace", () => {
           { id: "person-2", title: "女主参考", thumbnailUrl: "/person.png" },
         ],
       },
+      global: { stubs: { Teleport: true } },
     });
 
     expect(wrapper.text()).toContain("矩形");
@@ -83,6 +80,8 @@ describe("VideoEditWorkspace", () => {
     expect(new Set(frames.map((item) => item.attributes("src"))).size).toBe(12);
     expect(wrapper.get('[data-range-handle="start"]')).toBeDefined();
     expect(wrapper.get('[data-range-handle="end"]')).toBeDefined();
+    expect(wrapper.text()).toContain("编辑区间入口帧");
+    expect(wrapper.text()).toContain("编辑区间出口帧");
 
     await wrapper.get("textarea").setValue("女主转身并轻触发簪");
     await wrapper.get('[data-tool="rectangle"]').trigger("click");
@@ -96,15 +95,24 @@ describe("VideoEditWorkspace", () => {
       referenceAssetIds: ["person-2"],
     }));
     expect(calls.compileVideoEditRecipe).toHaveBeenCalledWith("recipe-1");
-    expect(wrapper.text()).toContain("2 次图片调用");
+    expect(wrapper.text()).toContain("0 次图片调用");
     expect(wrapper.text()).toContain("1 次视频调用");
 
     await wrapper.get('[data-action="submit"]').trigger("click");
     await flushPromises();
+    expect(calls.submitVideoEditRecipe).not.toHaveBeenCalled();
+    expect(wrapper.text()).toContain("取消，不创建任务");
+    expect(wrapper.text()).toContain("编译输入哈希");
+    await wrapper.get('[data-action="cancel-cost"]').trigger("click");
+    expect(calls.submitVideoEditRecipe).not.toHaveBeenCalled();
+
+    await wrapper.get('[data-action="submit"]').trigger("click");
+    await wrapper.get('[data-action="confirm-cost"]').trigger("click");
+    await flushPromises();
     expect(calls.submitVideoEditRecipe).toHaveBeenCalledWith(
       "recipe-1",
       expect.any(String),
-      11_000,
+      8_000,
     );
   });
 });

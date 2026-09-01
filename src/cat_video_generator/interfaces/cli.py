@@ -71,6 +71,7 @@ def serve_api(
     host: str = typer.Option("0.0.0.0", "--host"),
     port: int = typer.Option(8765, "--port", min=1, max=65535),
     static_dir: Path | None = typer.Option(None, "--static-dir"),
+    reload: bool = typer.Option(False, "--reload/--no-reload"),
 ) -> None:
     """Serve the API and, when supplied, the built Vue application."""
 
@@ -78,6 +79,25 @@ def serve_api(
         static_dir = static_dir.expanduser().resolve()
         if not (static_dir / "index.html").is_file():
             raise typer.BadParameter(f"static directory has no index.html: {static_dir}")
+    if reload:
+        if static_dir is not None:
+            raise typer.BadParameter("--reload cannot be combined with --static-dir")
+        uvicorn.run(
+            "cat_video_generator.interfaces.cli:create_runtime_app",
+            host=host,
+            port=port,
+            reload=True,
+            factory=True,
+        )
+        return
+
+    web_app = create_runtime_app(static_dir=static_dir)
+    uvicorn.run(web_app, host=host, port=port)
+
+
+def create_runtime_app(*, static_dir: Path | None = None):
+    """Own one API process' runtime resources and shutdown lifecycle."""
+
     container = build_runtime_container()
     executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="shot-queue")
     jobs = JobRegistry(executor=executor)
@@ -88,7 +108,7 @@ def serve_api(
         executor.shutdown(wait=False, cancel_futures=False)
         container.close()
 
-    uvicorn.run(web_app, host=host, port=port)
+    return web_app
 
 
 @app.command("canon-repair")
@@ -117,6 +137,39 @@ def repair_canon(
                         "path": None if item.path is None else str(item.path),
                     }
                     for item in repaired
+                ],
+            }
+        )
+    finally:
+        container.close()
+
+
+@app.command("canon-install")
+def install_canon(
+    source_dir: Path = typer.Option(
+        Path("风格定稿/Canon-v4"),
+        "--source-dir",
+        file_okay=False,
+        dir_okay=True,
+        exists=True,
+    ),
+) -> None:
+    """Install a new immutable Canon manifest without overwriting existing semantic keys."""
+
+    container = build_runtime_container()
+    try:
+        installed = container.canon.install_manifest(source_dir / "manifest.json")
+        _echo(
+            {
+                "installed": len(installed),
+                "assets": [
+                    {
+                        "id": str(item.id),
+                        "semanticKey": item.semantic_key,
+                        "sha256": item.sha256,
+                        "path": None if item.path is None else str(item.path),
+                    }
+                    for item in installed
                 ],
             }
         )

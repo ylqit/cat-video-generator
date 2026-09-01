@@ -5,6 +5,7 @@ export default defineConfig({
   plugins: [vue()],
   test: {
     environment: "jsdom",
+    setupFiles: ["./src/test/setup.ts"],
   },
   server: {
     port: 5173,

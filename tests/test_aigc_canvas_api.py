@@ -17,6 +17,7 @@ class _CanvasService:
         self.saved_layout: dict[str, object] | None = None
         self.asset_bindings: dict[str, object] | None = None
         self.approved_revision: uuid.UUID | None = None
+        self.story_edit: dict[str, object] | None = None
         self.storyboard_mode: str | None = None
         self.storyboard_references: tuple[uuid.UUID, ...] = ()
         self.manual_storyboard: dict[str, object] | None = None
@@ -30,28 +31,46 @@ class _CanvasService:
                 "assetId": str(uuid.uuid4()),
                 "purpose": "person_identity",
                 "instruction": "固定儿童面部身份",
+                "authority": None,
             },
             {
                 "assetId": str(uuid.uuid4()),
                 "purpose": "person_body",
                 "instruction": "固定儿童全身比例",
+                "authority": None,
             },
             {
                 "assetId": str(uuid.uuid4()),
                 "purpose": "cat_identity",
                 "instruction": "固定猫咪正面身份",
+                "authority": None,
             },
             {
                 "assetId": str(uuid.uuid4()),
                 "purpose": "cat_identity",
                 "instruction": "固定猫咪侧面身份",
+                "authority": None,
             },
             {
                 "assetId": str(uuid.uuid4()),
                 "purpose": "style",
                 "instruction": "只锁定线条、材质和光线",
+                "authority": None,
             },
         ]
+
+    def create_child_cat_project(self, payload: object) -> dict[str, object]:
+        return {
+            "projectId": str(uuid.uuid4()),
+            "briefId": str(uuid.uuid4()),
+            "recipeInstanceId": str(uuid.uuid4()),
+            "subjectIds": {
+                "protagonist": str(uuid.uuid4()),
+                "co_protagonist": str(uuid.uuid4()),
+            },
+            "title": payload.title,  # type: ignore[attr-defined]
+            "providerCallCount": 0,
+        }
 
     def save_brief(self, project_id: uuid.UUID, payload: object) -> dict[str, object]:
         self.brief = payload.model_dump(by_alias=True, mode="json")  # type: ignore[attr-defined]
@@ -286,16 +305,35 @@ class _CanvasService:
         self.approved_revision = revision_id
         return {"id": str(revision_id), "status": "approved"}
 
+    def edit_story_revision(self, revision_id: uuid.UUID, payload: object) -> dict[str, object]:
+        self.story_edit = payload.model_dump(by_alias=True, mode="json")  # type: ignore[attr-defined]
+        return {
+            "id": str(uuid.uuid4()),
+            "parentRevisionId": str(revision_id),
+            "revision": int(self.story_edit["expectedRevision"]) + 1,
+            "status": "candidate",
+            "source": "manual",
+            "warnings": [],
+            "legacyDetails": None,
+            "title": self.story_edit["title"],
+            "body": self.story_edit["body"],
+            "summary": self.story_edit["summary"],
+        }
+
     def create_storyboard(
         self,
         project_id: uuid.UUID,
         *,
+        source_story_revision_id: uuid.UUID | None = None,
         idempotency_key: str | None = None,
         creation_mode: str = "from_story",
         reference_asset_ids: tuple[uuid.UUID, ...] = (),
         instruction: str | None = None,
     ) -> dict[str, object]:
-        if self.approved_revision is None:
+        if (
+            self.approved_revision is None
+            or source_story_revision_id != self.approved_revision
+        ):
             raise ValueError("故事尚未人工批准，不能生成分镜")
         self.storyboard_mode = creation_mode
         self.storyboard_references = reference_asset_ids
@@ -385,6 +423,178 @@ class _CanvasService:
             "nodes": [],
             "edges": [],
             "syncStatus": "saved",
+        }
+
+    def get_director_shell(self, project_id: uuid.UUID) -> dict[str, object]:
+        modules = [
+            ("script", "剧本策划", "document", ["story"], "complete"),
+            ("assets", "角色资产", "media_board", ["cast", "references"], "needs_review"),
+            (
+                "production",
+                "分镜生产",
+                "spatial_canvas",
+                ["storyboard", "package"],
+                "ready",
+            ),
+            ("video", "视频生成", "video_workspace", ["video"], "ready"),
+            ("delivery", "成片交付", "delivery_timeline", ["video"], "ready"),
+        ]
+        return {
+            "project": {
+                "id": str(project_id),
+                "title": "雨天的小猫",
+                "status": "active",
+                "updatedAt": "2026-08-31T12:00:00Z",
+            },
+            "modules": [
+                {
+                    "id": module_id,
+                    "title": title,
+                    "order": order,
+                    "workspaceKind": workspace_kind,
+                    "status": module_status,
+                    "stageIds": stage_ids,
+                    "progress": 100 if module_status == "complete" else 0,
+                    "pendingReviewCount": 1 if module_status == "needs_review" else 0,
+                    "warningsCount": 0,
+                    "artifactIds": [],
+                }
+                for order, (
+                    module_id,
+                    title,
+                    workspace_kind,
+                    stage_ids,
+                    module_status,
+                ) in enumerate(modules)
+            ],
+            "recommendedModuleId": "assets",
+            "systemGraphAvailable": True,
+            "activeTaskSummary": {
+                "activeCount": 2,
+                "attentionCount": 1,
+                "latestTaskId": str(uuid.UUID(int=7)),
+                "latestStatus": "running",
+            },
+        }
+
+    def get_director_production_canvas(self, project_id: uuid.UUID) -> dict[str, object]:
+        return {
+            "nodes": [],
+            "edges": [],
+            "resources": [],
+            "shotOrder": [str(uuid.UUID(int=11)), str(uuid.UUID(int=12))],
+            "viewportHint": {"x": 12, "y": 24, "zoom": 0.9},
+            "revision": 3,
+        }
+
+    def get_workspace_shell(self, project_id: uuid.UUID) -> dict[str, object]:
+        return {
+            "project": {
+                "id": str(project_id),
+                "title": "雨天的小猫",
+                "status": "active",
+                "updatedAt": "2026-08-31T12:00:00Z",
+            },
+            "modules": [
+                {
+                    "id": module_id,
+                    "title": title,
+                    "order": order,
+                    "status": status,
+                    "progress": progress,
+                    "attentionCount": attention_count,
+                    "nextAction": {"label": action, "moduleId": module_id},
+                }
+                for module_id, title, order, status, progress, attention_count, action in (
+                    ("script", "剧本", 1, "complete", 100, 0, "查看成果"),
+                    ("assets", "角色资产", 2, "needs_review", 75, 1, "继续审核"),
+                    ("production", "生产画布", 3, "ready", 20, 0, "开始"),
+                )
+            ],
+            "recommendedModuleId": "assets",
+            "activeTaskSummary": {
+                "activeCount": 2,
+                "attentionCount": 1,
+                "latestTaskId": str(uuid.UUID(int=7)),
+                "latestStatus": "running",
+            },
+        }
+
+    def get_script_workspace(self, project_id: uuid.UUID) -> dict[str, object]:
+        story_id = uuid.UUID(int=17)
+        return {
+            "brief": {"id": str(uuid.UUID(int=16)), "theme": "窗边纸星星"},
+            "documents": [
+                {
+                    "id": str(story_id),
+                    "title": "纸星星回到窗边",
+                    "body": "孩子和猫咪一起把纸星星贴上玻璃。",
+                    "summary": "一段无对白的日常陪伴。",
+                    "revision": 2,
+                    "status": "approved",
+                    "source": "manual",
+                    "warnings": [],
+                }
+            ],
+            "currentStoryId": str(story_id),
+        }
+
+    def get_production_flow(self, project_id: uuid.UUID) -> dict[str, object]:
+        kinds = (
+            "script",
+            "director_plan",
+            "assets",
+            "storyboard_table",
+            "storyboard",
+            "workbench",
+        )
+        nodes = [
+            {
+                "id": str(uuid.uuid5(project_id, f"production-flow:{kind}")),
+                "kind": kind,
+                "title": kind,
+                "subtitle": "",
+                "status": "ready",
+                "position": {"x": index * 360.0, "y": 210.0},
+                "data": {},
+            }
+            for index, kind in enumerate(kinds)
+        ]
+        return {
+            "revision": 3,
+            "nodes": nodes,
+            "edges": [
+                {
+                    "id": f"{source['id']}:{target['id']}",
+                    "source": source["id"],
+                    "target": target["id"],
+                }
+                for source, target in zip(nodes, nodes[1:], strict=False)
+            ],
+            "viewport": {"x": 0, "y": 0, "zoom": 0.78},
+            "shotOrder": [],
+        }
+
+    def save_production_flow_layout(
+        self,
+        project_id: uuid.UUID,
+        *,
+        expected_version: int,
+        payload: object,
+    ) -> dict[str, object]:
+        return self.save_canvas_layout(
+            project_id,
+            expected_version=expected_version,
+            payload=payload,
+        )
+
+    def get_video_workbench(self, project_id: uuid.UUID) -> dict[str, object]:
+        return {
+            "activeTrackId": None,
+            "tracks": [],
+            "approvedReferences": [],
+            "timeline": None,
+            "exportSummary": None,
         }
 
     def save_canvas_layout(
@@ -507,6 +717,36 @@ def _client(tmp_path: Path, service: _CanvasService) -> TestClient:
     )
 
 
+def test_health_advertises_runtime_identity_and_web_api_features(tmp_path: Path) -> None:
+    container = SimpleNamespace(
+        repository=object(),
+        editing=object(),
+        canvas_v2=_CanvasService(),
+        alembic_revision="test-head",
+        runtime_settings=SimpleNamespace(work_root=tmp_path, asset_root=tmp_path),
+        runtime_configuration=SimpleNamespace(report=lambda: {}),
+    )
+    response = TestClient(
+        create_app(
+            container,  # type: ignore[arg-type]
+            job_registry=JobRegistry(inline=True),
+        )
+    ).get("/api/v1/health")
+
+    assert response.status_code == 200
+    document = response.json()
+    assert document["applicationVersion"] == "0.1.0"
+    assert document["serverStartedAt"].endswith("Z")
+    assert set(document["apiFeatures"]) >= {
+        "storyboard_production_confirmations",
+        "visual_asset_plan_manual_revisions",
+        "reference_media_video_generation",
+        "manual_video_edit_boundaries",
+        "workflow_task_cancellation_v1",
+        "legacy_director_workflow_adoption_v1",
+    }
+
+
 def test_v2_brief_and_generic_subject_endpoints(tmp_path: Path) -> None:
     service = _CanvasService()
     client = _client(tmp_path, service)
@@ -541,7 +781,7 @@ def test_v2_brief_and_generic_subject_endpoints(tmp_path: Path) -> None:
     assert subject_response.json()["kind"] == "animal"
 
 
-def test_v2_lists_subject_revisions_and_binds_assets_to_reference_nodes(tmp_path: Path) -> None:
+def test_v2_lists_subject_revisions_and_retires_generic_node_asset_binding(tmp_path: Path) -> None:
     service = _CanvasService()
     client = _client(tmp_path, service)
     project_id = uuid.uuid4()
@@ -561,12 +801,8 @@ def test_v2_lists_subject_revisions_and_binds_assets_to_reference_nodes(tmp_path
     assert subjects.status_code == 200
     assert subjects.json()[0]["revision"] == 1
     assert subjects.json()[0]["kind"] == "product"
-    assert bound.status_code == 200
-    assert bound.json()["revision"] == 2
-    assert service.asset_bindings == {
-        "bindings": [{"assetId": str(asset_id), "semanticRole": "packshot_front"}],
-        "allowMove": False,
-    }
+    assert bound.status_code == 405
+    assert service.asset_bindings is None
 
 
 def test_v2_storyboard_is_blocked_until_human_story_approval(tmp_path: Path) -> None:
@@ -577,12 +813,18 @@ def test_v2_storyboard_is_blocked_until_human_story_approval(tmp_path: Path) -> 
 
     blocked = client.post(
         f"/api/v2/projects/{project_id}/storyboard-runs",
-        json={"idempotencyKey": "blocked-0001"},
+        json={
+            "sourceStoryRevisionId": str(revision_id),
+            "idempotencyKey": "blocked-0001",
+        },
     )
     approved = client.post(f"/api/v2/story-revisions/{revision_id}/approve", json={})
     ready = client.post(
         f"/api/v2/projects/{project_id}/storyboard-runs",
-        json={"idempotencyKey": "ready-0001"},
+        json={
+            "sourceStoryRevisionId": str(revision_id),
+            "idempotencyKey": "ready-0001",
+        },
     )
 
     assert blocked.status_code == 202
@@ -608,6 +850,7 @@ def test_v2_character_storyboard_and_manual_draft_use_distinct_paths(tmp_path: P
         f"/api/v2/projects/{project_id}/storyboard-runs",
         json={
             "creationMode": "from_characters",
+            "sourceStoryRevisionId": str(revision_id),
             "referenceAssetIds": [str(child_asset_id), str(cat_asset_id)],
             "instruction": "孩子与猫咪一起整理窗台",
             "idempotencyKey": "characters-0001",
@@ -644,6 +887,45 @@ def test_v2_character_storyboard_and_manual_draft_use_distinct_paths(tmp_path: P
     assert service.manual_storyboard is not None
 
 
+def test_v2_story_document_edit_accepts_long_body_and_strict_version_contract(
+    tmp_path: Path,
+) -> None:
+    service = _CanvasService()
+    client = _client(tmp_path, service)
+    revision_id = uuid.uuid4()
+    long_body = "孩子和猫沿着雨后长廊整理画纸。" * 2_000
+
+    saved = client.post(
+        f"/api/v2/story-revisions/{revision_id}/edits",
+        json={
+            "title": "雨后长廊",
+            "body": long_body,
+            "summary": "孩子和猫一起完成雨后的整理。",
+            "expectedRevision": 7,
+            "idempotencyKey": "story-edit-api-0001",
+        },
+    )
+    extra = client.post(
+        f"/api/v2/story-revisions/{revision_id}/edits",
+        json={
+            "title": "雨后长廊",
+            "body": "正文",
+            "summary": None,
+            "expectedRevision": 7,
+            "idempotencyKey": "story-edit-api-0002",
+            "scorecard": {"average": 10},
+        },
+    )
+
+    assert saved.status_code == 201
+    assert saved.json()["source"] == "manual"
+    assert saved.json()["body"] == long_body
+    assert saved.json()["revision"] == 8
+    assert service.story_edit is not None
+    assert service.story_edit["expectedRevision"] == 7
+    assert extra.status_code == 422
+
+
 def test_v2_storyboard_prompt_compilation_preserves_versions_and_reference_roles(
     tmp_path: Path,
 ) -> None:
@@ -654,11 +936,17 @@ def test_v2_storyboard_prompt_compilation_preserves_versions_and_reference_roles
     profile_revision_id = uuid.uuid4()
     scene_id = uuid.uuid4()
     beat_id = uuid.uuid4()
+    storyboard_revision_id = uuid.uuid4()
+    generation_plan_id = uuid.uuid4()
 
     response = client.post(
         f"/api/v2/projects/{project_id}/storyboard-prompt-compilations",
         json={
             "storyRevisionId": str(story_revision_id),
+            "storyboardRevisionId": str(storyboard_revision_id),
+            "structureHash": "a" * 64,
+            "generationPlanId": str(generation_plan_id),
+            "generationPlanHash": "b" * 64,
             "visualProfileRevisionId": str(profile_revision_id),
             "healingRecipe": True,
             "shots": [
@@ -701,7 +989,7 @@ def test_v2_storyboard_prompt_compilation_preserves_versions_and_reference_roles
     assert response.json()["shots"][0]["inputHash"] == "c" * 64
 
 
-def test_v2_prompt_and_optimistic_canvas_layout_endpoints(tmp_path: Path) -> None:
+def test_v2_prompt_endpoint_and_retired_generic_canvas_routes(tmp_path: Path) -> None:
     service = _CanvasService()
     client = _client(tmp_path, service)
     project_id = uuid.uuid4()
@@ -709,7 +997,7 @@ def test_v2_prompt_and_optimistic_canvas_layout_endpoints(tmp_path: Path) -> Non
 
     prompt = client.get(f"/api/v2/prompt-runs/{prompt_id}")
     canvas = client.get(f"/api/v2/projects/{project_id}/canvas")
-    saved = client.patch(
+    retired_layout = client.patch(
         f"/api/v2/projects/{project_id}/canvas/layout",
         headers={"If-Match": "3"},
         json={
@@ -722,12 +1010,11 @@ def test_v2_prompt_and_optimistic_canvas_layout_endpoints(tmp_path: Path) -> Non
 
     assert prompt.status_code == 200
     assert prompt.json()["providerInternalTransform"] == "not_observable"
-    assert canvas.json()["layoutVersion"] == 3
-    assert saved.status_code == 200
-    assert saved.json()["layoutVersion"] == 4
+    assert canvas.status_code == 405
+    assert retired_layout.status_code == 405
 
 
-def test_v2_layout_ignores_legacy_business_edge_snapshot(tmp_path: Path) -> None:
+def test_v2_generic_canvas_mutations_are_not_public(tmp_path: Path) -> None:
     service = _CanvasService()
     client = _client(tmp_path, service)
     project_id = uuid.uuid4()
@@ -757,53 +1044,104 @@ def test_v2_layout_ignores_legacy_business_edge_snapshot(tmp_path: Path) -> None
         },
     )
 
-    assert saved.status_code == 200
-    assert service.saved_layout is not None
-    assert "edges" not in service.saved_layout
+    assert saved.status_code == 405
+    assert service.saved_layout is None
 
 
-def test_v2_canvas_node_archive_and_restore_are_versioned(tmp_path: Path) -> None:
+def test_v2_workspace_read_models_expose_only_three_product_modules(
+    tmp_path: Path,
+) -> None:
+    project_id = uuid.uuid4()
     service = _CanvasService()
     client = _client(tmp_path, service)
-    project_id = uuid.uuid4()
-    node_id = uuid.uuid4()
 
-    archived = client.post(
-        f"/api/v2/projects/{project_id}/canvas/nodes/{node_id}/archive",
+    shell_response = client.get(f"/api/v2/projects/{project_id}/workspace-shell")
+    script_response = client.get(f"/api/v2/projects/{project_id}/script-workspace")
+    flow_response = client.get(f"/api/v2/projects/{project_id}/production-flow")
+    video_response = client.get(f"/api/v2/projects/{project_id}/video-workbench")
+
+    assert shell_response.status_code == 200
+    shell = shell_response.json()
+    assert [module["id"] for module in shell["modules"]] == [
+        "script",
+        "assets",
+        "production",
+    ]
+    assert all("stageIds" not in module for module in shell["modules"])
+    assert shell["recommendedModuleId"] == "assets"
+
+    assert script_response.status_code == 200
+    assert script_response.json()["documents"][0]["body"].startswith("孩子和猫咪")
+
+    assert flow_response.status_code == 200
+    flow = flow_response.json()
+    assert [node["kind"] for node in flow["nodes"]] == [
+        "script",
+        "director_plan",
+        "assets",
+        "storyboard_table",
+        "storyboard",
+        "workbench",
+    ]
+    assert len(flow["edges"]) == 5
+    assert set(flow) == {
+        "revision",
+        "nodes",
+        "edges",
+        "viewport",
+        "shotOrder",
+    }
+
+    assert video_response.status_code == 200
+    assert video_response.json() == {
+        "tracks": [],
+        "approvedReferences": [],
+    }
+
+
+def test_v2_child_cat_project_creation_is_unpaid_and_explicit(tmp_path: Path) -> None:
+    client = _client(tmp_path, _CanvasService())
+    response = client.post(
+        "/api/v2/projects",
+        json={
+            "title": "窗边纸星星",
+            "brief": {
+                "body": "孩子和灰白虎斑猫在窗边贴上一颗纸星星。",
+                "durationSeconds": 8,
+                "aspectRatio": "9:16",
+                "qualityTier": "quick",
+            },
+            "childCanonProfileId": "canon-v4-healing-child-cat-line-texture",
+            "catCanonProfileId": "canon-v4-healing-child-cat-line-texture",
+            "styleBoardAssetId": str(uuid.uuid4()),
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["providerCallCount"] == 0
+    assert response.json()["title"] == "窗边纸星星"
+
+
+def test_v2_production_flow_layout_uses_revision_header(tmp_path: Path) -> None:
+    project_id = uuid.uuid4()
+    service = _CanvasService()
+    client = _client(tmp_path, service)
+    script_node_id = uuid.uuid5(project_id, "production-flow:script")
+
+    response = client.patch(
+        f"/api/v2/projects/{project_id}/production-flow/layout",
         headers={"If-Match": "3"},
-        json={"reason": "用户从画布移除"},
-    )
-    restored = client.post(
-        f"/api/v2/projects/{project_id}/canvas/nodes/{node_id}/restore",
-        headers={"If-Match": "4"},
-    )
-
-    assert archived.status_code == 200
-    assert archived.json()["archived"] is True
-    assert archived.json()["layoutVersion"] == 4
-    assert service.archived_node_id == node_id
-    assert restored.status_code == 200
-    assert restored.json()["archived"] is False
-    assert restored.json()["layoutVersion"] == 5
-    assert service.restored_node_id == node_id
-
-
-def test_v2_template_library_and_product_default(tmp_path: Path) -> None:
-    service = _CanvasService()
-    client = _client(tmp_path, service)
-    project_id = uuid.uuid4()
-
-    templates = client.get("/api/v2/canvas-templates")
-    instantiated = client.post(
-        f"/api/v2/projects/{project_id}/template-instances",
-        json={"templateKey": "product_ad"},
+        json={
+            "nodes": [{"nodeId": str(script_node_id), "x": 120, "y": 220}],
+            "viewport": {"x": 10, "y": 20, "zoom": 0.82},
+            "operations": [{"type": "move_node", "nodeId": str(script_node_id)}],
+        },
     )
 
-    assert templates.status_code == 200
-    product = next(item for item in templates.json() if item["key"] == "product_ad")
-    assert product["defaultCandidateCount"] == 4
-    assert instantiated.status_code == 201
-    assert instantiated.json()["templateKey"] == "product_ad"
+    assert response.status_code == 200
+    assert response.json()["layoutVersion"] == 4
+    assert service.saved_layout is not None
+    assert service.saved_layout["nodes"][0]["nodeId"] == str(script_node_id)
 
 
 def test_v2_video_edit_recipe_compile_and_submit_contract(tmp_path: Path) -> None:
@@ -959,7 +1297,9 @@ def test_video_filmstrip_queues_once_and_returns_distinct_cached_frames(tmp_path
     assert len({frame["contentUrl"] for frame in frames}) == 12
 
 
-def test_generation_config_and_capabilities_are_server_driven(tmp_path: Path) -> None:
+def test_provider_capabilities_remain_public_without_generic_node_configuration(
+    tmp_path: Path,
+) -> None:
     service = _CanvasService()
     client = _client(tmp_path, service)
     node_id = uuid.uuid4()
@@ -993,5 +1333,4 @@ def test_generation_config_and_capabilities_are_server_driven(tmp_path: Path) ->
 
     assert capabilities.status_code == 200
     assert capabilities.json()[0]["capabilities"]["resolutions"] == ["720p"]
-    assert saved.status_code == 201
-    assert saved.json()["revision"] == 3
+    assert saved.status_code == 405

@@ -3,7 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from cat_video_generator.domain.rendering import AudioPolicy, RenderOperation, VideoInputPlan
-from cat_video_generator.infrastructure.ark.gateway import ArkGateway
+from cat_video_generator.infrastructure.ark.gateway import ArkGateway, _video_task_result
 
 
 def test_video_input_plan_defaults_to_required_native_audio() -> None:
@@ -49,3 +49,27 @@ def test_ark_submission_maps_explicit_audio_policy_to_provider_flag() -> None:
         )
 
     assert [item["generate_audio"] for item in calls] == [True, False]
+    assert [item["return_last_frame"] for item in calls] == [True, True]
+
+
+def test_ark_task_result_preserves_provider_returned_tail_frame_url() -> None:
+    result = _video_task_result(
+        SimpleNamespace(
+            id="task-1",
+            status="succeeded",
+            content=SimpleNamespace(
+                video_url="https://provider.example/video.mp4",
+                last_frame_url="https://provider.example/tail.png",
+            ),
+            error=None,
+            created_at=None,
+            duration="8",
+            model="seedance-test",
+            ratio="9:16",
+            resolution="720p",
+            generate_audio=True,
+        )
+    )
+
+    assert result.video_url == "https://provider.example/video.mp4"
+    assert result.last_frame_url == "https://provider.example/tail.png"

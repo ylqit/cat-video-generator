@@ -53,6 +53,8 @@ class SequenceService:
         project_id: uuid.UUID,
         *,
         transitions: dict[uuid.UUID, SequenceTransition] | None = None,
+        intro_transition: SequenceTransition | None = None,
+        outro_transition: SequenceTransition | None = None,
         request_idempotency_key: str | None = None,
     ) -> StoredSequence:
         prior_sequences = self._repository.list_sequences(project_id)
@@ -114,7 +116,12 @@ class SequenceService:
             )
             cursor = timeline_start + duration_ms
 
-        plan = ProjectSequencePlan(duration_ms=cursor, clips=clips)
+        plan = ProjectSequencePlan(
+            duration_ms=cursor,
+            clips=clips,
+            introTransition=intro_transition,
+            outroTransition=outro_transition,
+        )
         landed = self._asset_store.compose_sequence(
             tuple(item[1].require_path() for item in selected),
             plan,
@@ -150,6 +157,16 @@ class SequenceService:
                     else item.transition_from_previous.model_dump(mode="json", by_alias=True)
                     for item in plan.clips
                 ],
+                "introTransition": (
+                    None
+                    if plan.intro_transition is None
+                    else plan.intro_transition.model_dump(mode="json", by_alias=True)
+                ),
+                "outroTransition": (
+                    None
+                    if plan.outro_transition is None
+                    else plan.outro_transition.model_dump(mode="json", by_alias=True)
+                ),
             },
         )
         project = self._repository.get_project(project_id)

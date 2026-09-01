@@ -12,9 +12,11 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from .. import __version__
 from ..application.shot_queue import GatewayUnavailableError, RevisionConflictError
 from ..domain.contracts import (
     CURRENT_CONTRACT_VERSION,
+    AcceptedVisualAssetPlan,
     ReferenceRole,
     ReferenceTarget,
     ReferenceUsage,
@@ -37,6 +39,7 @@ from .api_schemas import (
     AcceptVisualAssetPlanRequest,
     AssistShotRequest,
     BuildSequenceRequest,
+    CancelTaskRequest,
     CreateProjectRequest,
     DiagnoseStoryRequest,
     ExpandStoryRequest,
@@ -45,10 +48,12 @@ from .api_schemas import (
     GenerateSceneLookRequest,
     OrderRequest,
     PlanVisualAssetsRequest,
+    PreviewReferenceImageRequest,
     RangeEditRequest,
     ReconcileRequest,
     ReferencesRequest,
     ReviewRequest,
+    ReviseVisualAssetPlanRequest,
     RewriteStoryRequest,
     SaveAnchorBriefRequest,
     SaveSceneLookDraftRequest,
@@ -62,12 +67,23 @@ from .api_schemas import (
     VisualProfileRequest,
 )
 from .api_v2 import install_canvas_v2_routes
+from .http_headers import parse_version_header
 from .jobs import JobConflictError, JobRegistry
 from .production_recipes_api import install_production_recipe_routes
 from .sse import parse_event_cursor, stream_events
 
 if TYPE_CHECKING:
     from ..bootstrap import RuntimeContainer
+
+
+API_FEATURES = (
+    "manual_video_edit_boundaries",
+    "reference_media_video_generation",
+    "storyboard_production_confirmations",
+    "visual_asset_plan_manual_revisions",
+    "workflow_task_cancellation_v1",
+    "legacy_director_workflow_adoption_v1",
+)
 
 
 class _SPAStaticFiles(StaticFiles):
@@ -93,6 +109,7 @@ def create_app(
     static_dir: Path | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Cat Video Shot Queue", version="5.0.0", redoc_url=None)
+    server_started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     repository = container.repository
     roots = tuple(
         item.expanduser().resolve()
@@ -214,6 +231,9 @@ def create_app(
         return {
             "ready": database_ready,
             "databaseReady": database_ready,
+            "applicationVersion": __version__,
+            "serverStartedAt": server_started_at,
+            "apiFeatures": list(API_FEATURES),
             "contractVersion": CURRENT_CONTRACT_VERSION,
             "alembicRevision": container.alembic_revision,
             "expectedAlembicRevision": ALEMBIC_HEAD,
@@ -333,6 +353,10 @@ def create_app(
                 container.editing.expand_story(
                     scene_id,
                     allow_paid_generation=payload.allow_paid_generation,
+                    storyboard_revision_id=payload.storyboard_revision_id,
+                    structure_hash=payload.structure_hash,
+                    generation_plan_id=payload.generation_plan_id,
+                    generation_plan_hash=payload.generation_plan_hash,
                 )
             ),
             context={
@@ -475,6 +499,10 @@ def create_app(
                 container.editing.plan_visual_assets(
                     scene_id,
                     allow_paid_generation=payload.allow_paid_generation,
+                    storyboard_revision_id=payload.storyboard_revision_id,
+                    structure_hash=payload.structure_hash,
+                    generation_plan_id=payload.generation_plan_id,
+                    generation_plan_hash=payload.generation_plan_hash,
                 )
             ),
             context={
@@ -881,6 +909,7 @@ def create_app(
                 draft_revision=payload.draft_revision,
                 regenerate=payload.regenerate,
                 reason=payload.retry_reason,
+                expected_input_hash=payload.expected_input_hash,
             ),
             context={"sceneId": scene_id, "operationKey": "image:scene-look"},
             execution=execution,
@@ -918,6 +947,7 @@ def create_app(
                 allow_paid_generation=payload.allow_paid_generation,
                 regenerate=payload.regenerate,
                 reason=payload.retry_reason,
+                expected_input_hash=payload.expected_input_hash,
             ),
             context={
                 "projectId": scene.project_id,
@@ -927,6 +957,35 @@ def create_app(
             execution=execution,
         )
         return {**submitted, "operationKey": operation_key}
+
+    @app.post("/api/v1/scenes/{scene_id}/reference-images/preview")
+    def preview_scene_reference_image(
+        scene_id: uuid.UUID,
+        payload: PreviewReferenceImageRequest,
+    ) -> dict[str, Any]:
+        scene = repository.get_scene(scene_id)
+        return container.production.preview_reference_image(
+            project_id=scene.project_id,
+            scene_id=scene.id,
+            scope="scene",
+            draft=payload.draft,
+            regeneration_instruction=payload.reason if payload.regenerate else None,
+        )
+
+    @app.post("/api/v1/steps/{step_id}/visual-asset-plan-revisions")
+    def revise_visual_asset_plan(
+        step_id: uuid.UUID,
+        payload: ReviseVisualAssetPlanRequest,
+        if_match: str = Header(alias="If-Match"),
+    ) -> dict[str, Any]:
+        return _creative_step_json(
+            container.editing.revise_visual_asset_plan(
+                step_id,
+                expected_revision=parse_version_header(if_match),
+                plan=AcceptedVisualAssetPlan(selections=payload.selections),
+                note=payload.note,
+            )
+        )
 
     @app.post("/api/v1/projects/{project_id}/reference-images")
     def generate_project_reference_image(
@@ -959,6 +1018,7 @@ def create_app(
                 allow_paid_generation=payload.allow_paid_generation,
                 regenerate=payload.regenerate,
                 reason=payload.retry_reason,
+                expected_input_hash=payload.expected_input_hash,
             ),
             context={
                 "projectId": project_id,
@@ -967,6 +1027,19 @@ def create_app(
             execution=execution,
         )
         return {**submitted, "operationKey": operation_key}
+
+    @app.post("/api/v1/projects/{project_id}/reference-images/preview")
+    def preview_project_reference_image(
+        project_id: uuid.UUID,
+        payload: PreviewReferenceImageRequest,
+    ) -> dict[str, Any]:
+        return container.production.preview_reference_image(
+            project_id=project_id,
+            scene_id=None,
+            scope="project",
+            draft=payload.draft,
+            regeneration_instruction=payload.reason if payload.regenerate else None,
+        )
 
     @app.post("/api/v1/shots/{shot_id}/videos")
     def generate_video(
@@ -1067,6 +1140,8 @@ def create_app(
                 container.sequences.build_project_sequence(
                     project_id,
                     transitions=transitions,
+                    intro_transition=None if payload is None else payload.intro_transition,
+                    outro_transition=None if payload is None else payload.outro_transition,
                 )
             ),
             context={"projectId": project_id, "operationKey": "sequence:build"},
@@ -1135,10 +1210,44 @@ def create_app(
     @app.get("/api/v1/projects/{project_id}/tasks")
     def project_tasks(project_id: uuid.UUID) -> list[dict[str, Any]]:
         repository.get_project(project_id)
+        items = list(reversed(repository.list_steps(project_id=project_id)))[:100]
+        cancellations = _task_cancellations_json(container, items)
         return [
-            _task_json(item)
-            for item in reversed(repository.list_steps(project_id=project_id))
-        ][:100]
+            _task_json(
+                item,
+                recovery=_task_recovery_json(container, item),
+                cancellation=cancellations.get(item.id),
+            )
+            for item in items
+        ]
+
+    @app.post("/api/v1/task-center/tasks/{step_id}/recover")
+    def recover_persistent_task(step_id: uuid.UUID) -> dict[str, Any]:
+        container.workflow_queue.recover(step_id)
+        item = repository.get_step(step_id)
+        return _task_json(
+            item,
+            recovery=_task_recovery_json(container, item),
+            cancellation=_task_cancellation_json(container, item),
+        )
+
+    @app.post("/api/v1/steps/{step_id}/cancellation")
+    def cancel_persistent_task(
+        step_id: uuid.UUID,
+        payload: CancelTaskRequest,
+    ) -> dict[str, Any]:
+        container.workflow_queue.cancel(
+            step_id,
+            expected_status=payload.expected_status,
+            expected_provider_task_id=payload.expected_provider_task_id,
+            reason=payload.reason,
+        )
+        item = repository.get_step(step_id)
+        return _task_json(
+            item,
+            recovery=_task_recovery_json(container, item),
+            cancellation=_task_cancellation_json(container, item),
+        )
 
     @app.get("/api/v1/task-center")
     def task_center() -> dict[str, list[dict[str, Any]]]:
@@ -1172,14 +1281,19 @@ def create_app(
             latest_by_operation.values(),
             key=lambda item: item.created_at or datetime.min.replace(tzinfo=timezone.utc),
             reverse=True,
-        )
+        )[:100]
+        cancellations = _task_cancellations_json(container, persistent)
         assets_by_step: dict[uuid.UUID, list[Any]] = {}
         for asset in repository.list_assets():
             if asset.step_id is not None:
                 assets_by_step.setdefault(asset.step_id, []).append(asset)
 
         def persistent_task(item: Any) -> dict[str, Any]:
-            projected = _task_json(item)
+            projected = _task_json(
+                item,
+                recovery=_task_recovery_json(container, item),
+                cancellation=cancellations.get(item.id),
+            )
             snapshot = item.input_snapshot if isinstance(item.input_snapshot, dict) else {}
             completed_at = getattr(item, "completed_at", None)
             projected.update(
@@ -1206,7 +1320,7 @@ def create_app(
 
         return {
             "runtimeJobs": [item.to_dict() for item in job_registry.list(limit=100)],
-            "persistentTasks": [persistent_task(item) for item in persistent[:100]],
+            "persistentTasks": [persistent_task(item) for item in persistent],
         }
 
     @app.get("/api/v1/task-center/events")
@@ -1367,13 +1481,23 @@ def _creative_step_json(item: Any) -> dict[str, Any]:
         "providerOutput": item.input_snapshot.get("providerOutput"),
         "acceptedOutput": item.input_snapshot.get("acceptedOutput"),
         "acceptedAt": item.input_snapshot.get("acceptedAt"),
+        "source": item.input_snapshot.get("source"),
+        "manualRevisionOfStepId": item.input_snapshot.get("manualRevisionOfStepId"),
+        "manualRevisionNote": item.input_snapshot.get("manualRevisionNote"),
         "error": item.error,
         "createdAt": None if item.created_at is None else item.created_at.isoformat(),
     }
 
 
-def _task_json(item: Any) -> dict[str, Any]:
-    return {
+def _task_json(
+    item: Any,
+    *,
+    recovery: dict[str, object] | None = None,
+    cancellation: dict[str, object] | None = None,
+) -> dict[str, Any]:
+    snapshot = item.input_snapshot if isinstance(item.input_snapshot, dict) else {}
+    progress = item.progress if isinstance(item.progress, dict) else {}
+    projected = {
         "stepId": str(item.id),
         "projectId": str(item.project_id),
         "sceneId": None if item.scene_id is None else str(item.scene_id),
@@ -1384,15 +1508,67 @@ def _task_json(item: Any) -> dict[str, Any]:
         "operationKey": item.operation_key,
         "provider": item.provider,
         "providerTaskId": item.provider_task_id,
-        "businessObjectId": item.input_snapshot.get("businessObjectId"),
+        "canvasNodeId": snapshot.get("canvasNodeId"),
+        "canvasGroupId": snapshot.get("canvasGroupId"),
+        "recipeInstanceId": snapshot.get("recipeInstanceId"),
+        "businessObjectId": snapshot.get("businessObjectId"),
+        "creationMode": snapshot.get("creationMode"),
+        "parentStepId": snapshot.get("parentStepId"),
+        "childStepIds": progress.get("childStepIds", []),
+        "workflowStage": snapshot.get("workflowStage"),
+        "phase": snapshot.get("phase"),
         "model": item.model,
-        "inputSnapshot": item.input_snapshot,
+        "inputSnapshot": snapshot,
         "error": item.error,
-        "progress": item.progress,
-        "resultSummary": item.progress.get("resultSummary"),
+        "progress": progress,
+        "resultSummary": progress.get("resultSummary"),
         "createdAt": None if item.created_at is None else item.created_at.isoformat(),
         "updatedAt": None if item.updated_at is None else item.updated_at.isoformat(),
         "completedAt": None if item.completed_at is None else item.completed_at.isoformat(),
+    }
+    if recovery is not None:
+        projected["recovery"] = recovery
+    if cancellation is not None:
+        projected["cancellation"] = cancellation
+    return projected
+
+
+def _task_recovery_json(
+    container: Any,
+    item: Any,
+) -> dict[str, object] | None:
+    if item.status not in {
+        StepStatus.FAILED,
+        StepStatus.SUBMISSION_UNKNOWN,
+    }:
+        return None
+    if not (item.operation_key == "recipe:character_design" or item.kind.value == "video"):
+        return None
+    return container.workflow_queue.recovery_for(item.id).to_dict()
+
+
+def _task_cancellation_json(
+    container: Any,
+    item: Any,
+) -> dict[str, object] | None:
+    queue = getattr(container, "workflow_queue", None)
+    if queue is None:
+        return None
+    return queue.cancellation_for(item.id).to_dict()
+
+
+def _task_cancellations_json(
+    container: Any,
+    items: list[Any],
+) -> dict[uuid.UUID, dict[str, object]]:
+    queue = getattr(container, "workflow_queue", None)
+    if queue is None or not items:
+        return {}
+    return {
+        step_id: policy.to_dict()
+        for step_id, policy in queue.cancellations_for(
+            tuple(item.id for item in items)
+        ).items()
     }
 
 

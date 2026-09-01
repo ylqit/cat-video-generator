@@ -7,14 +7,25 @@ validated here.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import uuid
+from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
-from pydantic import Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from .contract_base import StrictModel
+from .production_recipes import ReferenceAuthorityDto
 
 
 class SubjectKind(StrEnum):
@@ -47,12 +58,166 @@ class StoryEventCandidateStatus(StrEnum):
     SUPERSEDED = "superseded"
 
 
+def creative_brief_canvas_node_id(project_id: uuid.UUID) -> uuid.UUID:
+    """Return the stable canvas identity for the project's versioned brief."""
+
+    return uuid.uuid5(project_id, "creative-brief")
+
+
 class StoryStrategy(StrEnum):
     RELATIONSHIP = "relationship"
     PROBLEM_SOLVING = "problem_solving"
     TWIST_HOOK = "twist_hook"
     COMBINED = "combined"
     LEGACY_IMPORT = "legacy_import"
+
+
+class WorkspaceStatus(StrEnum):
+    """User-facing readiness derived directly from production facts."""
+
+    BLOCKED = "blocked"
+    STALE = "stale"
+    NEEDS_REVIEW = "needs_review"
+    ACTIVE = "active"
+    COMPLETE = "complete"
+    READY = "ready"
+
+
+class WorkspaceModuleId(StrEnum):
+    SCRIPT = "script"
+    ASSETS = "assets"
+    PRODUCTION = "production"
+
+
+class WorkspaceModuleDto(StrictModel):
+    id: WorkspaceModuleId
+    title: str
+    order: int = Field(ge=1, le=3)
+    status: WorkspaceStatus
+    progress: int | None = Field(default=None, ge=0, le=100)
+    attention_count: int = Field(alias="attentionCount", ge=0)
+    primary_artifact_id: str | None = Field(alias="primaryArtifactId", default=None)
+    blocker: str | None = None
+    next_action: dict[str, str] | None = Field(alias="nextAction", default=None)
+
+
+class ProjectWorkspaceShellDto(StrictModel):
+    project: "WorkspaceProjectSummaryDto"
+    modules: tuple[WorkspaceModuleDto, ...]
+    recommended_module_id: WorkspaceModuleId = Field(alias="recommendedModuleId")
+    active_task_summary: "WorkspaceActiveTaskSummaryDto" = Field(alias="activeTaskSummary")
+
+
+class StoryDocumentDto(StrictModel):
+    id: uuid.UUID
+    title: str
+    body: str
+    summary: str | None = None
+    revision: int = Field(ge=1)
+    status: str
+    source: Literal["ai", "manual", "unknown"]
+    warnings: tuple[dict[str, Any], ...] = ()
+
+
+class ScriptWorkspaceDto(StrictModel):
+    brief: dict[str, Any] | None = None
+    documents: tuple[StoryDocumentDto, ...]
+    current_story_id: uuid.UUID | None = Field(alias="currentStoryId", default=None)
+    recipe_instance_id: uuid.UUID | None = Field(alias="recipeInstanceId", default=None)
+
+
+class ProductionFlowNodeKind(StrEnum):
+    SCRIPT = "script"
+    DIRECTOR_PLAN = "director_plan"
+    ASSETS = "assets"
+    STORYBOARD_TABLE = "storyboard_table"
+    STORYBOARD = "storyboard"
+    WORKBENCH = "workbench"
+
+
+class ProductionFlowNodeDto(StrictModel):
+    id: str
+    kind: ProductionFlowNodeKind
+    title: str
+    subtitle: str = ""
+    status: WorkspaceStatus
+    position: dict[str, float]
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProductionFlowEdgeDto(StrictModel):
+    id: str
+    source: str
+    target: str
+
+
+class ProductionFlowDto(StrictModel):
+    revision: int = Field(ge=0)
+    nodes: tuple[ProductionFlowNodeDto, ...]
+    edges: tuple[ProductionFlowEdgeDto, ...]
+    viewport: dict[str, float]
+    active_storyboard_revision_id: uuid.UUID | None = Field(
+        alias="activeStoryboardRevisionId", default=None
+    )
+    active_track_id: str | None = Field(alias="activeTrackId", default=None)
+    shot_order: tuple[str, ...] = Field(alias="shotOrder")
+
+
+class VideoWorkbenchReferenceDto(StrictModel):
+    asset_id: uuid.UUID = Field(alias="assetId")
+    title: str
+    semantic_role: str = Field(alias="semanticRole")
+    ordinal: int = Field(ge=1)
+    provider_eligible: bool = Field(alias="providerEligible")
+    content_url: str | None = Field(alias="contentUrl", default=None)
+    source_revision: int | None = Field(alias="sourceRevision", default=None)
+
+
+class VideoWorkbenchVersionDto(StrictModel):
+    asset_id: uuid.UUID = Field(alias="assetId")
+    status: str
+    content_url: str | None = Field(alias="contentUrl", default=None)
+    created_at: datetime = Field(alias="createdAt")
+    selected: bool = False
+
+
+class VideoWorkbenchTrackDto(StrictModel):
+    id: str
+    shot_ids: tuple[uuid.UUID, ...] = Field(alias="shotIds")
+    title: str
+    duration_seconds: int = Field(alias="durationSeconds", ge=1)
+    ordered_references: tuple[VideoWorkbenchReferenceDto, ...] = Field(
+        alias="orderedReferences"
+    )
+    prompt: str
+    provider_config: dict[str, Any] = Field(alias="providerConfig")
+    task: dict[str, Any] | None = None
+    versions: tuple[VideoWorkbenchVersionDto, ...]
+    selected_version_id: uuid.UUID | None = Field(alias="selectedVersionId", default=None)
+
+
+class VideoWorkbenchDto(StrictModel):
+    active_track_id: str | None = Field(alias="activeTrackId", default=None)
+    tracks: tuple[VideoWorkbenchTrackDto, ...]
+    approved_references: tuple[VideoWorkbenchReferenceDto, ...] = Field(
+        alias="approvedReferences"
+    )
+    timeline: dict[str, Any] | None = None
+    export_summary: dict[str, Any] | None = Field(alias="exportSummary", default=None)
+
+
+class WorkspaceProjectSummaryDto(StrictModel):
+    id: uuid.UUID
+    title: str
+    status: str
+    updated_at: datetime = Field(alias="updatedAt")
+
+
+class WorkspaceActiveTaskSummaryDto(StrictModel):
+    active_count: int = Field(alias="activeCount", ge=0)
+    attention_count: int = Field(alias="attentionCount", ge=0)
+    latest_task_id: uuid.UUID | None = Field(alias="latestTaskId", default=None)
+    latest_status: str | None = Field(alias="latestStatus", default=None)
 
 
 class CanvasNodeType(StrEnum):
@@ -70,6 +235,7 @@ class CanvasNodeType(StrEnum):
     STORYBOARD_DIRECTOR = "StoryboardDirectorNode"
     SCENE = "SceneNode"
     SHOT_BEAT = "ShotBeatNode"
+    GENERATION_PLAN = "GenerationPlanNode"
     IMAGE_GENERATION = "ImageGenerationNode"
     VIDEO_GENERATION = "VideoGenerationNode"
     REVIEW = "ReviewNode"
@@ -92,6 +258,12 @@ class CanvasPortType(StrEnum):
     STORY_REVISION = "story_revision"
     SCENE_PLAN = "scene_plan"
     SHOT_BEATS = "shot_beat[]"
+    STORYBOARD_SHOTS = "storyboard_shot[]"
+    SHOT_SEQUENCE = "shot_sequence"
+    GENERATION_PLAN = "generation_plan"
+    VIDEO_SEGMENTS = "video_segment[]"
+    COMPILED_PROMPT = "compiled_prompt"
+    APPROVED_ANCHOR = "approved_anchor"
     IMAGE_REFERENCES = "image_reference[]"
     IMAGE_ASSET = "image_asset"
     VIDEO_ASSET = "video_asset"
@@ -181,19 +353,99 @@ class SubjectCompletionProposal(StrictModel):
     warnings: list[str] = Field(default_factory=list, max_length=30)
 
 
-class ActualReferenceBinding(StrictModel):
+class GenerationReferenceBindingDraft(StrictModel):
+    """An ordered reference intention before provider capability compilation."""
+
     asset_id: uuid.UUID = Field(alias="assetId")
+    source_node_id: uuid.UUID | None = Field(alias="sourceNodeId", default=None)
+    source_type: str = Field(alias="sourceType", default="canvas", max_length=80)
     subject_revision_id: uuid.UUID | None = Field(alias="subjectRevisionId", default=None)
     semantic_role: str = Field(alias="semanticRole", min_length=1, max_length=80)
+    purpose: str = Field(default="reference", min_length=1, max_length=120)
+    instruction: str = Field(default="", max_length=2_000)
+    ordinal: int = Field(default=1, ge=1, le=30)
+    locked: bool = False
+    authority: ReferenceAuthorityDto | None = None
+
+
+class CompiledProviderReference(GenerationReferenceBindingDraft):
+    """The exact immutable provider-facing result of reference compilation."""
+
+    sha256: str | None = Field(default=None, min_length=64, max_length=64)
     provider_included: bool = Field(alias="providerIncluded")
     omission_reason: str | None = Field(alias="omissionReason", default=None, max_length=1_000)
     provider_slot: str | None = Field(alias="providerSlot", default=None, max_length=120)
+    origin: str = Field(default="canvas", min_length=1, max_length=120)
+    title: str | None = Field(default=None, max_length=240)
+    content_url: str | None = Field(alias="contentUrl", default=None, max_length=1_000)
+    evidence_level: Literal["frozen", "selected_only", "unknown"] = Field(
+        alias="evidenceLevel",
+        default="frozen",
+    )
 
     @model_validator(mode="after")
-    def require_omission_reason(self) -> ActualReferenceBinding:
+    def require_omission_reason(self) -> CompiledProviderReference:
         if not self.provider_included and not (self.omission_reason or "").strip():
             raise ValueError("omissionReason is required when a reference is omitted")
         return self
+
+
+class ActualReferenceBinding(CompiledProviderReference):
+    """Compatibility name for persisted V2 generation configs.
+
+    New code should use ``CompiledProviderReference``.  This class remains a real
+    schema boundary because older canvas documents use the ``actualReferences``
+    field name and still need strict validation.
+    """
+
+
+class GenerationInputPreview(StrictModel):
+    provider: str = Field(min_length=1, max_length=80)
+    model: str = Field(min_length=1, max_length=200)
+    mode: str = Field(min_length=1, max_length=80)
+    capability_revision: str = Field(alias="capabilityRevision", min_length=1, max_length=120)
+    prompt: str = Field(max_length=20_000)
+    references: list[CompiledProviderReference] = Field(default_factory=list, max_length=30)
+    blockers: list[str] = Field(default_factory=list, max_length=30)
+    warnings: list[str] = Field(default_factory=list, max_length=30)
+    estimated_cost_micros: int | None = Field(alias="estimatedCostMicros", default=None, ge=0)
+    input_hash: str = Field(alias="inputHash", min_length=64, max_length=64)
+
+
+def generation_input_hash(document: dict[str, Any]) -> str:
+    """Hash the exact provider input preview using the repository-wide JSON rules."""
+
+    payload = json.dumps(
+        document,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def character_design_generation_input(
+    *,
+    provider: str,
+    model: str,
+    candidate_count: int,
+    prompt: str,
+    references: list[dict[str, Any]],
+    capability_revision: str,
+) -> dict[str, Any]:
+    """Return the shared exact-input document for fixed character design batches."""
+
+    return {
+        "provider": provider,
+        "model": model,
+        "mediaKind": "image",
+        "mode": "all_reference",
+        "capabilityRevision": capability_revision,
+        "candidateCount": candidate_count,
+        "prompt": prompt,
+        "references": references,
+    }
 
 
 class NormalizedPoint(StrictModel):
@@ -233,7 +485,7 @@ class NodeGenerationConfigDraft(StrictModel):
     reference_annotations: list[GenerationReferenceAnnotation] = Field(
         alias="referenceAnnotations", default_factory=list, max_length=100
     )
-    actual_references: list[ActualReferenceBinding] = Field(
+    actual_references: list[CompiledProviderReference] = Field(
         alias="actualReferences", default_factory=list, max_length=30
     )
 
@@ -396,6 +648,119 @@ class StoryCandidateOutput(StrictModel):
     scenes: list[StorySceneOutline] = Field(min_length=1, max_length=30)
 
 
+class CreativeStoryCandidate(BaseModel):
+    """Minimal, tolerant contract for an LLM's editable story text."""
+
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+
+    title: str = Field(min_length=1)
+    body: str = Field(min_length=1)
+    summary: str | None = None
+
+    @field_validator("summary", mode="before")
+    @classmethod
+    def normalize_blank_summary(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+
+class CreativeStoryCandidateBatch(BaseModel):
+    """Tolerant batch envelope used only at the LLM creative-output boundary."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    candidates: list[CreativeStoryCandidate] = Field(min_length=1, max_length=5)
+
+
+class CanvasDiagnostic(StrictModel):
+    code: str = Field(min_length=1, max_length=120)
+    severity: Literal["warning", "blocker"]
+    message: str = Field(min_length=1, max_length=2_000)
+    target_id: str | None = Field(alias="targetId", default=None, max_length=200)
+
+
+class CreativeStoryCandidateParseResult(StrictModel):
+    batch: CreativeStoryCandidateBatch
+    diagnostics: list[CanvasDiagnostic] = Field(default_factory=list)
+
+
+def parse_llm_story_candidate_output(output: object) -> CreativeStoryCandidateParseResult:
+    """Normalize provider creativity while keeping downstream contracts strict."""
+
+    diagnostics: list[CanvasDiagnostic] = []
+
+    if isinstance(output, str):
+        body = output.strip()
+        if not body:
+            raise ValueError("LLM 创作输出不能为空")
+        batch = CreativeStoryCandidateBatch(
+            candidates=[
+                CreativeStoryCandidate(title="未命名故事候选", body=body)
+            ]
+        )
+        diagnostics.append(
+            CanvasDiagnostic(
+                code="story_candidate_unstructured",
+                severity="warning",
+                message="LLM 返回了非结构化文本，已保留为可编辑故事候选。",
+            )
+        )
+    elif isinstance(output, dict) and "candidates" in output:
+        if output["candidates"] == []:
+            raise ValueError("LLM 创作候选批次至少包含 1 个候选")
+        try:
+            batch = CreativeStoryCandidateBatch.model_validate(output)
+        except ValidationError as exc:
+            raise ValueError(f"LLM 创作候选批次无效：{exc}") from exc
+    elif isinstance(output, dict):
+        body: str | None = None
+        for field_name in ("body", "synopsis", "premise"):
+            value = output.get(field_name)
+            if isinstance(value, str) and value.strip():
+                body = value
+                break
+        if body is None:
+            raise ValueError("LLM 创作候选必须提供非空正文")
+
+        summary: str | None = None
+        for field_name in ("summary", "logline"):
+            value = output.get(field_name)
+            if isinstance(value, str) and value.strip():
+                summary = value
+                break
+
+        try:
+            batch = CreativeStoryCandidateBatch(
+                candidates=[
+                    CreativeStoryCandidate(
+                        title=output.get("title"),
+                        body=body,
+                        summary=summary,
+                    )
+                ]
+            )
+        except ValidationError as exc:
+            raise ValueError(f"LLM 创作候选无效：{exc}") from exc
+    else:
+        raise ValueError("LLM 创作输出必须是候选对象、候选批次或非空文本")
+
+    candidate_count = len(batch.candidates)
+    if candidate_count != 3:
+        diagnostics.append(
+            CanvasDiagnostic(
+                code="story_candidate_count",
+                severity="warning",
+                message=f"LLM 返回了 {candidate_count} 个故事候选，预期数量为 3。",
+            )
+        )
+
+    return CreativeStoryCandidateParseResult(
+        batch=batch,
+        diagnostics=diagnostics,
+    )
+
+
 def validate_story_scene_plan(
     candidate: StoryCandidateOutput,
     *,
@@ -425,17 +790,196 @@ def validate_story_scene_plan(
         )
 
 
-class StoryboardBeatOutput(StrictModel):
-    scene_order: int = Field(alias="sceneOrder", ge=1, le=30)
+class StoryboardBeatOutput(BaseModel):
+    """Minimal editable shot returned by a creative model.
+
+    This is deliberately tolerant only at the LLM boundary.  The normalized
+    object is subsequently checked against the approved story and execution
+    constraints before it can create media work.
+    """
+
+    model_config = ConfigDict(
+        extra="ignore",
+        populate_by_name=True,
+        str_strip_whitespace=True,
+    )
+
+    order: int = Field(ge=1, le=200)
+    scene_order: int = Field(alias="sceneOrder", default=1, ge=1, le=30)
+    scene_label: str | None = Field(alias="sceneLabel", default=None, max_length=160)
     title: str = Field(min_length=1, max_length=160)
-    action: str = Field(min_length=1, max_length=4_000)
-    camera: str = Field(min_length=1, max_length=2_000)
+    direction: str = Field(min_length=1, max_length=6_000)
+    duration_seconds: int | None = Field(
+        alias="durationSeconds", default=None, ge=1, le=60
+    )
+    duration_weight: int | None = Field(
+        alias="durationWeight", default=None, ge=1, le=100
+    )
+    camera: str = Field(default="", max_length=2_000)
     dialogue: str = Field(default="", max_length=4_000)
-    duration_weight: int = Field(alias="durationWeight", ge=1, le=100)
+    visual_description: str = Field(alias="visualDescription", default="", max_length=4_000)
+    child_action: str = Field(alias="childAction", default="", max_length=2_000)
+    cat_action: str = Field(alias="catAction", default="", max_length=2_000)
+    spatial_relation: str = Field(alias="spatialRelation", default="", max_length=2_000)
+    contact_occlusion: str = Field(alias="contactOcclusion", default="", max_length=2_000)
+    shot_size: str = Field(alias="shotSize", default="", max_length=200)
+    lighting: str = Field(default="", max_length=1_000)
+    sound_effect: str = Field(alias="soundEffect", default="", max_length=1_000)
+    music_intent: str = Field(alias="musicIntent", default="", max_length=1_000)
+    wardrobe_state: str = Field(alias="wardrobeState", default="", max_length=1_000)
+    prop_state: str = Field(alias="propState", default="", max_length=1_000)
+    continuity_in: str = Field(alias="continuityIn", default="", max_length=2_000)
+    continuity_out: str = Field(alias="continuityOut", default="", max_length=2_000)
+    cut_intent: Literal["continuous", "soft_cut", "hard_cut"] = Field(
+        alias="cutIntent", default="continuous"
+    )
+
+    @model_validator(mode="after")
+    def require_duration(self) -> StoryboardBeatOutput:
+        if self.duration_seconds is None and self.duration_weight is None:
+            raise ValueError("镜头必须提供 durationSeconds 或旧版 durationWeight")
+        return self
+
+    @property
+    def action(self) -> str:
+        """Legacy persistence name for the canonical direction text."""
+
+        return self.direction
 
 
-class StoryboardPlanOutput(StrictModel):
-    beats: list[StoryboardBeatOutput] = Field(min_length=1, max_length=75)
+class StoryboardPlanOutput(BaseModel):
+    """Tolerant LLM storyboard envelope with one legacy normalization boundary."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    shots: list[StoryboardBeatOutput] = Field(min_length=1, max_length=75)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_beats(cls, value: object) -> object:
+        if not isinstance(value, dict) or "shots" in value:
+            return value
+        beats = value.get("beats")
+        if isinstance(beats, list):
+            normalized: list[object] = []
+            for index, item in enumerate(beats, 1):
+                if not isinstance(item, dict):
+                    normalized.append(item)
+                    continue
+                direction = item.get("direction")
+                if not isinstance(direction, str) or not direction.strip():
+                    direction = item.get("visualDescription") or item.get("action")
+                normalized.append(
+                    {
+                        **item,
+                        "order": item.get("order", index),
+                        "direction": direction,
+                    }
+                )
+            return {**value, "shots": normalized}
+
+        scenes = value.get("scenes")
+        if not isinstance(scenes, list):
+            return value
+        flattened: list[object] = []
+        for scene_index, scene in enumerate(scenes, 1):
+            if not isinstance(scene, dict) or not isinstance(scene.get("shots"), list):
+                continue
+            scene_order = scene.get("sceneOrder", scene_index)
+            scene_label = scene.get("sceneLabel")
+            for shot in scene["shots"]:
+                if not isinstance(shot, dict):
+                    flattened.append(shot)
+                    continue
+                direction = shot.get("direction")
+                if not isinstance(direction, str) or not direction.strip():
+                    direction = shot.get("visualDescription") or shot.get("action")
+                flattened.append(
+                    {
+                        **shot,
+                        "order": len(flattened) + 1,
+                        "sceneOrder": shot.get("sceneOrder", scene_order),
+                        "sceneLabel": shot.get("sceneLabel", scene_label),
+                        "direction": direction,
+                        "soundEffect": shot.get("soundEffect", shot.get("soundCue", "")),
+                    }
+                )
+        return {**value, "shots": flattened}
+
+    @model_validator(mode="after")
+    def validate_execution_shape(self) -> StoryboardPlanOutput:
+        orders = [shot.order for shot in self.shots]
+        if orders != list(range(1, len(self.shots) + 1)):
+            raise ValueError("镜头顺序必须从1开始且连续")
+        scene_orders = sorted({shot.scene_order for shot in self.shots})
+        if scene_orders != list(range(1, max(scene_orders) + 1)):
+            raise ValueError("分镜场景必须从1开始且连续")
+        if not (
+            all(shot.duration_seconds is not None for shot in self.shots)
+            or all(shot.duration_weight is not None for shot in self.shots)
+        ):
+            raise ValueError("同一分镜必须统一使用 durationSeconds 或旧版 durationWeight")
+        return self
+
+    @property
+    def beats(self) -> list[StoryboardBeatOutput]:
+        """Compatibility view for persistence code during the schema transition."""
+
+        return self.shots
+
+
+class StoryboardPlanParseResult(StrictModel):
+    status: Literal["ready", "needs_structuring"]
+    plan: StoryboardPlanOutput | None = None
+    raw_text: str | None = Field(alias="rawText", default=None, max_length=200_000)
+    diagnostics: list[CanvasDiagnostic] = Field(default_factory=list)
+
+
+def parse_llm_storyboard_output(output: object) -> StoryboardPlanParseResult:
+    """Preserve creative output while admitting only executable shot structure."""
+
+    if isinstance(output, str):
+        raw_text = output.strip()
+        if not raw_text:
+            raise ValueError("LLM 分镜输出不能为空")
+        return _storyboard_needs_structuring(raw_text)
+    if not isinstance(output, dict):
+        raise ValueError("LLM 分镜输出必须是对象或非空文本")
+    try:
+        plan = StoryboardPlanOutput.model_validate(output)
+    except ValidationError:
+        return _storyboard_needs_structuring(
+            json.dumps(output, ensure_ascii=False, sort_keys=True)
+        )
+    return StoryboardPlanParseResult(status="ready", plan=plan)
+
+
+def _storyboard_needs_structuring(raw_text: str) -> StoryboardPlanParseResult:
+    return StoryboardPlanParseResult(
+        status="needs_structuring",
+        rawText=raw_text,
+        diagnostics=[
+            CanvasDiagnostic(
+                code="storyboard_needs_structuring",
+                severity="blocker",
+                message="分镜原文需要整理为至少一个包含标题、镜头描述和有效时长的镜头",
+            )
+        ],
+    )
+
+
+def storyboard_quality_diagnostics(shots: Sequence[object]) -> list[CanvasDiagnostic]:
+    """Return non-blocking creative observations for editable storyboard content."""
+
+    if any(str(getattr(shot, "dialogue", "")).strip() for shot in shots):
+        return [
+            CanvasDiagnostic(
+                code="storyboard_dialogue_present",
+                severity="warning",
+                message="分镜包含对白；请确认口型、声音和镜头时长是否适合当前成片。",
+            )
+        ]
+    return []
 
 
 class CanvasConnection(StrictModel):
@@ -604,13 +1148,14 @@ def approve_story_revision(
     current_status: StoryRevisionStatus,
     *,
     scorecard: StoryScorecard | None,
+    requires_scorecard: bool,
     revision_subject_ids: tuple[uuid.UUID, ...],
     required_subject_ids: tuple[uuid.UUID, ...],
 ) -> StoryRevisionStatus:
     if current_status is not StoryRevisionStatus.CANDIDATE:
         raise ValueError("只有候选故事版本可以批准")
-    if scorecard is None:
-        raise ValueError("故事批准前必须完成评审评分")
+    if requires_scorecard and scorecard is None:
+        raise ValueError("Legacy 结构化故事批准前必须完成评审评分")
     missing = set(required_subject_ids) - set(revision_subject_ids)
     if missing:
         raise ValueError(f"故事版本缺少主体：{len(missing)} 个")
@@ -642,6 +1187,9 @@ _NODE_INPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
             CanvasPortType.STORY_EVENT,
             CanvasPortType.STORY_REVISION,
             CanvasPortType.CHARACTER_DESIGN,
+            CanvasPortType.SHOT_SEQUENCE,
+            CanvasPortType.GENERATION_PLAN,
+            CanvasPortType.COMPILED_PROMPT,
         }
     ),
     CanvasNodeType.STORYBOARD_DIRECTOR: frozenset(
@@ -654,8 +1202,13 @@ _NODE_INPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
     ),
     CanvasNodeType.SCENE: frozenset({CanvasPortType.SCENE_PLAN}),
     CanvasNodeType.SHOT_BEAT: frozenset(
-        {CanvasPortType.SHOT_BEATS, CanvasPortType.SUBJECTS}
+        {
+            CanvasPortType.SHOT_BEATS,
+            CanvasPortType.STORYBOARD_SHOTS,
+            CanvasPortType.SUBJECTS,
+        }
     ),
+    CanvasNodeType.GENERATION_PLAN: frozenset({CanvasPortType.SHOT_SEQUENCE}),
     CanvasNodeType.IMAGE_GENERATION: frozenset(
         {
             CanvasPortType.SHOT_BEATS,
@@ -663,6 +1216,8 @@ _NODE_INPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
             CanvasPortType.IMAGE_REFERENCES,
             CanvasPortType.MEDIA_REFERENCES,
             CanvasPortType.PROMPT,
+            CanvasPortType.VIDEO_SEGMENTS,
+            CanvasPortType.COMPILED_PROMPT,
         }
     ),
     CanvasNodeType.VIDEO_GENERATION: frozenset(
@@ -673,10 +1228,16 @@ _NODE_INPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
             CanvasPortType.MEDIA_REFERENCES,
             CanvasPortType.IMAGE_ASSET,
             CanvasPortType.PROMPT,
+            CanvasPortType.VIDEO_SEGMENTS,
+            CanvasPortType.APPROVED_ANCHOR,
         }
     ),
     CanvasNodeType.REVIEW: frozenset(
-        {CanvasPortType.IMAGE_ASSET, CanvasPortType.VIDEO_ASSET}
+        {
+            CanvasPortType.IMAGE_ASSET,
+            CanvasPortType.VIDEO_ASSET,
+            CanvasPortType.APPROVED_ANCHOR,
+        }
     ),
     CanvasNodeType.TIMELINE: frozenset({CanvasPortType.APPROVED_ASSET}),
     CanvasNodeType.REFERENCE_ASSET: frozenset(),
@@ -688,8 +1249,10 @@ _NODE_INPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
     CanvasNodeType.VIDEO_EDIT: frozenset(
         {CanvasPortType.VIDEO_ASSET, CanvasPortType.MEDIA_REFERENCES}
     ),
-    CanvasNodeType.VIDEO_SEGMENT: frozenset({CanvasPortType.EDIT_RECIPE}),
-    CanvasNodeType.PROMPT_ARTIFACT: frozenset(),
+    CanvasNodeType.VIDEO_SEGMENT: frozenset(
+        {CanvasPortType.EDIT_RECIPE, CanvasPortType.GENERATION_PLAN}
+    ),
+    CanvasNodeType.PROMPT_ARTIFACT: frozenset({CanvasPortType.VIDEO_SEGMENTS}),
     CanvasNodeType.AUDIO_GENERATION: frozenset({CanvasPortType.PROMPT}),
 }
 
@@ -716,14 +1279,26 @@ _NODE_OUTPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
             CanvasPortType.STORY_EVENT,
             CanvasPortType.STORY_REVISION,
             CanvasPortType.CHARACTER_DESIGN,
+            CanvasPortType.SHOT_SEQUENCE,
+            CanvasPortType.GENERATION_PLAN,
+            CanvasPortType.COMPILED_PROMPT,
         }
     ),
     CanvasNodeType.STORYBOARD_DIRECTOR: frozenset({CanvasPortType.SCENE_PLAN}),
-    CanvasNodeType.SCENE: frozenset({CanvasPortType.SHOT_BEATS}),
-    CanvasNodeType.SHOT_BEAT: frozenset({CanvasPortType.SHOT_BEATS}),
-    CanvasNodeType.IMAGE_GENERATION: frozenset({CanvasPortType.IMAGE_ASSET}),
+    CanvasNodeType.SCENE: frozenset(
+        {CanvasPortType.SHOT_BEATS, CanvasPortType.STORYBOARD_SHOTS}
+    ),
+    CanvasNodeType.SHOT_BEAT: frozenset(
+        {CanvasPortType.SHOT_BEATS, CanvasPortType.STORYBOARD_SHOTS}
+    ),
+    CanvasNodeType.GENERATION_PLAN: frozenset({CanvasPortType.GENERATION_PLAN}),
+    CanvasNodeType.IMAGE_GENERATION: frozenset(
+        {CanvasPortType.IMAGE_ASSET, CanvasPortType.APPROVED_ANCHOR}
+    ),
     CanvasNodeType.VIDEO_GENERATION: frozenset({CanvasPortType.VIDEO_ASSET}),
-    CanvasNodeType.REVIEW: frozenset({CanvasPortType.APPROVED_ASSET}),
+    CanvasNodeType.REVIEW: frozenset(
+        {CanvasPortType.APPROVED_ASSET, CanvasPortType.APPROVED_ANCHOR}
+    ),
     CanvasNodeType.TIMELINE: frozenset(),
     CanvasNodeType.REFERENCE_ASSET: frozenset({CanvasPortType.MEDIA_REFERENCES}),
     CanvasNodeType.GENERATION_BATCH: frozenset({CanvasPortType.IMAGE_ASSETS}),
@@ -732,8 +1307,12 @@ _NODE_OUTPUT_PORTS: dict[CanvasNodeType, frozenset[CanvasPortType]] = {
     ),
     CanvasNodeType.VIDEO_ASSET: frozenset({CanvasPortType.VIDEO_ASSET}),
     CanvasNodeType.VIDEO_EDIT: frozenset({CanvasPortType.EDIT_RECIPE}),
-    CanvasNodeType.VIDEO_SEGMENT: frozenset({CanvasPortType.VIDEO_ASSET}),
-    CanvasNodeType.PROMPT_ARTIFACT: frozenset({CanvasPortType.PROMPT}),
+    CanvasNodeType.VIDEO_SEGMENT: frozenset(
+        {CanvasPortType.VIDEO_ASSET, CanvasPortType.VIDEO_SEGMENTS}
+    ),
+    CanvasNodeType.PROMPT_ARTIFACT: frozenset(
+        {CanvasPortType.PROMPT, CanvasPortType.COMPILED_PROMPT}
+    ),
     CanvasNodeType.AUDIO_GENERATION: frozenset({CanvasPortType.AUDIO_ASSET}),
 }
 
@@ -745,6 +1324,12 @@ _PORT_COMPATIBILITY: dict[CanvasPortType, frozenset[CanvasPortType]] = {
     CanvasPortType.STORY_REVISION: frozenset({CanvasPortType.STORY_REVISION}),
     CanvasPortType.SCENE_PLAN: frozenset({CanvasPortType.SCENE_PLAN}),
     CanvasPortType.SHOT_BEATS: frozenset({CanvasPortType.SHOT_BEATS}),
+    CanvasPortType.STORYBOARD_SHOTS: frozenset({CanvasPortType.STORYBOARD_SHOTS}),
+    CanvasPortType.SHOT_SEQUENCE: frozenset({CanvasPortType.SHOT_SEQUENCE}),
+    CanvasPortType.GENERATION_PLAN: frozenset({CanvasPortType.GENERATION_PLAN}),
+    CanvasPortType.VIDEO_SEGMENTS: frozenset({CanvasPortType.VIDEO_SEGMENTS}),
+    CanvasPortType.COMPILED_PROMPT: frozenset({CanvasPortType.COMPILED_PROMPT}),
+    CanvasPortType.APPROVED_ANCHOR: frozenset({CanvasPortType.APPROVED_ANCHOR}),
     CanvasPortType.IMAGE_REFERENCES: frozenset({CanvasPortType.IMAGE_REFERENCES}),
     CanvasPortType.IMAGE_ASSET: frozenset(
         {CanvasPortType.IMAGE_ASSET, CanvasPortType.IMAGE_REFERENCES}

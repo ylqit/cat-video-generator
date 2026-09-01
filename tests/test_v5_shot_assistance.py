@@ -638,10 +638,213 @@ def test_prompt_preview_returns_free_rules_pacing_and_source_layers(tmp_path: Pa
     assert retry_preview["inputHash"] == compiled.input_hash
 
 
+def test_scene_environment_reference_is_direct_video_input_when_scene_look_is_off(
+    tmp_path: Path,
+) -> None:
+    repository = _AssistRepository(tmp_path)
+    environment_path = tmp_path / "rainy-yard.png"
+    environment_path.write_bytes(b"environment")
+    environment = StoredAsset(
+        id=uuid.uuid4(),
+        project_id=repository.project.id,
+        scene_id=repository.scene.id,
+        shot_card_id=None,
+        step_id=None,
+        role="reference",
+        media_type="image",
+        scope="scene",
+        status="approved",
+        path=environment_path,
+        sha256=hashlib.sha256(environment_path.read_bytes()).hexdigest(),
+        metadata={"displayName": "雨后小院", "referencePurpose": "environment"},
+        semantic_key="scene:environment:rainy-yard",
+    )
+    repository.assets[environment.id] = environment
+    repository.scene = replace(
+        repository.scene,
+        look_draft=SceneLookDraft(
+            visualProfileRevisionId=repository.profile.id,
+            lookPlan=SceneLookPlan(environmentStyle="outdoor"),
+            referenceBindings=[
+                LookReferenceBinding(assetId=environment.id, purpose="environment")
+            ],
+        ),
+    )
+    shot = repository.shots[1]
+    repository.shots = (
+        repository.shots[0],
+        replace(
+            shot,
+            draft=shot.draft.model_copy(
+                update={"scene_look_usage": SceneLookUsage.OFF}
+            ),
+        ),
+        repository.shots[2],
+    )
+    service = ShotProductionService(
+        repository=repository,  # type: ignore[arg-type]
+        gateway=None,
+        asset_store=object(),  # type: ignore[arg-type]
+        media_probe=object(),  # type: ignore[arg-type]
+        frame_extractor=None,
+        provider_name="fake",
+        resolution="720p",
+    )
+
+    preview = service.preview_shot_prompt(repository.shots[1].id)
+
+    assert preview["providerInputMode"] == "reference_media"
+    assert preview["actualInputCount"] == 1
+    assert preview["references"][0]["assetId"] == str(environment.id)
+    assert preview["sceneLookUsage"] == "off"
+
+
+def test_approved_production_package_references_are_the_actual_video_inputs(
+    tmp_path: Path,
+) -> None:
+    repository = _AssistRepository(tmp_path)
+    frozen_assets: list[StoredAsset] = []
+    for index, (semantic_key, display_name) in enumerate(
+        (
+            ("person:headshot", "固定儿童身份"),
+            ("cat:front", "固定猫咪身份"),
+            ("scene:environment:rainy-yard", "雨后小院"),
+        ),
+        1,
+    ):
+        path = tmp_path / f"production-reference-{index}.png"
+        path.write_bytes(f"reference-{index}".encode())
+        asset = StoredAsset(
+            id=uuid.uuid4(),
+            project_id=repository.project.id,
+            scene_id=repository.scene.id if semantic_key.startswith("scene:") else None,
+            shot_card_id=None,
+            step_id=None,
+            role="reference",
+            media_type="image",
+            scope="scene" if semantic_key.startswith("scene:") else "canon",
+            status="approved",
+            path=path,
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            metadata={"displayName": display_name},
+            semantic_key=semantic_key,
+        )
+        repository.assets[asset.id] = asset
+        frozen_assets.append(asset)
+    service = ShotProductionService(
+        repository=repository,  # type: ignore[arg-type]
+        gateway=None,
+        asset_store=object(),  # type: ignore[arg-type]
+        media_probe=object(),  # type: ignore[arg-type]
+        frame_extractor=None,
+        provider_name="fake",
+        resolution="720p",
+    )
+    production_context = {
+        "compiledPrompt": "雨后小院里，固定儿童和固定猫咪共同守候叶片。",
+        "compiledShot": {"title": "守叶"},
+        "referenceBindings": [
+            {
+                "assetId": str(asset.id),
+                "role": role,
+                "purpose": purpose,
+                "providerIncluded": True,
+                "providerSlot": f"reference_image_{index}",
+            }
+            for index, (asset, role, purpose) in enumerate(
+                zip(
+                    frozen_assets,
+                    ("identity", "identity", "environment"),
+                    ("person_identity", "cat_identity", "environment"),
+                    strict=True,
+                ),
+                1,
+            )
+        ],
+        "storyboardRevisionId": "storyboard-1",
+        "structureHash": "structure-hash",
+        "generationPlanId": "plan-1",
+        "generationPlanHash": "plan-hash",
+        "productionPackageHash": "package-hash",
+        "compiledPromptId": "prompt-1",
+        "compiledPromptInputHash": "prompt-input-hash",
+        "compiledPromptHash": "prompt-hash",
+    }
+
+    compiled = service._compile_shot_generation(
+        repository.shots[1],
+        target=ReferenceTarget.VIDEO,
+        require_ready=False,
+        production_context=production_context,
+    )
+
+    assert compiled.provider_input_mode.value == "reference_media"
+    assert compiled.actual_input_count == 3
+    assert [asset.id for asset in compiled.sources] == [
+        asset.id for asset in frozen_assets
+    ]
+    assert compiled.snapshot["sourceAssetIds"] == [
+        str(asset.id) for asset in frozen_assets
+    ]
+    assert compiled.blockers == ()
+    assert compiled.prompt.text.count(str(production_context["compiledPrompt"])) == 1
+    assert "【主体、画风和素材职责】" not in compiled.prompt.text
+    assert "【执行规格】" in compiled.prompt.text
+
+    for index in range(4, 11):
+        path = tmp_path / f"production-reference-{index}.png"
+        path.write_bytes(f"reference-{index}".encode())
+        asset = StoredAsset(
+            id=uuid.uuid4(),
+            project_id=repository.project.id,
+            scene_id=repository.scene.id,
+            shot_card_id=None,
+            step_id=None,
+            role="reference",
+            media_type="image",
+            scope="scene",
+            status="approved",
+            path=path,
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            metadata={"displayName": f"补充参考 {index}"},
+            semantic_key=f"scene:prop:{index}",
+        )
+        repository.assets[asset.id] = asset
+        production_context["referenceBindings"].append(  # type: ignore[union-attr]
+            {
+                "assetId": str(asset.id),
+                "role": "prop",
+                "purpose": "prop",
+                "providerIncluded": True,
+                "providerSlot": f"reference_image_{index}",
+            }
+        )
+
+    over_limit = service._compile_shot_generation(
+        repository.shots[1],
+        target=ReferenceTarget.VIDEO,
+        require_ready=False,
+        production_context=production_context,
+    )
+
+    assert over_limit.actual_input_count == 10
+    assert any("最多允许9张参考图" in item for item in over_limit.blockers)
+    assert any("不会静默删除人物或猫咪" in item for item in over_limit.blockers)
+
+
 def test_recipe_scene_cannot_compile_before_visual_assets_and_scene_look_are_ready(
     tmp_path: Path,
 ) -> None:
     repository = _AssistRepository(tmp_path)
+    repository.shots = tuple(
+        replace(
+            shot,
+            draft=shot.draft.model_copy(
+                update={"scene_look_usage": SceneLookUsage.APPEARANCE_ONLY}
+            ),
+        )
+        for shot in repository.shots
+    )
     repository.scene = replace(
         repository.scene,
         draft=repository.scene.draft.model_copy(
@@ -684,10 +887,87 @@ def test_recipe_scene_cannot_compile_before_visual_assets_and_scene_look_are_rea
     assert "场景视觉基准" in message
 
 
+def test_skipped_visual_slots_and_scene_look_off_do_not_block_prompt_compilation(
+    tmp_path: Path,
+) -> None:
+    repository = _AssistRepository(tmp_path)
+    repository.shots = tuple(
+        replace(
+            shot,
+            draft=shot.draft.model_copy(
+                update={"scene_look_usage": SceneLookUsage.OFF}
+            ),
+        )
+        for shot in repository.shots
+    )
+    current_hash = shot_snapshot_hash(
+        (shot.id, shot.draft_revision, shot.draft) for shot in repository.shots
+    )
+    repository.step = StoredStep(
+        id=uuid.uuid4(),
+        project_id=repository.project.id,
+        scene_id=repository.scene.id,
+        shot_card_id=None,
+        kind=StepKind.DIRECTOR,
+        status=StepStatus.SUCCEEDED,
+        attempt=1,
+        operation_key="director:visual-asset-plan",
+        input_snapshot={
+            "shotSnapshotHash": current_hash,
+            "acceptedOutput": {
+                "selections": [
+                    {
+                        "suggestionKey": "optional-environment",
+                        "action": "skip",
+                        "displayName": "可选环境参考",
+                        "purpose": "environment",
+                        "targetScope": "scene",
+                        "prompt": "雨后小院空镜",
+                        "referenceAssetIds": [],
+                        "existingAssetId": None,
+                    }
+                ]
+            },
+        },
+    )
+    repository.list_assets = lambda **_kwargs: ()  # type: ignore[method-assign]
+    service = ShotProductionService(
+        repository=repository,  # type: ignore[arg-type]
+        gateway=None,
+        asset_store=object(),  # type: ignore[arg-type]
+        media_probe=object(),  # type: ignore[arg-type]
+        frame_extractor=None,
+        provider_name="fake",
+        resolution="720p",
+    )
+
+    readiness = ProjectEditingService(
+        repository=repository,  # type: ignore[arg-type]
+        director=None,
+        provider_name="fake",
+    ).scene_asset_readiness(repository.scene.id)
+    preview = service.preview_shot_prompt(repository.shots[1].id)
+
+    assert readiness.required_slots == []
+    assert readiness.scene_look_status == "off"
+    assert readiness.can_compile_shot_prompt is True
+    assert readiness.blockers == []
+    assert preview["ready"] is True
+
+
 def test_recipe_scene_reuses_bound_approved_assets_and_current_scene_look(
     tmp_path: Path,
 ) -> None:
     repository = _AssistRepository(tmp_path)
+    repository.shots = tuple(
+        replace(
+            shot,
+            draft=shot.draft.model_copy(
+                update={"scene_look_usage": SceneLookUsage.APPEARANCE_ONLY}
+            ),
+        )
+        for shot in repository.shots
+    )
     continuity = {
         "location": "雨后小院",
         "environment": "outdoor",

@@ -11,8 +11,12 @@ import type {
   CapabilityCompilationPlan, VideoEditAnnotationInput, VideoEditRecipeDto,
   VideoEditTool, VideoFilmstripDto,
 } from "../../api/types";
-import { clampVideoSelection, renderedVideoRect } from "./videoEditing";
-import type { VideoEditConsoleDraft } from "./canvasInteraction";
+import CanvasReviewDialog from "./CanvasReviewDialog.vue";
+import {
+  clampVideoSelection,
+  renderedVideoRect,
+  type VideoEditConsoleDraft,
+} from "./videoEditing";
 
 interface EditorReference {
   id: string;
@@ -70,6 +74,7 @@ const recipe = ref<VideoEditRecipeDto | null>(null);
 const plan = ref<CapabilityCompilationPlan | null>(null);
 const compiling = ref(false);
 const submitting = ref(false);
+const costReviewOpen = ref(false);
 const filmstrip = ref<VideoFilmstripDto | null>(null);
 const filmstripError = ref("");
 const filmstripLoading = ref(false);
@@ -88,6 +93,16 @@ const selectedReferences = computed(() => props.references.filter(
 const compiledReferenceById = computed(() => new Map(
   (plan.value?.actualReferences ?? []).map((item) => [item.assetId, item]),
 ));
+const boundaryPreviews = computed(() => {
+  const frames = filmstrip.value?.frames ?? [];
+  const nearest = (timestampMs: number) => frames.reduce<(typeof frames)[number] | undefined>(
+    (best, frame) => !best
+      || Math.abs(frame.timestampMs - timestampMs) < Math.abs(best.timestampMs - timestampMs)
+      ? frame : best,
+    undefined,
+  );
+  return { start: nearest(startMs.value), end: nearest(endMs.value) };
+});
 const annotationSurfaceStyle = computed(() => ({
   left: `${annotationSurface.value.left}px`, top: `${annotationSurface.value.top}px`,
   width: `${annotationSurface.value.width}px`, height: `${annotationSurface.value.height}px`,
@@ -109,6 +124,7 @@ watch(
 );
 watch([startMs, endMs, instruction, selectedReferenceIds, annotations], () => {
   plan.value = null;
+  costReviewOpen.value = false;
   emit("draft-change", {
     startMs: startMs.value,
     endMs: endMs.value,
@@ -337,6 +353,7 @@ async function submitRecipe() {
   submitting.value = true;
   try {
     await canvasApi.submitVideoEditRecipe(recipe.value.id, crypto.randomUUID(), plan.value.estimatedCostMicros);
+    costReviewOpen.value = false;
     ElMessage.success("视频局部重编已进入持久任务队列，原资产不会被覆盖");
     emit("submitted", recipe.value.id);
   } finally { submitting.value = false; }
@@ -393,6 +410,18 @@ onBeforeUnmount(() => {
             <label>终点 <input aria-label="重编终点毫秒" type="number" :value="endMs" min="500" :max="durationMs" step="100" @change="updateSelection('end', Number(($event.target as HTMLInputElement).value))" /></label>
             <label class="loop-toggle"><input v-model="loopSelection" type="checkbox" />选区循环</label><small :class="{ error: !intervalValid }">单区间 0.5–13 秒 · 区间外画面与原音轨保持不变</small>
           </div>
+          <div class="boundary-previews" aria-label="编辑区间真实边界帧">
+            <figure>
+              <img v-if="boundaryPreviews.start" :src="boundaryPreviews.start.contentUrl" alt="编辑区间入口帧" />
+              <span v-else>等待帧带</span>
+              <figcaption><b>编辑区间入口帧</b><small>{{ (startMs / 1000).toFixed(1) }}s · 提交时从源视频精确抽取</small></figcaption>
+            </figure>
+            <figure>
+              <img v-if="boundaryPreviews.end" :src="boundaryPreviews.end.contentUrl" alt="编辑区间出口帧" />
+              <span v-else>等待帧带</span>
+              <figcaption><b>编辑区间出口帧</b><small>{{ (endMs / 1000).toFixed(1) }}s · 提交时从源视频精确抽取</small></figcaption>
+            </figure>
+          </div>
         </section>
       </section>
 
@@ -403,9 +432,38 @@ onBeforeUnmount(() => {
           <p v-if="!references.length" class="empty-copy">未添加额外参考；仍会使用源视频与区间边界帧。</p>
         </section>
         <section v-if="plan" class="compile-plan"><div class="section-title"><span class="section-label">能力编译计划</span><b>{{ plan.mode === 'two_stage' ? '两阶段' : '直接提交' }}</b></div><div class="cost-grid"><span><strong>{{ plan.imageCallCount }}</strong> 次图片调用</span><span><strong>{{ plan.videoCallCount }}</strong> 次视频调用</span><span><strong>{{ plan.estimatedCostMicros ? `¥${(plan.estimatedCostMicros / 1_000_000).toFixed(3)}` : '待配置' }}</strong> 预计费用</span></div><p v-for="warning in plan.warnings" :key="warning">{{ warning }}</p></section>
-        <footer><button type="button" data-action="compile" :disabled="compiling" @click="compileRecipe"><VideoPlay />{{ compiling ? '编译中…' : '生成能力计划' }}</button><button type="button" class="primary" data-action="submit" :disabled="!plan || submitting" @click="submitRecipe">{{ submitting ? '提交中…' : '确认费用并生成新版本' }}</button><small>每次提交创建新 Recipe Revision 与新资产，绝不覆盖原视频。</small></footer>
+        <footer><button type="button" data-action="compile" :disabled="compiling" @click="compileRecipe"><VideoPlay />{{ compiling ? '编译中…' : '生成能力计划' }}</button><button type="button" class="primary" data-action="submit" :disabled="!plan || submitting" @click="costReviewOpen = true">{{ submitting ? '提交中…' : '打开费用确认' }}</button><small>每次提交创建新 Recipe Revision 与新资产，绝不覆盖原视频。</small></footer>
       </aside>
     </main>
+    <Teleport to="body">
+      <CanvasReviewDialog
+        v-if="costReviewOpen && plan && recipe"
+        title="视频局部编辑费用确认"
+        @close="costReviewOpen = false"
+      >
+        <section class="cost-review">
+          <h2>本次只调用视频模型，不生成控制锚点</h2>
+          <p>边界帧由服务端从源视频的人工选区免费抽取；确认前不会创建任务或发起 Provider 请求。</p>
+          <dl>
+            <div><dt>源视频</dt><dd>{{ sourceAssetId }}</dd></div>
+            <div><dt>编辑区间</dt><dd>{{ startMs }}ms → {{ endMs }}ms</dd></div>
+            <div><dt>Provider / 模型</dt><dd>{{ plan.provider }} · {{ plan.model }}</dd></div>
+            <div><dt>调用数量</dt><dd>{{ plan.imageCallCount }} 次图片 · {{ plan.videoCallCount }} 次视频</dd></div>
+            <div><dt>参考素材</dt><dd>{{ plan.actualReferences?.filter((item) => item.providerIncluded).length ?? 0 }} 项</dd></div>
+            <div><dt>编译输入哈希</dt><dd><code>{{ plan.inputHash || '当前服务端未返回' }}</code></dd></div>
+            <div><dt>预计费用</dt><dd>{{ plan.estimatedCostMicros ? `¥${(plan.estimatedCostMicros / 1_000_000).toFixed(3)}` : '费用尚未配置，不能据此推断免费' }}</dd></div>
+          </dl>
+          <div class="cost-boundaries">
+            <figure><img v-if="boundaryPreviews.start" :src="boundaryPreviews.start.contentUrl" alt="费用确认入口帧" /><figcaption>入口帧 · {{ startMs }}ms</figcaption></figure>
+            <figure><img v-if="boundaryPreviews.end" :src="boundaryPreviews.end.contentUrl" alt="费用确认出口帧" /><figcaption>出口帧 · {{ endMs }}ms</figcaption></figure>
+          </div>
+        </section>
+        <template #actions>
+          <button class="cost-cancel" type="button" data-action="cancel-cost" @click="costReviewOpen = false">取消，不创建任务</button>
+          <button class="cost-confirm" type="button" data-action="confirm-cost" :disabled="submitting" @click="submitRecipe">{{ submitting ? '提交中…' : '确认费用并生成新版本' }}</button>
+        </template>
+      </CanvasReviewDialog>
+    </Teleport>
   </section>
 </template>
 
@@ -416,9 +474,11 @@ onBeforeUnmount(() => {
 .editor-layout { min-height: 0; display: grid; grid-template-columns: minmax(0,1fr) 390px; }.preview-column { min-width: 0; min-height: 0; padding: 18px; display: grid; grid-template-rows: minmax(260px,1fr) auto auto; gap: 12px; }.video-stage { position: relative; min-height: 0; overflow: hidden; display: grid; place-items: center; background: #090a0c; border: 1px solid #2e333b; border-radius: 14px; }.video-stage video { width: 100%; height: 100%; object-fit: contain; }.video-stage canvas { position: absolute; pointer-events: none; }.video-stage canvas.active { cursor: crosshair; pointer-events: auto; }.exit-annotation { position: absolute; right: 12px; top: 12px; z-index: 2; padding: 7px 9px; color: #fff; background: rgb(26 30 36 / 88%); border: 1px solid #596472; border-radius: 8px; cursor: pointer; }
 .annotation-tools { padding: 7px; display: flex; align-items: center; gap: 4px; background: #20242b; border: 1px solid #353b45; border-radius: 12px; }.annotation-tools button { min-width: 42px; height: 40px; padding: 7px 10px; display: flex; align-items: center; gap: 6px; color: #aeb8c7; background: transparent; border: 0; border-radius: 8px; cursor: pointer; }.annotation-tools button :deep(svg) { width: 17px; }.annotation-tools button.active,.annotation-tools button:hover { color: #fff; background: #38404b; }.annotation-tools i { width: 1px; height: 24px; margin: 0 5px; background: #3b424d; }.annotation-tools input { min-width: 140px; padding: 7px; color: #e5ebf2; background: #111419; border: 1px solid #3e4652; border-radius: 7px; }
 .range-panel { padding: 12px; background: #181c22; border: 1px solid #303640; border-radius: 12px; }.filmstrip { position: relative; height: 76px; overflow: hidden; display: flex; background: #0f1216; border-radius: 8px; cursor: pointer; }.filmstrip img { min-width: 0; flex: 1; height: 76px; object-fit: cover; filter: brightness(.72); }.filmstrip-state { width: 100%; display: grid; place-items: center; color: #8793a3; font-size: 12px; }.filmstrip-state.error { color: #e79999; }.filmstrip-state button { margin-left: 8px; }.range-selection { position: absolute; top: 0; bottom: 0; min-width: 8px; border: 3px solid #75a9f8; border-radius: 8px; box-shadow: 0 0 0 999px rgb(4 6 8 / 46%); pointer-events: none; }.range-selection b { position: absolute; right: 5px; top: 5px; padding: 3px 5px; background: #101722; border-radius: 5px; font-size: 10px; }.range-handle { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: .01; pointer-events: none; }.range-handle::-webkit-slider-thumb { width: 22px; height: 76px; pointer-events: auto; cursor: ew-resize; }.range-handle::-moz-range-thumb { width: 22px; height: 76px; pointer-events: auto; cursor: ew-resize; }.range-inputs { margin-top: 10px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }.range-inputs label { display: flex; align-items: center; gap: 6px; color: #808b9c; font-size: 11px; }.range-inputs input[type=number] { width: 92px; padding: 7px; color: #d8e0eb; background: #111419; border: 1px solid #343b46; border-radius: 7px; }.range-inputs small { margin-left: auto; color: #7f8999; }.range-inputs small.error { color: #ef8e8e; }
+.boundary-previews { margin-top: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }.boundary-previews figure { min-width: 0; margin: 0; padding: 8px; display: grid; grid-template-columns: 74px 1fr; align-items: center; gap: 9px; background: #11151a; border: 1px solid #303844; border-radius: 9px; }.boundary-previews img,.boundary-previews figure>span { width: 74px; height: 52px; object-fit: cover; display: grid; place-items: center; color: #697587; background: #090b0e; border-radius: 6px; font-size: 10px; }.boundary-previews figcaption { min-width: 0; display: grid; gap: 4px; }.boundary-previews b { color: #dce5f0; font-size: 11px; }.boundary-previews small { color: #748094; font-size: 9px; line-height: 1.4; }
 .recipe-panel { min-height: 0; padding: 20px; overflow: auto; background: #171a20; border-left: 1px solid #2b3038; }.recipe-panel>section { padding-bottom: 20px; margin-bottom: 20px; border-bottom: 1px solid #2c323b; }textarea { box-sizing: border-box; width: 100%; margin-top: 10px; padding: 12px; resize: vertical; color: #e8edf4; background: #101318; border: 1px solid #343c48; border-radius: 10px; font: inherit; line-height: 1.6; }.section-title { display: flex; align-items: center; justify-content: space-between; }.section-title b { color: #aab6c7; font-size: 11px; }.reference-row { margin-top: 10px; padding: 8px; display: grid; grid-template-columns: auto 48px 1fr auto; align-items: center; gap: 9px; background: #20242b; border: 1px solid #323943; border-radius: 9px; cursor: pointer; }.reference-row img { width: 48px; height: 48px; object-fit: cover; border-radius: 7px; }.reference-row span { display: grid; }.reference-row small { color: #727e91; }.reference-row em { color: #74c79e; font-size: 9px; font-style: normal; }.reference-row em.omitted { color: #e5a083; }.empty-copy { color: #727e8f; font-size: 12px; }.compile-plan { padding: 14px !important; background: #1d2429; border: 1px solid #395144 !important; border-radius: 11px; }.cost-grid { margin: 12px 0; display: grid; grid-template-columns: repeat(3,1fr); gap: 6px; }.cost-grid span { padding: 8px; display: grid; color: #808c9d; background: #14181d; border-radius: 7px; font-size: 9px; }.cost-grid strong { color: #e4eaf2; font-size: 15px; }.compile-plan p { color: #8fb7a3; font-size: 11px; }
 .reference-title-actions { display: flex; align-items: center; gap: 8px; }.reference-title-actions button { min-height: 34px; padding: 6px 9px; color: #cfe6ff; background: #244e7c; border: 1px solid #3b6e9f; border-radius: 8px; cursor: pointer; }
 footer { display: grid; gap: 9px; }footer button { min-height: 42px; padding: 9px 12px; display: flex; align-items: center; justify-content: center; gap: 7px; color: inherit; background: #29303a; border: 1px solid #414c5a; border-radius: 9px; cursor: pointer; }footer button :deep(svg) { width: 16px; }footer button.primary { color: #10141a; background: #e7edf6; border-color: #e7edf6; font-weight: 800; }footer button:disabled { opacity: .38; cursor: not-allowed; }footer small { color: #6e798a; text-align: center; line-height: 1.5; }
+.cost-review { padding: 24px; }.cost-review h2 { margin: 0 0 8px; font-size: 19px; }.cost-review>p { margin: 0 0 20px; color: #96a2b2; }.cost-review dl { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; overflow: hidden; background: #343b45; border: 1px solid #343b45; border-radius: 12px; }.cost-review dl div { min-width: 0; padding: 12px; display: grid; gap: 5px; background: #1a1e24; }.cost-review dt { color: #7f8b9b; font-size: 10px; }.cost-review dd { min-width: 0; margin: 0; overflow-wrap: anywhere; color: #e0e7ef; }.cost-review code { color: #a9c9ee; font-size: 11px; }.cost-boundaries { margin-top: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }.cost-boundaries figure { margin: 0; overflow: hidden; background: #111419; border: 1px solid #333b46; border-radius: 10px; }.cost-boundaries img { width: 100%; height: 160px; display: block; object-fit: contain; background: #080a0d; }.cost-boundaries figcaption { padding: 9px; color: #aab5c4; font-size: 11px; }.cost-cancel,.cost-confirm { width: auto !important; min-width: 170px; padding: 0 16px; }.cost-confirm { color: #0e141b !important; background: #dbe9f8 !important; }.cost-cancel { color: #cad3de !important; background: #313741 !important; }
 .embedded .editor-header { padding: 0 18px; }.embedded .editor-header h1 { font-size: 14px; }.embedded .editor-layout { grid-template-columns: minmax(360px, .9fr) minmax(520px, 1.35fr); overflow: hidden; }.embedded .preview-column { padding: 14px 18px; display: block; overflow: auto; }.embedded .video-stage,.embedded .annotation-tools { display: none; }.embedded .range-panel { min-height: 170px; display: grid; align-content: center; }.embedded .filmstrip { height: 104px; }.embedded .filmstrip img { height: 104px; }.embedded .range-handle::-webkit-slider-thumb { height: 104px; }.embedded .range-handle::-moz-range-thumb { height: 104px; }.embedded .recipe-panel { padding: 14px 18px; display: grid; grid-template-columns: minmax(220px, .85fr) minmax(300px, 1.15fr); align-content: start; gap: 10px; border-left: 1px solid #2b3038; }.embedded .recipe-panel > section { min-width: 0; max-height: 200px; margin: 0; padding: 12px; overflow: auto; background: #1d2128; border: 1px solid #303742; border-radius: 10px; }.embedded .recipe-panel > section.compile-plan,.embedded .recipe-panel > footer { grid-column: 1 / -1; }.embedded .recipe-panel textarea { min-height: 88px; margin-top: 8px; }.embedded .reference-row { grid-template-columns: auto 42px 1fr; }.embedded .reference-row img { width: 42px; height: 42px; }.embedded .reference-row em { display: none; }.embedded .recipe-panel footer { grid-template-columns: 1fr 1fr; align-items: center; }.embedded .recipe-panel footer small { grid-column: 1 / -1; }
 @media (max-width: 980px) { .editor-layout { grid-template-columns: 1fr; overflow: auto; }.preview-column { min-height: 650px; }.recipe-panel { border: 1px solid #2b3038; }.annotation-tools span { display: none; } }
 @media (max-width: 1100px) { .embedded .editor-layout { grid-template-columns: 1fr; overflow: auto; }.embedded .preview-column { min-height: 190px; }.embedded .recipe-panel { grid-template-columns: 1fr; border-left: 0; }.embedded .recipe-panel > section.compile-plan,.embedded .recipe-panel > footer { grid-column: auto; } }

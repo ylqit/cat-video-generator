@@ -9,7 +9,10 @@ from pathlib import Path
 from threading import Event, Thread
 from typing import Any, Protocol
 
+from pydantic import ValidationError
+
 from ..domain.aigc_canvas import SubjectCompletionProposal
+from ..domain.production_recipes import RecipeDispatchError
 from ..domain.rendering import VideoInputPlan
 from ..domain.workflow import StepStatus
 from .ports import (
@@ -37,7 +40,7 @@ class MediaCanvasQueue(Protocol):
         *,
         worker_id: str,
         lease_seconds: int = 60,
-    ) -> Any: ...
+    ) -> Any | None: ...
 
     def update_progress(
         self,
@@ -60,6 +63,13 @@ class MediaCanvasQueue(Protocol):
         next_retry_at: datetime | None = None,
         result_summary: dict[str, object] | None = None,
         progress_update: dict[str, object] | None = None,
+    ) -> None: ...
+
+    def assert_provider_submission_allowed(
+        self,
+        step_id: uuid.UUID,
+        *,
+        worker_id: str,
     ) -> None: ...
 
 
@@ -102,6 +112,8 @@ class MediaCanvasWorkRepository(Protocol):
         landed: LandedAsset,
         provider_url: str,
         provider_model: str,
+        last_frame_landed: LandedAsset | None = None,
+        last_frame_provider_url: str | None = None,
     ) -> str: ...
 
 
@@ -217,11 +229,14 @@ class _LeaseHeartbeat:
     def _run(self) -> None:
         while not self._stop.wait(self._interval_seconds):
             try:
-                self._queue.heartbeat(
+                renewed = self._queue.heartbeat(
                     self._step_id,
                     worker_id=self._worker_id,
                     lease_seconds=self._lease_seconds,
                 )
+                if renewed is None:
+                    self._stop.set()
+                    return
             except BaseException as exc:
                 self._error = exc
                 self._stop.set()
@@ -337,10 +352,90 @@ class UniversalMediaWorker:
                     percent=35,
                     message="输入验证完成，正在执行生成步骤",
                 )
+                self._queue.assert_provider_submission_allowed(
+                    lease.step_id,
+                    worker_id=self._worker_id,
+                )
                 execution = self._execute(lease)
+        except ValidationError as exc:
+            if lease.operation_key != "recipe:character_design":
+                self._queue.finish(
+                    lease.step_id,
+                    worker_id=self._worker_id,
+                    status=StepStatus.FAILED,
+                    error={"code": "media_worker_failed", "message": str(exc)},
+                    progress_update={"message": "Worker 输入验证失败"},
+                )
+                raise
+            self._queue.finish(
+                lease.step_id,
+                worker_id=self._worker_id,
+                status=StepStatus.FAILED,
+                error={
+                    "code": "recipe_input_validation_failed",
+                    "failedStep": "validate_recipe_input",
+                    "recoverable": True,
+                    "providerSubmitted": False,
+                    "message": str(exc),
+                },
+                progress_update={
+                    "currentStep": 2,
+                    "totalSteps": 3,
+                    "percent": 35,
+                    "message": "角色设计输入解析失败；供应商尚未提交，可从失败步骤继续",
+                    "providerStatus": "not_submitted",
+                },
+            )
+            raise
+        except RecipeDispatchError as exc:
+            validation_dispatch = (
+                lease.operation_key == "recipe:character_design_validation"
+            )
+            error_document = exc.to_error_document()
+            if validation_dispatch:
+                error_document.update(
+                    {
+                        "recoverable": False,
+                        "message": "引用验证调度失败；未提交 Provider，且本轮禁止自动恢复或重试",
+                    }
+                )
+            self._queue.finish(
+                lease.step_id,
+                worker_id=self._worker_id,
+                status=StepStatus.FAILED,
+                error=error_document,
+                progress_update={
+                    "currentStep": 2,
+                    "totalSteps": 3,
+                    "percent": 35,
+                    "message": (
+                        "引用验证调度失败；供应商尚未提交，本轮已停止且不自动重试"
+                        if validation_dispatch
+                        else "角色设计调度失败；供应商尚未提交，可从失败步骤继续"
+                    ),
+                    "providerStatus": "not_submitted",
+                },
+            )
+            raise
         except GatewayError as exc:
             retry_count = int(lease.progress.get("networkRetryCount", 0) or 0)
-            should_retry = exc.retryable and not exc.submission_unknown and retry_count < 3
+            task_input = lease.input_snapshot.get("input")
+            character_design = (
+                task_input.get("characterDesign")
+                if isinstance(task_input, dict)
+                else None
+            )
+            validation_only = bool(
+                lease.operation_key.startswith("media:image:batch:")
+                and isinstance(character_design, dict)
+                and character_design.get("validationOnly") is True
+            )
+            should_retry = (
+                not validation_only
+                and exc.retryable
+                and not exc.submission_unknown
+                and retry_count < 3
+            )
             status = (
                 StepStatus.SUBMISSION_UNKNOWN
                 if exc.submission_unknown
@@ -364,7 +459,13 @@ class UniversalMediaWorker:
                     if should_retry
                     else {"message": "Provider 提交状态未知，等待人工对账恢复"}
                     if exc.submission_unknown
-                    else {"message": "任务执行失败"}
+                    else {
+                        "message": (
+                            "引用验证首次 Provider 调用失败；已按费用边界停止，不自动重试"
+                            if validation_only
+                            else "任务执行失败"
+                        )
+                    }
                 ),
             )
             raise
@@ -387,6 +488,17 @@ class UniversalMediaWorker:
                 {
                     "message": "Provider 正在处理，已安排下一次状态查询",
                     "percent": 60,
+                    **(
+                        {"providerStatus": provider_status}
+                        if (
+                            provider_status := str(
+                                execution.payload.get("providerStatus")
+                                or execution.payload.get("status")
+                                or ""
+                            ).strip().lower()
+                        ) in {"pending", "queued", "running"}
+                        else {}
+                    ),
                 }
                 if execution.status is StepStatus.QUEUED
                 else {
@@ -494,7 +606,10 @@ class UniversalMediaWorker:
             )
         if result.status in {"pending", "queued", "running"}:
             return MediaExecutionResult(
-                payload={"providerTaskId": result.task_id},
+                payload={
+                    "providerTaskId": result.task_id,
+                    "providerStatus": result.status,
+                },
                 status=StepStatus.QUEUED,
                 next_retry_at=datetime.now(UTC)
                 + timedelta(seconds=self._provider_poll_interval_seconds),
@@ -506,11 +621,18 @@ class UniversalMediaWorker:
                 retryable=False,
             )
         landed = self._asset_store.download(result.video_url, suffix=".mp4")
+        last_frame_landed = (
+            self._asset_store.download(result.last_frame_url, suffix=".png")
+            if result.last_frame_url
+            else None
+        )
         asset_id = self._repository.complete_video_candidate(
             step_id,
             landed=landed,
             provider_url=result.video_url,
             provider_model=result.model or "unknown",
+            last_frame_landed=last_frame_landed,
+            last_frame_provider_url=result.last_frame_url,
         )
         return MediaExecutionResult(
             payload={"assetId": asset_id},

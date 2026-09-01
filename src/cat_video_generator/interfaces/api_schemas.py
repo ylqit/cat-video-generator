@@ -23,6 +23,7 @@ from ..domain.contracts import (
     StoryProjectInput,
     StoryRewriteOutput,
     StoryRewriteStrategy,
+    VisualAssetPlanSelection,
     VisualProfileDraft,
 )
 from ..domain.rendering import SequenceTransition
@@ -82,6 +83,14 @@ class AcceptStoryExpansionRequest(ApiModel):
 
 class PlanVisualAssetsRequest(ApiModel):
     allow_paid_generation: bool = Field(alias="allowPaidGeneration")
+    storyboard_revision_id: UUID = Field(alias="storyboardRevisionId")
+    structure_hash: str = Field(
+        alias="structureHash", pattern=r"^[0-9a-f]{64}$"
+    )
+    generation_plan_id: UUID = Field(alias="generationPlanId")
+    generation_plan_hash: str = Field(
+        alias="generationPlanHash", pattern=r"^[0-9a-f]{64}$"
+    )
 
 
 class AcceptStoryDiagnosisRequest(ApiModel):
@@ -108,6 +117,11 @@ class AcceptStoryRewriteRequest(ApiModel):
 
 class AcceptVisualAssetPlanRequest(ApiModel):
     plan: AcceptedVisualAssetPlan
+
+
+class ReviseVisualAssetPlanRequest(ApiModel):
+    selections: list[VisualAssetPlanSelection] = Field(max_length=12)
+    note: str = Field(default="", max_length=2_000)
 
 
 class AssistShotRequest(ApiModel):
@@ -157,6 +171,14 @@ class BuildSequenceRequest(ApiModel):
         default_factory=list,
         max_length=500,
     )
+    intro_transition: SequenceTransition | None = Field(
+        default=None,
+        alias="introTransition",
+    )
+    outro_transition: SequenceTransition | None = Field(
+        default=None,
+        alias="outroTransition",
+    )
 
 
 class ReferencesRequest(ApiModel):
@@ -200,6 +222,12 @@ class GenerateReferenceImageRequest(GenerateRequest):
     draft: ReferenceImageDraft
 
 
+class PreviewReferenceImageRequest(ApiModel):
+    draft: ReferenceImageDraft
+    regenerate: bool = False
+    reason: Annotated[str | None, Field(max_length=1000)] = None
+
+
 class ReviewRequest(ApiModel):
     decision: Literal["approved", "rejected"]
     reason: Annotated[str | None, Field(max_length=2000)] = None
@@ -216,6 +244,15 @@ class RangeEditRequest(ApiModel):
 
 class ReconcileRequest(ApiModel):
     provider_task_id: Annotated[str, Field(alias="providerTaskId", min_length=3, max_length=200)]
+
+
+class CancelTaskRequest(ApiModel):
+    expected_status: Annotated[str, Field(alias="expectedStatus", min_length=1, max_length=32)]
+    expected_provider_task_id: Annotated[
+        str | None,
+        Field(default=None, alias="expectedProviderTaskId", min_length=1, max_length=200),
+    ] = None
+    reason: Annotated[str | None, Field(default=None, max_length=1000)] = None
 
 
 class SelectSequenceRequest(ApiModel):

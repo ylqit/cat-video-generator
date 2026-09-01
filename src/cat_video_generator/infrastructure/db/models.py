@@ -413,6 +413,7 @@ class Scene(Base):
             "sort_order",
             unique=True,
             postgresql_where=text("active = true"),
+            sqlite_where=text("active = 1"),
         ),
         Index("ix_scenes_run_status", "production_run_id", "status", "sort_order"),
         {"schema": SCHEMA_NAME},
@@ -490,7 +491,11 @@ class ShotCard(Base):
     __table_args__ = (
         CheckConstraint(_check("status", _values(ShotStatus)), name="ck_shot_cards_status"),
         CheckConstraint("sort_order >= 1", name="ck_shot_cards_sort_order"),
-        CheckConstraint("duration_seconds BETWEEN 8 AND 15", name="ck_shot_cards_duration"),
+        CheckConstraint(
+            "plan_sort_order IS NULL OR plan_sort_order >= 1",
+            name="ck_shot_cards_plan_sort_order",
+        ),
+        CheckConstraint("duration_seconds BETWEEN 1 AND 60", name="ck_shot_cards_duration"),
         CheckConstraint(
             "anchor_mode IN ('text_only', 'existing', 'generate')",
             name="ck_shot_cards_anchor_mode",
@@ -499,7 +504,11 @@ class ShotCard(Base):
             _check("scene_look_usage", _values(SceneLookUsage)),
             name="ck_shot_cards_scene_look_usage",
         ),
-        UniqueConstraint("scene_id", "sort_order", name="uq_shot_cards_scene_order"),
+        UniqueConstraint(
+            "generation_plan_id",
+            "plan_sort_order",
+            name="uq_shot_cards_generation_plan_order",
+        ),
         Index("ix_shot_cards_scene_status", "scene_id", "status", "sort_order"),
         {"schema": SCHEMA_NAME},
     )
@@ -511,9 +520,28 @@ class ShotCard(Base):
         nullable=False,
     )
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    plan_sort_order: Mapped[int | None] = mapped_column(Integer)
     title: Mapped[str] = mapped_column(String(100), nullable=False)
     direction: Mapped[str] = mapped_column(Text, nullable=False)
     duration_seconds: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=8)
+    generation_plan_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            f"{SCHEMA_NAME}.generation_plans.id",
+            name="fk_shot_cards_generation_plan",
+            use_alter=True,
+            ondelete="SET NULL",
+        ),
+    )
+    prompt_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            f"{SCHEMA_NAME}.prompt_records.id",
+            name="fk_shot_cards_prompt",
+            use_alter=True,
+            ondelete="SET NULL",
+        ),
+    )
     anchor_mode: Mapped[str] = mapped_column(String(24), nullable=False, default="text_only")
     reference_bindings_json: Mapped[list[dict[str, Any]]] = mapped_column(
         JSONB, nullable=False, default=list, server_default="[]"
@@ -978,6 +1006,117 @@ class StoryRevisionRecord(Base):
     )
 
 
+class StoryboardRevision(Base):
+    __tablename__ = "storyboard_revisions"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('draft', 'structure_approved', 'production_approved', "
+            "'changes_requested', 'superseded')",
+            name="ck_storyboard_revisions_status",
+        ),
+        UniqueConstraint(
+            "production_run_id",
+            "revision",
+            name="uq_storyboard_revisions_run_revision",
+        ),
+        Index(
+            "ix_storyboard_revisions_current",
+            "production_run_id",
+            "status",
+            "revision",
+        ),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    story_revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.story_revisions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="draft", server_default="draft"
+    )
+    structure_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_step_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.workflow_steps.id", ondelete="SET NULL"),
+    )
+    input_bindings_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
+    approved_structure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    production_package_hash: Mapped[str | None] = mapped_column(String(64))
+    production_approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class GenerationPlan(Base):
+    __tablename__ = "generation_plans"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('proposed', 'approved', 'stale')",
+            name="ck_generation_plans_status",
+        ),
+        UniqueConstraint(
+            "storyboard_revision_id",
+            "revision",
+            name="uq_generation_plans_storyboard_revision",
+        ),
+        Index(
+            "ix_generation_plans_current",
+            "storyboard_revision_id",
+            "status",
+            "revision",
+        ),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    storyboard_revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.storyboard_revisions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="proposed", server_default="proposed"
+    )
+    provider: Mapped[str] = mapped_column(String(80), nullable=False)
+    model: Mapped[str] = mapped_column(String(200), nullable=False)
+    capability_revision: Mapped[str] = mapped_column(String(80), nullable=False)
+    input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    estimated_image_call_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    estimated_video_call_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    estimated_cost_micros: Mapped[int | None] = mapped_column(BigInteger)
+    warnings_json: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
+    blockers_json: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class StoryScore(Base):
     __tablename__ = "story_scores"
     __table_args__ = (
@@ -1031,7 +1170,20 @@ class SceneSubjectBinding(Base):
 class ShotBeat(Base):
     __tablename__ = "shot_beats"
     __table_args__ = (
-        UniqueConstraint("scene_id", "sort_order", "revision", name="uq_shot_beats_order_revision"),
+        CheckConstraint(
+            "cut_intent IN ('continuous', 'soft_cut', 'hard_cut')",
+            name="ck_shot_beats_cut_intent",
+        ),
+        CheckConstraint(
+            "reference_binding_revision >= 1",
+            name="ck_shot_beats_reference_binding_revision",
+        ),
+        UniqueConstraint(
+            "storyboard_revision_id",
+            "scene_id",
+            "sort_order",
+            name="uq_shot_beats_storyboard_order",
+        ),
         Index("ix_shot_beats_story", "story_revision_id", "scene_id", "sort_order"),
         {"schema": SCHEMA_NAME},
     )
@@ -1046,15 +1198,49 @@ class ShotBeat(Base):
     story_revision_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.story_revisions.id", ondelete="SET NULL")
     )
+    storyboard_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.storyboard_revisions.id", ondelete="CASCADE"),
+    )
     prompt_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey(f"{SCHEMA_NAME}.prompt_records.id", ondelete="SET NULL")
+    )
+    reference_bindings_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
+    reference_binding_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
     )
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False)
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     title: Mapped[str] = mapped_column(String(160), nullable=False)
     action: Mapped[str] = mapped_column(Text, nullable=False)
+    visual_description: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default=""
+    )
+    child_action: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    cat_action: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    spatial_relation: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default=""
+    )
+    contact_occlusion: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default=""
+    )
+    shot_size: Mapped[str] = mapped_column(
+        String(200), nullable=False, default="中景", server_default="中景"
+    )
     camera: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    lighting: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
     dialogue: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    sound_effect: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    music_intent: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    wardrobe_state: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    prop_state: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    continuity_in: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    continuity_out: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    cut_intent: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="continuous", server_default="continuous"
+    )
     duration_seconds: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     temporal_beats_json: Mapped[list[dict[str, Any]]] = mapped_column(
         JSONB,
@@ -1068,6 +1254,64 @@ class ShotBeat(Base):
     stale_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class GenerationClipShot(Base):
+    __tablename__ = "generation_clip_shots"
+    __table_args__ = (
+        CheckConstraint("ordinal >= 1", name="ck_generation_clip_shots_ordinal"),
+        CheckConstraint(
+            "start_second >= 0 AND end_second > start_second",
+            name="ck_generation_clip_shots_interval",
+        ),
+        CheckConstraint(
+            "transition_in IN ('continuous', 'soft_cut', 'hard_cut')",
+            name="ck_generation_clip_shots_transition",
+        ),
+        UniqueConstraint(
+            "generation_plan_id",
+            "shot_card_id",
+            "ordinal",
+            name="uq_generation_clip_shots_clip_order",
+        ),
+        UniqueConstraint(
+            "generation_plan_id",
+            "shot_beat_id",
+            name="uq_generation_clip_shots_plan_beat",
+        ),
+        Index(
+            "ix_generation_clip_shots_plan_clip",
+            "generation_plan_id",
+            "shot_card_id",
+            "ordinal",
+        ),
+        {"schema": SCHEMA_NAME},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    generation_plan_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.generation_plans.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    shot_card_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.shot_cards.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    shot_beat_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA_NAME}.shot_beats.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_second: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    end_second: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    transition_in: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="continuous", server_default="continuous"
     )
 
 
@@ -1536,6 +1780,12 @@ class MediaGenerationBatch(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     idempotency_key: Mapped[str] = mapped_column(String(96), nullable=False)
     input_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    reference_manifest_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
+    reference_manifest_hash: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=""
+    )
     output_asset_ids_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

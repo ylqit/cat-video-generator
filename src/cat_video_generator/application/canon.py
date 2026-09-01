@@ -27,6 +27,17 @@ class CanonManifestEntry(StrictModel):
 class CanonRepository(Protocol):
     def list_assets(self) -> tuple[StoredAsset, ...]: ...
 
+    def install_canon_asset(
+        self,
+        *,
+        landed: LandedAsset,
+        semantic_key: str,
+        role: str,
+        display_name: str,
+        group: str | None,
+        recommended_default: bool,
+    ) -> StoredAsset: ...
+
     def repair_canon_assets(
         self,
         repairs: tuple[tuple[uuid.UUID, LandedAsset], ...],
@@ -45,6 +56,43 @@ class CanonRepairService:
         if not isinstance(entries, list):
             raise ValueError("Canon manifest must contain an assets list")
         return self.repair_entries(source_root=resolved.parent, entries=tuple(entries))
+
+    def install_manifest(self, manifest_path: Path) -> tuple[StoredAsset, ...]:
+        """Install new immutable Canon assets or verify their exact existing rows."""
+
+        resolved = manifest_path.expanduser().resolve()
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+        entries = payload.get("assets")
+        if not isinstance(entries, list):
+            raise ValueError("Canon manifest must contain an assets list")
+        manifest = tuple(CanonManifestEntry.model_validate(item) for item in entries)
+        keys = [item.semantic_key for item in manifest]
+        if len(keys) != len(set(keys)):
+            raise ValueError("Canon manifest contains duplicate semantic keys")
+
+        root = resolved.parent
+        installed: list[StoredAsset] = []
+        for entry in manifest:
+            source = (root / entry.file).resolve()
+            if not source.is_relative_to(root) or not source.is_file():
+                raise ValueError(f"Canon source file is unavailable: {entry.file}")
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            if digest != entry.sha256:
+                raise ValueError(f"Canon hash mismatch: {entry.semantic_key}")
+            landed = self._asset_store.import_local(source)
+            if landed.sha256 != digest:
+                raise ValueError(f"Canon imported hash mismatch: {entry.semantic_key}")
+            installed.append(
+                self._repository.install_canon_asset(
+                    landed=landed,
+                    semantic_key=entry.semantic_key,
+                    role=entry.role or entry.group or "canon_reference",
+                    display_name=entry.display_name or entry.semantic_key,
+                    group=entry.group,
+                    recommended_default=entry.recommended_default,
+                )
+            )
+        return tuple(installed)
 
     def repair_entries(
         self,

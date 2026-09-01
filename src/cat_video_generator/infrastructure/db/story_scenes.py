@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from typing import Any
 
@@ -11,6 +12,12 @@ from sqlalchemy.orm import Session
 
 from ...domain.workflow import SceneStatus
 from .models import Scene, StoryRevisionRecord
+
+logger = logging.getLogger(__name__)
+
+
+class SceneLookRevisionIntegrityError(RuntimeError):
+    """An existing scene violates the persisted Scene Look revision invariant."""
 
 
 def normalized_story_scenes(row: StoryRevisionRecord) -> list[dict[str, Any]]:
@@ -126,6 +133,7 @@ def materialize_approved_story_scenes(
     materialized: list[Scene] = []
     for index, outline in enumerate(outlines, 1):
         scene_key = str(outline["sceneKey"])
+        next_look_plan = scene_look_plan_from_outline(outline)
         row = current_by_key.get(scene_key)
         if row is None:
             row = Scene(
@@ -139,10 +147,55 @@ def materialize_approved_story_scenes(
                 source_text=str(outline.get("synopsis") or outline.get("purpose") or "剧情场景"),
                 story_mode="single",
                 target_shot_count=1,
+                look_plan_json=next_look_plan,
+                look_draft_json={},
+                look_draft_revision=1,
+                selected_look_asset_id=None,
                 status=SceneStatus.READY.value,
             )
             session.add(row)
-        next_look_plan = scene_look_plan_from_outline(outline)
+            logger.info(
+                "materialized new approved-story scene",
+                extra={
+                    "production_run_id": str(story.production_run_id),
+                    "story_revision_id": str(story.id),
+                    "story_revision": story.revision,
+                    "scene_key": scene_key,
+                    "scene_id": str(row.id),
+                    "scene_reused": False,
+                    "look_draft_revision": 1,
+                },
+            )
+        else:
+            revision = row.look_draft_revision
+            if type(revision) is not int or revision < 0:
+                raise SceneLookRevisionIntegrityError(
+                    "已持久化场景的 Scene Look 修订号无效："
+                    f"sceneId={row.id}, storyRevisionId={story.id}, "
+                    f"storyRevision={story.revision}, sceneKey={scene_key}, "
+                    f"lookDraftRevision={revision!r}"
+                )
+            if row.look_plan_json != next_look_plan:
+                previous_plan = row.look_plan_json
+                row.look_plan_json = next_look_plan
+                row.look_draft_json = {}
+                row.look_draft_revision = revision + 1
+                row.selected_look_asset_id = None
+                logger.info(
+                    "updated approved-story scene look plan",
+                    extra={
+                        "production_run_id": str(story.production_run_id),
+                        "story_revision_id": str(story.id),
+                        "story_revision": story.revision,
+                        "scene_key": scene_key,
+                        "scene_id": str(row.id),
+                        "scene_reused": True,
+                        "previous_look_plan": previous_plan,
+                        "next_look_plan": next_look_plan,
+                        "previous_look_draft_revision": revision,
+                        "look_draft_revision": revision + 1,
+                    },
+                )
         row.story_revision_id = story.id
         row.scene_key = scene_key
         row.active = True
@@ -159,11 +212,6 @@ def materialize_approved_story_scenes(
             ensure_ascii=False,
             sort_keys=True,
         )
-        if row.look_plan_json != next_look_plan:
-            row.look_plan_json = next_look_plan
-            row.look_draft_json = {}
-            row.look_draft_revision += 1
-            row.selected_look_asset_id = None
         row.story_mode = "single"
         row.status = SceneStatus.READY.value
         materialized.append(row)

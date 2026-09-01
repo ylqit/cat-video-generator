@@ -1,7 +1,12 @@
 import { computed, readonly, ref } from "vue";
 
 import { api } from "../api/client";
-import type { JobDto, PersistentTaskDto } from "../api/types";
+import type {
+  JobDto,
+  PersistentTaskDto,
+  PersistentTaskRecoveryDto,
+  TaskCancellationPolicyDto,
+} from "../api/types";
 
 export type TaskCenterStatus =
   | "queued"
@@ -12,6 +17,8 @@ export type TaskCenterStatus =
   | "succeeded"
   | "failed"
   | "submission_unknown"
+  | "cancelling"
+  | "cancellation_unknown"
   | "restart_pending"
   | "cancelled";
 
@@ -38,6 +45,8 @@ export interface TaskCenterItem {
   attempt?: number;
   model?: string | null;
   providerTaskId?: string | null;
+  recovery?: PersistentTaskRecoveryDto;
+  cancellation?: TaskCancellationPolicyDto;
   result?: unknown;
   resultSummary?: Record<string, unknown> | null;
   progress?: {
@@ -94,11 +103,12 @@ const EVENT_CURSOR_KEY = "cvg.v5.task-event-cursor";
 const ACTIVE_INTERVAL_MS = 4_000;
 const IDLE_INTERVAL_MS = 25_000;
 const activeStatuses = new Set<TaskCenterStatus>([
-  "queued", "pending", "submitting", "running", "restart_pending",
+  "queued", "pending", "submitting", "running", "cancelling", "restart_pending",
 ]);
 const knownStatuses = new Set<TaskCenterStatus>([
   ...activeStatuses,
-  "awaiting_review", "succeeded", "failed", "submission_unknown", "cancelled",
+  "awaiting_review", "succeeded", "failed", "submission_unknown",
+  "cancellation_unknown", "cancelled",
 ]);
 const items = ref<TaskCenterItem[]>(loadStoredItems());
 const notifiedTerminalEvents = new Set<string>(loadNotifiedTerminalEvents());
@@ -108,6 +118,8 @@ const sceneSignals = ref<Record<string, TaskCenterScopeSignal>>({});
 const shotSignals = ref<Record<string, TaskCenterScopeSignal>>({});
 const workspaceRefreshRequest = ref<WorkspaceRefreshRequest | null>(null);
 const connectionError = ref("");
+const recoveringStepIds = ref<string[]>([]);
+const cancellingStepIds = ref<string[]>([]);
 let timer: number | undefined;
 let reconnectTimer: number | undefined;
 let eventSource: EventSource | undefined;
@@ -131,7 +143,8 @@ const activeCount = computed(() => items.value.filter(
 const attentionCount = computed(() => items.value.filter(
   (item) => item.status === "awaiting_review"
     || item.status === "failed"
-    || item.status === "submission_unknown",
+    || item.status === "submission_unknown"
+    || item.status === "cancellation_unknown",
 ).length);
 
 function loadStoredItems(): TaskCenterItem[] {
@@ -198,6 +211,8 @@ function materialSignature(item: TaskCenterItem): string {
     resultSummary: item.resultSummary,
     progress: item.progress,
     error: item.error,
+    recovery: item.recovery,
+    cancellation: item.cancellation,
   });
 }
 
@@ -253,7 +268,13 @@ function updateItem(next: TaskCenterItem) {
   ) signalMaterialChange(merged);
   if (previous && previous.status !== merged.status) {
     const event = { item: merged, previousStatus: previous.status };
-    const terminal = ["awaiting_review", "succeeded", "failed", "submission_unknown"].includes(
+    const terminal = [
+      "awaiting_review",
+      "succeeded",
+      "failed",
+      "submission_unknown",
+      "cancellation_unknown",
+    ].includes(
       merged.status,
     );
     const fingerprint = merged.eventSequence
@@ -343,6 +364,8 @@ function mergeWorkflowTask(task: PersistentTaskDto) {
     attempt: task.attempt,
     model: task.model,
     providerTaskId: task.providerTaskId,
+    recovery: task.recovery ?? undefined,
+    cancellation: task.cancellation ?? undefined,
     result: existing?.result,
     resultSummary: task.resultSummary,
     progress: task.progress,
@@ -354,6 +377,58 @@ function mergeWorkflowTask(task: PersistentTaskDto) {
   });
 }
 
+export async function recoverPersistentTask(
+  task: Pick<TaskCenterItem, "stepId" | "recovery">,
+): Promise<PersistentTaskDto> {
+  if (!task.stepId) throw new Error("任务缺少持久步骤标识，无法安全恢复");
+  if (!task.recovery?.allowed) {
+    throw new Error(task.recovery?.disabledReason || "该任务当前不允许安全恢复");
+  }
+  if (recoveringStepIds.value.includes(task.stepId)) {
+    throw new Error("恢复请求正在提交，请勿重复操作");
+  }
+  recoveringStepIds.value = [...recoveringStepIds.value, task.stepId];
+  try {
+    const recovered = await api.recoverPersistentTask(task.stepId);
+    mergeWorkflowTask(recovered);
+    persist();
+    return recovered;
+  } finally {
+    recoveringStepIds.value = recoveringStepIds.value.filter((id) => id !== task.stepId);
+  }
+}
+
+export async function cancelPersistentTask(
+  task: {
+    stepId?: string;
+    status: string;
+    providerTaskId?: string | null;
+    cancellation?: TaskCancellationPolicyDto | null;
+  },
+  reason?: string,
+): Promise<PersistentTaskDto> {
+  if (!task.stepId) throw new Error("任务缺少持久步骤标识，无法取消");
+  if (!task.cancellation?.allowed) {
+    throw new Error(task.cancellation?.disabledReason || "该任务当前不允许取消");
+  }
+  if (cancellingStepIds.value.includes(task.stepId)) {
+    throw new Error("取消请求正在提交，请勿重复操作");
+  }
+  cancellingStepIds.value = [...cancellingStepIds.value, task.stepId];
+  try {
+    const cancelled = await api.cancelPersistentTask(task.stepId, {
+      expectedStatus: task.status,
+      expectedProviderTaskId: task.providerTaskId ?? null,
+      reason: reason?.trim() || null,
+    });
+    mergeWorkflowTask(cancelled);
+    persist();
+    return cancelled;
+  } finally {
+    cancellingStepIds.value = cancellingStepIds.value.filter((id) => id !== task.stepId);
+  }
+}
+
 const pushedTaskEvents = [
   "task_queued",
   "task_running",
@@ -362,6 +437,10 @@ const pushedTaskEvents = [
   "task_succeeded",
   "task_failed",
   "task_submission_unknown",
+  "task_provider_cancelling",
+  "task_cancelled_before_provider",
+  "task_provider_cancelled",
+  "task_cancellation_unknown",
 ] as const;
 const projectionEvents = [
   "canvas_projection_changed",
@@ -416,6 +495,10 @@ function handlePushedEvent(eventType: string, event: MessageEvent<string>) {
     task_succeeded: "succeeded",
     task_failed: "failed",
     task_submission_unknown: "submission_unknown",
+    task_provider_cancelling: "cancelling",
+    task_cancelled_before_provider: "cancelled",
+    task_provider_cancelled: "cancelled",
+    task_cancellation_unknown: "cancellation_unknown",
   };
   const rawStatus = typeof data.status === "string" ? data.status : statusByEvent[eventType];
   const progress = data.progress && typeof data.progress === "object"
@@ -618,7 +701,8 @@ export function stopTaskCenter() {
 export function clearCompletedTasks() {
   items.value = items.value.filter((item) => activeStatuses.has(item.status)
     || item.status === "awaiting_review"
-    || item.status === "submission_unknown");
+    || item.status === "submission_unknown"
+    || item.status === "cancellation_unknown");
   persist();
 }
 
@@ -636,7 +720,7 @@ export function taskKindLabel(kind: string): string {
     generate_video: "视频片段",
     range_edit: "区间重拍",
     recipe_story: "治愈短片故事候选",
-    recipe_story_events: "治愈短片事件方案",
+    recipe_story_events: "完整故事候选（兼容入口）",
     recipe_story_script: "治愈短片剧情脚本扩写",
     recipe_creative_brief: "治愈短片创意补全",
     recipe_character_design: "治愈短片角色设计",
@@ -644,7 +728,7 @@ export function taskKindLabel(kind: string): string {
     recipe_anchor: "治愈短片视觉锚点",
     recipe_video: "治愈短片逐镜视频",
     recipe_sequence: "治愈短片最终音画",
-    story_strategy: "三案故事策划",
+    story_strategy: "故事候选批次生成",
     storyboard: "分镜脚本生成",
     build_sequence: "本地成片合成",
     resume_step: "Provider 任务恢复",
@@ -664,15 +748,16 @@ function operationLabel(operationKey: string): string {
     "video:shot": "视频片段",
     "video:range-edit": "区间重拍",
     "recipe:story": "治愈短片故事候选",
-    "recipe:story_events": "生成三个事件方案",
+    "recipe:story_events": "生成完整故事候选（兼容入口）",
     "recipe:story_script": "扩写完整剧情脚本",
     "recipe:creative": "治愈短片创意补全",
     "recipe:character_design": "治愈短片角色设计",
+    "recipe:character_design_validation": "三槽位引用顺序验证",
     "recipe:storyboard": "治愈短片分镜脚本",
     "recipe:anchor": "治愈短片视觉锚点",
     "recipe:video": "治愈短片逐镜视频",
     "recipe:sequence": "治愈短片最终音画",
-    "canvas:story_strategy": "三案故事策划",
+    "canvas:story_strategy": "故事候选批次生成",
     "canvas:storyboard": "分镜脚本生成",
     "canvas-group:run": "一人一猫整组执行",
   } as Record<string, string>)[operationKey]
@@ -690,5 +775,7 @@ export function useTaskCenter() {
     shotSignals: readonly(shotSignals),
     workspaceRefreshRequest: readonly(workspaceRefreshRequest),
     connectionError: readonly(connectionError),
+    recoveringStepIds: readonly(recoveringStepIds),
+    cancellingStepIds: readonly(cancellingStepIds),
   };
 }

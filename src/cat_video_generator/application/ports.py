@@ -30,9 +30,79 @@ from ..domain.workflow import (
 )
 
 
+def reference_display_name(
+    *,
+    semantic_key: str | None,
+    role: str,
+    metadata: dict[str, Any],
+) -> str:
+    """Return the stable creator-facing name for a reference asset.
+
+    Generated assets historically stored their internal semantic key in
+    ``displayName``.  That key is useful for lineage, but it must never leak
+    into a creator-facing Prompt or reference strip.  Keep the semantic key in
+    audit data and derive the visible production role here.
+    """
+
+    semantic = semantic_key or ""
+    character_design = metadata.get("characterDesign")
+    slot = (
+        str(character_design.get("slot") or "")
+        if isinstance(character_design, dict)
+        else ""
+    )
+    if not slot and semantic.startswith("character-design:"):
+        parts = semantic.split(":")
+        slot = parts[2] if len(parts) > 2 else ""
+    slot_names = {
+        "child": "本集儿童设计",
+        "cat": "本集猫咪设计",
+        "pair_scale": "一人一猫同框比例",
+    }
+    if slot in slot_names:
+        return slot_names[slot]
+
+    shot_parts = semantic.split(":")
+    if len(shot_parts) >= 3 and shot_parts[0] == "shot":
+        if shot_parts[2] == "video" and len(shot_parts) >= 4:
+            return f"视频版本 V{shot_parts[3]}"
+        if shot_parts[2] == "anchor":
+            return "开场视觉锚点"
+        if shot_parts[2] == "tail":
+            return "视频真实尾帧"
+
+    configured = metadata.get("displayName") or metadata.get("title")
+    if isinstance(configured, str) and configured.strip():
+        value = configured.strip()
+        if not value.startswith("character-design:"):
+            return value
+    names = {
+        "person:headshot": "人物大头照",
+        "person:fullbody": "人物全身",
+        "person:front": "人物正面",
+        "person:side": "人物侧面",
+        "person:back": "人物背面",
+        "cat:front": "猫咪正面",
+        "cat:side": "猫咪侧面",
+        "cat:back": "猫咪背面",
+        "style:line_texture": "线条与材质",
+        "style:outdoor": "户外画风",
+        "style:indoor": "室内画风",
+    }
+    return names.get(semantic, semantic or role)
+
+
 @dataclass(frozen=True, slots=True)
 class DirectorResult:
     payload: dict[str, Any]
+    response_id: str
+    model: str
+    request_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class CreativeDirectorResult:
+    payload: dict[str, Any] | str
     response_id: str
     model: str
     request_hash: str
@@ -49,6 +119,7 @@ class VideoTaskResult:
     task_id: str
     status: str
     video_url: str | None = None
+    last_frame_url: str | None = None
     error_code: str | None = None
     error_message: str | None = None
     model: str | None = None
@@ -62,6 +133,7 @@ class VideoTaskResult:
 @dataclass(frozen=True, slots=True)
 class VideoDiagnosticResult:
     identity_ok: bool
+    identity_assessment: str
     style_ok: bool
     constraints_ok: bool
     narrative_order_ok: bool
@@ -213,23 +285,11 @@ class StoredAsset:
 
     @property
     def display_name(self) -> str:
-        value = self.metadata.get("displayName")
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-        names = {
-            "person:headshot": "人物大头照",
-            "person:fullbody": "人物全身",
-            "person:front": "人物正面",
-            "person:side": "人物侧面",
-            "person:back": "人物背面",
-            "cat:front": "猫咪正面",
-            "cat:side": "猫咪侧面",
-            "cat:back": "猫咪背面",
-            "style:line_texture": "线条与材质",
-            "style:outdoor": "户外画风",
-            "style:indoor": "室内画风",
-        }
-        return names.get(self.semantic_key or "", self.semantic_key or self.role)
+        return reference_display_name(
+            semantic_key=self.semantic_key,
+            role=self.role,
+            metadata=self.metadata,
+        )
 
     @property
     def reference_purpose(self) -> str | None:
@@ -314,8 +374,28 @@ class DirectorGateway(Protocol):
     @property
     def analysis_model(self) -> str: ...
 
+    def generate_creative_text(
+        self,
+        *,
+        prompt: str,
+        output_name: str,
+    ) -> CreativeDirectorResult: ...
+
+    def generate_storyboard_text(
+        self,
+        *,
+        prompt: str,
+        output_name: str,
+        image_paths: tuple[Path, ...] = (),
+    ) -> CreativeDirectorResult: ...
+
     def generate_structured(
-        self, *, prompt: str, schema: dict[str, Any], output_name: str
+        self,
+        *,
+        prompt: str,
+        schema: dict[str, Any],
+        output_name: str,
+        image_paths: tuple[Path, ...] = (),
     ) -> DirectorResult: ...
 
     def analyze_structured(
@@ -350,12 +430,19 @@ class MediaGateway(Protocol):
 
     def get_video_task(self, task_id: str) -> VideoTaskResult: ...
 
+    def cancel_video_task(self, task_id: str) -> VideoTaskResult: ...
+
     def list_video_tasks(
         self, *, model: str, page_size: int = 100
     ) -> tuple[VideoTaskResult, ...]: ...
 
     def diagnose_video_frames(
-        self, *, prompt: str, frame_paths: tuple[Path, ...]
+        self,
+        *,
+        prompt: str,
+        frame_paths: tuple[Path, ...],
+        reference_paths: tuple[Path, ...] = (),
+        reference_labels: tuple[str, ...] = (),
     ) -> VideoDiagnosticResult: ...
 
     def diagnose_image(self, *, prompt: str, image_path: Path) -> ImageDiagnosticResult: ...
@@ -406,7 +493,7 @@ class MediaProbe(Protocol):
         *,
         expected_duration_seconds: int,
         expected_resolution: str,
-        minimum_duration_seconds: int = 8,
+        minimum_duration_seconds: int = 4,
         maximum_duration_seconds: int = 15,
         duration_tolerance_ms: int = 1000,
         require_audio: bool = True,
@@ -484,6 +571,19 @@ class ShotQueueStore(Protocol):
 
     def get_scene(self, scene_id: uuid.UUID) -> StoredScene: ...
 
+    def approved_character_design_assets(
+        self, project_id: uuid.UUID
+    ) -> tuple[StoredAsset, ...]: ...
+
+    def requires_character_design_assets(self, project_id: uuid.UUID) -> bool: ...
+
+    def storyboard_production_context(self, scene_id: uuid.UUID) -> dict[str, Any]: ...
+
+    def generation_clip_production_context(
+        self,
+        shot_id: uuid.UUID,
+    ) -> dict[str, Any]: ...
+
     def select_scene_look_asset(
         self,
         scene_id: uuid.UUID,
@@ -547,8 +647,20 @@ class ShotQueueStore(Protocol):
         self,
         *,
         step_id: uuid.UUID,
-        expected_shot_snapshot_hash: str,
+        expected_storyboard_revision_id: uuid.UUID,
+        expected_structure_hash: str,
+        expected_generation_plan_id: uuid.UUID,
+        expected_generation_plan_hash: str,
         accepted_output: AcceptedVisualAssetPlan,
+    ) -> StoredStep: ...
+
+    def revise_visual_asset_plan(
+        self,
+        *,
+        step_id: uuid.UUID,
+        expected_revision: int,
+        accepted_output: AcceptedVisualAssetPlan,
+        note: str,
     ) -> StoredStep: ...
 
     def update_shot(self, shot_id: uuid.UUID, draft: ShotCardDraft) -> StoredShot: ...

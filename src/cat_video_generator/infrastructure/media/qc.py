@@ -230,7 +230,7 @@ class FfprobeMediaProbe:
         *,
         expected_duration_seconds: int,
         expected_resolution: str,
-        minimum_duration_seconds: int = 8,
+        minimum_duration_seconds: int = 4,
         maximum_duration_seconds: int = 15,
         duration_tolerance_ms: int = 1000,
         require_audio: bool = True,
